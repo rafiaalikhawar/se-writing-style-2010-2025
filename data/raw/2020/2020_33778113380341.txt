@@ -1,0 +1,1248 @@
+Verifying Object Construction
+Martin Kellogg
+U. of Washington, USA
+kelloggm@cs.washington.eduManli Ran
+UC Riverside, USA
+mran002@ucr.eduManu Sridharan
+UC Riverside, USA
+manu@cs.ucr.edu
+Martin Schäf
+Amazon Web Services, USA
+schaef@amazon.comMichael D. Ernst
+U. of Washington, USA
+mernst@cs.washington.edu
+ABSTRACT
+Inobject-orientedlanguages,constructorsoftenhaveacombina-
+tionofrequiredandoptionalformalparameters.Itistediousand
+inconvenientforprogrammerstowriteaconstructorbyhandfor
+each combination. The multitude of constructors is error-prone for
+clients,andclientcodeisdifficulttoreadduetothelargenumberof
+constructorarguments.Therefore,programmersoftenusedesign
+patterns that enable more flexible object construction—the builder
+pattern, dependency injection, or factory methods.
+However,thesedesignpatternscanbe tooflexible:notallcom-
+binations of logical parameters lead to the construction of well-
+formed objects. When a client uses the builder pattern to construct
+anobject,thecompilerdoesnotcheckthatavalidsetofvalueswas
+provided. Incorrect use of builders can lead to security vulnerabili-
+ties, run-time crashes, and other problems.
+This work shows how to statically verify uses of object con-
+struction, such as the builder pattern. Using a simple specification
+language,programmersspecifywhichcombinationsoflogicalar-
+guments are permitted. Our compile-time analysis detects client
+codethatmayconstructobjectsunsafely.Ouranalysisisbasedona
+novelspecialcaseoftypestatechecking, accumulationanalysis,that
+modularlyreasonsaboutaccumulationsofmethodcalls.Because
+accumulationanalysisdoesnotrequireprecisealiasinginformation
+for soundness, our analysis scales to industrial programs. We eval-
+uated it on over 9 million lines of code, discovering defects which
+includedpreviously-unknownsecurityvulnerabilitiesandpotentialnull-pointerviolationsinheavily-usedopen-sourcecodebases.Our
+analysis has a low false positive rate and low annotation burden.
+Our implementation and experimental data are publicly avail-
+able.
+CCS Concepts: •Software and its engineering →Software
+verification ;Automatedstaticanalysis ;Datatypesandstruc-
+tures.Keywords:
+Pluggabletypesystems,AMIsniping,builderpattern,light-
+weight verification, Lombok, AutoValue
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+onthe firstpage.Copyrights forcomponentsof thisworkowned byothersthan the
+author(s)mustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,or
+republish,topostonserversortoredistributetolists,requirespriorspecificpermission
+and/or a fee. Request permissions from permissions@acm.org.
+ICSE ’20, May 23–29, 2020, Seoul, Republic of Korea
+© 2020 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-7121-6/20/05...$15.00
+https://doi.org/10.1145/3377811.3380341ACM Reference Format:
+Martin Kellogg, Manli Ran, Manu Sridharan, Martin Schäf, and Michael D.
+Ernst.2020.VerifyingObjectConstruction.In 42ndInternationalConference
+onSoftwareEngineering(ICSE’20),May23–29,2020,Seoul,RepublicofKorea.
+ACM,NewYork,NY,USA,12pages.https://doi.org/10.1145/3377811.3380341
+1 INTRODUCTION
+This paper concerns verification of flexible object construction pat-
+terns in Java-like languages. Objects in such languages often have
+a combination of required and optional properties. For example, an
+API for a point might require xandyvalues, with colorbeing op-
+tional. It would be legal for a client to supply {x,y}or{x,y,color},
+but not{x,color}. As another example, a bibliographic entry for a
+book might require titleand either authororeditor.
+Ideally, an object construction API should:
+•Onlypermitclientstosupplypermittedsetsofvalues,ensuring
+at compile time that only well-formed objects can be created.
+•Make code that constructs objects readable.
+•Allowflexibilityinclientcode,e.g.,re-useofcommoninitial-
+ization code in different scenarios.
+The standard API for Java object construction contains one con-
+structor for each combination of possible values that results in a
+well-formedobject.ThisAPIsatisfiesthefirstrequirement:ifsome
+combination is nonsensical, the API does not include the corre-
+spondingconstructor.Forexample,everyconstructorforapoint
+might require both an xand a yargument. At a constructor call
+site,invalidargumentcombinationsarerejectedbythecompiler.
+However,thisstrategyfailstheothertwocriteria.Forreadability,
+itisoftendifficultforclientstodeterminehowanobjectisbeing
+constructed from the constructor invocation, particularly if mul-
+tipleobjectpropertieshavethesametype.Forcomplexclasses,a
+constructorisneededforeverypossiblecombinationofoptional
+parameters, leading to a combinatorial explosion in constructor
+definitions. Finally, constructorsprovide littleflexibility, asall pa-
+rameters must be provided at once in a single call.
+Duetothesedrawbacksofconstructors,alternatepatternsforob-
+ject construction have been devised, such as the builder pattern.T o
+usethebuilderpattern,theprogrammercreatesaseparate“builder”
+class, which has two kinds of methods:
+•setters, each of which provides a logical argument —a value that
+ordinarily would be a constructor argument, and
+•afinalizer(often named build), which actually constructs the
+object and initializes its fields appropriately.
+Thebuilderpatterniseasyforclientstouse:ataclientcallsite,the
+name of each setter method that is invoked indicates what is being
+14472020 IEEE/ACM 42nd International Conference on Software Engineering (ICSE)
+set.Thebuilderpatternavoidsthecombinatorialexplosionproblem
+of constructors, since one method exists per parameter, not per
+combination of parameters. Builders enable client-code flexibility,
+ascodethatcallsasubsetofsetterscanbeabstractedintomethods1.
+Popular frameworks like Lombok [ 63] and AutoValue [ 15] ease
+creation of builders by automatically generating a builder class
+from the class definition of the object to be constructed.
+The builder pattern is important and widespread. The builder
+pattern is one of the original design patterns in the seminal “Gang
+of Four” book [ 31]. It was already a common design pattern in
+Smalltalk-80[ 51].Open-sourceprojectsthatautomaticallygenerate
+builder classes are popular: Lombok has 8500 stars on GitHub, and
+AutoValue has 8200. The codebase of Amazon Web Services has
+over 769,000 uses of buildersin non-test code, and both the Azure
+and AWS SDKs for Java provide builder-pattern-like APIs.
+Unfortunately,usageofthebuilderpatternsacrificessomeofthe
+staticsafetyprovidedbyconstructors.Aclientusingabuilderobject
+caninvokeanysubsetofthesettermethods.Effectively,thebuilder
+supports all 2npossible constructors. Not all such combinations
+are valid, and a client can mistakenly use an illegal combination,
+whichcanleadtoseriousproblems.Section2.1describesasecurity
+concern associated with improperly configured requests submitted
+to a public AWS API [45].
+In other cases, the builder finalizer method throws an exception
+if a client invokes an invalid combination of setters. Programmers
+(and users!) find run-time crashes from builders frustrating. Hence,
+it would be highly desirable to have a tool that could statically
+verifybuilderusage,i.e.,thatclientsonlycallvalidcombinationsof
+setter methods. Such a static verifier for correct usage of a builder
+objectbmust perform two tasks:
+(1)Track which setter methods have been invoked on bat each
+program point.
+(2)Whenb’s finalizer is invoked, ensure that all required setter
+methods have been invoked on b.
+Typestate analysis [ 61] may seem like a natural fit for verifying
+such a property, as it is capable of tracking changes to object state
+acrossdifferentpr ogrampoints.However, setterscanbeinvoked
+in any order, and accommodating all orders causes a blowup in
+the finite-state-machine representation used by typestate analyses.
+Moreseriously,typestateanalysiscanbedifficulttoscaletolarge
+programs, as it relies heavily on precise alias analysis [27].
+Our key contribution is accumulation analysis, a special case of
+typestateanalysisthatcanbeperformedmodularlywithoutanalias
+analysis. Verifying builder usage is an example of an accumulation
+analysis.Anaccumulationanalysisisfreetoonlydopartialreason-
+ing about aliasing, or no reasoning at all. Ignored aliases can cause
+imprecision and false positive warnings, but never unsoundness.
+An accumulation analysis, then, can be expressed as a standard
+typesystem.Weimplementedourverifier,calledtheObjectCon-
+struction Checker, as a pluggable type system [50] that estimates
+which methods have been called on an object. This formulation
+enables type-based verification of the builder pattern, which yields
+anumberof advantages, includingscalability,modularity,andun-
+derstandability. As explained in section 7, accumulation analysis is
+1For example, see the setCommonFields method in google/gapic-generator: https://
+tinyurl.com/vhtyblwDescribeImagesRequest request = new DescribeImagesRequest();
+request.withFilters(new Filter("name", "RHEL-7.5 _HVM_GA"));
+api.describeImages(request);
+Figure 1: Vulnerable client code that does not properly construct a
+request to the DescribeImagesRequest API, resulting in a potential
+“AMI sniping” concern.
+applicabletoproblemsbeyondthebuilderpattern,suchasdepen-
+dency injection and some instances of typestate.
+This paper describes the design and implementation of our type
+systemandtheObjectConstructionChecker.Flow-sensitivetype
+refinement can usually determine which setters have been invoked
+on a builder object automatically, without developer-written anno-
+tations. Our system can express disjunctionsof required methods,
+crucial for handling cases like the AWS security vulnerability (sec-
+tion 2.1). We present a type-based extension to our system that
+capturesaliasingcausedbythe fluentAPI programmingstylefre-
+quently used with builders, where setter calls are chained (e.g.,
+b.setX().setY() ....build() ).Forcommonframeworksthatgen-
+eratebuilderclasses,likeLombokandAutoValue,ourtoolautomat-
+ically determines which logical arguments are required and which
+are optional, further reducing the need for manual annotation.
+Our typechecker found 16 security vulnerabilities with only
+3 false positives in over 9 million lines of industrial and open-
+source code. In open-source case studies, our typechecker found
+null-pointerviolationsandpermittedthedeletionofhundredsof
+lines of manually written, inflexible, error-prone builder code. In a
+smalluserstudy,usersfoundthetooldramaticallymoreusefuland
+usable than the state of the practice.
+The contributions of our work are:
+•the identification of three real-world problems stemming from
+unsafe object construction (section 2),
+•accumulation analysis, a special case of typestate analysis that
+can be checked soundly without precise (section 3),
+•an accumulation analysis for reasoning about unsafe object
+construction (section 4),
+•an implementation of that analysis for Java (section 5), and
+•an evaluation of the type system on the three problems pre-
+sented in section 2 (section 6).
+The paper concludes with a discussion of applications of accu-
+mulation analysis beyond the builder patterns (section 7) and a
+discussion of related work (section 8).
+2 UNSAFE OBJECT CREATION
+Tomotivateourwork,thissectionillustratesthreereal-worldexam-
+plesofunsafeobjectconstruction:asecurityvulnerabilitycausedbyimproperuseofabuilderincodethatcallsanAWSAPI(section2.1),
+andbuggyusageofLombok-generatedbuilders(section2.2)and
+AutoValue-generated builders (section 2.3). Our approach soundly
+detects all the problems described in this section.
+2.1 AWS AMI Sniping
+Aclientofacloudservicesprovidercancreatevirtualcomputers
+programmatically, using the provider’s public API. An imageis the
+virtual computer’s file system; it includes an operating system and
+1448package com.amazonaws.services.ec2.model;
+public class DescribeImagesRequest {
+public DescribeImagesRequest() {...}
+public DescribeImagesRequest withOwners(String... owners) {...}public DescribeImagesRequest withFilters(Filter... filters) {...}public DescribeImagesRequest withImageIds(String... imageIds) {...}
+}
+Figure 2: The DescribeImagesRequest API. A client constructs a
+DescribeImagesRequest ,modifiesitviathe with *methods,thensends
+it to AWS to obtain a machine image.
+additional installedsoftware, andso itdetermines whatcode runs
+on the virtual computer.
+For example, a client of Amazon Web Services indicates what
+imagetouseviathe DescribeImagesRequest API(liketheclientin
+fig. 1). This API (fig. 2) requires clients to carefully create requests
+to avoid a potential operational security risk [45].
+There are three safe ways to select which image to use when
+sending a request to the API:
+•Use the withImageIds method to specify a globally unique
+image ID.
+•Usethe withFilters methodtosetsomecriteria(suchasthe
+name of the image, its operating system, etc.), anduse the
+withOwners method to restrict the images searched to those
+owned by the requester or some other trusted party.
+•Use the withFilters method to set criteria that restrict the
+imagetoonethatisownedbyatrustedpartyusingthe“owner”,
+“owner-id”, “owner-alias”, or “image-id” filters.
+Theunsafeexampleinfig.1usesthe“name”filterwithoutanowner
+filter, which causes the API to return all the images that match the
+name. This introduces the potential for a so-called “AMI (Amazon
+Machine Image) sniping attack” [ 45], in which a malicious third
+party intentionally creates a new image whose name collides with
+the desired image, permitting the third party to surreptitiously
+inject their own code onto newly allocated machines. Any call that
+searches the public database without specifying some information
+thatanadversarycannotfakeispotentiallyvulnerabletoasniping
+attack and should be forbidden.
+Thevulnerabilityisanunsafeuseofthebuilderpattern. Describe-
+ImagesRequest is a builder: the with *methods are setters and the
+describeImages() call is the finalizer. Because the compiler per-
+mits all combinations of method calls, a client can accidentally fail
+to set the owner when setting the name, as in fig. 1.
+Misuse of the API must be prevented, even though a client-side
+coding concern is not ordinarily eligible for a CVE [ 46,49]. Revok-
+ing or changing the behavior of this widely-used API incompatibly
+couldbeabreakingchangeforcustomers,soAWS’sproposedmiti-
+gationisfor“customerstofollowthebestpracticeandspecifyan
+owner” [9]. An independent security researcher published instruc-
+tions on how to detect if running virtual machines were impacted,
+butagreedthatfollowingbestpracticeswasthebestavailablemiti-
+gation [52]. Our sound static analysis is better: it does not depend
+on programmers to remember to use the best practice.@Builderpublic class UserIdentity {
+private final @NonNull String name;private final @NonNull String displayName;private final @NonNull ByteArray id;
+}
+Figure 3: A class that has a builder. The @Builder annotation causes
+Lomboktogenerateabuilderatcompiletime.Thisexampleissim-
+plified code from the Yubico/java-webauthn-server project.
+UserIdentity.builder()
+.name(username)
+.displayName(displayName).id(generateRandom(32)).build()
+Figure 4: A client of the UserIdentity builder defined in fig. 3, from
+the same project. This builder use will not cause a run-time excep-
+tion, because all fields whose type is @NonNull have been set.
+2.2 Lombok builders
+Lombok [ 66] is a widely-used Java code generation library that
+allows developers to avoid writing boilerplate code. Writing an
+@Builder annotationonclass Cgeneratesabuilderclassfor C.A
+clientcreatesabuilderobject,incrementallyaddsinformationto
+itbycallingsettermethodscorrespondingto C’sfields,andthen
+calls the finalizer method build()to construct a Cobject. If some
+fieldsofChavetypesthatareannotatedas @NonNull ,then build()
+throws a null-pointer exception if any such field has not been set.
+Acommoncauseoffrustrationforclientsofsuchlibrariesisthe
+addition of new @NonNull fields. For example, consider an applica-
+tiondeveloperwhodependsonalibrarylikeYubico/java-webauthn-
+server2, which includes the class in fig. 3. Figure 4 is an example of
+suchcode,fromjava-webauthn-server’sincludeddemo.Asdefined,
+this code works correctly. However, suppose that a developer of
+java-webauthn-serveraddsanotherfieldto UserIdentity .Ifthis
+field’s type is annotated as @NonNull , then the code in fig. 4 will
+begintofail—atruntime!—whenthelibrarydependencyisupdated.
+Even if this is caught during testing, debugging the cause can still
+bepainfulbecausethebugwillmanifestasanull-pointerexceptionintheunmodifiedclientcode.Thesesortsofbugscouldbeavoided
+by checking—at compile time—that the setter for each field whose
+type is non-null has been called before buildis called.
+Clients prefer compile-time checking that mandatory fields are
+setonbuilders;itisoneofLombok’smostrequestedfeatures[ 6,16–
+18,29,38,39,44,48,53]. Reinier Zwitserloot, leader of the Lombok
+project, says “We get this feature request every other week: A way
+tohave @Builder generatecodesuchthatthingsthataremandatory
+to set cause compile-time errors if you forget to set them” [65].
+2.3 Google AutoValue
+AutoValue [ 12] is a Java annotation processor that generates much
+of the boilerplate code for immutable Java classes, such as accessor
+methods for fields, equals() ,hashCode() , and toString() . Like
+Lombok,AutoValuecanalsogeneratebuilderclasses[ 15],which
+contain run-time checks to ensure that when build()is called on
+2https://github.com/Yubico/java-webauthn-server
+1449thebuilder,allrequiredpropertieshavebeenset.AutoValuegen-
+eratesbuildersasnewsubclassesofuser-writtenabstractclasses,
+whereas Lombok directly adds the builder to user-written code.
+Run-time failures due to unset properties of AutoValue builders
+lead to pain points similar to those described for Lombok builders.
+Users desire a compile-time check that required properties are set,
+becauseincomplexcodethispropertycanbedifficulttotestfor[ 59].
+Further,itcanbedifficulttodiscoverwhichpropertieshavedefault
+valuesandwhichneedtobesetbyaclient,complicatingbuilder
+usage [47]. And, library upgrades can lead to run-time failures
+when properties in AutoValue types become required.3
+3 MODULAR ACCUMULATION ANALYSIS
+Thissectiondescribeshowverifyingobjectconstructionisanin-
+stanceofan accumulationanalysis,aspecialcaseoftypestateanaly-
+sisthatcanbecomputedsoundlywithoutperformingaliasanalysis.
+When a builder’s finalizer is called, every required logical argu-
+mentmusthavebeensuppliedtothebuilder.Ouranalysismaintains
+acompile-timeestimateofwhichargumentshavebeenprovided.
+Morespecifically,ourimplementationestimateswhatmethodshave
+beencalledoneveryobject.Thiscompile-timeestimatecanonly
+increase.Atacalltothefinalizer,ifthereceiverobjectmightnot
+satisfy the finalizer’s specification, our tool issues an error.
+A typestate system permits the type of an object to change as
+a result of operations in the program, so it is a natural candidatefor expressing which logical arguments have been provided to abuilder. For example, in a typestate system, a chess piece’s typemight change from
+PawntoQueen, or a file’s type might change
+from UnopenedFile toOpenedFile toClosedFile . Fileoperations
+likeread()are permitted only on an OpenedFile .
+Wedefineanaccumulationanalysisasaprogramanalysiswhere
+theanalysisabstractionisamonotonicallyincreasingset,andsome
+operation is legal only when the set is large enough—that is, the
+estimatehasaccumulatedsufficientlymanyitems.Accumulation
+analysisisaspecialcaseoftypestateanalysisinwhich(1)theorder
+inwhichoperationsareperformeddoesnotaffectwhatissubse-
+quentlylegal,and(2)theaccumulationdoesnotaddrestrictions;
+thatis,asmoreoperationsareperformed,moreoperationsbecome
+legal.
+Forbuilders,eachtypestatestandsforadifferentsetoflogical
+arguments that have been provided so far. The finalizer operation
+ispermittedinalltypestateswhosesetisasupersetoftherequired
+logical arguments. Builders therefore satisfy the definition of accu-
+mulation analysis.
+We have devised a modulartypestate analysis, for the special
+caseofanaccumulationanalysis.Anarbitrarytypestateanalysis
+requiresaliasanalysisforsoundness.Supposethattwo OpenedFile
+references f1and f2might refer to the same file object. Calling
+f1.close() must change the estimate of the type of f2, or else the
+analysis would permit the program to perform the possibly illegal
+operation f2.read() .
+Thisproblemdoesnotariseforanaccumulationanalysis,which
+can soundly disregard aliasing. Suppose that a1anda2are must-
+aliased,andtheirestimateoflogicalargumentssuppliedis {x,y}.
+The operation a1.z()changes a1’s estimate to {x,y,z}. The valid
+3E.g., see https://github.com/spotify/docker-client/issues/635.operationsontheoldtypeareasubsetofthevalidoperationson
+thenewtype.Itwouldbesoundtoupdatetheestimateof a2’stype,
+but it is not necessary: the old estimate for a2remains valid, but
+imprecise.Thisimprecisionmightleadtofalsepositivewarnings.
+In our case studies, we observed a need to track aliasing created
+byfluentmethodreturnstoavoidfalsepositives(section4.3);we
+observed no other false positives due to aliasing.
+Ignoringaliasesdoesnotmeanignoringsideeffects.Whenevera
+side effect, such as an assignment, might change the object that an
+expression evaluates to, the refined estimate for that expression is
+discarded,andtheanalysisusesitsspecification(thatis,itsdeclared
+type) instead.
+The secondary reason that our analysis does not require whole-
+program analysis is that our analysis checks rather than infers
+methodspecifications.Evenso,ourimplementationrequirespro-
+grammerstowritefewannotations,andtheseannotationsserveasvaluablemachine-checkeddocumentation.Ifauserwishedto
+eliminatethesource-codeannotations,whole-programinference
+could do so without requiring a heavyweight alias analysis.
+Becauseofitsspecialproperties,anaccumulationanalysiscan
+beexpressedasanordinaryflow-sensitivetypesystem—itdoesnotrequireafulltypestateanalysis.Ourimplementationisapluggable
+type system, layered on top of a host language.
+A pluggable type system decorates each basetype from the host
+programming language with a type qualifier that mixes in more
+information.OurimplementationisforJava,whosetypeannota-
+tion syntax expresses a qualifier as a symbol preceded by @. For
+example, @NonNull String and@Nullable String are types.Our
+typesystemusesthe @CalledMethods typequalifier.Anexample
+Java variable declaration is @CalledMethods({"setX", "setY"})
+PointBuilder b; .
+4 A TYPE SYSTEM FOR BUILDERS
+This section presents our type system that guarantees required
+methods are always invoked on builder objects. Suppose there is a
+builder for this example Bookclass:
+class Book {
+String title; // required
+String author; // required
+}
+Aclientusingthebuildermustcallmethodsthatsetboththe title
+andauthorfields, as in this example of safe code:
+BookBuilder b = Book.builder();b.title("Effective Java");b.author("Joshua Bloch");b.build();
+To prove this code is safe, an analysis needs two kinds of facts:
+•After each call to a setter s, the analysis must estimate that s
+has definitely been called on the receiver. Further, the analysis
+must also incorporate the previous estimate of called methods:
+after the call to b.author() above, the analysis must estimate
+that both titleandauthorhave been called on b(section 4.1).
+•buildmusthaveaspecificationtoindicatethatboth titleand
+authormust have been called on its receiver (section 4.2).
+Two facts allow us to treat the object construction problem with
+builders as an accumulation analysis:
+1450@CM({}) =/latticetop
+@CM({"withFilters"})@CM({"withImageIds"})@CM({"withOwners"})
+@CM({"withFilters", "withImageIds"}) @CM({"withImageIds", "withOwners"})
+@CM({"withFilters", "withImageIds", "withOwners"})
+⊥
+Figure 5: A type qualifier represents which methods have been
+called.“ @CM”standsfor @CalledMethods ,forbrevity.Ifanexpression’s
+type has qualifier @CalledMethods({"withFilters", "withOwners"}) ,
+then the methods withFilters and withOwners have definitely been
+called on the expression’s value. Arrows represent subtyping rela-tionships.Section4.1formalizesthesubtypingrelationship.Thedi-agram shows a part of the type hierarchy; the full hierarchy is alattice of arbitrary size.
+•Theorderin which the client calls the setters is not important
+to enforce the specification on the finalizer.
+•The analysis only accumulates method calls: it is always safe
+to forget that a method has been called on an object, even if it
+may be imprecise.
+Because an accumulation analysis can verify that a client of a
+builder provides all required arguments, we can use a modular,
+flow-sensitive, pluggable type system to solve it, as detailed in the
+remainder of the section.
+4.1 Estimating the methods called on an object
+Ourtypesystemprocessestypesoftheform @CalledMethods( A)
+T, where Tis a Java basetype and @CalledMethods( A)is a type
+qualifier.Anexpressionwiththistypemustevaluatetoaninstance
+ofT(or a subclass of T) which has definitely had each method in
+Acalledonit.Forexample,afterthecallto b.title() above,the
+typeof bis@CalledMethods({"title"}) BookBuilder .Ourtype
+system computes @CalledMethods types for every expression and
+method in the program, not just builders and setter methods.
+Figure 5 shows part of the type qualifier hierarchy for @Called-
+Methodstypes. The subtyping rule for two @CalledMethods anno-
+tations, with sets of methods AandB, is:
+A⊇B
+@CalledMethods(A) /subsetsqequal@CalledMethods(B)
+Ourtypesystemisflow-sensitive:aparticularexpressionmay
+have different types on different lines of the program, but must
+always be consistent with (a subtype of) the expression’s declared
+type. Our type system relies on local type inference to compute
+updated expression types after method calls, e.g., updating b’s type
+qualifierto @CalledMethods({"title"}) afterthecallto b.title() .
+Though the type hierarchy has size up to 2mwheremis the
+numberofmethodsintheprogram,thedataflowanalysis(i.e.,localtypeinference)isguaranteedtoterminate:therearenounbounded
+ascending chains, which also means that there is no need to define
+widening operators (approximate /unionsqoperators).
+Inlocaltypeinference,processingofmethodcallsispolymorphic.
+Saybhas an inferred qualifier @CalledMethods( M)before a call
+b.m().Afterthecall,theinferencecomputes b’snewqualifieras
+@CalledMethods( M∪m), independent of M.Local type inference means that programmers need not write
+annotations within method bodies, but only on method signatures
+whenthereisinter-proceduralflowofpartially-completedbuilders.
+In such cases, the specifications (the type qualifiers) serve as valu-
+able, machine-checked documentation.
+As an example of a needed source-code annotation, consider
+this call to describeImages() in file LatestImageProvider.java
+in https://github.com/iVirus/gentoo_bootstrap_java:.
+public Optional<Image> get() {
+DescribeImagesResult result =
+ec2Client.describeImages(getRequest());
+...
+}
+For each of the three overriding definitions of getRequest() ,w e
+added an @CalledMethods annotation to the return type that indi-
+cated that withOwners() had been called.
+@CalledMethods("withOwners") DescribeImagesRequest getRequest() {...}
+After adding those three annotations, the Object Construction
+Checker verifies the project. This also guarantees that each im-plementation of
+getRequest() does call withOwners() , since the
+Object Construction Checker verifies, not trusts, each annotation.
+4.2 Specifying finalizer methods
+Verifying correct use of a method requires a specification of that
+method. Consider the finalizer for the BookBuilder example:
+interface BookBuilder {
+Book build(@CalledMethods({"title", "author"}) BookBuilder this);
+}
+Its specification states that the receiver for a call to buildmust be
+an object on which titleandauthorhave been called.
+At each call to the finalizer ( build), the typechecker checks that
+thebuilderargumentpassedasthereceiverhasan @CalledMethods
+qualifierthatisasubtypeofthedeclaredreceiverqualifierinthe
+method signature. From our subtyping rule, this check ensures
+that atleast themethods listedin the receiverqualifier havebeen
+invoked on the builder. If the check fails, the checker issues a type
+error, indicating possibly-defective code.
+4.3 Fluent setters
+Many builders are fluent: each setter method returns the builder
+again (i.e., the method returns this), so that calls can be chained.
+Considerthefollowingclientcodefortherunning Bookexample:
+BookBuilder b = Book.builder();
+b.title("Effective Java").author("Joshua Bloch");Book theBook = b.build();
+The local inference described in section 4.1 is insufficient to verify
+this code. After the second line, the inferred types are:
+b : @CalledMethods({"title"}) BookBuilder
+b.title("Effective Java") : @CalledMethods({"author"}) BookBuilder
+Theinferredtypefor bdoesnotsatisfythespecificationof build.
+The key issue is aliasing: the return value of a fluent call is aliased
+withitsreceiver,butoursystemasdescribedthusfarisunaware
+of thisfact. This lack ofalias reasoning can leadto false positives,
+as discussed in section 3.
+1451Toverifythiscode,itisnecessarytoknowthateachfluentsetter
+method returns its receiver. To express this specification, we intro-
+duceanewtypeannotation: @This.Whenwrittenonamethod’s
+returntype,itindicatesthatthereturnvalueofthemethodisalways
+exactlythereceiverobject( thisinJava).Forthe Bookexample,the
+setters should be specified as:
+interface BookBuilder {
+@This BookBuilder title(String title);
+@This BookBuilder author(String author);
+}
+We verify @Thisannotations by ensuring the corresponding meth-
+ods always return this.4
+Given a call e.m(), the inference of section 4.1 computes an
+updatedtypefor e.Given @Thisannotations,theinferenceperforms
+twonewtypesofupdates.If m’sreturntypehasan @Thisqualifier,
+theinferencealsoupdatesthe @CalledMethods qualifierof e.m()to
+bethesameasthequalifierfor eafterthecall.If eitselfisamethod
+calle/prime.n()with an @Thisreturn type, the inference also updates
+the type of e/primeafter the call, and recurses into e/primeas appropriate.5
+For the expression b.title( ...).author( ...), since both title
+and authorhave @Thisannotations, the inference computes the
+types of b,b.title( ...), and b.title( ...).author( ...)to all be
+@CalledMethods({"author","title"}) .
+4.4 Disjunctive types
+Sometimes,abuilder’sspecificationrequiresoneoftwomethodsbe
+called.Forexample,supposethatthe Bookclassalsohasan editor
+field,andthatawell-formed Bookhaseitheranauthor,aneditor,
+or both. Then, clients like the following would be permitted:
+Book b = Book.builder()
+.title("Advanced Topics in Types and Programming Languages")
+.editor("Benjamin Pierce").build();
+There is no corresponding @CalledMethods annotation that the
+API designer can write to specify the receiver type of the build
+method. We therefore introduce disjunctive types. Each of these
+types is a disjunction of @CalledMethod types. This means that,
+every set of @CalledMethod types has a perfectly precise least
+upper bound. (It already has a perfectly precise greatest lower
+bound: @CalledMethods( X)/intersectionsq@CalledMethods( Y)=@Called-
+Methods( X∪Y).)
+Foruserconvenience,weimplementthesedisjunctionsasasim-
+pleBooleanexpressionlanguagewhichuserswriteasanargument
+to a new type annotation called @CalledMethodsPredicate . The
+specification language uses the following grammar:
+S→method name |(S)|S∧S|S∨S
+This permits the user to construct a specification like “author ∨
+editor”, expressed in Java as @CalledMethodsPredicate("author
+|| editor") .
+4.4.1 Using @CalledMethodsPredicate to specify the AWS API. As
+a practical example, the specification for the AMI sniping example
+(section2.1)requiresadisjunction.Thecorrespondingspecification
+4Ourcheckeralsochecksforvalidmethodoverriding,usingstandardsupportfrom
+the Checker Framework.
+5Sincechainsoffluentcallsarenotoverlylonginpractice(wedidnotobserveany
+larger than about 20 methods), this recursion has negligible performance overhead.iswrittenontheparametertothe describeImages APIintheAWS
+SDK (for presentation, the full specification has been shortened):
+DescribeImageResponse describeImages(
+@CalledMethodsPredicate("withImageIds || withOwners")
+DescribeImageRequest request);
+Given this specification for describeImages , the typechecker re-
+jectsanycallwhosereceiverhasnothadeither withImageIds or
+withOwners called on it. This specification is sound: it prevents all
+AMI sniping attacks.
+4.4.2 Subtyping for disjunctive types.
+@CalledMethods(A) /subsetsqequal@CalledMethodsPredicate(P)
+If the set of methods Ain the @CalledMethods annota-
+tion causes the predicate Pto evaluate to true, then the
+@CalledMethods annotation is a subtype:
+A|=P
+@CalledMethods(A) /subsetsqequal@CalledMethodsPredicate(P)
+@CalledMethodsPredicate(P) /subsetsqequal@CalledMethodsPredicate(Q)
+If¬(P⇒Q) is unsatisfiable.
+@CalledMethodsPredicate(P) /subsetsqequal@CalledMethods(A)
+If¬(P⇒Q)isunsatisfiable,whereQistheconjunctionofthe
+methods in A.
+4.5 Method effects
+Sometimes programmers write methods that are wrappers for one
+ormorecallstosetters,tore-usecommoninitializationlogic.For
+example,supposeaprogrammerwrotethisclientcodeforthe Book
+class:
+void setEjBookData(BookBuilder b) {
+b.title("Effective Java");b.author("Joshua Bloch");
+}
+...
+BookBuilder b = Book.builder();setEjBookData(b);b.build();
+The programmer needs to be able to specify the behavior of the
+setEjBookData method, which calls methods on its formal param-
+eter. Without this specification, our checker will report an error at
+thebuildcall, as it does not perform inter-procedural inference.
+To specify such code, our implementation supports a method
+annotation @EnsuresCalledMethods .Itsargumentsareanexpres-
+sion and a set of methods that are called on that expression. So,
+setEjBookData() can be specified as:
+@EnsuresCalledMethods("b", {"title", "author"})void setEjBookData(BookBuilder b) {
+b.title("Effective Java");b.author("Joshua Bloch");
+}
+As with all annotations, it is checked, not trusted. The method
+annotated with @EnsuresCalledMethods typechecks only if b’s
+type at each exit point of the method is a subtype of @Called-
+Methods("title", "author") .
+14524.6 Implicit specifications
+So far, this section has described how a programmer can specify
+methods. Our implementation infers most specifications for setter
+and finalizer methods, so programmers do not need to write them.
+An@Thistype annotation is added to return types of setter
+methods in Lombok and AutoValue builders, as the generated code
+of such methods always returns this.
+An@CalledMethods typeannotationisaddedtobuilderfinalizer
+methods generated by Lombok and AutoValue. For Lombok the
+methods in the annotation are the setters for any field whose type
+is@NonNull , except fields with an @Singular annotation and fields
+withan @Builder.Default annotation.ForAutoValue,themethods
+in the annotation are the setters for each field whose type is not
+nullable, Optional , or a Guava Immutable type.
+The Lombok authors are so excited by our work that Lombok
+nowsupportsitdirectly.Lombokreleases1.18.10andlatercanauto-
+maticallyinsert @Thisand@CalledMethods annotationsinLombok-
+generated builders. This eliminates the need for our tool to add
+specifications in those classes.
+5 IMPLEMENTATION
+We implemented the Object Construction Checker for Java atop
+the Checker Framework [ 50]. Our implementation is 1,397 non-
+comment, non-blank lines of code.
+Thecurrentversionofourtoolisavailableathttps://github.com/
+kelloggm/object-construction-checker.Theversionofthetoolused
+fortheevaluationinsection6,includingtheopen-sourceportion
+of our scripts and data, is publicly available at https://doi.org/10.
+5281/zenodo.3634993.
+5.1 Limitations
+Ourtypesystemguaranteesthatsomemethodsarecalledbefore
+others. It does not guarantee that those methods are called with
+valid parameter values. For example, a programmer might pass an
+integervaluethatisoutoftherangerequiredbythesettermethod’s
+specification,oraprogrammermightpassanullvaluetoasetter
+methodrequiringanon-nullvalue.Existingtypesystemsforthe
+CheckerFrameworkalreadyverifytheseproperties[ 22,40,50]and
+can be run together with the Object Construction Checker. Or, a
+user could use a different analysis (e.g., NullAway [ 5]). A benefit of
+ourapproachisthatitpermitsausertouseanarbitraryanalysis
+for validating method arguments.
+Other analyses can also be used to enhance reasoning about
+method argumentswithin the Object ConstructionChecker.Con-
+sider the AMI sniping example in section 2.1. A common falsepositivewhenapplyingonlythe
+@CalledMethods typesystemto
+code that calls the describeImages() API is that it is also possible
+tospecifyanownerusingaparticularfilter,withoutactuallycall-
+ingwithOwners() . We plugged the Checker Framework’s constant
+propagation analysis [ 19] into the @CalledMethods type system to
+eliminatethesefalsepositives,bytreatingcallsthatsetanowner
+via a filter the same as direct calls to withOwners() .
+Anotherlimitationisthataccumulationanalysisdoesnothandle
+guaranteeing that a method is notcalled, nor can it enforce a spec-
+ification “either both methods are invoked or neither.” Handling
+these cases soundly requires a sound alias analysis.Table 1: Detection of AMI sniping vulnerabilities.
+Open Closed
+source source
+Projects 36 509
+Non-comment non-blank lines of Java code 427K 8.7MManually-written annotations 5 29
+True positives 3 13
+False positives 2 1
+DescribeImagesRequest request = new DescribeImagesRequest();
+if (imageIds != null) {
+request.setImageIds(Arrays.asList(imageIds));
+}DescribeImagesResult result = ec2Client.describeImages(request);
+Figure 6: A true positive AMI sniping concern in Netflix’s Simian-
+Army project.
+6 EVALUATION
+Our evaluation aims to answer these research questions:
+•RQ1:Is the Object Construction Checker sufficiently scalable
+and effective to find previously-unknown AMI sniping attacks
+in real-world programs (section 6.1)?
+•RQ2:Is the Object Construction Checker useful to program-
+mers when they work with frameworks that provide flexible
+builders at the cost of compile-time checking (section 6.2)?
+6.1 Finding AMI sniping bugs
+We evaluated our approach to detecting AMI sniping attacks on
+two corpora of codebases:
+•36 open-source codebases from GitHub (about 427,000 lines of
+Java code). This corpus was collected by searching GitHub for
+projects that use the describeImages API, and then filtering
+out (for technical reasons) projects whose root directory did
+not contain a Gradle or Maven build file and those that did not
+buildwithaJava8compiler.Wealsodiscardedeverycopyor
+fork of the AWS Java SDK or a project already in the corpus.
+•509 codebases from Amazon Web Services that contain calls
+to the describeImages() API. These codebases contain about
+8.7 million lines of Java source code.
+The results appear in table 1. The Object Construction Checker
+found13AWScodebasespotentiallyvulnerabletothird-partyabuse
+via AMI sniping. The developers fixed each potential vulnerability.
+Eachofthe29annotations waswrittenonahelpermethodthat
+wraps setter calls, similar to those discussed in section 6.3.2.
+Includingbothsetsofexperiments,thetooloverallachieved84%
+precision, and required one annotation per 268,000 lines of code.
+Onetruepositivewediscoveredintheopen-sourceevaluation
+wasintheprojectNetflix/SimianArmy;therelevantcodeappears
+in fig. 6. If the list of image ids is null, then the code (by design)
+fetches every AMI available. Though the method’s documentation
+doesnotsayso,itisincumbentonanycallerofthiscodetofilter
+the result after the fact.
+Both false positives in the open-source experiments (cases
+where ourtypesystem couldnot verifysafe code,even withaddi-
+tionalannotations)wereduetoasingleprojectwhichwrapsthe
+describeImages APIwithmethodsthattakealistof Filterobjects.
+1453public static StartRegistrationOptionsBuilder.MandatoryStages
+builder() {
+return new StartRegistrationOptionsBuilder.MandatoryStages();
+}
+public static class StartRegistrationOptionsBuilder {
+public static class MandatoryStages {
+private final StartRegistrationOptionsBuilder builder = new
+StartRegistrationOptionsBuilder();
+public StartRegistrationOptionsBuilder user(UserIdentity user)
+{
+return builder.user(user);
+}
+}
+}
+Figure7:CodefromtheprojectYubico/java-webauthn-serverwhich
+usesacomplexJavatypetoforceprogrammerstosetrequiredfieldsin a builder. This code is from the
+StartRegistrationOptions class.
+Notethatthiscodereplacesgeneratedcode,sowithourapproachitcan be safely deleted.
+Our type systemcannot express that a listof Filterobjects must
+containthecorrectfilters.Thefalsepositiveintheclosed-source
+code was due to a similar code pattern.
+6.2 Usefulness to programmers
+There are two ways that programmers interact with the Object
+Construction Checker:
+•When a programmer begins using our tool, they need to on-
+boardtheirprojectbyrunningthecheckerandpossiblywriting
+annotations or changing their code.
+•When a programmer change to a project, the tool might issue
+a warning.
+To evaluate the usefulness of our tools to programmers in each of
+these scenarios, we did two corresponding kinds of evaluation:
+•Case studies:we ranthe Object Construction Checkeron exist-ingprograms.Thecasestudiesdemonstratethetypicaleffortto
+find issues or to confirm the correctness of an existing project
+that was developed without our tools (section 6.3).
+•A user study: we presented industrial engineers with common
+tasks related to modifying existing builders. The user studydemonstrates that our tools ease editing existing code (sec-
+tion 6.4).
+6.3 Case studies
+The case studies (table 2) demonstrate the costs and benefits of on-
+boardinganexistingproject.WesampledtheprojectsfromGitHub
+by searching for projects with significant builder usage that could
+compilewithourinfrastructure,preferringmorepopularprojects
+wherepossible(basedonnumberofGitHubstars).Thepaperau-
+thors (who performed the case studies) were not familiar with the
+projects or their use of Lombok or AutoValue.
+6.3.1 Lombok.
+Codetoforceorderofinitialization. Thejava-webauthn-server
+projectcontainedcomplexmanually-writtencodetostaticallyen-
+force that required fields are set in a specific order. This is called
+the Mandatory Stages Pattern. If there are nmandatory fields, theclass StartAssertionOptions {
+private final @NonNull Optional<Long> timeout;
+static class StartAssertionOptionsBuilder {
+private @NonNull Optional<Long> timeout = Optional.empty();public @This StartAssertionOptionsBuilder timeout(long t) {
+return this.timeout(Optional.of(t));
+}
+}
+}
+Figure 8: Manually-written timeout() setter method from the
+projectYubico/java-webauthn-serverwhichrequiresan @Thisanno-
+tation.
+static @CalledMethods({"baseDirectory","inPlace"}) Builder builder() {
+return new AutoValue _ErrorProneOptions _PatchingOptions.Builder()
+.baseDirectory("")
+.inPlace(false);
+}
+Figure 9: Example AutoValue builder code, adapted from
+google/error-prone, that sets default values.
+code introduces n−1newbuilder types,each ofwhich hasasetter
+for only one field that returns the next builder type in the chain.
+Thelastonereturnsastandardbuilderinstancethatcanbeused
+to set optional fields. Figure 7 gives a simple example with just
+one required argument.When employing this pattern withmulti-
+ple required arguments, the programmer must impose an order in
+which the arguments are to be set, or else create an exponential
+number of builder types. With our approach, none of these classes
+are necessary. In the case studies, we were able to delete them.
+Initializing fields of Optionaltype.Lombok permits users to man-
+ually write parts of the builder that Lombok would otherwise gen-
+erate.Thejava-webauthn-serverprogramusedthisfacilityexten-
+sively to permit fields with Optional<T> to have both a setter that
+takes a Tas an argument and a setter that takes an Optional<T> , like
+the code in fig. 8. When writing a setter manually, the user also
+has to manually write the @Thisannotation. All 48 annotations in
+java-webauthn-serverwere @Thisannotationsonmanually-written
+settersfor Optional s.Theuseof Optional isaquestionabledesign
+decision[ 23].TheLombokauthorsadvocateusing nulltoindicate
+an optional value when using Lombok builders [ 58], and doing
+so avoids the need for either manually-written setters or @This
+annotations. This pattern also required us to add some code that
+Lombok would normally have generated, but which the original,hand-written code elided—showing the danger of hand-writing
+code in this way.
+6.3.2 AutoValue.
+Need for annotations. The most common code pattern requir-
+ing manual annotation was setting of default values when creat-
+ing a builder [ 13]. Figure 9 shows an example, adapted from the
+google/error-prone benchmark. Here, the builder() method used
+to construct a new builder sets the baseDirectory and inPlace
+properties to default values before returning the builder. Hence,client code need not explicitly set these properties before calling
+build().A@CalledMethods annotation documents this fact.
+1454Table 2: Verifying uses of the builder pattern. Throughout, “LoC” is lines of non-comment, non-blank Java code. “Annos.” is number of
+manually-written annotations to specify existing methods. “TPs” is true positives. “FPs” is false positives, where the Object Construction
+Checker could not guarantee that the call was safe, but manual analysis revealed that no run-time failure was possible.
+Project Framework LoC Finalizer calls LoC added LoC removed Annos. TPs FPs
+Yubico/java-webauthn-server Lombok 7,153 42 52 426 48 0 3
+javagurulv/clientManagementSystem Lombok 5,134 65 00 0 0 0
+google/error-prone AutoValue 74,180 9 00 2 0 2
+googleapis/gapic-generator AutoValue 49,054 442 20 5 8 1 1
+google/nomulus AutoValue 71,627 95 00 2 3 0 8
+model
+.getInterfaces(productConfig)
+.stream().filter(productConfig::hasInterfaceConfig).map(InterfaceModel::getFullName).findFirst().map(name -> pathMapper.getOutputPath(name, productConfig)).ifPresent(path -> packageInfo.outputPath(path +
+File.separator + "package-info.java"));
+[...]return packageInfo.build();
+Figure 10: Excerpt of real bug discovered in googleapis/gapic-
+generator by the Object Construction Checker.
+AutoValueusershavediscussedthedifficultyoffindingwhich
+properties have default values when the above pattern is used [ 47].
+Our introduced @CalledMethods annotations ease this problem by
+makingthedefaultedpropertiesevidentfromthemethodsignature.
+The second most common need for annotations was when a
+builder is passed to a method that sets several required proper-
+ties. We annotated the method with @EnsuresCalledMethods (sec-
+tion 4.5). We believe these annotations in particular are useful
+documentation, as it was non-obvious in many such cases why the
+code was safe.
+Inthefuture,weplantoextendtheObjectConstructionChecker
+to suggest these annotations to users.
+Addedcode. Weaddedadefaultcaseforoneswitchstatement
+(two lines of code), capturing the fact that the other cases were
+exhaustiveandenablingtheObjectConstructionCheckertoreason
+that a property was always set.
+Bug found. The Object Construction Checker found a de-
+fect in googleapis/gapic-generator (fig. 10). The packageInfo
+variable holds the relevant builder, and required method
+packageInfo.outputPath() is only invoked if the Optional re-
+turnedby findFirst() ispresent.Ifthe Optional isabsent,then
+thecallto packageInfo.build() willthrowarun-timeerror.We
+reported the bug to the developers, who promptly verified and
+fixed the issue, saying “your static analysis tool sounds truly amaz-
+ing!”[60]Fortheonefalsepositiveingapic-generator,anon-trivial
+global invariant ensures the relevant property is always set.
+False positives. The Object Construction Checker reported 10
+totalfalsepositivewarningsingoogle/nomulusandgoogle/error-
+prone. In all cases, the false positives were due to use of AutoValuefeatures that our tool does not yet automatically support, like man-
+ually writing a builder’s build()method with delegation to a gen-
+erated autoBuild() method [14]. We plan to add support for such
+patterns in the future.
+6.4 User study
+To further explore the usefulness of the Object Construction
+Checker, we undertook a small user study.
+6.4.1 Participants. Eachparticipantwasemployedasasoftware
+engineer,regularlyusesJava,andwasfamiliarwithLombok.Partic-
+ipants were not familiar with our tool. We recruited 6 participants;
+all were at the same level but worked on different teams.
+6.4.2 Methodology. The task for the study was to add a new re-
+quiredfieldtoaclasswithanexistingLombok-generatedbuilder,
+and then update all call sites to provide a reasonable value (each
+call site, if not updated, will throw an exception if executed).
+The task was carried out on java-webauthn-server, one of
+the case studies in section 6.3. Participants started with a fully-
+annotated codebase that type-checks with the Object Construction
+Checker;they werenot requiredtoonboard thetool. Theoriginal
+project has some tests written in Scala; we removed those, because
+ourtooldoesnothandleScalacode.Thisalsoallowedustosimulate
+another class of problems: changes to classes whose builders are
+not covered by tests.
+Wechosetwodifferentclassesforparticipantstoaddanewfield
+to.Onetask’sclasshadatestcasewritteninJava;theotherclass
+hadnotest.Weusedafactorialdesign:eachparticipantexecuted
+the task for both of these classes; for one, they had access to our
+tool, and for the other, they did not. To control for learning effects,
+both the order of the tasks and the order of tool/not-tool were
+randomized independently for each participant.
+No training on our tool was provided. Its messages came to
+participants via the standard compiler interface.
+6.4.3 Measurement. Werecordedhowlongittookeachparticipant
+to complete each task (participants were capped at one hour per
+task,thoughmostweremuchfaster).Wealsomeasuredwhether
+theycompletedeachtaskcorrectly—definedbyrunningtheheld-
+out Scala tests. We also surveyed the participants after they had
+completed the tasks. We asked the following questions:
+•Howoftendoyouencountertaskslikethoseintheexperiment
+in your day-to-day work?
+•Did you find compiler messages indicating where required
+fields had not been set useful?
+14556.4.4 Results. 3/6 participants failed to complete the task without
+ourtool(twointheconditionlackingafailingtest),butall6suc-
+ceededwithourtool. Therewasadifferenceinmeansin thetime
+taken when considering only those who finished both tasks: using
+our tool was about 1.5x faster (≈200 seconds vs. ≈306 seconds).
+Inthesurveys,5/6userssaidtheyencounteredtasksliketheseat
+least monthly. The subjects were also convinced that the compile-
+timewarningswereuseful.Forexample,onesubjectsaid“Itwas
+easiertohavethetoolreportissuesatcompiletime.”Severalalso
+mentioned the tool’s value in localizing where to make changes:
+for example, one said the tool “allowed me to immediately hone in
+on the problem.”
+6.5 Threats to validity
+The analyzed projects are written in Java, so our results might not
+generalize to other languages.
+Oursmalluserstudyusesonlyafewdevelopersfromasingle
+company, and therefore may not be representative.
+There is a threat to construct validity in the user study: the
+subjects may have guessed that we were evaluating the Object
+ConstructionChecker,sincetheywerefamiliarwithLombokbut
+not with our work.
+7 BEYOND BUILDERS
+Thispaperhasshownhowamodularaccumulationanalysiscan
+verifyobjectsconstructedviathebuilderpatternarewell-formed.
+Weseepromiseinapplyingaccumulationanalysistoothertypes
+of object construction, and to typestate properties more generally.
+7.1 Setters for multiple fields
+As presented in this paper, the accumulation analysis assumes that
+everysetteroperatesondisjointfields.Ifthisassumptionisviolated,
+then the accumulation analysis should accumulate the set of fields
+rather than the method calls. This is how the dependency injection
+analysisofsection7.2works.InLombokandAutoValuebuilders,
+there is a one-to-one correspondence between methods called and
+fieldsset,sotheaccumulationanalysiscanaccumulatethesetof
+methods called, as a proxy for the fields set.
+7.2 Dependency injection
+Like the builder pattern, dependency injection is a way of creating
+objectsthatismoreflexibleandexpressivethanconstructors,but
+alsomoreerror-prone.Forexample,inaframeworklikeGuice[ 34],
+there are multiple ways to provide a logical argument:
+•A class provides a single logical argument via the @Provides
+annotation on a method.
+•A call to bind(requiredArgument).to(provider) behaves
+like @Provides in that it provides a value, but that value is
+obtained from elsewhere than the current class.
+•Each call to this.install(someClass) within configure()
+providesthereceiverwitheverylogicalargumentof someClass .
+This may provide multiple logical arguments.
+•The values required by a class are typically its logical construc-
+tor arguments. However, its superclass may impose require-
+ments, which the class must also satisfy. The superclass may
+also provide values, relieving the subclass of that requirement.The exit of installis the finalization point.
+Webelievethatthese,andotherfeaturesofGuiceanditsilk,can
+allbeexpressedasanaccumulationanalysisoverlogicalarguments.
+7.3 Typestate
+Atypestateanalysisisanaccumulationanalysis(section3)ifthe
+set of legal operations only grows as an object transitions through
+typestates. That is, if typestate TS2is reachable from TS1, then
+enabled(TS2)⊇enabled(TS1). More generally, the properties of
+TS2are stronger than those of TS1.
+Ourmodularaccumulationanalysis cannothandlecyclictype-
+state graphs (discounting self-loops). Doing so requires an alias
+analysis, and an imprecise alias analysis may lead to an unaccept-
+able number of false positives. Few typestate examples require a
+cyclic graph, especially in well-structured code. FileorSocketob-
+jects, e.g., are rarely closed and re-opened: new objects are created
+instead.
+Similarly,fewreal-worldtypestateproblemshavecomplexorder-
+ingrestrictionsonoperations.Real-worldproblemsareoftenofthe
+simpleform"Alwayscallmbeforen,"involvingasingleoperator
+(e.g., requiring a call to an initializer method). The requirement
+can be a longer sequence, e.g., "Call m1, then m2, and then m3."Our type system can handle such cases with an
+@CalledMethods
+annotation at each intermediate method to enforce the ordering.
+8 RELATED WORK
+ObjectConstruction: Thereisscantrelatedworkdirectlyonstatic
+analyses to ensure that all mandatory setters are called before a
+finalizer in the builder pattern. However, this issue motivates some
+language design choices such as named and default parameters in
+languageslikePython.Theclosestworksaretoolsthatgeneratein-terfacesthatenforcethemandatorystagespattern(section6.3),andonlypermitcallstofinalizersfrominterfaceswhichhaveallmanda-
+tory fields set. Examples include the AutoValue Step builder [ 57]
+and the Jilt library [ 56]. Type-safe builders can also be encoded
+using phantom types [ 28] or in the Scala type system [ 26]. Recent
+work shows how to generate a fluent API encoding a deterministic
+context-free language in Java while preserving type safety [ 33],
+whichcouldinprinciplebeusedtogenerateatype-safebuilder.All
+thesetechniquesrequireeitheranexponentialnumberofclasses
+in the number of logical parameters, setting parameters in a pre-
+defined order, or both; none of them can be applied to legacy code
+withoutmodifyingit.Ouranalysisneitherrequiresprogrammersto
+rewritetheirbuildersnorrequiresmethodsbecalledinaparticular
+order or exponentially-many classes.
+Othershaveaddressedproblemsinobjectconstruction.Types
+have been used in functional languages to enforce that unmar-
+shallingobjectsissafe[ 35].Specializedanalysesforlanguagesthat
+permitmix-insoraspectstoenforcethatobjectsunderconstruction
+are not provided with conflicting method definitions also exist [ 8].
+Object Initialization: Another category of related approaches
+are type systems and other static analyses for detecting nullness
+errors,especiallythosecausedbyobjectinitialization.Forexample,freedombeforecommitment[
+62]typesystemsforreasoningabout
+the initialization of objects defend against null pointer exceptions
+1456generally,butrequiresignificantlymoreannotationsthanourmore-
+specialized approach, and are also less general in that they cannot
+be used for errors that will not throw a null-pointer exception,
+like our AMI sniping example.Similar type systems exist for Java
+bytecode [ 37]. Delayed [ 25] and mask [ 54] types track the fields
+thathavebeeninitializedonanobject,andpermitspecifications
+on methods that require certain fields to be set before the method
+is invoked. Their approach is designed around the internal state of
+an object, while ours uses externally visible properties (i.e. method
+calls) that correspond to how clients will actually use an object.
+Typestate: Our type system can be viewed as a limited form
+of typestate [ 61] in which objects can only accumulate method
+calls. This limited form can be efficiently implemented without an
+expensive, potentially imprecise alias analysis. Our system also
+permitsonlydownwardrefinement,whereasfulltypestatesystems
+permit arbitrary changes to state. Our approach is simpler, but,
+as we have shown, is sufficient for the problem of constructing
+well-formed objects.
+Fähndrich and Leino defined heap-monotonic typestates [ 24],
+which have similarities to our notion of accumulation and can
+also be verified without alias analysis. Their work defines heap-
+monotonic typestate systems as those in which “statically observ-
+ableobjectinvariantsonlybecomestrongerasobjectsevolve.”Itthen formalizes heap monotonicity within a general system for
+specifying typestates, transitions, and object invariants. Our focus
+isonlyoncheckingcorrectnessofclientcode,notenforcingdata
+structureinvariants.Hence,wecandefineaccumulationanalysis
+purelyintermsofavailableoperationsonanobject(section3),with-outformalizingitsinternalinvariants.TheFähndrich-Leinosystemcannotexpresspropertieswheremethodsmaybeinvokedinanarbi-traryorder,liketherequiredmethodspropertyforbuilders.Finally,
+the Fähndrich-Leino system was not implemented and evaluated.
+Modular typestates using access control abstractions have been
+proposed [ 10]. Their system handles arbitrary typestate properties
+but forces programmers to reason about aliasing. Typestate specifi-
+cations can be converted to working Java programs and checked if
+allobjectswithtypestatesarelinear[ 41].Usingamixofstatictype-
+statecheckinganddynamictypestatechecks,arbitrarytypestate
+properties can be enforced [ 11]. Our approach is more targeted but
+entirelystatic.Fullytypestate-orientedlanguageshavealsobeen
+proposed [3], but they cannot be applied to legacy code.
+Gradual typestate [ 64] is an unsound technique that inserts run-
+time checks where the static analysis cannot prove a fact. The pro-
+gramcrashesifitattemptstoperformanunsafeoperation.Gradual
+typing is of no benefit in our context, since incorrect operations
+alreadyleadtoacrash.Thegoalofourstaticverificationistoavoid
+such crashes.
+Therehasbeensignificantworkoninferringthecorrecttype-
+state model for a program based on its implementation. Bothstatic [
+21,32,36] and dynamic [ 4,20,30,43] approaches to this
+problemexist.Forthebuildercase,thecorrectspecificationisread-
+ily apparent: all required methods must be called. Our approach is
+therefore complementary to these: it is concerned with efficiently
+enforcing properties, not inferring them.
+Static Analysis for Security: Several static analyses exist that
+are designed to detect security problems. Coverity is a heuristicbug-finding tool that is commercially available and heavily usedin industry [
+7] that can find some security vulnerabilities. Cog-
+niCrypt [ 42] and CryptoGuard [ 55] are tools for finding unsafe
+uses of cryptographic APIs; CogniCrypt is based on abstract inter-
+pretation, while CryptoGuard is based on program slicing. None of
+these tools contains rules for finding image sniping attacks.
+9 CONCLUSION
+Flexibleobjectconstructionviathebuilderpatternissuperiortomanuallywritingconstructorsforcomplexclassesinmostways.However, it has one glaring flaw: it permits any combination oflogical arguments, so malformed objects that would never havebeen possible if all constructors were written by hand become
+possible.Thesemalformedobjectscanleadtorun-timeerrorsor,
+worse,securityvulnerabilities—addingadramaticcostinbugsto
+the readability and flexibility benefits of builders.
+Wehaveproposedalimitedformoftypestatecheckingthatonly
+tracks which methods have been invoked on an object that verifies
+that legacy code using builders never produces malformed objects.
+Our system requires few code changes or annotations, scales to
+real-worldJavaprograms,andwarnsprogrammersatcompile-time
+about possible violations with few false positives. It found real
+securitybugsandenthusedtheprogrammersthattestedit.With
+our system, programmers gain all the flexibility and readability of
+the builder pattern, without the risk of malformed objects.
+ACKNOWLEDGMENTS
+ThankstoMaxWillsey,TaliaRinger,ChandrakanaNandi,DonBai-
+ley,AndyWarfield,ChrissStephens,andtheanonymousreviewers
+for their comments on an earlier versions of this paper.
+REFERENCES
+[1]2007.OOPSLA2007,Object-OrientedProgrammingSystems,Languages,andAp-
+plications. Montreal, Canada.
+[2]2008.ICSE 2008, Proceedings of the 30th International Conference on Software
+Engineering. Leipzig, Germany.
+[3]Jonathan Aldrich, Joshua Sunshine, Darpan Saini, and Zachary Sparks. 2009.
+Typestate-oriented programming. In OOPSLA Companion:Object-Oriented Pro-
+gramming Systems, Languages, and Applications. Orlando, FL, USA, 1015–1022.
+[4]Rajeev Alur, Pavol Černý, P. Madhusadan, and Wonhong Nam. 2005. Synthe-
+sis of interface specifications for Java classes. In POPL 2005: Proceedings of the
+32ndAnnualACMSIGPLAN-SIGACTSymposiumonPrinciplesofProgramming
+Languages. Long Beach, CA, USA, 98–109.
+[5]SubarnoBanerjee,LazaroClapp,andManuSridharan.2019. NullAway:Practical
+type-basednull safetyfor Java.In ESEC/FSE2019: TheACM 27thjoint European
+SoftwareEngineeringConferenceandSymposiumontheFoundationsofSoftware
+Engineering (ESEC/FSE). Tallinn, Estonia, 740–750.
+[6]Chris Beams. 2014. @Builder should requireinvoking methods associated with
+final fields. https://github.com/rzwitserloot/lombok/issues/707. Accessed 20
+August 2019.
+[7]AlBessey,KenBlock,BenChelf,AndyChou,BryanFulton,SethHallem,CharlesHenri-Gros,AsyaKamsky,ScottMcPeak,andDawsonEngler.2010. Afewbillion
+lines of code later: using static analysis to find bugs in the real world. Commun.
+ACM53, 2 (2010), 66–75.
+[8]Lorenzo Bettini, Viviana Bono, and Silvia Likavec. 2005. Safe andflexible objects.
+InSAC 2005: Proceedings of the 2005 ACM Symposium on Applied Computing.
+Santa Fe, NM, USA, 1258–1263.
+[9]Jeremy Bicha and Nancy Alvine. 2018. CVE-2018-15869: –owners flag isn’t
+mandatory. https://github.com/aws/aws-cli/issues/3629. Accessed 5 June 2019.
+[10]KevinBierhoffandJonathanAldrich.2007. Modulartypestatecheckingofaliased
+objects, See [1], 301–320.
+[11]Eric Bodden. 2010. Efficient hybrid typestate analysis by determiningcontinuation-equivalent states. In ICSE 2010, Proceedings of the 32nd Interna-
+tional Conference on Software Engineering. Cape Town, South Africa, 5–14.
+[12]Kevin Bourrillion and Éamonn McManus. 2019. AutoValue. https://github.com/
+google/auto/tree/master/value. Accessed 14 August 2019.
+1457[13]KevinBourrillion andÉamonnMcManus. 2019. AutoValue:How doIspecifya
+default value for a property? https://github.com/google/auto/blob/master/value/
+userguide/builders-howto.md#default. Accessed 14 August 2019.
+[14]KevinBourrillionandÉamonnMcManus.2019. AutoValue:HowdoIvalidate
+property values? https://github.com/google/auto/blob/master/value/userguide/
+builders-howto.md#-validate-property-values. Accessed 14 August 2019.
+[15]Kevin Bourrillion and Éamonn McManus. 2019. AutoValue with Builders. https:
+//github.com/google/auto/blob/master/value/userguide/builders.md. Accessed
+14 August 2019.
+[16]JanBrodda.2018.Commenton"MarkfieldsasrequiredforBuilder".https://github.
+com/rzwitserloot/lombok/issues/1043#issuecomment-405509087. Accessed12
+August 2019.
+[17]ChristianBrunotte.2016. MarkfieldsasrequiredforBuilder. https://github.com/
+rzwitserloot/lombok/issues/1043. Accessed 20 August 2019.
+[18]João Campos. 2018. Comment on "Mark fields as required for Builder". https:
+//github.com/rzwitserloot/lombok/issues/1043#issuecomment-389344262. Ac-
+cessed 12 August 2019.
+[19]CheckerFramework[n.d.]. TheCheckerFrameworkManual:Custompluggable
+types for Java. http://CheckerFramework.org/.
+[20]Valentin Dallmeier, Christian Lindig, Andrzej Wasylkowski, and Andreas Zeller.
+2006. MiningobjectbehaviorwithADABU.In WODA2006:WorkshoponDynamic
+Analysis. Shanghai, China, 17–24.
+[21]GuidodeCaso,VictorBraberman,DiegoGarbervetsky,andSebastianUchitel.
+2013. Enabledness-based program abstractions for behavior validation. ACM
+Transactions on Software Engineering and Methodology 22, 3 (July 2013), 25:1–
+25:46.
+[22]Werner Dietl, Stephanie Dietzel, Michael D. Ernst, Kıvanç Muşlu, and ToddSchiller. 2011. Building and using pluggable type-checkers. In ICSE 2011, Pro-
+ceedings of the 33rd International Conference on Software Engineering. Waikiki,
+Hawaii, USA, 681–690.
+[23]Michael D. Ernst. 2016. Nothing is better than the Optional type. https://homes.
+cs.washington.edu/~mernst/advice/nothing-is-better-than-optional.html.
+[24]ManuelFähndrichandK.RustanM.Leino.2003. HeapMonotonicTypestates.In
+IWACO 2003: International Workshop on Aliasing, Confinement and Ownership in
+object-oriented programming. Darmstadt, Germany.
+[25]Manuel Fähndrich and Songtao Xia. 2007. Establishing object invariants with
+delayed types, See [1], 337–350.
+[26]RafaelFerreira.2008. Type-safeBuilderPatterninScala. http://blog.rafaelferreira.
+net/2008/07/type-safe-builder-pattern-in-scala.html. Accessed 15 August 2019.
+[27]StephenJ.Fink,EranYahav,NuritDor,G.Ramalingam,andEmmanuelGeay.2008.
+Effective typestate verification in the presence of aliasing. ACM Transactions on
+Software Engineering and Methodology 17, 2, Article Article 9 (2008), 34 pages.
+[28]Matthew Fluet and Riccardo Pucella. 2005. Practical datatype specializations
+withphantomtypesandrecursion schemes.In ML2005:Proceedingsofthe 2005
+workshop on ML. Tallinn, Estonia, 211–237.
+[29]FredrikFriis.2016. Callingfinalbuilderstepwithoutprovidingrequiredargu-
+ments. https://github.com/rzwitserloot/lombok/issues/1202. Accessed20August
+2019.
+[30]MarkGabelandZhendongSu.2008. Symbolicminingoftemporalspecifications,
+See [2], 51–60.
+[31]Erich Gamma, Richard Helm, Ralph E. Johnson, and John Vlissides. 1995. Design
+Patterns. Addison-Wesley, Reading, MA.
+[32]DimitraGiannakopoulouandCorinaS.Păsăreanu.2009. Interfacegenerationand compositional verification in JavaPathfinder. In FASE 2009: Fundamental
+Approaches to Software Engineering. York, UK, 94–108.
+[33]YossiGilandOriRoth.2019. Fling—AfluentAPIgenerator.In ECOOP2019—
+Object-OrientedProgramming,33rdEuropeanConference .London,UK,13:1–13:25.
+[34]Google. 2006. Guice. https://github.com/google/guice. Accessed 23 August 2019.
+[35]GrégoireHenry,MichelMauny,EmmanuelChailloux,andPascalManoury.2012.
+Typing unmarshalling without marshalling types. In ICFP 2012: Proceedings of
+the 17th ACM SIGPLAN International Conference on Functional Programming.
+Copenhagen, Denmark, 287–298.
+[36]Thomas A. Henzinger, Ranjit Jhala, and Rupak Majumdar. 2005. Permissive
+interfaces.In ESEC/FSE2005:Proceedingsofthe10thEuropeanSoftwareEngineering
+Conferenceandthe13thACMSIGSOFTSymposiumontheFoundationsofSoftware
+Engineering. Lisbon, Portugal, 31–40.
+[37]Laurent Hubert, Thomas Jensen, Vincent Monfort, and David Pichardie. 2010.Enforcing secure object initialization in Java. In ESORICS 2010: Proceedings of
+the 15th European Symposium on Research in Computer Security. Athens, Greece,
+101–115.
+[38]jax.2015. Requiredargumentswithalombok@Builder. https://stackoverflow.
+com/questions/29885428/required-arguments-with-a-lombok-builder. Accessed
+20 August 2019.
+[39]ArashKamangir.2019. UsingLomboktocreatebuildersforclasseswithrequired
+and optional attributes. https://stackoverflow.com/questions/54155315/using-lombok-to-create-builders-for-classes-with-required-and-optional-attribute.
+Accessed 20 August 2019.[40]MartinKellogg,VlastimilDort,SuzanneMillstein,andMichaelD.Ernst.2018.Lightweight verification of array indexing. In ISSTA 2018, Proceedings of the
+2018 International Symposium on Software Testing and Analysis. Amsterdam,
+Netherlands, 3–14.
+[41]Dimitrios Kouzapas, Ornela Dardha, Roly Perera, and Simon J. Gay. 2016. Type-
+checkingProtocolswithMungoandStMungo.In PPDP’16:Proceedingsofthe18th
+InternationalSymposiumonPrinciplesandPracticeofDeclarativeProgramming.
+Edinburgh, UK, 146–159.
+[42]StefanKrüger,JohannesSpäth,KarimAli,EricBodden,andMiraMezini.2018.
+CrySL: An extensible approach to validating the correct usage of cryptographic
+APIs. InECOOP 2018 — Object-Oriented Programming, 32nd European Conference.
+Amsterdam, Netherlands, 10:1–10:27.
+[43]Davide Lorenzoli, Leonardo Mariani, and Mauro Pezzè. 2008. Automatic genera-
+tion of software behavioral models, See [2], 501–510.
+[44]BennettLynch.2019. [FEATURE]@StepBuilder. https://github.com/rzwitserloot/
+lombok/issues/2055. Accessed 20 August 2019.
+[45]MITRE.2018.CVE-2018-15869.https://cve.mitre.org/cgi-bin/cvename.cgi?name=
+CVE-2018-15869.
+[46]MITRE. 2018. Inclusion decisions for CVE Numbering Authority (CNA) rules.
+https://cve.mitre.org/cve/cna/rules.html#Appendix_C_inclusion_decisions.
+[47]KevinMost.2019.AllowdefaultvaluestobesetonAutoValuebuildersinproperty
+defaultimpls. https://github.com/google/auto/issues/704. Accessed14August
+2019.
+[48]Atsushi Nakagawa. 2017. Feature: Allow fields to be specified only via builder’s
+constructor. https://github.com/rzwitserloot/lombok/issues/1303. Accessed20
+August 2019.
+[49]AndrejNemecandRiccardoSchirone.2018. awscli:Allowsloadingofanunde-
+siredAMIbysettingsimilarimageproperties. https://bugzilla.redhat.com/show_
+bug.cgi?id=1623095.
+[50]Matthew M. Papi, Mahmood Ali, Telmo Luis Correa Jr., Jeff H. Perkins, and
+MichaelD.Ernst.2008. PracticalpluggabletypesforJava.In ISSTA2008,Proceed-
+ingsofthe2008InternationalSymposiumonSoftwareTestingandAnalysis.Seattle,
+WA, USA, 201–212.
+[51]ParcPlace Systems. 1990. ObjectWorks\Smalltalk Release 4 Users Guide. Mountain
+View, CA, USA.
+[52]Scott Piper. 2018. Investigating Malicious AMIs. https://summitroute.com/blog/
+2018/09/24/investigating_malicious_amis/. Accessed 5 June 2019.
+[53]Mohit Punjabi. 2018. FindBugs detecter for NonNull Lombok builder at-
+tributes. https://stackoverflow.com/questions/51324922/findbugs-detecter-for-
+nonnull-lombok-builder-attributes. Accessed 20 August 2019.
+[54]Xin Qi and Andrew C. Myers. 2009. Masked types for sound object initialization.
+InPOPL 2009: Proceedings of the 36th Annual ACM SIGPLAN-SIGACT Symposium
+on Principles of Programming Languages. Savannah, Georgia, USA, 53–65.
+[55]SazzadurRahaman,YaXiao,SharminAfrose,FahadShaon,KeTian,MilesFrantz,
+Murat Kantarcioglu, and Danfeng (Daphne) Yao. 2019. CryptoGuard: High preci-
+sion detection of cryptographic vulnerabilities in massive-sized Java projects. In
+CCS 2019: Proceedings of the 21st ACM Conference on Computer and Communica-
+tions Security. London, UK, 2455–2472.
+[56]Adam Ruka. 2017. The Type-Safe Builder pattern in Java, and the Jilt li-
+brary. https://www.endoflineblog.com/type-safe-builder-pattern-in-java-and-
+the-jilt-library. Accessed 15 August 2019.
+[57]Kamil Sopko. 2019. auto-value-step-builder. https://github.com/sopak/auto-
+value-step-builder. Accessed 14 August 2019.
+[58]RoelSpilker.2015.AnswertoStackOverflowquestiontitled"OptionalinLombok".
+https://stackoverflow.com/a/31674917. Accessed 21 August 2019.
+[59]JoshuaSpoerri.2019. Failfastforlackofdefault. https://github.com/google/auto/
+issues/554. Accessed 14 August 2019.
+[60]Manu Sridharan. 2019. Possible missing packageInfo property in JavaSurface-
+Transformer. https://github.com/googleapis/gapic-generator/issues/2892.
+[61]Robert E. Strom and Shaula Yemini. 1986. Typestate: A programming language
+conceptforenhancingsoftwarereliability. IEEETransactionsonSoftwareEngi-
+neeringSE-12, 1 (January 1986), 157–171.
+[62]AlexanderJ.SummersandPeterMüller.2011. Freedombeforecommitment:A
+lightweighttypesystemforobjectinitialisation.In OOPSLA2011,Object-Oriented
+Programming Systems, Languages, and Applications. Portland, OR, USA, 1013–
+1032. http://doi.acm.org/10.1145/2048066.2048142
+[63]The Lombok Authors. 2019. @Builder. https://projectlombok.org/features/
+Builder. Accessed 12 February 2019.
+[64]Roger Wolff, Ronald Garcia, Éric Tanter, and Jonathan Aldrich. 2011. Grad-ual Typestate. In ECOOP 2011 — Object-Oriented Programming, 25th European
+Conference. Lancaster, UK, 459–483.
+[65]Reinier Zwitserloot. 2018. "Mandatory" fields with @Builder. https:
+//github.com/rzwitserloot/lombok/wiki/FEATURE-IDEA:-%22Mandatory%22-
+fields-with-@Builder. Accessed 12 August 2019.
+[66]Reinier Zwitserloot and Roel Spilker. 2019. Project Lombok. https://
+projectlombok.org/. Accessed 19 April 2019.
+1458

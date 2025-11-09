@@ -1,0 +1,1329 @@
+Detecting JavaScript Races that Matter
+Erdal Mutlu
+Ko c UniversitySerdar Tasiran
+Ko c UniversityBenjamin Livshits
+Microsoft Research
+Abstract
+As JavaScript has become virtually omnipresent as the lan-
+guage for programming large and complex web applica-
+tions in the last several years, we have seen an increase
+in interest in nding data races in client-side JavaScript.
+While JavaScript execution is single-threaded, there is still
+enough potential for data races, created largely by the non-
+determinism of the scheduler. Recently, several academic
+eorts have explored both static and runtime analysis ap-
+proaches in an eort to nd data races. However, despite
+this, we have not seen these analysis techniques deployed in
+practice and we have only seen scarce evidence that devel-
+opers nd and x bugs related to data races in JavaScript.
+In this paper we argue for a dierent formulation of what
+it means to have a data race in a JavaScript application
+and distinguish between benign and harmful races, aecting
+persistent browser or server state. We further argue that
+while benign races | the subject of the majority of prior
+work | do exist, harmful races are exceedingly rare in
+practice (19 harmful vs. 621 benign). Our results shed a new
+light on the issues of data race prevalence and importance.
+To nd races, we also propose a novel lightweight runtime
+symbolic exploration algorithm for nding races in traces of
+runtime execution. Our algorithm eschews schedule explo-
+ration in favor of smaller runtime overheads and thus can
+be used by beta testers or in crowd-sourced testing. In our
+experiments on 26 sites, we demonstrate that benign races
+are considerably more common than harmful ones.
+1. Introduction
+When it comes to client-side Web programming, today
+JavaScript powers the majority of large and popular Web
+sites. JavaScript execution is single-threaded. Yet the com-
+plex needs of sites such as Facebook, Outlook, Google Maps,
+and the like have led to asynchrony becoming a common way
+to program complex Web applications. It is asynchronous
+processing that is responsible for interactive and responsive
+user interfaces (UIs) that operate without blocking the UI
+thread or requiring a reload, as did web applications of the
+late 1990s. Despite JavaScript lacking conventional threads,
+the presence of asynchrony creates a potential for races. In
+particular, the ordering of event execution in JavaScript as
+well as the timing of completions of asynchronous requests is
+non-deterministic, prone to be aected by network delayes,
+etc., resulting in data races.
+In this paper we argue that one should distinguish be-
+tween races that have persistent consequences and those
+that are ephemeral. We argue that the majority of races in
+JavaScript have no persistent consequences | we dub these
+races benign . This is because these races only result in invis-
+ible to the user portions of the program state, or, at worst,UI glitches that are either unnoticed by the user, or disap-
+pear if the user reloads the page. Given the forgiving nature
+of JavaScript execution, where failures of individual event
+handlers force the scheduler to terminate the current event
+handler and move execution to the next one, these kinds
+of failures are not as important as previously believed. We
+suggest that a more useful way to think about data races on
+the web is by focusing on persistent state , such as client-local
+cookies, localStorage andsessionStorage mechanisms, as
+well as server-based side eorts. The latter are achieved via
+POST calls to the server ( GETcalls are designed for reads and
+are supposed to be idempotent, and thus are not frequently
+used for state updates). Our experiments conrm that the
+number of such harmful races is quite modest, yet it is these
+kinds of races that are more likely to be considered serious
+and xed by developers. Previous research eorts tend to
+produce a large number of reports, despite the emphasis on
+suppressing false positives [10, 12, 17].
+It is not our goal to provide a sound over-approximation
+of all possible races in a given application or site. Doing
+so is a very dicult task. Indeed, there are some funda-
+mental limitation of program analysis for nding races in
+JavaScript. Static analysis is unlikely to be sound for large
+programs, given the presence of eval and complex language
+features, not to mention the fact that precise reasoning
+about happens-before relationship between event handlers
+statically is simply very dicult. Runtime analysis, includ-
+ing various forms of symbolic exploration of possible sched-
+ules falls victim to code coverage.
+Instead, our goal is to provide a lightweight exploration
+algorithm that allows for the exploration of multiple sched-
+ules while only requiring a single run. This approach can be
+used for testing, including collaborative testing by a large
+number of beta- or crowd-sourced testers. A number of com-
+panies nowadays provide commercial crowd-sourced testing
+services for web sites ( http://www.utest.com ), which can
+be used as a cheap and practical way to increase coverage.
+Contributions: We make the following contributions:
+We propose a new view of benign and harmful data races in
+JavaScript web applications, and argue that harmful races
+should be the primary focus of analysis tools, due to them
+aecting the persistent client- or server-side state of the
+applications.
+We propose a lightweight exploration algorithm for nding
+data races in runtime traces of JavaScript programs. A key
+advantage for the scalability of our approach is that it does
+not require multiple program runs and can operate on the
+basis of a single execution.
+We nd and investigate a total of 19 harmful and 621
+benign races in 26 web sites, with only 2 observed false
+positives.
+1 2015/3/162. Overview
+In the last several years, we have seen an upsurge of interest
+in data races in asynchronous programs and in JavaScript,
+more specically. Researchers have tried applying static and
+runtime analysis to the problem of nding races. A funda-
+mental challenge with static analysis for a language as dy-
+namic as JavaScript is that it is really quite dicult to even
+enumerate all the relevant code, as much of the JavaScript
+code is produced with the help of eval calls and dynamic
+code loading. As a result, the traditional advantage of static
+analysis, namely, full path coverage largely does not apply to
+this problem. As such, the ability to make sound statements
+about the lack of data races is compromised [3, 5, 15, 17].
+Additionally, reasoning about runtime events such as multi-
+pleXmlHttpRequest s (XHRs), whose callbacks race against
+each other statically is fundamentally very dicult, because
+the happens-before relation is quite complex.
+Runtime techniques in this space are also vulnerable to
+losing precision, which leads tool authors to develop heuris-
+tics to eliminate potential false positives [4, 8, 12]. They also
+suer from the lack of coverage and the inability of mak-
+ing sound guarantees about the lack of races. Additionally,
+runtime techniques that involve combinatorial schedule ex-
+ploration can run into scalability challenges, especially when
+the number of possible handlers to schedule is high [8, 12].
+Our technique attempts to combine the advantages of
+static and runtime analysis. We execute the code only once,
+yet we explore multiple execution orders. As such, our tech-
+nique scales well, while increasing the coverage of a single-
+pass runtime analysis. One way to see our approach is that
+in explores neighboring schedules for a particular runtime
+execution. We foresee this approach as being especially use-
+ful in the context of beta- or crowd-sourced testing: having a
+large number of users will naturally increase code coverage.
+At the same time, the users' sessions will not be signicantly
+slowed down. It should be noted that in the browser, slow-
+ing down the browser runtime runs the risk of modifying the
+behavior of timeout set with setTimeout and setInterval ;
+additionally, the runtime may actively attempt to terminate
+slow-running events.
+2.1 What is a Data Race?
+Several possibly denitions of data races have been proposed
+for web applications [9, 10, 12]. They all center around
+the idea of writes to shared state that are performed by
+callbacks. Some of the races in prior work are caused by
+user interactions and browser-induced timing. In this work,
+our chief focus is on the XmlHttpRequest mechanism, which
+allows client-side code to request data from servers:
+1 var xhr = new XmlHttpRequest ();
+2 xhr. open ("GET", " http :// www. data .com/ mydata . json ");
+3 xhr. onreadystatechange = function (e, d){
+4 ...
+5 };
+6 xhr. send ( null );
+The code above is for a typical GETrequest that obtains
+JSON data from a server and schedules an asynchronous
+onreadystatechange callback to process the data once it
+arrives. Multiple such callbacks can be outstanding, creating
+the possibility of what we dub an XHR-XHR race, if these
+callbacks write to shared state. Moreover, commonly, while
+synchronous XHR execution is possible, XHRs are scheduled
+to be dispatched asynchronously, to maintain a responsive
+client-side UI [9]. In the rest of the paper, we shall focus on
+asynchronous XHRs.Secondly, a single XHR callback can race with the
+browser, resulting in the state variable being set to either 1
+or 2. This is because the browser may have multiple script
+blocks, some of which may be scheduled either before or af-
+ter the callback, depending on the callback's arrival and how
+fast the browser is rendering content:
+1 <script >
+2 var xhr = new XmlHttpRequest ();
+3 xhr. open (" GET", " http :// www. data .com/ mydata . json ");
+4 xhr. onreadystatechange = function (e, d){
+5 state = 1;
+6 };
+7 xhr. send ( null );
+8 </ script >
+9 ...a lot of text and images here ...
+10 <script >
+11 state = 2;
+12 </script >
+Thirdly, and even more subtly, if the user opens the same
+site in multiple browser tabs, it is possible for these tabs
+to lead to concurrent execution. Two instance of the code
+below may race with each other when run in dierent tabs,
+resulting in a cookie-based race on line 5:
+1 <script >
+2 var xhr = new XmlHttpRequest ();
+3 xhr. open (" GET", " http :// www. data .com/ mydata . json ");
+4 xhr. onreadystatechange = function (e, d){
+5 document . cookie = " value =" + Math . Random ();
+6 };
+7 xhr. send ( null );
+8 </ script >
+The happens-before relation for asynchronous callbacks is
+dened by the creation order. The XHR callback is preceded
+by the code that creates the XHR ( xhr:send). A specic
+case of this is what we call nested (or chained) XHRs, when
+callbacks are dened one within another. Practically, this is
+about the only way for the developer to ensure that there
+is ordering of XHR callbacks, so we see this programming
+pattern quite a bit.
+2.2 Motivating Examples
+In an eort to understand the possible impact of data races
+on the web, we spent some time analyzing bug reports for
+open-source projects located on GitHub. Below we describe
+some of the examples of subtle server-side bugs from GitHub.
+in the interest of fairness we should mention that these ex-
+amples of races reported as GitHub issues were not particu-
+larly common bugs for JavaScript projects, an intuition that
+is largely conrmed by our results in Section 4.
+Example 1 [Old server state.] Issue #79 for the Wheaton-
+WHALE project1describes the following situation:
+1. The user reloads the page;
+2.onbeforeunload listener res, and the data is saved to
+server;
+3. the page is loaded up again, and asks the server for the
+data;
+4. the client-side JavaScript code loads up the old (out-
+dated) data;
+5. client state is saved to the server.
+In the last step, the old, outdated data is saved to the server,
+essentially ignoring data updates. The culprit is the fact that
+steps 1 and 3 can race with each other: the data load request
+1https://github.com/WheatonWHALE/whaleweb/issues/79
+2 2015/3/161 <html >
+2 <script > // 1
+3 var xhr = new Xhr ();
+4 xhr . open ('', false );
+5 xhr . onreadystatechange = function (){ // 2
+6 document . cookie = 'var1 =1 ';
+7 };
+8 xhr . send ();
+9 // for(i =0;i <10000000; i ++) console . trace (i);
+10 </script >
+11 ...
+12 <!-- <input id='mydiv ' /> -- >
+13 <script > // 3
+14 document . cookie = 'var1 =2 ';
+15 </script >
+16 ...
+17 <script > // 4
+18 var xhr2 = new Xhr ();
+19 xhr2 . open ('', false );
+20 xhr2 . onreadystatechange = function (){ // 5
+21 document . cookie = 'var1 =3 ';
+22 };
+23 xhr2 . send ();
+24 </script >
+25 </html >
+26 Put your code here .
+Figure 1: Multiple XHR example.
+may arrive before the save is processed. The implemented x
+makes data updates synchronous. 
+Example 2 [Racing for a user ID.] A somewhat similar
+situation that has to do with the issue of stale data obtained
+from the server is captured in issue #20 in a project called
+LikeLines2. LikeLines provides users with a in-browser video
+player with a navigable heat map of interesting regions for
+the videos they are watching. This case describes two racing
+XHR calls that are issued to the backend server during
+initialization by the following functions: 1) createSession
+and 2) aggregate . The rst call is to create a new session
+for recording user interactions. The second call is needed for
+drawing a heat map.
+The problem arises when a user has not contacted the
+backend server before. In this case, both XHR calls will be
+issued without a cookie, and in both cases the server will
+create a new user ID. This is clearly a problem because
+interaction sessions are tied to a user ID in this applications.
+If the cookie from the call to aggregate \wins" (i.e., arrives
+last), then subsequent calls to the server will contain a user
+ID that does not match the interactions session. 
+In addition to the GitHub issues discussed above, below
+we list an illustrative example inspired by some of the
+samples from prior work [12, 17], although prior work did
+not focus on the issue of asynchronous XHRs.
+Example 3 [Racing with the browser.] Consider the code
+in Figure 1. For convenience, we mark every handler above
+with a number. The happens-before relation induced by this
+code example is as follows: 1 2,1 3,3 4,
+4 5. As such, our exploration algorithm will consider
+the possibility 1 2 3and 1 3 2. Similarly,
+because 2and 5are weakly ordered, traces in which 2
+happens before or after 5will be considered.
+While one can explore these traces via a search in the
+schedule space, we choose to do so via data ow. We keep
+track of the event handlers that may be \concurrent" and
+mark the writes that they make to the same locations as
+weak writes.
+2https://github.com/ShinNoNoir/likelines-player/issues/20 .1 READ PROP ID[ 99044816 ] = " open " : JSFunction
+2 XHR [ 0000001 ] Open GET
+3 READ PROP ID[ 98817648 ] = " send " : JSFunction
+4 XHR [ 0000001 ] Send
+5 XHR [ 0000001 ] Callback
+6 BEGIN XHR_Callback
+7 READ ID[ 235205312 ] = document : JSObject
+8 WRITE PROP ID[ 242159440 ] = cookie : JSInteger (1)
+9 Cookie [ 1020 D800 ] Write " var1 =1"
+10 END XHR_Callback
+11
+12 READ ID[ 235205312 ] = document : JSObject
+13 WRITE PROP ID[ 242159440 ] = cookie : JSInteger (2)
+14 Cookie [ 1020 D800 ] Write " var1 =2"
+15
+16 READ PROP ID[ 99044816 ] = " open " : JSFunction
+17 XHR [ 0000002 ] Open GET
+18 READ PROP ID[ 98817648 ] = " send " : JSFunction
+19 XHR [ 0000002 ] Send
+20 XHR [ 0000002 ] Callback
+21 BEGIN XHR_Callback
+22 READ PROP ID[ 108330176 ] = " readyState ": JSInteger (4)
+23 READ ID[ 235205312 ] = " document " : JSObject
+24 WRITE PROP ID[ 242159440 ] = " cookie " : JSInteger (3)
+25 Cookie [ 1020 D800 ] Write " var1 =3"
+26 END XHR_Callback
+Figure 2: Sample trace illustrating cookie races.
+Because 2and 3can race, the value of document:cookie
+will be either var1 =1orvar1 =2. Similarly, for 2 and 5,
+the value of document:cookie will be either var1 =1or
+var1 =5. To preserve precision, our algorithm maintains
+existing happens-before relations such as those between 1
+and 2and 1and 4.
+2.3 Trace Processing
+Figure 2 shows a simple trace obtained by running the code
+in Figure 1 that illustrates cookie-based races. We start
+processing the lines 1{4 where the XHR is opened and send
+to the remote server, we mark the XHR callback as an active
+callback which can be executed asynchronously any time in
+the future. As we process the rst XHR callback on lines 6{
+10, we will record the write value made to cookie variable
+into the memory map where we store values for each variable
+id (i.e. 242159440 for cookie).
+While recording the written value, we will look for values
+of the variable that are written by any callbacks that may
+be racing with each other, and complain about a race if
+there is any. As we continue processing the trace, we will
+record the value written on lines 12-14 by rst checking the
+earlier values of document:cookie . As this sequential code
+segment can race with the earlier XHR callback (there is no
+happens-before edge), our processing will record a race on
+document:cookie , while adding a new value for the cookie
+into the memory map. As we continue to process the trace,
+a new XHR is opened and send to the server on lines 16{19
+and added to the active callbacks list.
+Later, the callback for the second XHR will be pro-
+cessed, when a write to the cookie is performed on lines 21{
+26. While processing the write operation, the values for
+document:cookie will be checked and a race will be recorded,
+as two XHR callbacks are marked as racing, resulting in dif-
+ferent cookie values.
+2.4 Algorithm Summary
+Here we provide the underlying intuition for our approach,
+with a more formal treatment relegated to Section 3. The key
+idea behind our approach is to consider alternative scenarios
+within a given trace. We do not attempt to force exploration
+3 2015/3/16of UI interactions, for example, however, we do explore the
+possibilities of dierent schedules that may occur because of
+the order of arrival of asynchronous handlers that are part
+of the trace.
+Our approach eectively performs static analysis on a
+trace that is collected at runtime, as a way to consider dif-
+ferent schedule orders. When considering multiple execution
+of XHR callbacks as shown in Figure 3, the key observation
+is that instead of separately considering each of the possi-
+ble schedules, we can encode the eect of the possible race
+by merging the state and keeping track of multiple, merged
+values. This is analogous to doing meets in static dataow
+or abstract interpretation-style analysis, as an alternative to
+a costly meet-over-all-paths (MOP) solution. Conceptually,
+given a merge point for variable xwith multiple values com-
+ing in for two racing XHRs, x=v1andx=v2, we keep
+track of both values fv1;v2g; not of course that if v1=v2,
+no need to keep two copies of the same values exists.
+XHR 1
+x =  
+y =  
+z = v1XHR 2
+z = v2
+z={v1,v2}
+Figure 3: Merging two
+states after an XHR.We formulate our race
+detection algorithm as a
+dataow analysis on the val-
+ues within a given execution
+trace. We ag a possible
+race if multiple values may
+ow to a sensitive location,
+indicating a presence of
+scheduling dependencies;
+these sensitive locations
+are persistent storage such
+as cookies, localStorage ,
+sessionStorage , and,
+lastly, the DOM, etc. These
+latter locations serve as
+the sinks of our data ow
+analysis. Returning to the
+example in Figure 1, we
+can represent the race between handlers 2and 5as an
+assignment document:cookie =f'var1 =2';'var1 =3'g
+as a merge node after handler 5. This of course represents
+a direct ow of multiple values to a sensitive persistent
+storage location document:cookie . More interesting cases
+involve multiple steps of propagation.
+2.5 Implementation
+To collect execution traces, we have instrumented the most
+recent version of the Firefox web browser. Our changes span
+both the SpiderMonkey JavaScript engine to track data
+propagation through the memory of the browser as well as
+operations on cookies, localStorage , and the like, which are
+recorded by instrumenting the DOM. Our instrumentation
+spans over three main components of Firefox:
+XPCOM (Cross Platform Component Object
+Model): In order to record the triggered XHR call-
+backs, we instrumented the event queue in Firefox in
+nsThread:cpp. When events are taken from the queue
+for execution, we mark XHR readystatechanged events
+as well as button clicks initiated by the user.
+Gecko (Layout engine): We also need to instrument
+DOM API implementation of Firefox for recording up-
+dates made to DOM elements of interest. We achieved
+this by modifying various DOM class implementations
+likensGlobalWindow :cpp,DOMStorage :cpp, etc.
+SpiderMonkey (JavaScript Interpreter): Lastly, we
+instrumented the JavaScript interpreter for recordingvalue manipulation on variables and objects and also to
+mark the start and end points of XHR callback execution.
+The former is achieved by instrumenting the JavaScript
+bytecode interpreter on Interpreter :cppandjsapi:cpp.
+Overall, our instrumentation is quite sparse and we believe
+can be easily migrated to another open-source browser such
+as Chromium. We have added a total of about 430 lines of
+instrumentation code to Firefox to collect our traces. A total
+of 12 les were modied.
+Deployment strategies: The process of race detection
+is something that can be performed both online3, as the
+application is running, as well as oine, as an auditing step.
+We envision that as part of beta-testing, traces from multiple
+users can be analyzed. Note that as we will highlight in
+Section 4, even relatively simple-looking sites can create long
+traces with a large number of events. At the same time,
+the number of events relevant to asynchrony and scheduling
+is relatively small. Our analysis for nding potential races
+is implemented as a linear pass over the trace. However, if
+desired, this is something that can be parallelized as well, by
+splitting longer traces to be analyzed on dierent machines.
+3. Formalization
+Since JavaScript execution is single-threaded, the execution
+of event handlers and XHR callbacks is carried out non-
+preemptively, without interruption. We nd it convenient to
+represent the executions of event handlers, XHR callbacks,
+and portions of script code executed without pre-emption
+(\sequential blocks") as execution blocks with unique IDs.
+Other entries in an execution trace will also be assigned
+unique IDs as detailed later4.
+There is no universally accepted denition of the
+happens-before relation for web-based JavaScript code. We
+dene the happens-before relation (denoted  ) not at the
+level of low-level memory accesses, but at the level of higher-
+level language constructs, based on causality information we
+abstract from JavaScript operational semantics as was il-
+lustrated in Figure 1. Within each uninterrupted execution
+block, trace entries are ordered by the program, and, there-
+fore, happens-before order. We dene and record a happens-
+before order between blocks such that if id id0then all
+trace entries in idhappen before those in id0. We order
+id id0ifid0appears later in the trace and one of the
+following hold:
+1. Both blocks are sequential blocks. Sequential blocks are
+ordered by in the order they appear in the trace
+because of the browser-imposed ordering.
+2. Both blocks are event-handling blocks. Event handling
+blocks are ordered by  by how they occur in the trace
+to reect the order of user interactions.
+3.id0is an XHR callback, and its XHR send is within block
+id; this is because the XHR callback can only happen
+after the send operation.
+3According to the data in Figure 6, our analysis is fast enough
+to be run online, so the beta testers only need to use a dierently
+compiled version of the browser or perhaps a browser with a ag
+that they turn on. The results of such exploration can be centrally
+collected and communicated to the site developers.
+4Note that these IDs are not to be confused with the statically-
+assigned numbers in Figure 1 as, for instance, the point in an
+execution where an XHR callback is registered and the point
+where it is executed are dierent.
+4 2015/3/163.1 Modeling and Analysis of Traces
+The set of memory locations (simply referred to as \loca-
+tions" from here on) manipulated by a JavaScript program
+is denoted by Locs, and the set of values they can take by
+Val. To denote the values of locations that have not yet been
+assigned a value, we use the symbol ?Val. We treat each
+eld of each object as a unique, separate ordinary location
+for race-detection purposes. Client-side persisted locations
+are of type key-value store and are treated specially. These
+aredocument:cookie ,sessionStorage and localStorage .
+The set of these locations is denoted by KV. To treat read
+and write accesses in the trace uniformly, we consider each
+(kv;ky) pair to be a memory location, i.e., an element in
+Locs and use?Valto represent the value for keys not in the
+store. Accesses to distinct keys in a given kv2KV, similarly
+to accesses to dierent memory locations, do not race with
+each other, The set of locations that represent DOM ele-
+ments and are written to using the setter for the innerHtml
+property of a DOM element is denoted by DOMEltsLocs.
+The value of each location vat each point in the execution
+is represented by a memory map, V.V(v) consists of set of
+pairs of the form ( vl;id) wherevl2Valand id2IDs.
+Intuitively, ( vl;id)2V(v) means that in this trace or a re-
+ordering of it preserving the happens-before relation, vmay
+have the value vlwhich has been written to it within the
+block id. When a trace entry with ID idis a write access to
+v, all entries in the memory map V(v) by trace entries with
+idid0that happen before idare removed. Other entries in
+V(v) are there due to \concurrent" execution blocks and are
+therefore not removed.
+3.2 Dening Traces
+Formally, a trace is a nite sequence of trace entries
+h0;1;2;::: niof the following types:
+XHR, event handling, and sequential blocks: Trace
+entries=CBBegin (id) and=CBEnd (id) denote
+the beginning and end of the execution of the callback
+for the XHR with ID id.=HandlerBegin (id) and
+=HandlerEnd (id) do the same for event handler
+blocks, and =SeqBegin (id) and=SeqEnd (id) for
+sequential blocks.
+Key, location, innerHTML accesses  =
+keyWr (kv;ky;vl;varsRd;id) denotes the writing of
+the value vlfor the key kyin the key-value store
+kvwithin the block with ID id. The value vlhas
+been computed immediately prior to the write trace
+entry as the result of an expression over the memory
+locations varsRd .=keyRm (kv;ky;id) denotes the
+removal of the value the key kyfrom kvwithin block
+id.=varWrite (v;vl; id) denotes the writing of the
+valuevlto the location vwithin block id. Finally,
+=setHTML (hElt;hVal;id) denotes the setting of the
+innerHtml property of a DOM element hElt to value
+hVal within block id.
+POST, XHR send:=post(url;id;idin;vl;varsRd ) is a
+POST request XHR call or Window with id idand the call
+occurs within an execution block with ID idin. The data
+postedvlis the computed result of an expression over the
+memory locations varsRd .=xhrSend (id;idin) denotes
+an XHR send operation for the XHR object with ID id
+that takes place within an execution block with ID idin.
+This send is aGETrequest.Evt-Handler-Begin
+=HandlerBegin (id) HB0=TransClose (HB[f(idEvt;id)g)
+(V;HB;P;idSeq;idEvt) !(V;HB0;P;idSeq;idEvt)
+Evt-Handler-End
+=HandlerEnd (id) id0
+Evt=id
+(V;HB;P;idSeq;idEvt) !(V;HB;P;idSeq;id0
+Evt)
+Seq-Blk-Begin
+=SeqBegin (id) HB0=TransClose (HB[f(idSeq;id)g)
+(V;HB;P;idSeq;idEvt) !(V;HB0;P;idSeq;idEvt)
+Seq-Blk-End
+=SeqEnd (id) id0
+Seq=id
+(V;HB;P;idSeq;idEvt) !(V;HB;P;id0
+Seq;idEvt)
+XHR-Post
+=post(url;id;idin;vl;varsRd )
+P0=P[f (v;id)jv2varsRdg HB0=HB[f(idin;id)g
+(V;HB;P;idSeq;idEvt) !(V;HB0;P0;idSeq;idEvt)
+XHR-Send
+=xhrSend (id;idin) HB0=TransClose (HB[f(idin;id)g)
+(V;HB;P;idSeq;idEvt) !(V;HB0;P;idSeq;idEvt)
+Key-Write
+=keyWr (kv;ky;vl;varsRd;id)
+V0=V[(kv;ky) :=V(kv;ky)[f(vl;id)gnf(vl0;id0)jid0 idorid0=idg]
+(V;HB;P;idSeq;idEvt) !(V0;HB;P;idSeq;idEvt)
+Write
+=varWrite (v;vl; id)
+V0=V[(v) :=V(v)[f(vl;id)gnf(vl0;id0)jid0 idorid0=idg]
+(V;HB;P;idSeq;idEvt) !(V0;HB;P;idSeq;idEvt)
+Set-DOM
+=setHTML (hElt;hVal );id)
+V0=V[(hElt) :=V(hElt)[f(vl;id)gnf(vl0;id0)jid0 idorid0=idg]
+(V;HB;P;idSeq;;idEvt) !(V0;HB;P;idSeq;idEvt)
+XHR-Post
+=post(url;id;idin;vl;varsRd )
+P0=P[f (v;id)jv2varsRdg HB0=HB[f(idin;id)g
+(V;HB;P;idSeq;idEvt) !(V;HB0;P0;idSeq;idEvt)
+XHR-Send
+=xhrSend (id;idin) HB0=TransClose (HB[f(idin;id)g)
+(V;HB;P;idSeq;idEvt) !(V;HB0;P;idSeq;idEvt)
+Figure 4: Trace analysis rules.
+3.3 Interpreting Traces
+Given a trace Trace =h0;1;2;:::; ni, our race detec-
+tion algorithm analyzes it by processing it sequentially, one
+log entry at a time. The algorithm maintains analysis state
+represented by the tuple  = ( V;HB;P;idSeq;idEvt). Here,
+Vis the memory map. HBis the happens-before relation,
+which is a partial order over IDs. Whenever new elements
+are added to HBby a trace processing rule, the transitive
+closure of the relation is taken to obtain the resultant HB.
+HBis initially the empty relation. Pis a list of pairs of the
+form (v;id) where the location vhas been read while com-
+puting the value submitted by a XHR POST request with ID
+id. Finally, idSeq, and idEvtare the IDs of the last sequential
+block processed or the last event handling block processed by
+our algorithm, respectively, or ?if no such callback or block
+exists. Given a state  = ( V;HB;P;idSeq;idEvt) reached at
+a point in the trace, the analysis state reached after process-
+ing the log entry is described by the rules given in Figure 4
+and explained below.
+5 2015/3/16XHR Persistent state writes Session state writes DOM writes
+Web site
+XHR open
+XHR send
+XHR
+Callbacks
+Nested XHR
+Count
+Cookie
+Nested
+Cookie
+Nested XHR
+POSTs
+localStorage
+Nested
+localStorage
+sessionStorage
+Nested
+session
+Storage
+SetinnerHtml
+Nested Set
+innerHtml
+INPUT
+Element
+Nested INPUT
+edition.cnn.com 3 3 13 0 35 0 0 71 1 3 0 12,065 3 31 0
+mlb.mlb.com 25 25 92 0 68 2 0 28 2 30 2 93 46 39 0
+news.qq.com 8 8 28 0 17 0 0 8 0 0 0 153 10 64 2
+wireless.att.com 22 22 72 3 79 4 0 46 32 11 2 902 847 60 5
+www.aljazeera.net 12 12 32 2 24 0 0 6 0 0 0 1,095 29 46 7
+www.bild.de 32 32 86 1 75 11 0 515 1 14 2 589 17 164 0
+www.eltiempo.com 10 10 20 0 81 0 0 521 0 1 0 160 2 72 0
+www.fedex.com.us 10 10 18 0 88 1 0 2 0 2 0 251 25 172 0
+www.fujitv.co.jp 41 41 122 2 38 0 0 27 0 16 0 172 22 34 0
+www.gazetta.it 22 22 67 4 115 15 0 68 0 19 0 119 24 52 0
+www.girlsgogames.com 18 18 44 0 92 4 0 30 6 11 2 21 8 43 0
+www.imdb.com 4 4 12 1 14 0 0 4 0 0 0 66 3 42 0
+www.milliyet.com.tr 7 7 19 0 46 0 0 0 0 4 0 51 19 210 143
+www.myvideo.de 20 20 87 0 99 0 0 115 0 8 0 86 0 23 0
+www.nasa.gov 35 35 113 18 148 0 0 11 0 8 0 703 82 62 8
+www.ntv.com.tr 10 10 14 0 58 1 0 55 0 293 0 112 3 66 0
+www.nytimes.com 8 8 0 0 10 0 0 6 0 2 0 35 0 46 0
+www.optimum.net 29 29 78 8 174 3 0 6 0 6 0 426 258 182 21
+www.politico.com 27 27 65 9 231 47 0 36 18 1 0 110 19 248 10
+www.premierleague.com 21 21 101 0 31 0 0 0 0 0 0 223 11 47 0
+www.radikal.com.tr 13 11 20 0 111 0 0 33 0 2 0 85 5 59 0
+www.sports.ru 28 28 90 1 48 0 0 84 0 0 0 128 58 52 1
+www.sporx.com 5 5 0 0 33 0 0 31 0 0 0 49 0 38 0
+www.tvguide.com 15 15 26 2 90 6 0 15 0 23 0 728 586 57 0
+www.welt.de 23 23 44 1 112 0 0 366 0 4 0 546 19 68 0
+www.zaobao.com 37 37 121 0 83 0 0 0 0 0 0 127 36 125 78
+Figure 5: Characteristics of our benchmarks web sites.
+Callbacks: CB-Begin andCB-End (not shown) keep track
+of the ID of the ongoing XHR callback block. Seq-Blk-
+Begin processes the log entry indicating the beginning of
+a sequential block with ID idby setting idSeqtoid.Seq-
+Blk-End resets idSeqto?. The rules ensure that the oc-
+currence order of sequential blocks in the trace and their
+happens-before order coincide. Evt-Handler-Begin and
+Evt-Handler-End operate similarly to the corresponding
+Seq-Blk rules. The order of occurrence in the trace of the
+event handlers is the same as their happens-before order.
+Event handlers and sequential blocks are not ordered with
+respect to each other by the happens-before relation.
+Location updates: Key-Write handles the case where
+key kyin the key-value map kvis updated. We declare
+a potentially-harmful race if jVal(v)j>1 any location v
+read while the new value for the key is being computed
+(v2varsRd ) indicating the potential for non-determinism.
+The rule computes V0(kv;ky) by fromV(kv;ky) by adding
+the pair (vl;id). removing all pairs ( vl0;id0) such that id0 
+id.Key-Remove (not shown) writes the value ?Valto the
+keyky.Write andSet-DOM are similar to Key-Write
+above, updatingVfor a location vor a DOM element hElt
+by removing value-ID pairs overwritten as dictated by the
+happens-before relation and adding the new value-id pair
+written by the current trace entry.
+POST,send:The rule XHR-Post declares a potentially
+harmful race ifjV(v)j>1 for any location v2varsRd , since
+at least one location used in the computation of vl, the data
+posted, has the potential for non-determinism. XHR-SEND
+updates the happens-before relation. xhrSend (id;idin) indi-
+cates that the send for the XHR with id idhas taken place in
+block idin.idin id. This rule and the fact that CB-Begin
+andCB-End do not modify the happens-before relation en-code the fact that only chained XHR calls are ordered by  
+with respect to each other5.
+3.4 Detecting Races
+We sayV(v) has non-determinism potential on a location v
+when the memory map contains at least two dierent values
+forv, i.e., when there are pairs ( vl;id) and (vl0;id0) inV0(v),
+such thatvl6=vl0and id6=id0. Our algorithm declares a
+race on a location vwhile evaluating the Write ,Set-DOM ,
+andKey-Write rules if the memory map V0(v) computed
+by the rule has non-determinism potential on v. We also
+declare a race when evaluating the XHR-Post andKey-
+Write rules, if a variable read when computing the value
+posted or written, v2varsRd ,V(v) has non-determinism
+potential for v. Of these races, only the ones associated with
+Key-Write andXHR-Post rules are deemed to be harmful
+races.
+Consider a prex of the trace in a \quiet" state such that,
+at the end of the prex, no XHR callback or execution block
+is in progress. Suppose that our algorithm has signaled non-
+determinism potential on a location vwhile processing a
+trace entry within the last block or callback with id idin
+this prex. Then a dierent re-ordering of the the execution
+blocks and/or XHR callbacks while leaving the happens-
+before relation in the prex intact may result in a dierent
+nal value for v, as explained next.
+5Note that it is possible to dene the happens-before relationship
+dierently, for instance, declaring xhrito happen before xhrjif
+the send entry for xhrjappears later in the trace than the end
+of the callback for xhri. While such a denition may capture
+the happens-before relationship observed in a particular schedule
+more precisely, our denition narrows in on ordering relationships
+enforced by the JavaScript semantics and excludes those that may
+have taken place dierently in dierent executions of the same
+program driven by the same user interaction.
+6 2015/3/16Website
+Trace Size
+(MB)
+Compressed
+Trace Size
+(MB)
+Browsing
+Time (sec)
+Analysis
+Time (sec)
+www.imdb.com 14.28 1.21 58 2
+www.zaobao.com 30.75 1.40 38 6
+news.qq.com 30.77 1.01 78 4
+www.sporx.com 37.49 1.92 49 6
+www.nytimes.com 40.58 1.26 47 8
+www.fujitv.co.jp 45.79 1.39 72 8
+www.girlsgogames.com 51.98 1.92 78 10
+www.gazetta.it 93.02 3.07 182 17
+www.radikal.com.tr 94.20 3.41 102 17
+www.fedex.com.us 95.44 3.30 58 19
+www.milliyet.com.tr 95.78 3.93 133 16
+www.myvideo.de 104.82 4.38 121 18
+www.welt.de 125.11 5.39 233 26
+www.bild.de 138.47 5.74 119 22
+mlb.mlb.com 142.81 4.61 81 21
+wireless.att.com 151.22 4.47 87 24
+www.tvguide.com 152.90 6.39 250 27
+www.ntv.com.tr 162.09 6.50 158 27
+www.aljazeera.net 169.87 6.72 93 28
+www.sports.ru 209.68 8.33 257 29
+edition.cnn.com 216.09 8.13 115 35
+www.eltiempo.com 222.65 11.43 169 43
+www.optimum.net 224.22 9.06 244 41
+www.premierleague.com 264.08 8.16 244 47
+www.politico.com 271.29 11.22 261 48
+www.nasa.gov 407.76 40.91 425 56
+Figure 6: Trace statistics and processing times.
+Let (vl;id) and (vl0;id0) be in Val(v) such that id06=id
+andvl6=vl0. It must be the case that while both id0and id
+wrote tov, these two execution blocks are not ordered by
+the happens-before relationship. Otherwise, either ( vl;id)
+or (vl0;id0) would have been removed from Val(v), accord-
+ing to the update rules of our algorithm and how they use
+the happens-before relation in variable updates. Therefore,
+it is possible to modify the execution by delaying the exe-
+cution of the block with id id0until after the execution of
+the block with id id. In this case, the nal value of the lo-
+cationvor (kv;ky) would be dierent at the nal state of
+the newly-obtained execution. This points to a potentially
+dierent result produced purely as a result of XHR callback
+scheduling non-determinism.
+There are two sources of false positives in our race detec-
+tion approach. The rst source is the assumption made in the
+argument in the previous paragraph while obtaining a new
+execution by delaying the execution of the block with ID id0
+past other blocks. The assumption is that control decisions
+made in the original execution based on data values written
+by the block idarenot modied in a way that makes the
+reordered execution infeasible. In our empirical experience,
+such cases are rare and can be ruled out by inspection or re-
+playing and validating the reordered execution. The second
+source is the check performed when a value is written to a
+persisted location or sent on the network. In these cases,
+if, while computing the written or sent value, a location
+with non-determinism is read, our algorithm signals a po-
+tentially harmful race. This approach is conservative, i.e.,
+non-determinism in the value of one of the locations in an
+expression may not result in non-determinism in the value
+of the result. Even in cases where this is the cause of a false
+alarm, we believe that the potentially dierent data values
+owing to a persisted output location may be of concern to
+programmers.Web site
+document:cookie
+localStorage
+sessionStorage
+XHR POST
+innerHtml
+INPUT element
+Memory
+XHR GET
+postMessage
+edition.cnn.com 0 0 0 0 0 0 12 0 0
+mlb.mlb.com 1 0 0 0 0 0 28 0 0
+news.qq.com 0 0 0 0 1 0 6 0 0
+wireless.att.com 1 0 0 0 9 0 43 0 0
+www.aljazeera.net 0 0 0 0 2 1 4 0 0
+www.bild.de 0 0 0 0 0 0 58 0 0
+www.eltiempo.com 0 0 0 0 0 0 9 0 0
+www.fedex.com.us 1 0 0 0 1 0 10 0 0
+www.fujitv.co.jp 0 0 0 0 1 0 13 0 0
+www.gazetta.it 2 0 0 0 0 0 19 0 0
+www.girlsgogames.com 2 1 0 0 0 0 0 0 0
+www.imdb.com 0 0 0 0 0 0 8 0 0
+www.milliyet.com.tr 0 0 3 0 0 0 5 0 0
+www.nasa.gov 0 0 0 0 9 0 14 0 0
+www.ntv.com.tr 0 0 0 0 0 0 13 0 0
+www.optimum.net 2 0 0 0 10 3 22 0 0
+www.politico.com 6 0 0 0 0 2 224 0 11
+www.radikal.com.tr 0 0 0 0 1 0 11 0 0
+www.sports.ru 0 0 0 0 0 0 17 0 0
+www.tvguide.com 0 0 0 0 0 0 15 0 0
+www.welt.de 0 0 0 0 0 0 19 0 2
+www.zaobao.com 0 0 0 0 0 7 11 0 0
+Totals 15 1 3 0 34 13 561 0 13
+=19 =47 =574
+Figure 7: Races found by our analysis.
+4. Evaluation
+This section describes the experimental evaluation we have
+performed on a set of 26 complex pages.
+Research Questions: Our goal has been to address the
+research questions listed below.
+RQ1: How common are races on persistent state such as
+document:cookie ,localStorage , and side-eects such as
+POST requests? We consider these to be the most harmful
+races there are in web applications.
+RQ2: How common are races on sessionState ? Session
+state is cleared on browser restarts. However, given that
+the browser is often not restarted for days if not weeks,
+data in sessionState can persist for long periods of time,
+if not permanently.
+RQ3: How common are races on transient state such as
+memory locations and DOM elements? These are gen-
+erally not the kind of errors that we deem to be highly
+problematic and, moreover, often these are not even ob-
+servable by the user [9].
+4.1 Experimental Setup
+For our experiments, we have selected a set of 26 sites from
+Alexa's top 5,000 list. To nd suitable sites, we used an
+instrumented browser to crawl all sites, focusing on sites
+that have a large number of outstanding XHRs.
+Site statistics: Figure 5 summarizes various aspects of the
+sites we picked. We specically separate the number of op-
+erations within XHR callbacks, as these can lead to races.
+Columns 2{5 show the number of observed XHR open and
+send operations, executed XHR onreadystatechange call-
+backs, and the number of callbacks within other callbacks
+(so-called nested XHRs). Columns 6{11 focus on the use of
+persistent storage. Columns 6{7 show the number of writes
+todocument:cookie as well as writes nested in an XHR
+callback. Column 8 shows the number of XHR POST oper-
+ations in an XHR callback. Columns 9{10 give the num-
+7 2015/3/16ber of writes to localStorage both in general and within
+XHR callbacks. Columns 11{12 give the same information
+forsessionStorage . Lastly, columns 13{16 give information
+about various forms of DOM manipulation such as setting
+innerHtml and changing the contents of INPUT elements;
+both totals and nested variants of these counts are provided.
+Trace statistics: The workload used to collect these counts
+was simply loading the page and applying basic user in-
+teractions like button-link clicks. The counts for DOM
+manipulation are generally higher than those for cookies,
+localStorage , or sessionStorage . It is natural to expect
+more races on DOM elements as well, compared to more
+uncommonly used persistent elements. Figure 6 summarizes
+information about the traces we used for our analysis. The
+compression ratios range between 9.97 and 33.83. The per-
+centage of time it takes to analyze a trace compared to the
+time to record a trace ranges between 3% and 32%.
+Detection Time: Figure 6 shows the trace collection6and
+analysis time as a function of trace size. Analysis time grows
+approximately linearly with the size of the trace and is a
+fraction of the trace recording time shown in the second
+column. Since trace analysis can be parallelized or run on
+an unused core, we can envision this analysis being run in
+parallel with execution. Among other advantages, this would
+obviate the need for trace storage and transfer.
+4.2 Detection Results
+In this section we describe and analyze several representative
+races found with our approach.
+Example 4 [sessionStorage inmilliyet.com.tr .] In the
+case of www.milliyet.com.tr , the race on sessionStorage
+was caused by a shared variable namespace that is used
+for generating the key name. The variable is written at
+two dierent locations, one being an XHR callback that is
+executed using jQuery:ajax method. The execution steps
+are listed below and the relevant code is shown in Figure 8:
+1. As a page loads, an XHR is created using the jQuery:ajax
+method (included in www.milliyet.com.tr/D/j/base.
+js?v=20 ) and sent to the server (lines 3{5);
+2. once the response is received a user-dened callback is
+executed using jQuery:ajax:done (lines 19{22);
+3.namespace variable is set to empty string at the end of
+jQuery:ajax:done method (line 21);
+4. an external library is initialized by setting the namespace
+variable to 'uv'(line 46);
+5.namespace variable is subsequently used for generating a
+sessionStorage key (lines 43{45).
+In the last step, the value of namespace is used for setting an
+item on the sessionStorage for recording user interactions
+with the web page. In this particular trace, we observe
+that multiple items are added to the sessionStorage using
+thenamespace as a prex (i.e. uvautoprompt disabled ,
+uvr). Any future read operations on the sessionStorage
+keys will depend on this prex namespace . As the XHR
+callback can race with the namespace writes which sets the
+value for namespace to the empty string, it may result in a
+failed read operation. 
+Example 5 [innerHtml inradikal.com.tr .] Another race-
+inducing execution trace is obtained from www.radikal.
+6Sample traces can be found at pastebin.com/MxF7ENPx ,
+pastebin.com/JeSY4Fy8 and pastebin.com/1pUsGUgb .1 <script >
+2 function MilGraphWithStatsV2 (...){
+3 jQuery . ajax ( method , url ,
+4 // 1: www. milliyet .com.tr/D/j/ base .js?v=20
+5 function ( data ) { // Process data });
+6 ...
+7 }
+8 </ script >
+9 ...a lot of text and images here ...
+10 <script >
+11 jQuery . extend ({
+12 ajax : function (url , options ){
+13 ...
+14 var xhr = new XmlHttpRequest ();
+15 xhr . open ( method , url )
+16 xhr . onreadystatechange = done ;
+17 xhr . send ( null );
+18 ...
+19 function done (...){
+20 // 2: www. milliyet . com .tr/D/j/ base .js?v =20
+21 namespace = ""; // write to sessionState
+22 }
+23 }});
+24 </script >
+25 ...
+26 <script >
+27 // 3: widget . uservoice .com/ uE6Mda0sQpbMbkAEhFaUig .js
+28 r. prototype . get = function (t) {
+29 if ( this . storage ) {
+30 var e = this . storage . getItem ( this . makeKey (t));
+31 return e;
+32 }
+33 };
+34 r. prototype . set = function (t, e) {
+35 this . storage &&
+36 this . storage . setItem ( this . makeKey (t),
+37 JSON . stringify (e))
+38 };
+39 r. prototype . remove = function (t) {
+40 this . storage &&
+41 this . storage . removeItem ( this . makeKey (t))
+42 };
+43 r. prototype . makeKey = function (t) {
+44 return r. namespace + t
+45 };
+46 r. namespace = " __uv_ "; // write to sessionState
+47 </script >
+Figure 8: sessionStorage manipulation in milliyet :com :tr. To
+save space, we remove unrelated lines of code.
+com.tr , where two XHR callbacks race with each other
+when it comes to writing to innerHtml property of a <div>
+block in the DOM. In this news web site, users can lter
+displayed news according to their preferred categories, by
+using category links on the page. Each click action on a
+category link will generate an XHR call to server to gather
+news for the corresponding category. The race is captured
+within the execution steps listed below; the corresponding
+code is shown in Figure 9:
+1. User clicks on a category link (lines 2{3) for enabling
+a category on the web page triggering the AddCategory
+method (lines 8{11);
+2.AddCategory method will than trigger GetArticle
+method (line 10);
+3.GetArticle method (lines 12{15) makes an XHR call
+using jQuery:load for<div> with id r5content upd
+(line 14);
+4. user clicks another category link (lines 4{5) triggering
+another XHR call;
+5. both XHR calls sets innerHtml of the same <div> on the
+DOM (line 8).
+8 2015/3/161 <html > // 1: index . html
+2 <a id=" a_hayat " class =" category "
+3 href ='Javascript : AddCategory (" hayat "); '>HAYAT </a>
+4 <a id=" a_spor " class =" category "
+5 href ='Javascript : AddCategory (" spor "); '>SPOR </a>
+6 <div id=" r5_content_upd " ></div >
+7 <script >
+8 function AddCategory ( categoryname ){
+9 mynewCategoriesValue += categoryname ;
+10 GetArticle ( mynewCategoriesValue );
+11 }
+12 function GetArticle ( categoryValue ){
+13 var c_url = c_srcDomain + categoryValue ;
+14 $("# r5_content_upd "). load ( c_url , cbFunction );
+15 }
+16 </ script >
+17 </html >
+Figure 9: Race on innerHtml manipulation in radikal :com :tr.
+To save space, we remove unrelated lines of code.
+At the end of this execution, the displayed DOM will depend
+on the order of the responses returned from the server as
+the<div id= r5_content_upd> is directly aected by the
+asynchronous XHR callback. 
+1 <script >
+2 // 1: rum-dytrc . gazzetta .it
+3 // / ajax / dtagent60_bjnprs3t_7082 .js
+4 function sb(a, b) {
+5 var d;
+6 d = d + "?" + " dtCookie \x3d"
+7 + encodeURIComponent (v(Ua )) + ";"
+8 + encodeURIComponent ( document . location . href );
+9 fb(cb , d, c, e)
+10 }
+11 E(q, " load ", function (){
+12 fb(m, b. path , n, b. data );
+13 }
+14 function fb(a, b, c, d) {
+15 var h;
+16 h. onreadystatechange = function () {
+17 4 == a. readyState && (200 == a. status ?
+18 e(a. responseText ) : db && B.sf &&
+19 eb. push ({ path : b,data : c}), a = m)
+20 }
+21 h. open (" POST ", b, c);
+22 h. send (d);
+23 }
+24 function e(a) {
+25 a = a && a. split ("|");
+26 for ( var b = 1; b < a. length ; b ++) {
+27 var c = a[b]. indexOf (" dtCookie \ x3d ");
+28 if (-1 < c) {
+29 y(" dtCookie ",
+30 decodeURIComponent (a[b]. substr (c + 9)));
+31 break
+32 }
+33 }
+34 }
+35 function y(a, b) {
+36 document . cookie = a+"\ x3d"+b
+37 +"; path \x3d/" + w. domain ;
+38 }
+39 <\script >
+Figure 10: Race on document :cookie manipulation in
+gazetta :it. To save space, we remove unrelated lines of code.
+Example 6 [document:cookie ingazetta.it .] In this ex-
+ample of a document:cookie race from www.gazetta.it , the
+web site uses an application monitoring library (DynaTrace
+Real User Monitoring found at dynatrace.com ) for record-
+ing and POSTing user actions and browsing experience to a
+remote server. Each POST request initiated by this library
+updates the key dtCookie of the document:cookie with the1 XHR [ 126 F0800 ] Send
+2 ...
+3 READ ID[ 235205312 ] = document : JSObject
+4 WRITE PROP ID[ 242159440 ] = cookie : JSString
+5 Cookie [ 1020 D800 ] Write " fsr .s=%7B %22 v2 %22%7 D" (1)
+6 ...
+7 READ ID[ 235205312 ] = document : JSObject
+8 WRITE PROP ID[ 242159440 ] = cookie : JSString
+9 Cookie [ 1020 D800 ] Write " fsr .s=%7B %22 v2 %22%2 C%7D" (2)
+10 ...
+11 XHR [126 F0800 ] Callback
+12 BEGIN XHR_Callback
+13 ...
+14 READ ID[ 235205312 ] = document : JSObject
+15 READ PROP ID[ 242159440 ] = cookie : JSInteger - (3)
+16 "fsr.s =%7 B%22 v2 %22%2 C%7D"
+17 ...
+18 READ ID[ 235205312 ] = document : JSObject
+19 WRITE PROP ID[ 242159440 ] = cookie : JSString
+20 Cookie [ 1020 D800 ] Write
+21 " fsr .s=%7B %22 v2 %22%2 C %22%3 A1 %7D" (4)
+22 END XHR_Callback
+Figure 11: Trace from optimum :netillustrating a false positive.
+response value from the server. A race occurs when mul-
+tiple XHR calls try to write the new response value to
+document:cookie . The execution steps are listed below, with
+line references from the code shown in Figure 10:
+1. At the page load time, an XHR call is created for initial-
+izing the monitoring process (line 9);
+2. the data is sent to a URL constructed from dtCookie
+value (lines 6{8);
+3.dtCookie key is updated with the server's response
+(lines 35{37);
+4. a new XHR is created at onLoad DOM event for posting
+loading time of the page (lines 11-13);
+5. callbacks of each XHR try to write to the same
+document:cookie keydtCookie (lines 35{37).
+The value of dtCookie key depends on the order of the
+XHR callbacks, causing possible issues with future POST
+operations, as the value is used for URL generation. 
+4.3 False Positives
+In looking for possible false positives, we have decided to
+focus our attention on both persistent races (19) and those
+on the DOM state (47). Out of the 66 races we investigated,
+we identied only two cases as false positives. These are
+cookie races in fedex.com and optimum.net .
+Figure 11 shows the trace from optimum.net , with writes
+to the cookie key fsr:sat multiple locations (lines 6, 10,
+and 22), one of which is within an XHR callback. In this
+case, fsr:sis used for collecting site statistics where the key
+value is updated by concatenating new values(lines 11{22).
+Although the XHR callback may happen in between two
+cookie writes on lines 5 and 6, causing a dierent value for
+the key, at the end of the execution the cookie key fsr:swill
+contain all the written values but in dierent orders. In this
+case, the program treats this value as a set and not a list,
+so, while we catch the non-determinism correctly, this is not
+really a bug in the program. The false positive in fedex.com
+is very similar, with a race is on cookie key ssess, updated
+within an XHR callback.
+Benign memory races: We would also like to highlight
+an example of a memory race that does not have persistent
+consequences. On radikal.com.tr , there is a global variable
+\duration" that is used to measuring time elapsed at dier-
+ent points throughout the execution on which there is a race
+9 2015/3/16between its update in sequential code and in an XHR call-
+back. The value of this memory location does not propagate
+to any persisted state and cause non-determinism.
+4.4 Discussion
+Returning to the research questions in Section 4, we
+clearly see that according to Figure 7, races on persistent
+state (RQ 1) are quite uncommon, with only 19 for 26 sites.
+Races on session state (RQ 2) are also uncommon (only 3
+races observed), in part because session state is used not
+as frequently as cookies (Figure 6). Lastly, races on tran-
+sient state are considerably more frequent. While changes
+to HTML content may technically be races, one could ar-
+gue that most of these are ephemeral. Indeed, the execution
+model of JavaScript-based web pages induces a great deal
+of non-determinism. This is because many if not most web
+pages are not the same across multiple reloads: the ads on
+the sides of the page change; content of pages often changes
+(consider a rapidly changing news site), sometimes the ex-
+perience of the rst visit to a page and subsequent ones
+is dierent because of cookies. The browser user has been
+trained over the last decade not to expect much consistency
+and, when everything else fails, to reload the page. Addi-
+tionally, the JavaScript execution model is extremely per-
+missive: errors are \swallowed" by the runtime (the current
+event handler is terminated) and in many cases pages can
+survive exceptions and keep on running.
+Our observations mesh well with the anecdotal experience
+of the user encountering any problem on the web: one only
+needs to reload the page for the problem to go away. In a
+sense, web programming is very forgiving. This is dierent
+from thread-related races in desktop applications and also
+data races in mobile apps [4, 8], where researchers are able
+to replicate races with obvious visual consequences (mangled
+or upside down images on the screen, for instance).
+5. Related Work
+This section covers some of the recent work on nding races
+in JavaScript programs and asynchronous code.
+Races in Asynchronous Programs: Hsiao et al. propose
+an approach to nding a subset of asynchronous races in
+Android apps, focusing on races that lead to use-after-free
+violations (i.e. uses of a freed pointer) [4]. While this tool
+also does oine analysis of a single execution trace, their
+focus is on computing an explicit happens-before relation,
+which they apply to the trace in order to nd accesses that
+may lead to user-after-free possibilities. They employ some
+heuristics to minimize the possibility of false positives. We
+focus on data ow from multiple values to sensitive locations
+(like document:cookie ), an approach that naturally elimi-
+nates the need to explicitly reason about commutativity.
+Maiya et al. [8]et al. focus on a systematic exploration of
+possible schedules using a UI explorer and reasoning about
+the obtained traces using a race detector. A precise model
+of the Android execution life cycle is key to avoiding false
+positives, although a large number of these remain.
+Races in JavaScript: Zheng et al. [17] propose a static
+technique to detect potential races in JavaScript applica-
+tions. More recently, Petrov et al. [10] and Raychev et al. [12]
+have observed the potential for asynchrony creating out-of-
+order execution and developed a notion of race conditions
+for Web applications written in JavaScript. In principle,
+race conditions can arise because of accesses to data shared
+among components of a Web page which are not ordered by
+proper synchronization, or, more formally, a happens-beforerelation. Of course, on a Web page, the entire DOM is (a
+giant blob of) global state, creating the potential for races.
+Petrov et al. [10] dene a happens-before relation for Web
+pages and generalize the notion of race conditions to take
+into account cases where, logically, there are unordered ac-
+cesses to the same resource. The authors present a dynamic
+method for detecting races in a given execution of a Web
+page, explore similar executions that could potentially be
+racy, and, in later work [12] identify and lter out large
+sets of benign races. As discussed earlier, our work is distin-
+guished from these studies by the fact that we only pursue
+race conditions that lead to non-determinism in persisted
+state or data sent to the server. Our choice of the happens-
+before relationship follows from this design decision and only
+records high-level causality relationships.
+Mutlu et. al. [9] advocate the notion of observable races,
+i.e. those that can be seen and visually distinguished by the
+end user. Our notion of persistent side eects is even stronger
+than that captured in this paper.
+Program Analysis in JavaScript: A number of analyses
+have been propose for JavaScript in recent years; here we
+highlight only a handful. Additionally, several aspects of the
+language such as the use of eval [5, 14] and trying to under-
+stand JavaScript performance [11, 13]. Rozzle [6] proposes
+the idea of lightweight multi-execution in the context of a
+JavaScript engine, similar to our work. The goal of Rozzle
+is to expand the impact of malware detectors by increasing
+code coverage and thereby observing more, potentially ma-
+licious, code. In terms of techniques, Rozzle is probably the
+closest runtime exploration approach to the work described
+in this paper. A project by Chugh et al. focuses on staged
+analysis of JavaScript and nding information ow viola-
+tions in client-side code [1]. The Gatekeeper project [2, 3]
+proposes a points-to analysis together with a range of queries
+for security and reliability as well as support for incremental
+code loading. Gulfstream [3] is a successor of the Gatekeeper
+project whose focus is on incremental analysis and dynamic
+code loading. Sridharan et al. [16] presents a technique for
+tracking correlations between dynamically computed prop-
+erty names in JavaScript programs. Their technique allows
+them to reason precisely about properties that are copied
+from one object to another as is often the case in libraries
+such as jQuery. Madsen et al. [7] proposes the idea of a
+use analysis for the purposes of call graph construction in
+JavaScript applications that use large frameworks and li-
+braries. Their use analysis is combined with a points-to anal-
+ysis for the rest of the application.
+6. Conclusions
+This paper proposes an alternative way of looking at what
+constitutes a race in web applications written in JavaScript.
+We advocate a focus on races that are caused by asyn-
+chronous callbacks and their order of arrival, primarily in-
+vestigating races produced by the XmlHttpRequest (XHR)
+mechanism. Unlike prior work which concluded that there is
+ample potential for races in JavaScript, our ndings suggest
+that given the forgiving nature of JavaScript applications,
+damaging, persistent races are considerably more rare.
+Nevertheless, we propose a lightweight algorithm that ex-
+plores dierent schedules in the \neighborhood" of a partic-
+ular runtime trace. Our approach avoids the imprecision of
+static analysis and the combinatorial explosion and scala-
+bility issues of runtime schedule exploration. We nd and
+investigate a total of 19 harmful races and 621 benign races
+in 26 web sites.
+10 2015/3/16References
+[1] R. Chugh, J. A. Meister, R. Jhala, and S. Lerner. Staged
+information ow for JavaScript. In PLDI , June 2009.
+[2] S. Guarnieri and B. Livshits. Gatekeeper: Mostly static
+enforcement of security and reliability policies for JavaScript
+code. In Proceedings of the Usenix Security Symposium ,
+2009.
+[3] S. Guarnieri and B. Livshits. Gulfstream: Incremental static
+analysis for streaming JavaScript applications. In Proceed-
+ings of the USENIX Conference on Web Application Devel-
+opment , 2010.
+[4] C.-H. Hsiao, J. Yu, S. Narayanasamy, Z. Kong, C. L. Pereira,
+G. A. Pokam, P. M. Chen, and J. Flinn. Race detection for
+event-driven mobile applications. In Proceedings of the Con-
+ference on Programming Language Design and Implementa-
+tion, 2014.
+[5] S. H. Jensen, P. A. Jonsson, and A. Mller. Remedying the
+eval that men do. In In Proceedings of the International
+Symposium on Software Testing and Analysis (ISSTA) , July
+2012.
+[6] C. Kolbitsch, B. Livshits, B. Zorn, and C. Seifert. Rozzle:
+De-cloaking internet malware. In Proceedings of the 2012
+IEEE Symposium on Security and Privacy , 2012.
+[7] M. Madsen, B. Livshits, and M. Fanning. Practical static
+analysis of JavaScript applications in the presence of frame-
+works and libraries. In Proceedings of the International Sym-
+posium on the Foundations of Software Engineering , 2013.
+[8] P. Maiya, A. Kanade, and R. Majumdar. Race detection
+for android applications. In Proceedings of the 35th ACM
+SIGPLAN Conference on Programming Language Design
+and Implementation , 2014.
+[9] E. Mutlu, S. Tasiran, and B. Livshits. I know it when I see it:
+Observable races in JavaScript applications. In Proceedings
+of the Workshop on Dynamic Languages and Applications ,
+2014.
+[10] B. Petrov, M. Vechev, M. Sridharan, and J. Dolby. Race
+detection for web applications. In Proceedings of the 33rd
+ACM SIGPLAN Conference on Programming Language De-
+sign and Implementation , 2012.
+[11] P. Ratanaworabhan, B. Livshits, and B. Zorn. JSMeter:
+Comparing the behavior of JavaScript benchmarks with real
+Web applications. In Proceedings of the USENIX Conference
+on Web Application Development , June 2010.
+[12] V. Raychev, M. Vechev, and M. Sridharan. Eective race
+detection for event-driven programs. In Proceedings of the
+2013 ACM SIGPLAN International Conference on Object
+Oriented Programming Systems Languages &#38; Applica-
+tions .
+[13] G. Richards, A. Gal, B. Eich, and J. Vitek. Automated
+construction of javascript benchmarks. In Proceedings of
+the 2011 ACM International Conference on Object Oriented
+Programming Systems Languages and Applications , 2011.
+[14] G. Richards, C. Hammer, B. Burg, and J. Vitek. The eval
+that men do { a large-scale study of the use of eval in
+JavaScript applications. In ECOOP , pages 52{78, 2011.
+[15] G. Richards, C. Hammer, B. Burg, and J. Vitek. The
+eval that men do: A large-scale study of the use of eval
+in javascript applications. In Proceedings of the European
+Conference on Object-oriented Programming , 2011.
+[16] M. Sridharan, J. Dolby, S. Chandra, M. Schaefer, and F. Tip.
+Correlation tracking for points-to analysis of JavaScript. In
+ECOOP , 2012.
+[17] Y. Zheng, T. Bao, and X. Zhang. Statically locating web ap-
+plication bugs caused by asynchronous calls. In Proceedings
+of the International Conference on World Wide Web , 2011.
+11 2015/3/16

@@ -1,0 +1,1228 @@
+Semantic Debugging
+MartinEberlein
+Humboldt-Universitätzu Berlin
+Berlin, Germany
+martin.eberlein@hu-berlin.deMariusSmytzek
+CISPA Helmholtz Center for
+InformationSecurity
+Saarbrücken, Germany
+marius.smytzek@cispa.deDominicSteinhöfel
+CISPA Helmholtz Center for
+InformationSecurity
+Saarbrücken, Germany
+dominic.steinhoefel@cispa.de
+LarsGrunske
+Humboldt-Universitätzu Berlin
+Berlin, Germany
+grunske@hu-berlin.deAndreasZeller
+CISPA Helmholtz Center for
+InformationSecurity
+Saarbrücken, Germany
+zeller@cispa.de
+ABSTRACT
+Whydoesmyprogramfail?Wepresentanovelandgeneraltech-
+nique to automatically determine failure causes and conditions,
+usinglogicalproperties overinputelements:“Theprogram fails if
+andonlyif int(⟨length⟩)>len(⟨payload⟩)holds—thatis,thegiven
+⟨length⟩is larger than the ⟨payload⟩length.” Our AVICENNA pro-
+totype uses modern techniquesfor inferringpropertiesofpassing
+andfailinginputsandvalidatingandreﬁninghypothesesbyhaving
+a constraint solver generate supporting test cases to obtain such
+diagnoses. As a result, AVICENNA produces crisp and expressive
+diagnoses even for complex failure conditions, considerably im-
+proving over the state of the art with diagnoses close to those of
+human experts.
+CCSCONCEPTS
+•Softwareanditsengineering →Softwaretestinganddebug-
+ging;•Theory of computation →Grammars and context-free
+languages ;Oraclesand decision trees ; Active learning.
+KEYWORDS
+program behavior,debugging, behaviorexplanation,testing
+ACM Reference Format:
+MartinEberlein,MariusSmytzek,DominicSteinhöfel,LarsGrunske,andAn-
+dreasZeller.2023.SemanticDebugging.In Proceedingsofthe31stACMJoint
+European Software Engineering Conference and Symposium on the Foun-
+dations of Software Engineering (ESEC/FSE ’23), December 3–9, 2023, San
+Francisco, CA, USA. ACM, New York, NY, USA, 12pages.https://doi.org/10.
+1145/3611643.3616296
+1 INTRODUCTION
+When software fails, one needs to debugit—ﬁnd the error in the
+code that causes the failure and ﬁx it. Before digging into the code,
+however, one must ﬁrst identify the circumstances under which
+the failure occurs. Such circumstances give important hints on
+ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA,USA
+©2023 Copyright heldby theowner/author(s).
+ACM ISBN 979-8-4007-0327-0/23/12.
+https://doi.org/10.1145/3611643.3616296⟨heartbeat-request ⟩::= 0x1⟨length⟩ ⟨payload⟩ ⟨padding⟩
+⟨heartbeat-response ⟩::= 0x2⟨length⟩ ⟨payload⟩ ⟨padding⟩
+⟨length⟩::=⟨int⟩
+⟨payload⟩::=/u1D716|⟨byte⟩ ⟨payload⟩
+⟨padding⟩::=/u1D716|⟨byte⟩ ⟨padding⟩
+Figure 1:Syntax of TLSHeartbeatexchanges
+thefailurecause,andthushowandwheretoﬁxthebug;provide
+insights into how severe the problem is; and help producing exact
+ﬁxes,preventing patches that only ﬁxapart of the problem.
+Let us illustrate the role offailure circumstancesreferringtothe
+well-known Heartbleed problem.Inversionsbetween2012and2014,
+TLSserverswerevulnerabletotheHeartbleedattack,inwhichan
+attackercouldextractinternalmemorycontentsfromaserver.The
+attackwasbasedonthe TLSHeartbeat protocol,inwhichaclient
+checks whether a server is still alive by sending it some payload
+stringandexpectingthe same payloadto be returned.
+The elementsofaHeartbeat clientrequest and serverresponse
+are shown in Figure 1. The client sends a 0x1byte, followed by the
+length of the payload, and then the payload itself; extra padding
+bytes are used toextendthe request tothe data frame length. The
+server responds with a 0x2byte, followed by the same payload,
+indicatingthat it has receivedthe request.
+TheHeartbleed attack now consisted of having the declared
+payloadlengthdiﬀer from the actualpayloadlength.Aftersend-
+inga⟨length⟩valueof,say,4,000,andaﬁve-characterpayloadof
+"Hello",theserverwouldreplywith "Hello"—butfollowedbyan-
+other3,995bytesthatwouldhappentoresideinitsmemorybehind
+the payload string. Such “over-read” bytes can contain arbitrary
+information about the server state, including sensitive information
+such as unencryptedpasswords andcertiﬁcates.
+Heartbleed wasfoundby fuzzing TLSserversin2014[ 27].Indeed,
+simplyfeedingthegrammarfrom Figure1intoanygrammar-based
+fuzzer (e.g., [ 2,6,11,12,21,38,44,45]) immediately produces a
+request where ⟨length⟩andthe length of the ⟨payload⟩diﬀer,say
+⟨attack-request ⟩::=0x1 0x0123 "hello" 0x0 ...
+Sending⟨attack-request ⟩to a server with a memory sanitizer
+enabled would instantly reveal the invalid memory access. The
+vulnerability has been present since 2012, and administrators all
+overthe world rushedtopatch andupdatethe serversoftware.
+Thiswork islicensedunderaCreativeCommonsAttribution4.0Interna-
+tional License.
+438
+ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA MartinEberlein, Marius Smytzek, Dominic Steinhöfel,LarsGrunske,andAndreas Zeller
+Failing
+Program Inputsin2Determine Relevant
+Input ElementsLearn failure-related
+PatternsFailure
+CircumstancesNegate ConstraintsGenerate New Inputs
+to Refine Theory
+Input Grammar
+Pattern Catalogue
+Machine LearningISLa +
+Z3 SMT SolverAVICENNA
+in1
+1 23 4
+out
+Figure 2: How AVICENNA works. Starting with an input grammar ( in1) and a failing input ( in2),AVICENNA automatically
+determines the failure circumstances. Then, AVICENNA iteratively reﬁnes its failure hypothesis through repeated experiments.
+To learn the failure-inducinginputconstraints, AVICENNA leverages bothgenerativemodelsand predictivemodelsto satisfy
+constraints over grammar elements and to detect relations of input elements, respectively. Ultimately, AVICENNA obtains a
+theory ofthefailure circumstances( out) that explains andpredicts whenthebehavior inquestionoccurs.
+To ﬁx the problem, we need to know the exact circumstances
+under which the problem occurs—in our case, something along
+the lines of “The given payload length is diﬀerent from the ac-
+tual payload length”—such that we can characterize, locate, and
+ﬁxthefailure.Recently,twonovelapproachesforobtainingsuch
+circumstances automatically have been presented:
+•ALHAZEN by Kampmann et al. [ 20] uses repeated experi-
+mentstodeterminewhetherspeciﬁc properties ofinputel-
+ementscorrelatewithfailure.Thesetofpropertiesisﬁxed
+to existence, length, maximal code point, and numeric inter-
+pretation,and ALHAZEN candoagoodjobifaconjunction
+of individual properties causes a failure. ALHAZEN, however,
+does not check for relationships between properties, such
+as⟨length⟩and the length of ⟨payload⟩. The failure circum-
+stances produced by ALHAZEN therefore only relate to the
+⟨payload⟩length inisolation:
+len/parenleftbig⟨payload⟩/parenrightbig≤16357 (1)
+WhileEquation (1) (“The failure occurs if the ⟨payload⟩has
+less than 16,357 characters”) is a correct necessary condition
+(if⟨payload⟩is longer, the data frame becomes invalid), it is
+notsuﬃcient forthefailuretooccur.Nordoesitgivehints
+onhowto ﬁxthe failure.
+•ISLearndescribed by Steinhöfel and Zeller [ 39] learnsse-
+manticproperties overinputelementsthatholdforallinputs
+observed.Forthispurpose,itchecksinputsfor patternsof
+these properties that match all observed inputs. In our ex-
+ample,the pattern
+int/parenleftbig$1/parenrightbig>len/parenleftbig$2/parenrightbig(2)
+instantiatedwith $1=⟨length⟩and$2=⟨payload⟩applies
+toallfailingHeartbleed inputs and would be returned byISLearn as acommon inputproperty:
+int/parenleftbig⟨length⟩/parenrightbig>len/parenleftbig⟨payload⟩/parenrightbig(3)
+Equation (3) precisely captures the failure circumstances.
+However,itisburiedinhundreds1ofadditional coinciden-
+talinstantiationsthat alsoholdfor thegivenfailinginputs,
+such aslen/parenleftbig⟨padding⟩/parenrightbig>len/parenleftbig⟨payload⟩/parenrightbigorlen/parenleftbig⟨padding⟩/parenrightbig
+>int/parenleftbig⟨length⟩/parenrightbig. In contrast to ALHAZEN , ISLearn has no
+mechanismto reﬁne diagnosesthroughexperiments.
+Inthispaper,wepresent AVICENNA2,aprecise,general,andex-
+tensibleapproach to determine failure circumstances automatically
+(Figure2).AVICENNA buildsontheideathatonecandecomposethe
+inputintoindividualelementsusingagrammarandthatproperties
+oftheseinputelementscanpreciselycapturefailurecircumstances.
+In addition, AVICENNA makes three novel contributions, extending
+the state ofthe art:
+Quickly determining relevant elements. To narrow down the
+search space inthe (potentially large) set of inputelements,
+AVICENNA usesShapley values [26], a mechanism used to
+explain AI decisions, to determine which input elements and
+derivedpropertiescontributemosttotheoccurrenceoffailures.
+Only these are considered for deriving failure hypotheses,
+allowing for eﬃcient use even of complex patterns.
+In our example, AVICENNA quickly determines that ⟨length⟩
+andlen/parenleftbig⟨payload⟩/parenrightbigcontribute most to failure occurrence.
+⟨payload⟩byitselfcontributeslittle(otherthanforitslength),
+⟨padding⟩notatall.Tothebestofourknowledge, AVICENNA
+1450in ourexperiments; see Table 4.
+2IbnS¯ın¯a(Latinizedas Avicenna;980–1037)wasoneofthemostsigniﬁcantphysicians,
+astronomers, philosophers, and writers of the Islamic Golden Age. He was one of
+the earliest proponents of the scientiﬁc method of experimentation: In his “Book
+of Healing” (Kit ¯ab al-Shif ¯a) on science and philosophy, he explained that the ideal
+situation is when one ﬁnds that a “relation holds between the terms, which would
+allowfor absolute, universalcertainty.”[ 48]
+439SemanticDebugging ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+is the ﬁrst debugging approach to determine the relevance of
+inputelementsforthefailureusingtechniquesfromexplain-
+ableAI.
+Reasoningoverpassingandfailingruns. AVICENNA makesuse
+ofISLearntoinferfailure-inducingpatterns. AVICENNA ,how-
+ever,makesuse ofboth passingandfailinginputs and thus
+learns input properties that hold for failing runs, but notfor
+passing runs. Hence, coincidental input properties that hold
+forallinputs are eliminated in the ﬁrst place, narrowing
+downthesetofcandidatepropertiestowardsthoserelated
+to failures, including Equation (3) . To the best of our knowl-
+edge,AVICENNA is the ﬁrst debugging approach to detect
+arbitraryfailure-related patternsin inputs.
+Logical reﬁnement. Tofurtherassessdiagnosiscandidates, AVI-
+CENNAuses the ALHAZEN approach to generate additional
+testcases. But while the ALHAZEN generatoris limited to its
+four hard-coded input properties, AVICENNA makes use of
+the ISLaconstraint language and solver [39], allowing to ex-
+pressandsolveevencomplexconditionsoverinputelements.
+This way, AVICENNA can generate hundreds of test inputs
+satisfying the candidate diagnoses learned by ISLearn. Only
+Equation(3) reliablyproducesinputsthatcausethefailure
+andisthereforeretained;theother“coincidental”properties
+donot andare thus eliminated.
+Tothebestofourknowledge, AVICENNA istheﬁrstdebug-
+ging approach to determine diagnoses by logical reasoning
+and experimentation over input elements. We therefore call
+AVICENNA asemantic debugging approach in contrast to lex-
+ical/syntactical approacheslikeinputreduction[ 13,40,42]
+andML-based approacheslike ALHAZEN .
+TheHeartbleed failurecircumstanceasisolatedby AVICENNA and
+validatedbyhundredsoftest inputsthus reads:
+int/parenleftbig⟨length⟩/parenrightbig>len/parenleftbig⟨payload⟩/parenrightbig(4)
+Thisfailurecircumstanceis100%precise—the Heartbleed failure(as
+amemoryoverread)occursifandonlyifthisconditionismet.It
+couldalsobeusedbyan inputsanitizer topreciselypredictandpre-
+ventHeartbleed attacks. This is in contrast to ALHAZEN’s diagnosis
+inEquation(1) ,whichcannotseparateattacksfromlegitimatere-
+quests, and the ISLearn diagnosis,embedding the correct property
+inamyriad ofcoincidental properties.
+With this singlefailure condition andthe test cases, AVICENNA
+(1) providesimportanthints onthe nature ofthe problem;
+(2) makessure that any ﬁxwillbe well-testedandvalidated;
+(3) suppliesacondition for inputcheckers to detectattacks;
+(4) ensures agreatstartfor locating andﬁxing the fault.
+To achieve all this, AVICENNA leverages recent advances in input
+speciﬁcation,inputgeneration,andinputinference—notably,the
+ISLa language and input generator [ 39], which generates inputs
+satisfying constraints over grammar elements, and the ISLearn in-
+putinvariantlearner[ 39],whichdetectsISLapropertiesingiven
+inputs.ButwhileISLaandISLearnweredesignedtoproduceseman-
+ticallyvalidinputs, AVICENNA showsthattheyalsoenablepowerful
+automated debugging approaches. In our evaluation, AVICENNA de-
+termines crisp failure conditions that are much shorter yet moreprecise than ALHAZEN or ISLearn, closely matching diagnoses col-
+lected from human experts. AVICENNA and all experimental data is
+available as open source( Section 8).
+2 BACKGROUNDAND RELATED WORK
+Automateddebugging collectivelyreferstolocalization[ 19,24,29,
+31,46,49,53], understanding [ 13,17,20,22,23,35,39,40,42,52],
+explaining [ 20,39], and ﬁxing [ 14,25,28,36,50] a faulty system.
+Automatedtoolsthatguidedeveloperstowardcorrectingerroneous
+program behavior can signiﬁcantly reduce the cost of software
+developmentandimprove the overallquality of the software.
+2.1 ProgramSlicing
+Oneoftheﬁrstseminalautomateddebuggingtechniquesis program
+slicing,introducedbyWeiser[ 46].Asliceisthesetofprogramstate-
+mentsthatcanbeinﬂuencedfromagivenstatement(forwardslice)
+orthatmayhaveinﬂuencedaspeciﬁcstatement(backwardslice):
+“TheNULLvalueinLine20comesfromLine18,whichexecuted
+becauseoftheconditioninLine10.”Indebugging,abackwardslice
+from a failing statement helps narrow down possible causes in the
+program code—also by eliminating those parts that could nothave
+contributedto thefailure. Program slices,however, explainfailures
+intermsofprogramcode—notas(input)circumstancesthatexist
+independently ofstatements andvariables.
+2.2 Statistical Debugging
+Statistical debugging techniques [ 19,24,53] identifyexecution fea-
+turesthatcorrelatewithfailure,suchasindividualcodelinesmostly
+executed in failing runs: “Lines 10, 11, and 50 are executed only in
+failingruns.” The resulting statistical models thusexposerelation-
+shipsbetweenspeciﬁcprogrambehaviorandeventualsuccessor
+failure.However,theremaybemultipleexecutionfeaturescorre-
+lating with failures, and then the developer must determine which
+of these may be in error. Also, to prevent overﬁtting, statistical
+debuggingmayneed comprehensivesets ofpassingandfailingruns,
+whichmaynot exist inpractice.
+2.3 DeltaDebugging
+Automated debugging techniques can be made much more precise
+if they can generateadditional inputs to narrow down possible
+failure causes. One seminal example of such experimental tech-
+niques is Delta Debugging [ 52], a strategy to eﬀectively reduce
+failure-inducing inputs: “The failing input can be reduced to the
+two characters ‘ .’ and ‘x’.” Delta Debugging assumes an automated
+testthat determines whether a (reduced) input still produces the
+failureandwhoseoutcomethusguidesthereductionprocess.In
+contrast to the above techniques, its result does not refer to the
+code but, instead, areducedinputthat stillreproduces the failure.
+2.4 LeveragingInput Syntax
+Knowing the input structure can make experimental debugging
+techniques far more eﬃcient and also provide better diagnoses.
+To describe input languages, Context-Free Grammars (CFGs) are
+themostpopularformalism,well-studiedintheoreticalcomputer
+science,compilerdesign,andlinguistics[ 18].Usinginputgrammars,
+440ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA MartinEberlein, Marius Smytzek, Dominic Steinhöfel,LarsGrunske,andAndreas Zeller
+onecanextendreductionto structured inputswithPerses[ 40],C-
+reduce[35],HDD[17]andHDDr[ 23,42].Allthesearesigniﬁcantly
+faster(andoften more precise)thanlexical Delta Debugging.
+While the above approaches still reduce a given failing input
+into ashorterfailing input, the DDSETalgorithm[ 13] aimsto ﬁnd a
+patternthatcharacterizesthefailure.Inthepattern, nonterminals
+describe sequences that can take any value as deﬁned by the gram-
+mar,thusabstractingoverspeciﬁccontents:“Thefailureoccursfor
+any inputofthe form ⟨expr⟩*⟨expr⟩”.
+2.5 Learning Relevant Input Properties
+ALHAZEN [20]requires a setoflabeledinputsto determinethe cir-
+cumstances of a program’s failure automatically. It uses a grammar
+to parse the inputsinto individual syntactical features ,such as the
+length of an element or the presence of speciﬁc elements. To form
+the ﬁrst debugging hypotheses, ALHAZEN needs at least one initial
+failing input. This hypothesis is shaped by ﬁrst deconstructing the
+initial inputs into features with the help of the grammar and utiliz-
+ingthesefeaturestolearna decisiontree. Next,ALHAZEN usesthe
+treetolearn associations betweentheinputfeaturesandprogram
+failure. Then, ALHAZEN attempts to reﬁne the ﬁrst hypothesis in
+aniterative process : The decision tree—representing the current
+explanatorytheory—andthegrammarareusedtoconstructnew
+inputs toprobe theprogram.Thesenew samplescanthen becon-
+sideredto reﬁne the hypothesisinthe decision tree.
+Eventually, ALHAZEN presents its ﬁnal theory relating input fea-
+tureswith thefaulty program behavior: “The failure occurswhen-
+ever thelength of the ⟨command-line ⟩elementexceeds264”. This
+way,ALHAZEN extends the state of the art beyond DDSET, not only
+generalizingthesyntacticpartsoftheinputbutalsodetermining
+whichinputfeatures contributeto the failure.
+2.6 DynamicInvariants
+Duringdebugging,havingaspeciﬁcationofthecorrectbehaviorof
+theprogramisbeneﬁcial.Ifsuchaspeciﬁcationis formal,automated
+debuggingtechniquescanleverageittoguidetheprocess.Formally
+speciﬁed pre-andpostconditions as well as data invariants can
+signiﬁcantlyreducedebuggingeﬀort—ifoneknows,forinstance,
+thatduringanexecution,thepreconditionofsomefunctionwas
+satisﬁed,butnotitspostcondition,thenwecannarrowdownthe
+searchto the executionofsaid function.
+Afterall,howcanweobtainsuchspeciﬁcations?Oneseminal
+workinspeciﬁcationminingisthe DAIKONdynamicinvariantde-
+tector[8],whichtakesasetof(passing)runsandforallfunction
+arguments and returns, determines from a pattern library whether
+there are speciﬁc properties that hold for these arguments and
+returns. If a function y = sqrt(x) , for instance, is always called
+with positive values of x, it can deduce the invariants x>0,y>0,
+and even x=y∗y. Today’s program synthesis techniques [ 16]
+extendover DAIKONbysynthesizingcomplex formulas thatcapture
+relationships between inputandoutputvariables.
+However,onedownsideofallsuchdynamictechniquesisthat
+theminedspeciﬁcationsmay overﬁttothegivenruns.Assuming
+thatx=0is a valid argument for sqrt(x), for instance, the above
+invariants overspecialize. Only if DAIKONand the like see an in-
+vocation sqrt(0) will we get the correct invariants x≥0andy≥0. One may attempt to mitigate this problem by generating test
+inputs.Still,thenwerunintotheproblemofpotentiallyviolating
+the very preconditions we want to mine in the ﬁrst place: From
+aninvocationof sqrt(-1) ,DAIKONandthelikemayhavelotsof
+undeﬁnedbehaviorfrom whichto learn.
+2.7 Input Invariants
+Recently,theconceptsofspecifyingandlearninginvariantswere
+extended to the systemlevel, which allows expressing pre- and
+postconditions over system inputs. The ISLa language [ 39] com-
+binesacontext-freegrammarwith constraints aspredicatesover
+nonterminals. Given the grammar in Figure 1, for instance, the
+ISLaconstraint“ int/parenleftbig⟨length⟩/parenrightbig=len/parenleftbig⟨payload⟩/parenrightbig”expressesthatthe
+⟨length⟩ﬁeldshouldholdthelengthofthe ⟨payload⟩ﬁeld.Thisway,
+ISLa leverages the simplicity of CFGs while signiﬁcantly extending
+theirexpressiveness.
+TheISLatoolallowsto producevalidinputsthatsatisfythegiven
+constraints (using an SMT solver). It can also checkgiven inputs
+againstanISLaspeciﬁcation; mutateinputswhilemaintainingvalid-
+ity; andrepairinputs to make them valid. The constraint language
+allowsaddressinggrammarelementswithuniversalandexistential
+quantiﬁers,relatingtheir positionswithstructuralpredicates,and
+constrainingtheirvaluesusingSMT-LIBformulas,makingISLaa
+robust systemfor test generationandblack-box fuzzing.
+2.8 Learning Input Constraints
+AlongwithISLa[ 39], theauthors also describe ISLearn, apattern-
+basedapproachforminingconstraintsfromexistinginputs.ISLearn
+follows the DAIKONapproach, using a conﬁgurable catalog of com-
+mon constraint patterns. It instantiates these over all inputs and
+inputelements,retainingthosecandidatesthatholdforallgiven
+inputs:“In allinputsseen, len/parenleftbig⟨payload⟩/parenrightbig≤16357holds.”
+In contrast to DAIKONand like dynamic speciﬁcation miners,
+however,ISLearncanmakeuseof generatedinputs intheﬁrstplace,
+leveragingISLaasaproducer.Hence,evengivenonlyapartialspec-
+iﬁcation (say, only the grammar), one can ﬁrst run ISLa to produce
+amyriadofinputsandthenhaveISLearninfertheconstraintsonly
+from the validinputs that are accepted by the program under test.
+This pipeline of test generation and speciﬁcation mining works at
+the system level because programs are expectedto explicitly reject
+invalid inputs (which speciﬁcation mining can then ignore)—an
+assumption that does not hold at the unit level. So far, neither ISLa
+norISLearn has been usedfor debuggingpurposes.
+3 APPROACH
+Inthissection,wepresent AVICENNA ,ourprecise,general,andex-
+tensibleapproach to determine failure circumstances automatically.
+Thekeyideaistoleveragebothgenerativeandpredictivemodelsto
+satisfyconstraints overgrammar elementsand todetectarbitrary
+(subject to the catalog patterns) relations of input elements. For
+this,AVICENNA makesuse of fourbuilding blocks:
+•ISLa’sspeciﬁcation language allowsAVICENNA to express
+even complex failure circumstances as predicates over input
+elements.
+•The ISLearn toolallowsAVICENNA to learn input properties
+that are common acrossallfailinginputs.
+441SemanticDebugging ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+•The ISLa toolallowsAVICENNA toproducevalid inputs—
+notably inputs that fulﬁllpotential failure-inducing proper-
+ties, thus allowing for systematic experimentation.
+•Finally, AVICENNA follows ALHAZEN in using a feedback loop
+to narrow down failure causes with systematic experiments.
+Thecombinationoflearningandgeneratingtechniquesenables AVI-
+CENNAtoproducea precisepredicatethatpinpointsthecircumstances
+underwhichaprogramfails.
+AVICENNA starts with a program, a grammar for the input for-
+mat, and a set of initial inputs ( Figure 2/u1D456/u1D45B1&/u1D456/u1D45B2). To locate and
+determine the root causes of a program’s crash, AVICENNA requires
+at least one failinginput.AVICENNA will automatically generate ad-
+ditionalfailinginputstostrengthenitshypothesizeddiagnosis.The
+grammarallowsustoassociatesyntacticalfeaturesandsemantic
+propertieswiththe observedprogram behavior.
+To detect arbitrary failure-related explanations of the failure
+circumstances,we proceedinfoursteps:
+(1)Wedeterminethemostrelevantinputelementsofthepro-
+gram’s failure ( Section 3.1 ).
+(2)We instantiate patterns that capture arbitrary relations of
+the observedfailure ( Section 3.2 ).
+(3)Weproducenewinputstoreﬁneandstrengthenourhypoth-
+esis (Section 3.3 ), and
+(4)We repeat this procedure until a stopping criterion is met
+(Section 3.4 ).
+3.1 DeterminingRelevant Input Properties
+In contrast to approaches like ALHAZEN,AVICENNA checks passing
+andfailinginputsfor patternsoverinputelementsandproperties.
+We use these patterns to capture arbitrary relations between input
+elements and the circumstance of the program’s failure. AVICENNA
+retains those patterns that apply to all or at least the majority of
+failinginputs,yetnottothepassinginputs,andthusmakesa di-
+agnosis candidate. However,instantiating dozens of patterns with
+hundreds of input elements and derived values means checking
+manycombinations.Thus,tonarrowthesearchspaceandthenum-
+berofpossiblepatternmatches, AVICENNA automaticallyfocuses
+onlyonthefailure-inducinginputs’essentialcharacteristics.Our
+toolachievesthisbytrainingamachine-learningmodelandexplain-
+ing its decisions with Shapley values . This mechanism allows us to
+determine which input elements and derived properties contribute
+most to a machine learning model’s prediction, i.e., the failure of a
+program. Only those that contribute most are considered during
+patterninstantiation,allowingfortheeﬃcientuseevenofcomplex
+patterns ( Figure 2,Activity1 ).
+AVICENNA starts bydecomposing eachinput into its syntactical
+constituentsbasedonthegrammar.Theresultingfeaturevectors
+andtheinformationiftheinputisfailure-inducingarethenusedto
+trainamachinelearningmodel.Themodeleventuallyassociates
+the program’s failure with the occurrence of speciﬁc derivation
+sequences, particularly non-terminals . To determine the features
+thatcontribute mostto thefailure in question, AVICENNA employs
+SHAP[26], a game-theoretic approach explaining the output of a
+machinelearningmodelbasedonShapleyvaluesfromcoalitional
+game theory. The goal of SHAPis to interpret the model’s outcomebycomputingthecontributionofeachfeaturetotheﬁnalpredic-
+tion.Theﬁnal SHAP-valueforafeaturerepresentshowmuchthe
+model’spredictionchangeswhenweobservethatfeature.Using
+these values as an indicatorof non-terminalsthat contribute most
+totheoccurrenceofafailureallowsustoexcludeirrelevantchar-
+acteristics.Thisproceduregivesusatremendousadvantageover
+state-of-the-artapproacheslike ISLearn.
+Returning to our example, AVICENNA can quickly determine that
+⟨length⟩and⟨payload⟩contributemosttothefailureoccurrence.
+⟨payload⟩,⟨int⟩,and⟨byte⟩bythemselvescontributelittle(other
+thanfor its length), ⟨padding⟩not at all.
+3.2 Learning FailureConstraintswith Pattern
+Matching
+AVICENNA learns failure-related constraints via pattern matching.
+Steinhöfel et al. [ 39] showed that input invariants can be mined
+from existing inputs. Building upon their original pattern-based
+learnerISLearn,we derivecomplex semanticconstraints thatcap-
+ture the observed failure. We reduce the computational complexity
+of the pattern matcher by only considering the most relevant in-
+put elements for the instantiation of pattern candidates, such as
+⟨length⟩and⟨payload⟩.
+Figure2showsthatthelearningandcandidategenerationphase
+(Activity2 )instantiatesselectedpatternsfromaprovided pattern
+catalogbasedonthegiveninitialinputs.Intheﬁrststep,thepattern-
+matcher instantiates non-terminal placeholdersin quantiﬁers and
+matchesexpressionplaceholderarguments,e.g., len($1)>num($/u1D456)
+with⟨length⟩or⟨payload⟩.Thispatternstatesthatthefailureoc-
+curs whenever the length of the matched non-terminal is larger
+thansomenumber $/u1D456.Thecandidatesaftereachinstantiationphase
+are approximatelyﬁlteredusing an ISLearn checkerforschematic
+formulas. Whenever most failure-inducing inputs satisfy an instan-
+tiatedpattern, AVICENNA retains that pattern.
+Letusreconsiderourinitial Heartbleed example.Using AVICENNA ,
+aﬁrstfailurediagnosisbasedontheinitialinputsmaybesimilar
+to the following simpleconstraint:
+len/parenleftbig⟨payload⟩/parenrightbig>6 (5)
+Thisconstraintstatesthatwheneverthe ⟨payload⟩ofarequestis
+largerthan 6characters,theprogramfailureoccurs.Atthisearly
+stage, the pattern int/parenleftbig⟨length⟩/parenrightbig>len/parenleftbig⟨payload⟩/parenrightbigand the above
+constraintareequivalentregardingtheircapabilitiestopartition
+theinitialinputs into passing and failing ones. To improve this
+initial diagnosis and learn the best failure-related constraint, we
+needto conduct more experiments—with more inputs.
+3.3ValidatingHypothesesthroughExperiments
+The failure-related constraints computed initially may be far from
+perfect.Becauseofthelimitedsetofinitialinputs, AVICENNA can
+onlymakebasicobservations,oftenresultinginextremeoverﬁtting
+to the given inputs. To reﬁne or refute the initial candidates, we
+generatenewinputs tostrengthenthelearnedconstraints. AVICENNA
+generates new inputs according to the mostpromisingextracted
+failurehypotheses,i.e.,constraintsthatbestseparatefailingfrom
+passing inputs. Using the extracted hypotheses allows us to ef-
+ﬁciently guide the generation process and focus on the relevant
+442ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA MartinEberlein, Marius Smytzek, Dominic Steinhöfel,LarsGrunske,andAndreas Zeller
+aspects of the failing inputs. AVICENNA is based on the scientiﬁc
+method:It tries to refutethe initial diagnosis hypothesis by actively
+generating new inputs that satisfy the constraints but do not result
+inthe program’s failure.
+To this end, AVICENNA additionally negatesthe candidate con-
+straints to ( i) explore the boundaries ofthe inputelements, ( ii) ex-
+pand the set of relevant input properties, and ( iii) reﬁne the sur-
+roundings of the input elements. For instance, if both the presence
+andtheabsenceoftheinputelement ⟨padding⟩resultinthefailure
+of the program, then the relevance of ⟨padding⟩is diminished ( Fig-
+ure 2,Activity 3 ). Thus, we generate additional inputs bothfrom
+theoriginalandnegatedconstraintsandassignthemtothecate-
+goriesfailingandpassingbasedontheprogram’sbehaviorunder
+test. Note that we do not reﬁne the current set of constraints by
+direct manipulations. Instead, we reﬁne our data set of passing and
+failinginputs,whichallowsusto( i)concretizethesetofrelevant
+inputelementsand( ii)infermorepreciseinstantiationsinthenext
+inference step.
+To eﬃciently produce new inputs satisfying constraints, we use
+the recently introduced ISLa fuzzer [ 39] (Figure 2,Activity 4 ). ISLa
+not only allows us to producenew inputs but also to validatecom-
+plex constraints.
+Inourrunningexample,westrengthenourinitial hypothesisby
+deriving andaddingthe following negatedconstraint:
+len/parenleftbig⟨payload⟩/parenrightbig≤6 (6)
+Hence,withthehelpofISLa, AVICENNA willnowproduceinputs
+thatwillhaveapayloadofeither lessoreuqal than6(forpassing
+inputs)or morethan6(forfailinginputs)characters.However,as
+the length of the ⟨payload⟩is only failure-inducing in combination
+with thestated ⟨length⟩value,AVICENNA quicklygenerates inputs
+that donot satisfy the initialfailingdiagnosis.
+3.4 Reﬁning Hypotheses in aFeedbackLoop
+Toreﬁnetheinitialdiagnosis(failure-relatedconstraints),werepeat
+the procedure of determining the most relevant input elements,
+learning constraints, and generating additional inputs. By learning
+andgeneratinginputsalternately,wecan infer,verify,andgeneralize
+relations between input elements and properties. Most notably,
+by also considering the negation of the constraints, we generate
+adversarialinputs tofalsifyourcandidateconstraintspossibly.After
+only three iterations of the feedback loop, AVICENNA derives the
+correctfailure constraintfor the Heartbleed example:
+int/parenleftbig⟨length⟩/parenrightbig>len/parenleftbig⟨payload⟩/parenrightbig(7)
+In general, the ideal instantiation will always be among the
+possible candidate instantiations from the beginning (if it could be
+derived from AVICENNA ’s patterns). It will receive a signiﬁcantly
+betterrankingwiththe generationofadditionaltest inputs.
+4 IMPLEMENTATION
+AVICENNA ,withthedeterminationoftherelevantinputelements
+andthefeedbackloop,isimplementedinPython.We usethelatest
+versionsofISLaandISLearntogenerateandinstantiatenewfailing
+patterns.Inaddition,toreducethecomputationalcomplexityofthe
+patternmatcher,wepassISLearnasetofnon-terminalsthatshould
+not beconsideredduringthepattern instantiation.We obtainthisTable 1:Subjectsand Grammars
+Subject Grammar Subject Grammar
+Heartbleed Figure 1 Pysnooper.1 custom
+Calculator calculator[ 20]Pysnooper.2 custom
+Genson JSON [30]Cookiecutter.1 custom
+ﬁnd.07b941b1 ﬁnd [ 20]Cookiecutter.2 custom
+ﬁnd.091557f6 ﬁnd [20]Cookiecutter.3 custom
+ﬁnd.dbcb10e9 ﬁnd [ 20]FastAPI.1 custom
+ﬁnd.ﬀ248a20 ﬁnd [20]FastAPI.2 custom
+grep.3220317a grep [ 20]FastAPI.3 custom
+grep.3c3bdace grep [20]FastAPI.4 custom
+grep.5fa8c7c9 grep [ 20]youtube-dl.1 custom
+grep.7aa698d3 grep [20]youtube-dl.2 custom
+grep.c96b0f2c grep [ 20]youtube-dl.3 custom
+exclusionsetbydeterminingthemostrelevantinputelementsby
+trainingagradientboostingtreebasedontheXGBoost(Extreme
+Gradient Boosting) framework [ 5], an optimized distributed gradi-
+ent boosting library. Then, we use the SHAPlibrary [26], providing
+a fast implementation supporting XGBoost to extract the failure-
+inducing input elements. We consider both the presence and the
+absenceofinputelementsasnecessary.Furthermore,weusethe
+grammar-based fuzzer from the Fuzzing Book [ 51].AVICENNA and
+allexperimental data isavailable as open source( Section 8).
+5 EVALUATION
+Let us assess how well AVICENNA fares—both in comparison to
+humandiagnoses,aswellasincomparisontothestateoftheart.
+We addressthe following research questions:
+RQ1)Howdoes AVICENNA compareagainstdiagnosesprovidedby
+humanexperts?
+RQ2)Howdoes AVICENNA compareagainst ALHAZEN intermsof
+diagnosis complexity andaccuracy?
+RQ3)How does AVICENNA compare against ISLearnin terms of
+diagnosis complexity?
+5.1 EvaluationSetup
+5.1.1 Evaluation Subjects. To examine the eﬀectiveness of AVI-
+CENNA, we evaluate our tool’s diagnoses on a set of test subjects
+similartothoseinitiallycoveredbyKampmannetal.with ALHAZEN.
+Intotal,weevaluate 24bugsfrom ninediﬀerentprojectsofdiﬀerent
+complexity,namelythe Heartbeat protocol,acustom calculator ,the
+GensonJSON parser [ 4], the command line utils grepandﬁndfrom
+DBGBench[3],andPysnooper [33],Cookiecutter [15],FastAPI[34]
+andyoutube-dl [1] selected from the Tests4Py Benchmark [ 37].
+Tests4Py leverages the bugs present in BugsInPy [ 47] and extends
+themwiththe capability to verifyinputsonasystemlevel, which
+makesitidealforevaluating AVICENNA .Moreover,eachsubjectof
+Tests4Py comes with a grammar specifying the input format we
+can leverage. If a subject of Tests4Py does not provide a CLI for
+directlyaccessingtheprogram,Tests4Pyalreadyprovidesaharness
+asaccessforexecution. DBGBenchprovidesthemeanstocompile
+andexecuteoldversionsofgrepandﬁndanddocumentthebugs
+in those old versions. For the calculator ,grep, andﬁnd, we used the
+443SemanticDebugging ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+grammar provided by ALHAZEN. ForGenson, we adapted the gram-
+mar found in the GitHub repository for ANTLR grammars [ 30].
+The handwritten grammars for grepandﬁnddescribe complete
+shellcommandsconsisting ofan input,alistofenvironmentvari-
+ables,andaninvocationoftherespectivecommandlineutility.The
+subjects,bugs,andusedgrammarare describedin Table1.
+5.1.2 DataSets. Toanswer RQ2(similartotheevaluationof AL-
+HAZEN), we require sets of test inputs to evaluate the prediction
+capabilitiesof AVICENNA ’sandALHAZEN’sfailurediagnosis.Togen-
+eratethesevalidationinputs,weusethek-pathcoverageguided,
+grammar-aware mutation fuzzer provided by ISLearn. With the
+fuzzer, we automatically generate 100 unique validation inputs for
+eachsubject—50passingand50failure-inducingtestcases.How-
+ever,asthefailureconditionsforthe ﬁndbugsareincrediblynarrow,
+we could not obtain 50 failing inputs within one hour. Thus, we
+reduced the validation set for the ﬁndsubjects to 20 passing and
+20 failing inputs. We measure the respective predictive power of
+the failure diagnosesbasedonthesevalidation inputs.
+In contrast to the ALHAZEN evaluation, we evaluate AVICENNA ’s
+performancewithaninitialinputcorpusoftwoinputsonly—one
+bug-triggering and onepassinginput. This decision follows the
+idea that we want to know if our extended learning process and
+thefeedbackloopcangeneratemeaningfuladditionalinputsand
+thus improve its accuracy and precision. The two initial inputs,
+onepassingand onebug-triggering , were provided by ALHAZEN ,
+DBGBench,andTests4Py.
+5.1.3 ResearchProtocol. Toanswertheresearchquestions,wepro-
+ceededasfollows:( i)First, we started AVICENNA foreach subject
+with the respective grammarand the twoprovided initialinputs.
+(ii) Then we performed at most 20 iterations of the learning and
+reﬁnement process. We stopped if we did not generate new inputs
+inaniterationor AVICENNA couldnotﬁnishthe20iterationswithin
+onehour. For RQ1,weanalyzed AVICENNA ’sfailurediagnosesfor
+Heartbleed and the DBGBench subjects. We compare the individual
+failureconditionsofeachdiagnosistothebugreportprovidedby
+experts.WeexcludedtheCalculator,Genson,andTests4Pysubjects
+as we do not have an expert diagnosis for these bugs. All of AVI-
+CENNA’sdiagnoses,alongwithdetailsoftherespectivefailures,are
+available as part ofthe AVICENNA experimental data ( Section 8).
+Toanswer RQ2,wecomparedthepredictivepowerof AVICENNA ’s
+diagnosesto ALHAZEN andproceededasfollows:( i)First,wegen-
+erated the evaluation data sets with the mutation fuzzer. ( ii) Then,
+weranAVICENNA andALHAZEN withthesamestartingconditions
+(i.e., with the same grammar and initial inputs). ( iii) Finally, we
+measuretheperformanceoftheﬁnaldiagnosisforeachsubjectand
+approach. Withthe same starting conditions,rerunning AVICENNA
+andALHAZEN did not change their diagnoses. Finally, to answer
+RQ3,weassessed AVICENNA ’sfeedbackloopanditsperformance
+eﬀectsoverISLearn.Wecomparethenumberofreturnedfailure
+diagnosesto answer this researchquestion.
+5.2 RQ1: AVICENNAvs. Human Diagnoses
+Let us start with our ﬁrst research question, pitching AVICENNA
+against human experts. For a substantial subset of bugs in our
+evaluation setup, we have diagnoses by human experts availablecollected in the DBGBench study [ 3], in which practitioners would
+debug real-world bug reports for the ﬁndandgreputilities. As
+part of their task, these practitionerswere asked to determine the
+exact circumstances under which the bug would occur as part of a
+simpliﬁed bug report—the exact problem that AVICENNA is set to
+address.Inourevaluation,wecouldthuscomparetheexpertbug
+reportswiththe AVICENNA diagnosesandassesswhether AVICENNA
+wouldproducetoomuch,toolittle,orevenmisleadinginformation.
+Table2relatesthe AVICENNA diagnoses(usingISLasyntax)against
+thesummariesprovidedbyhumanexperts.Fragmentsmarkedin
+boldrelate to concepts referred to in both the AVICENNA diagnoses
+andtheexpertdiagnosis;matchingconceptsareshowninthesame
+colorandlinkedwithaline.Fragmentsmarkedwith italicsrelate
+to unmatched concepts and thus indicate failure conditions missed
+byAVICENNA .
+EvenwithoutcompleteknowledgeofISLa,thefactthatalmostall
+conceptsofexpert diagnosesexist inthe AVICENNA diagnosesand
+viceversaisstriking.Althoughindependentlyobtained,thenatural
+language diagnoses read as translations of the formal AVICENNA
+diagnoses,whereasthe AVICENNA diagnosesreadasaformalization
+ofthenaturallanguagediagnoses.Inalmostallcases,thesemantics
+are identical.
+Failurecircumstancesas produced by AVICENNA are verycloseto
+thosedetermined byhumanexperts.
+AVICENNA took about 30 minutes on a regular PC to produce
+a diagnosis for ﬁndandgrep; this is slightly slower than it took
+theDBGBench participants to debug things [ 3]. However, in the
+DBGBench study [ 3], only 58% of patches were correct in the sense
+that they addressed all failure circumstances. We conjecture that if
+developers are aware of the exact bug circumstances (as AVICENNA
+provides them) and able to test their ﬁxes automatically (for in-
+stance, byhavingISLaproducetest casesfrom thediagnoses), the
+qualityofﬁxes mayvery muchincrease.
+5.3 RQ2: AVICENNAvs. ALHAZEN
+Let us now compare AVICENNA against state-of-the-art tools. AL-
+HAZEN[20] pioneered the concept of automatically determining
+failure circumstances, leveraging and producing decision trees that
+expressfailureconditions.Weﬁrstcomparethe complexity ofdi-
+agnosesproducedby AVICENNA andALHAZEN ,respectively.From
+Table 2, we already have seen that a typical AVICENNA diagnosis
+contains 2–3 conditions, each referring to one property of an input
+element; the average number of conditions across our entire set
+of subjects is 2.25, which is not the case for ALHAZEN diagnoses,
+though. As listed in [ 20, Table 6], the average ALHAZEN decision
+tree has19.48 nodes, each one expressing a condition over input
+elements.We,therefore,conjecturethatthe AVICENNA diagnoses
+are muchcrisper.
+AVICENNA diagnoses are only 1/8as long as ALHAZEN diagnoses.
+However, a shorter (and thus more general) failure condition
+mightalsoresultinless accuracy, possiblyﬂagginginputsasfailure-
+inducingthatarenot.We,therefore,evaluatetheaccuracyof AVI-
+CENNAvs.ALHAZEN.Foreachsubject,testinput,andtool,weassess
+whetherthetoolﬂagstheinputasfailure-inducingandhowthat
+444ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA MartinEberlein, Marius Smytzek, Dominic Steinhöfel,LarsGrunske,andAndreas Zeller
+Table 2: AVICENNA diagnosesvs.humandiagnoses
+Bug AVICENNA diagnosis(using ISLasyntax [ 39]) ExpertBug Description
+Heartbleed str.to.int( <length>) >str.len( <payload>)“Attackers can send Heartbeat requests with the value of
+the length ﬁeld greater than the actual length of the
+payload”[10]
+grep.7aa698d3exists <utf8> in <lc_all>:
+<utf8> = "UTF-8"and
+exists <ignore_case> in <general_options>:
+<ignore_case> = "-i"“If grepconducts a case-insensitive search (-i) on an input
+that contains multibyte characters andthe locale is UTF8 ,
+thengrep printsamatchofincorrect length.”[ 3]
+grep.5fa8c7c9exists <patterns> in <command>:
+<patterns> = "''"and
+exists<utf8>in <lc_all>:
+inside(<utf8>, <lc_all>) and
+exists<fixed_string> in <cmd_1>:
+inside(<fixed_string>, <cmd_1>)“Searching with grep -Ffor anempty string in amultibyte
+locals[sic] wouldfreeze grep.”[ 3]
+(Note:⟨ﬁxed_string ⟩expandsto -Fand–fixed-strings )
+grep.c96b0f2cexists <regex_> in <patterns>:
+<regex_> = "^$"and
+(exists <ignore_case>in <matching_control>:
+inside(<ignore_case>, <matching_control>) or
+exists<line_no>in <output_line_prefix_control>:
+inside(<line_no>, <output_line_prefix_control>))“Options -iand-nwillnotworkwhenappliedtoan empty
+line”[3][ina UTF-8locale ]
+(Note:⟨ignore_case ⟩expandsto -iand–ignore-case ;⟨line_-
+no⟩expandsto -nand–line-number )
+grep.3c3bdaceexists<extended _regex> in <matcher_selection>:
+inside(<extended_regex>, <matcher_selection>) and
+exists<repetition> in <patterns>:
+<repetition> = "*"“Coredumpwithpattern '(^|␣)*( |$)'”[3][and-Eoption ]
+(Note: ⟨extended_regex ⟩expands to -Eand
+–extended-regexp )
+grep.3220317aexists<bracket _expr>in <first_expression>:
+inside(<bracket_expr>, <first_expression>) and
+exists<utf_characters> in <bracket_char>:
+inside(<utf_characters>, <bracket_char>)“Segmentationfault on multibyte character classes ”[3]
+(Note:⟨bracket_expr ⟩expands to [...]in a regular expres-
+sion;⟨utf_characters ⟩occur within ⟨bracket_char ⟩, i.e. the
+characterswithin ⟨bracket_expr ⟩)
+ﬁnd.07b941b1exists <match_opts> in <find_expression>:
+<match_opts> = "-regex "and
+exists <character_expr_no_minus> in <first_expression>:
+<character_expr_no_minus> = "."“ﬁnd segfaults when using -regex, for instance
+./find -regex '.*'”[3]
+ﬁnd.091557f6exists <file_properties> in <find_expression>:
+<file_properties> = "-type f"and
+exists<directory _name>in <starting_dir_list>:
+inside(<directory_name>, <starting_dir_list>)“assertion failure on symbolic link loop : Let’s say we acci-
+dentally create a symlink loop $ mkdir tmp; cd tmp and
+$ ln -s a b; ln -s b a anduseﬁndtoﬁndﬁlesandfollow
+symlinksinsidethe tmp-folder: ../find -L -type f”[3]
+ﬁnd.dbcb10e9exists <digit> in <last_modified> :
+inside(<digit>, <last_modified>) and
+exists<numeric_ arg>in <find_command>:
+inside(<numeric_arg>, <find_command>)“-mtime produces segmentation fault, e.g., ./find
+-mtime2”[3]
+(Note:⟨last_modiﬁed ⟩expandsto -mtime)
+ﬁnd.ﬀ248a20exists<ln_file>in <ln>:
+<ln_file> = "al_ln -s . link" and
+exists <find_expression_or_empty> in <command>:
+<find_expression_or_empty> = " -follow"“inﬁniteloopwith -follow;e.g.,$ mkdir testingfindagain;
+ln -s . testingfindagain/symlink;
+./find testingfindagain -follow ”[3]
+For details onall DBGBench bugs(includingexpertbugdescriptions), visit https://dbgbench.github.io/ .
+For the Heartbleeddescription,see https://www.synopsys.com/blogs/software-security/heartbleed-bug/ .
+445SemanticDebugging ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+Table3:Precision andrecallofthe produced failure condi-
+tions:AVICENNA vs.ALHAZEN
+SubjectAVICENNA ALHAZEN
+Precision Recall Precision Recall
+Heartbleed 100%100% 11%10%
+Calculator 100% 100% 100% 100%
+Genson 100%100% 100% 74%
+ﬁnd.07b941b1 80% 100% 100% 85%
+ﬁnd.091557f6 47%40% 31%25%
+ﬁnd.dbcb10e9 93% 70% 95% 90%
+ﬁnd.ﬀ248a20 83%75% 83%100%
+grep.3220317a 77% 100% 72% 56%
+grep.3c3bdace 77%100% 74%56%
+grep.5fa8c7c9 96% 92% 94% 58%
+grep.7aa698d3 64%28% 18%12%
+grep.c96b0f2c 73% 96% 91% 86%
+Pysnooper.1 100%100% 100%100%
+Pysnooper.2 100% 100% 100% 100%
+Cookiecutter.1 78%94% 13%15%
+Cookiecutter.2 88% 90% 88% 83%
+Cookiecutter.3 100%100% 11%24%
+FastAPI.1 100% 100% 100% 100%
+FastAPI.2 100%100% 100%100%
+FastAPI.3 69% 90% 69% 78%
+FastAPI.4 100%100% 40%31%
+youtube-dl.1 88% 98% 14% 65%
+youtube-dl.2 98%100% 11%66%
+youtube-dl.3 94% 100% 66% 92%
+Average 88% 91% 66% 67%
+classiﬁcation compares against the ground truth given by the re-
+spectiveprogramandoracle.Ahigh precision meansthatoutputs
+ﬂagged as failure-inducing actually induce failures; a high recall
+meansthatinputsthatinducefailuresareidentiﬁedassuch.Our
+resultsaredetailedin Table3.Weseethatdespitehavingshorter
+(and more general) failure conditions, the precision of AVICENNA is
+at leastonparwiththe state-of-the-art ALHAZEN .
+Theaverage precision of AVICENNA diagnoses is onparwith
+ALHAZEN diagnoses.
+Inadebuggingcontext,however,precisionisnotthatimportant,
+as false positives can easily be identiﬁed by them not causing a
+failure. Of much larger interest are the false negatives , as they indi-
+cate that the diagnosis may misssome failure conditions, which in
+turnmayleadtoincompleteﬁxes.Thisisactuallywhere AVICENNA
+surpasses ALHAZEN in22ofthe24subjects,leveragingitscapability
+to identifymore generalfailure circumstances.
+Theaverage recall of AVICENNA diagnoses surpasses therecall of
+ALHAZEN diagnoses.
+Generallyspeaking,the ALHAZEN diagnosesfollowtheoriginal
+failure-inducinginputmuchcloserthanthemoregeneral AVICENNA
+diagnoses, whichis a reasonableapproach. Diagnosesofprevious
+techniqueslikesyntacticinputreductionalsostayclosetotheorigi-
+nalfailinginput,stillprovidingbeneﬁtsforprogrammers.However,
+AVICENNA does a better job in exploring the surroundings of the
+originalfailingtestcase,thusinferringgeneralizationsthatstate-
+of-the-artapproacheslike ALHAZEN miss.Withthisinmind,wesee
+thatALHAZEN archives slightly better results for ﬁnd.dbcb10e9 and
+AVICENNA
+ALHAZENgrep.7aa698d3
+grep.7aa698d3
+Figure3: AVICENNA vs.ALHAZEN :Diagnosesfor grep.7aa698d3 .
+ﬁnd.ﬀ248a20 .Wearguethatthisisduetotheirextremelynarrow
+failing conditions. Consequently, the validation set is similar to the
+original failing input; thus, overspecializing to the failure-inducing
+inputs is beneﬁcial for ALHAZEN ’s prediction — even though the
+diagnoses are not as general as those producedby AVICENNA . This
+property is even further highlighted if we take a closer look at, for
+instance, the diagnoses for grep.7aa698d3 . We show the diﬀerences
+bytranslatingthedecisiontree[ 20,Figure9]producedby ALHAZEN
+to an equivalentISLaformula ( Figure 3).
+Bycomparingthisdiagnosisto AVICENNA andtheexpertdiag-
+nosis(Table2),wequicklyrealizethattheproducedformula,and
+thus the equivalent decision tree, not only overspecializes to the
+failure-inducing inputs but is also more complex than the expla-
+nation produced by AVICENNA . Even with the shorter diagnosis,
+AVICENNA capturesthecircumstancesofthefailurebetterbynot
+overspecializing to the singleUnicode character “U+0130”.
+5.4 RQ3: AVICENNAvs. ISLearn
+Inthelastpartofourevaluation,wepitch AVICENNA againstISLearn,
+the input invariant learner [ 39]. As discussed earlier, AVICENNA
+makes extensive use of ISLearn, gradually reﬁning the detected
+inputinvariantsinafeedbackloop.Isthisfeedbackloopnecessary,
+anddoes AVICENNA improveoverISLearn?Toanswerthisquestion,
+we compared the number of invariants produced by ISLearn to the
+numberof invariants obtained atthe end of an AVICENNA run. For
+ISLearn,weonlyconsideredinvariantswithrecallandspeciﬁcity
+estimates of 100%: From ISLearn’s point of view, all reported in-
+variantshaveanequivalentquality. Table4summarizesourresults.
+We see that running ISLearn on its own is not aviable alternative,
+producing hundreds to tens of thousands of invariants. Additionally,
+ISLearn was not able to produce any invariants for Cookiecutter
+withinonehour( n/a).AVICENNA canreducethisnumber—toasingle
+invariantinallcases—solelybyreﬁningtheseinvariantsthrough
+additionalexperiments.
+TheAVICENNA feedbackloopis crucial for providing
+crisp failure circumstances.
+446ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA MartinEberlein, Marius Smytzek, Dominic Steinhöfel,LarsGrunske,andAndreas Zeller
+Table 4:# Invariantsproduced by AVICENNA vs.ISLearn
+Subject AVICENNA ISLearn Subject AVICENNA ISLearn
+HeartBleed 1451Pysnooper.1 1194
+Calculator 1 39 Pysnooper.2 1 8844
+Genson 1777Cookiecutter.1 1n/a
+ﬁnd.07b941b1 1 1006 Cookiecutter.2 1 n/a
+ﬁnd.091557f6 1361Cookiecutter.3 1n/a
+ﬁnd.dbcb10e9 1 69 FastAPI.1 1 247
+ﬁnd.ﬀ248a20 1620FastAPI.2 1346
+grep.3220317a 1 475 FastAPI.3 1 607
+grep.3c3bdace 1 4FastAPI.4 1711
+grep.5fa8c7c9 1 54 youtube-dl.1 1 245
+grep.7aa698d3 126,711 youtube-dl.2 1 3
+grep.c96b0f2c 1 456 youtube-dl.3 1 4427
+5.5 Threatsto Validity
+Our evaluation has the following threatsto validity:
+Internal Validity. Thethreatstointernalvalidityrelatetothecor-
+rectness of AVICENNA ’s implementation and the correctness
+ofourexperiments. AVICENNA has4,000linesofcodeintotal,
+and formally proving its correctness would be cumbersome
+at least. However, the results in Table 2strongly suggest,
+basedonfacevalidity,that AVICENNA operatesasintended.
+Concerningourexperiments,wecanruleoutmajormistakes
+due to the tuning of parameters since AVICENNA does not
+relyontuningparameters.Additionally,weperformedthe
+experiments with realistic settings; more precisely, we set
+theupperboundforthenumberof AVICENNA iterationsto
+20 and used a one-hour time limit for the experiments to
+showthe practical valueof AVICENNA .
+ExternalValidity. The threats to external validity are mainly re-
+lated to the selection of the programs and bugs in our study.
+We have used DBGBench [3], a common debugging bench-
+mark,andTests4Py[ 37],abenchmarkcomprisedofmany
+diﬀerent projects, as sources of programs and real bugs. The
+Heartbleed ,Calculator , andGensonsubjects show that AVI-
+CENNAcanproduceadiagnosisforauthenticbugs.Conse-
+quently, we would argue that the results of our study are
+transferable andgeneralizable to otherprograms andbugs.
+6 LIMITATIONS
+Despiteitsadvances, AVICENNA isnotaperfectdiagnosistool,as
+therearefundamentallimitations.Toillustratethechallenge,letus
+havealookatthe grep.7aa698d3 bug,forwhich AVICENNA misses
+the fact that the input“contains multibytecharacters” ( Table2).
+Ifgrepconductsacase-insensitivesearch( -i)onaninputcon-
+taining multibyte characters and the locale is UTF8, then grep
+prints a match of incorrect length. When conducting the case-
+insensitivesearch, EXECUTE_FCT ﬁrstconvertstheinputtolower-
+case (search.c:388). The length of the match is computed for the
+match in the lower-case input (search.c:555). However, a multi-
+byte character can take 1 byte less in lower-case: The lengths
+of the normal-case and lower-case inputs diﬀer. The computed
+match_size value could be half the expected value (grep.c:1081–
+1085); the match in the normal-case input is printed with incorrect
+length (grep.c:1091).A perfectfailure condition wouldthus read
+len/parenleftBig
+utf-8/parenleftbigupper/parenleftbig⟨arg⟩/parenrightbig/parenrightbig/parenrightBig
+>len/parenleftBig
+utf-8/parenleftbiglower/parenleftbig⟨arg⟩/parenrightbig/parenrightbig/parenrightBig
+(8)
+which,incontrasttotheactual AVICENNA diagnosis( Table2)would
+be 100% accurate.
+Whycan AVICENNA notsynthesizesuchadiagnosis?Theprob-
+lem is twofold. First, AVICENNA needs an appropriate vocabulary
+eventoexpress thefailure conditions—inourcase, functionslike
+“utf-8” and “upper”. Second, we are facing a combinatorial complex-
+ityproblem, asthere canbe an arbitrarynumberofcombinations
+ofpredicates,functions,operators,andnonterminalstoconsider
+whenderivingadiagnosis.Eventually,theproblemcanbeframedas
+aprogramsynthesis problem—wewantaformula(orprogram)that
+exactlypredictswhenaninputcausesafailure,which,ofcourse,
+resembles the haltingproblem andthus isundecidable ingeneral.
+However, an undecidable problem may still be solvable under
+speciﬁc (often common)conditions; our results illustratethis.Pos-
+sible waysto obtain even more comprehensive diagnosesinclude:
+Domain-speciﬁcvocabularies. Adding catalogs with domain-
+orprogram-speciﬁcpatterns,predicates,andfunctionswould
+allowAVICENNA todetectthesefailureconditionsintheﬁrst
+place.Ifasigniﬁcantportionof grepbugs,forinstance,were
+relatedtoUTF-8handling,thenaddinganappropriatevocab-
+ulary would allow AVICENNA to detect and express related
+failure causes.
+Program analysis. Staticanddynamicprogramanalysiscouldre-
+veal important functions and properties directing the search
+toward a meaningful diagnosis. In grep.7aa698d3 , for in-
+stance, a data ﬂow analysis could reveal that the input is
+subject to UTF-8and case transformations, thus guiding the
+searchto vocabulariesrelatedto theseproperties.
+Documentation. Thegrepdocumentationrelatesthe -ioption
+to case sensitivity, which in conjunction with the current
+AVICENNA diagnosis( Table2) could again guide the search.
+Expert interaction. Guidance such as above could also be pro-
+vided by a human expert, starting with the initial AVICENNA
+diagnosisandgiving hints onwhere to search further.
+Program synthesis. Finally,program synthesis could provide fur-
+therinspirationtosynthesize higher-ordercombinators [9],
+recursive functions [32], or even relational queries [41,43].
+In the extreme, a tool like AVICENNA would thus not only
+produce a single predicate but synthesize a program that
+wouldprecisely characterizeandpredict failure conditions.
+7 CONCLUSION AND FUTUREWORK
+WithAVICENNA , we introduce a technique to fully automatically
+determine failure circumstances, expressed as logical properties over
+input elements. The approach is general and uses an extensible
+vocabulary, a powerful constraint solver, and a reﬁnement loop to
+conduct additional experiments, resulting in crisp and to-the-point
+diagnoses, matching the precision of human experts. Furthermore,
+by formulating the failure diagnosis problem as ﬁnding a predicate
+overinputelements, AVICENNA opensupawealthoffutureresearch
+opportunities.Notably,eachofthediagnosescanbeinstantiated
+into a myriad of test cases for exploring the surroundings of a bug,
+447SemanticDebugging ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+validatingﬁxes,andpreventingregressions.Allthisisgoodnews
+for the future ofautomateddebugging.
+Besidesgeneral improvementsregardingperformanceand gen-
+erality,our future work willfocusonthe following topics:
+Locationconditions. Besidesfailurevs.success, AVICENNA can
+determine the circumstances of arbitrary execution predi-
+cates—forinstance,the(input)circumstancesunderwhich
+aparticularlocationisreached,whichnotonlyhelpswith
+understandingcode.Notably,solvingthecircumstancesof
+acodelocation /u1D43Fyieldsinputsthatspeciﬁcallytarget /u1D43F—a
+greatfeature for test generators.
+Resource consumption. Anotherinterestingclassofexecution
+predicates to apply AVICENNA on arenon-functional prop-
+erties such as resource consumption : Under which circum-
+stances does this program require more than one GB of
+memory? Or more than one second for a request? Extend-
+ingAVICENNA withnumericalapproximationalgorithmscan
+precisely narrowthesecircumstances.
+Faultlocalization. AVICENNA diagnosesallowgeneratinganun-
+limitednumberofpassingandfailingruns;thisshouldenable
+a much more precise fault localization than with only a few
+failingruns. We want to evaluate this.
+Automated repair. TheAVICENNA diagnosesprovideimportant
+hints on how to repair code automatically. We want to map
+input elements to variables and relate their properties to syn-
+thesizeﬁxes that exactly capture failure conditions.
+8 DATA-AVAILABILITYSTATEMENT
+Our evaluated AVICENNA artifact is publicly available [ 7]. The cur-
+rent versions of our AVICENNA prototype can be downloaded from
+https://github.com/martineberlein/avicenna
+ACKNOWLEDGMENTS
+This research was partially funded by the Deutsche Forschungs-
+gemeinschaft(DFG,GermanResearchFoundation)–GR3634/4-2
+Emperor (261444241). M. Eberlein conducted this work during a
+research visit at CISPA Helmholtz Center for Information Security.
+REFERENCES
+[1] RemitaAmine. 2021. youtube-dl. https://github.com/ytdl-org/youtube-dl
+[2]Cornelius Aschermann, Tommaso Frassetto, Thorsten Holz, Patrick Jauernig,
+Ahmad-Reza Sadeghi, and Daniel Teuchert. 2019. NAUTILUS: Fishing for Deep
+BugswithGrammars.In 26thAnnualNetworkandDistributedSystemSecurity
+Symposium, NDSS 2019 . The Internet Society. https://www.ndss-symposium.
+org/ndss-paper/nautilus-ﬁshing-for-deep-bugs-with-grammars/
+[3]Marcel Böhme,Ezekiel OlamideSoremekun,Sudipta Chattopadhyay,Emamurho
+Ugherughe, and Andreas Zeller. 2017. Where is the Bug and How is it Fixed?
+An Experiment with Practitioners. In Proceedings of the 11th Joint meeting of the
+European Software Engineering Conference and the ACM SIGSOFT Symposium on
+theFoundationsofSoftwareEngineering (ESEC/FSE2017) .1–11.https://dbgbench.
+github.io/
+[4] EugenCepoi. 2017. Genson. https://github.com/owlike/genson .
+[5]Tianqi Chen and Carlos Guestrin. 2016. XGBoost: A Scalable Tree Boosting
+System. In Proceedings of the 22nd ACM SIGKDD International Conference on
+KnowledgeDiscoveryandDataMining (SanFrancisco,California,USA) (KDD’16) .
+ACM,NewYork, NY, USA,785–794. https://doi.org/10.1145/2939672.2939785
+[6]Martin Eberlein, Yannic Noller, Thomas Vogel, and Lars Grunske. 2020. Evo-
+lutionary Grammar-Based Fuzzing. In Proceedings of the 12th Symposium on
+Search-BasedSoftwareEngineering (SSBSE 2020) .
+[7]MartinEberlein,MariusSmytzek,DominicSteinhöfel,LarsGrunske,andAndreas
+Zeller. 2023. AVICENNA .https://doi.org/10.1145/3580408[8]MichaelD.Ernst,JakeCockrell,WilliamG.Griswold,andDavidNotkin.2001. Dy-
+namically Discovering Likely Program Invariants to Support Program Evolution.
+IEEE Trans. Software Eng. 27, 2 (2001), 99–123. https://doi.org/10.1109/32.908957
+[9]JohnK.Feser,SwaratChaudhuri,andIsilDillig.2015.SynthesizingDataStructure
+Transformations from Input-Output Examples. In ACM SIGPLAN Conference on
+ProgrammingLanguageDesignand Implementation(PLDI) (Portland,OR, USA)
+(PLDI ’15) . Association for Computing Machinery, New York, NY, USA, 229–239.
+https://doi.org/10.1145/2737924.2737977
+[10]AnilGajawada.2016. Heartbleedbug:Howitworksandhowtoavoidsimilar
+bugs.https://www.synopsys.com/blogs/software-security/heartbleed-bug/
+[11]PatriceGodefroid,AdamKiezun,andMichaelY.Levin.2008. Grammar-Based
+Whitebox Fuzzing. In Proceedings of the 29th ACM SIGPLAN Conference on
+Programming Language Design and Implementation (Tucson, AZ, USA) (PLDI
+’08). Association for Computing Machinery, New York, NY, USA, 206–215.
+https://doi.org/10.1145/1375581.1375607
+[12]PatriceGodefroid,HilaPeleg,andRishabhSingh.2017. Learn&Fuzz:Machine
+LearningforInputFuzzing.In Proceedingsofthe32ndIEEE/ACMInternational
+Conference on Automated Software Engineering (Urbana-Champaign, IL, USA)
+(ASE2017) .IEEE Press,Piscataway,NJ,USA, 50–59. http://dl.acm.org/citation.
+cfm?id=3155562.3155573
+[13]RahulGopinath,AlexanderKampmann,NikolasHavrikov,EzekielO.Soremekun,
+and Andreas Zeller.2020. Abstracting Failure-Inducing Inputs. In ACM Interna-
+tional Symposium on Software Testing and Analysis (ISSTA) (Virtual Event). ACM,
+237–248. https://doi.org/10.1145/3395363.3397349
+[14]ClaireLeGoues,ThanhVuNguyen,StephanieForrest,andWestleyWeimer.2012.
+GenProg:AGenericMethodforAutomaticSoftwareRepair. IEEETrans.Software
+Eng.38,1 (2012), 54–72. https://doi.org/10.1109/TSE.2011.104
+[15]Audrey Roy Greenfeld. 2022. Cookiecutter. https://github.com/cookiecutter/
+cookiecutter
+[16]SumitGulwani,OleksandrPolozov,andRishabhSingh.2017. ProgramSynthesis.
+FoundationsandTrendsinProgrammingLanguages 4,1-2(2017),1–119. https:
+//doi.org/10.1561/2500000010
+[17]Satia Herfert, Jibesh Patra, and Michael Pradel. 2017. Automatically reducing
+tree-structured test inputs. In Proceedings of the 32nd IEEE/ACM International
+ConferenceonAutomatedSoftwareEngineering,ASE2017,Urbana,IL,USA,Oc-
+tober30-November03,2017 ,GrigoreRosu,MassimilianoDiPenta,andTienN.
+Nguyen(Eds.).IEEEComputerSociety,861–871. https://doi.org/10.1109/ASE.
+2017.8115697
+[18]JohnEHopcroft,RajeevMotwani,andJeﬀreyDUllman.2001. Introductionto
+automata theory, languages, and computation. Acm Sigact News 32, 1 (2001),
+60–65.
+[19]James A. Jones and Mary Jean Harrold. 2005. Empirical Evaluation of the Taran-
+tulaAutomaticFault-LocalizationTechnique.In Proceedingsofthe20thIEEE/ACM
+International ConferenceonAutomatedSoftware Engineering (Long Beach,CA,
+USA)(ASE ’05) . Association for Computing Machinery, New York, NY, USA,
+273–282. https://doi.org/10.1145/1101908.1101949
+[20]AlexanderKampmann,NikolasHavrikov,EzekielSoremekun,andAndreasZeller.
+2020. When does my Program do this? Learning Circumstances of Software
+Behavior.In JointMeetingoftheEuropeanSoftwareEngineeringConferenceandthe
+ACMSIGSOFTSymposiumontheFoundationsofSoftwareEngineering(ESEC/FSE) .
+https://doi.org/10.1145/3368089.3409687
+[21]FitsumMesheshaKifetew,RobertoTiella,and PaoloTonella.2017. Generating
+validgrammar-basedtestinputsbymeansofgeneticprogrammingandannotated
+grammars. Empirical Software Engineering 22, 2 (2017), 928–961. https://doi.org/
+10.1007/s10664-015-9422-4
+[22]LukasKirschner,EzekielO.Soremekun,andAndreasZeller.2020. Debugging
+inputs. In ICSE ’20: 42nd International Conference on Software Engineering, Seoul,
+South Korea, 27 June - 19 July, 2020 , Gregg Rothermel and Doo-Hwan Bae (Eds.).
+ACM,75–86. https://doi.org/10.1145/3377811.3380329
+[23]Ákos Kiss, Renáta Hodován, and Tibor Gyimóthy. 2018. HDDr: a recursive
+variantof thehierarchicalDeltaDebuggingalgorithm. In Proceedings ofthe9th
+ACMSIGSOFTInternationalWorkshoponAutomatingTESTCaseDesign,Selection,
+andEvaluation,A-TEST@SIGSOFTFSE2018,LakeBuenaVista,FL,USA,November
+05,2018,WishnuPrasetya,TanjaE.J.Vos,andSinemGetir(Eds.).ACM,16–22.
+https://doi.org/10.1145/3278186.3278189
+[24]Ben Liblit, Mayur Naik, Alice X. Zheng, Alex Aiken, and Michael I. Jordan.
+2005. Scalable Statistical Bug Isolation. In Proceedings of the 2005 ACM SIGPLAN
+ConferenceonProgrammingLanguageDesignandImplementation (Chicago,IL,
+USA)(PLDI ’05) . Association for Computing Machinery, New York, NY, USA,
+15–26.https://doi.org/10.1145/1065010.1065014
+[25]Fan Long and Martin Rinard. 2016. Automatic Patch Generation by Learning
+CorrectCode.In Proceedingsofthe43rdAnnualACMSIGPLAN-SIGACTSympo-
+siumonPrinciplesofProgrammingLanguages(POPL) (St.Petersburg,FL,USA)
+(POPL ’16) . Association for Computing Machinery, New York, NY, USA, 298–312.
+https://doi.org/10.1145/2837614.2837617
+[26]Scott M. Lundberg and Su-In Lee. 2017. A Uniﬁed Approach to Interpreting
+Model Predictions. In Advances in Neural Information Processing Systems 30:
+Annual Conference on Neural Information Processing Systems 2017, December
+4-9, 2017, Long Beach, CA, USA , Isabelle Guyon, Ulrike von Luxburg, Samy
+448ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA MartinEberlein, Marius Smytzek, Dominic Steinhöfel,LarsGrunske,andAndreas Zeller
+Bengio, Hanna M. Wallach, Rob Fergus, S. V. N. Vishwanathan, and Roman
+Garnett (Eds.). 4765–4774. https://proceedings.neurips.cc/paper/2017/hash/
+8a20a8621978632d76c43dfd28b67767-Abstract.html
+[27]EricMarkowitz. 2014. BehindtheScenes:TheCrazy72HoursLeadingUpto the
+HeartbleedDiscovery. https://www.vocativ.com/tech/hacking/behind-scenes-
+crazy-72-hours-leading-heartbleed-discovery/
+[28]Sergey Mechtaev, Jooyong Yi, and Abhik Roychoudhury. 2016. Angelix: scalable
+multiline program patch synthesisvia symbolic analysis. In Proceedingsofthe
+38thInternationalConferenceonSoftwareEngineering,ICSE2016,Austin,TX,USA,
+May14-22,2016 ,LauraK.Dillon,WillemVisser,andLaurieA.Williams(Eds.).
+ACM,691–701. https://doi.org/10.1145/2884781.2884807
+[29]LeeNaish,HuaJieLee,andKotagiriRamamohanarao.2011. Amodelforspectra-
+basedsoftwarediagnosis. ACMTrans.Softw.Eng.Methodol. 20,3(2011),11:1–
+11:32.https://doi.org/10.1145/2000791.2000795
+[30]Terence Parr. 2013. The Deﬁnitive ANTLR 4 Reference (2nd ed.). Pragmatic
+Bookshelf.
+[31]Spencer Pearson, José Campos, René Just, Gordon Fraser, Rui Abreu, Michael D.
+Ernst, Deric Pang, and Benjamin Keller. 2017. Evaluating and improving fault
+localization. In Proceedings of the 39th International Conference on Software Engi-
+neering, ICSE 2017, Buenos Aires, Argentina, May 20-28, 2017 , Sebastián Uchi-
+tel, Alessandro Orso, and Martin P. Robillard (Eds.). IEEE / ACM, 609–620.
+https://doi.org/10.1109/ICSE.2017.62
+[32]Nadia Polikarpova, Ivan Kuraj, and Armando Solar-Lezama. 2016. Program
+Synthesis from Polymorphic Reﬁnement Types. In ACM SIGPLAN Conference on
+ProgrammingLanguageDesignandImplementation(PLDI) (SantaBarbara,CA,
+USA)(PLDI ’16) . Association for Computing Machinery, New York, NY, USA,
+522–538. https://doi.org/10.1145/2908080.2908093
+[33]Ram Rachum. 2019. PySnooper - Never use print for debugging again. https:
+//github.com/cool-RR/pysnooper
+[34] Sebastián Ramírez. 2018. FastAPI. https://github.com/tiangolo/fastapi
+[35]John Regehr, Yang Chen, Pascal Cuoq, Eric Eide, Chucky Ellison, and Xuejun
+Yang.2012. Test-casereductionforCcompilerbugs.In ACMSIGPLANConference
+onProgrammingLanguageDesignandImplementation,PLDI’12,Beijing,China
+- June 11 - 16, 2012 , Jan Vitek, Haibo Lin, and Frank Tip (Eds.). ACM, 335–346.
+https://doi.org/10.1145/2254064.2254104
+[36] Ridwan SalihinShariﬀdeen,YannicNoller,LarsGrunske,andAbhikRoychoud-
+hury.2021. Concolicprogramrepair.In PLDI’21:42ndACMSIGPLANInterna-
+tional ConferenceonProgrammingLanguageDesignand Implementation,Virtual
+Event, Canada, June 20-25, 2021 , Stephen N. Freund and Eran Yahav (Eds.). ACM,
+390–405. https://doi.org/10.1145/3453483.3454051
+[37]Marius Smytzek, Martin Eberlein, Batuhan Serce, Lars Grunske, and Andreas
+Zeller.2023. Tests4Py:ABenchmarkforSystemTesting. arXiv: 2307.05147 [cs.SE]
+[38]EzekielSoremekun,EstebanPavese,NikolasHavrikov,LarsGrunske,andAn-
+dreas Zeller. 2020. Inputs from Hell: LearningInput Distributions for Grammar-
+Based Test Generation. IEEE Transactions onSoftwareEngineering (2020).
+[39]DominicSteinhöfelandAndreasZeller.2022. InputInvariants.In JointMeetingof
+the European Software Engineering Conference and the ACM SIGSOFT Symposium
+ontheFoundationsofSoftwareEngineering(ESEC/FSE) .https://publications.cispa.
+saarland/3596/
+[40]Chengnian Sun, Yuanbo Li, Qirun Zhang, Tianxiao Gu, and Zhendong Su. 2018.
+Perses: syntax-guided program reduction. In Proceedings of the 40th International
+ConferenceonSoftwareEngineering,ICSE2018,Gothenburg,Sweden,May27-June
+03, 2018, Michel Chaudron, Ivica Crnkovic, MarshaChechik, and Mark Harman
+(Eds.).ACM,361–371. https://doi.org/10.1145/3180155.3180236[41]Aalok Thakkar, Aaditya Naik, Nathaniel Sands, Rajeev Alur, Mayur Naik, and
+MukundRaghothaman.2021. Example-GuidedSynthesisofRelationalQueries.In
+ACMSIGPLANConferenceonProgrammingLanguageDesignandImplementation
+(PLDI). AssociationforComputingMachinery, NewYork,NY,USA, 1110–1125.
+https://doi.org/10.1145/3453483.3454098
+[42]DánielVince,RenátaHodován,DaniellaBársony,andÁkosKiss.2022. Theeﬀect
+of hoisting on variants of Hierarchical Delta Debugging. Journal of Software:
+Evolutionand Process onlineﬁrst(2022). https://doi.org/10.1002/smr.2483
+[43]ChenglongWang,AlvinCheung,andRastislavBodik.2017. SynthesizingHighly
+Expressive SQL Queries from Input-Output Examples. In ACM SIGPLAN Confer-
+ence on Programming Language Design and Implementation (PLDI) (Barcelona,
+Spain)(PLDI 2017) . Association for Computing Machinery, New York, NY, USA,
+452–466. https://doi.org/10.1145/3062341.3062365
+[44]JunjieWang,BihuanChen, LeiWei,and YangLiu. 2017. Skyﬁre: Data-Driven
+SeedGenerationforFuzzing. In 2017IEEESymposiumonSecurityandPrivacy,
+SP 2017, San Jose, CA, USA, May 22-26, 2017 . IEEE Computer Society, 579–594.
+https://doi.org/10.1109/SP.2017.23
+[45]Junjie Wang, Bihuan Chen, Lei Wei, and Yang Liu. 2019. Superion: grammar-
+aware greybox fuzzing. In Proceedings of the 41st International Conference on
+Software Engineering, ICSE2019 . IEEE /ACM, 724–735. https://doi.org/10.1109/
+ICSE.2019.00081
+[46]Mark David Weiser. 1979. Program Slices: Formal, Psychological, and Practical
+InvestigationsofanAutomaticProgramAbstractionMethod . Ph.D.Dissertation.
+USA. AAI8007856.
+[47]RatnadiraWidyasari,ShengQinSim,CamelliaLok,HaodiQi,JackPhan,Qijin
+Tay, Constance Tan, Fiona Wee, Jodie Ethelda Tan, Yuheng Yieh, Brian Goh,
+FerdianThung,HongJinKang,ThongHoang,DavidLo,andEngLiehOuh.2020.
+BugsInPy:adatabaseofexistingbugsinPythonprogramstoenablecontrolled
+testinganddebuggingstudies.In ESEC/FSE’20:28thACMJointEuropeanSoftware
+EngineeringConferenceandSymposiumontheFoundationsofSoftwareEngineering,
+Virtual Event, USA, November 8-13, 2020 , Prem Devanbu, Myra B. Cohen, and
+Thomas Zimmermann (Eds.). ACM, 1556–1560. https://doi.org/10.1145/3368089.
+3417943
+[48]Wikipedia. Accessed 2022-07-26. Avicenna. https://en.wikipedia.org/wiki/
+Avicenna .
+[49]W. Eric Wong, Ruizhi Gao, Yihao Li, Rui Abreu, and Franz Wotawa. 2016. A
+Survey on Software Fault Localization. IEEE Trans. Software Eng. 42, 8 (2016),
+707–740. https://doi.org/10.1109/TSE.2016.2521368
+[50]Jifeng Xuan, Matias Martinez, Favio Demarco, Maxime Clement, Sebastian
+R.LamelasMarcote,ThomasDurieux,DanielLeBerre,andMartinMonperrus.
+2017. Nopol: Automatic Repair of Conditional Statement Bugs in Java Programs.
+IEEETrans.SoftwareEng. 43,1(2017),34–55. https://doi.org/10.1109/TSE.2016.
+2560811
+[51]AndreasZeller,RahulGopinath,MarcelBöhme,GordonFraser,andChristian
+Holler. 2019. The Fuzzing Book. In The Fuzzing Book . Saarland University.
+https://www.fuzzingbook.org/
+[52]Andreas Zeller and Ralf Hildebrandt. 2002. Simplifying and Isolating Failure-
+Inducing Input. IEEE Trans. Software Eng. 28, 2 (2002), 183–200. https://doi.org/
+10.1109/32.988498
+[53]Alice Zheng, Michael Jordan, Ben Liblit, and Alex Aiken. 2003. Statistical Debug-
+ging of Sampled Programs.In AdvancesinNeuralInformation ProcessingSystems ,
+S.Thrun,L.Saul,andB.Schölkopf(Eds.),Vol.16.MITPress. https://proceedings.
+neurips.cc/paper/2003/ﬁle/0a65e195cb51418279b6fa8d96847a60-Paper.pdf
+Received 2023-02-02; accepted 2023-07-27
+449

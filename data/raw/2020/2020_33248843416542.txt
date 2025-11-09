@@ -1,0 +1,1201 @@
+Representing and Reasoning about Dynamic Code
+Jesse Bartels
+Department of Computer Science
+The University Of Arizona
+Tucson, AZ 85721, USA
+jessebartels@cs.arizona.eduJon Stephens
+Department of Computer Science
+University Of Texas
+Austin, TX 78712, USA
+jon@cs.utexas.eduSaumya Debray
+Department of Computer Science
+The University Of Arizona
+Tucson, AZ 85721, USA
+debray@cs.arizona.edu
+ABSTRACT
+Dynamiccode,i.e.,codethatiscreatedormodifiedatruntime,is
+ubiquitous in today’s world. The behavior of dynamic code can
+dependonthelogicofthedynamiccodegeneratorinsubtleandnon-
+obvious ways, e.g., JIT compiler bugs can lead to exploitable vul-
+nerabilitiesintheresultingJIT-compiledcode.Existingapproaches
+to program analysis do not provide adequate support for reason-
+ing about such behavioral relationships. This paper takes a first
+step in addressing this problem by describing a program represen-
+tation and a new notion of dependency that allows us to reason
+about dependency and information flow relationships between the
+dynamiccodegeneratorandthegenerateddynamiccode.Experi-
+mental results show that analyses based on these concepts are able
+to capture properties of dynamic code that cannot be identified
+using traditional program analyses.
+KEYWORDS
+Program Analysis, Program Representations,Dynamic Code, Self-
+Modifying Code, Slicing
+1 INTRODUCTION
+Dynamiccode,i.e.,codethatiscreatedormodifiedatruntime,is
+ubiquitous in today’s world. Such code arises in many contexts, in-
+cluding JIT-compilation, obfuscation, and dynamic code unpacking
+in malware. Dynamic code raises a host of new program analy-sis challenges, arising partly from the fact that the behavior ofan application containing dynamic code may depend in part onlogic that is not part of the application itself, but rather is in thedynamic code generator. As a concrete example, Rabet describesaJITcompilerbuginChrome’sV8JavaScriptenginethatcausessome initialization code in the application program to be (incor-rectly) optimized away, resulting in an exploitable vulnerability
+(CVE-2017-5121) [ 38]. As another example, Frassetto et al.describe
+how a memory corruption vulnerability can be used to modify the
+byte code of an interpreted program such that subsequent JIT com-
+pilation results in the creation of the malicious payload [ 14]. To
+reason about such situations, it would be helpful to be able to start
+from some appropriate point in the dynamically generated code
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+on the first page. Copyrights for components of this work owned by others than ACMmustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,orrepublish,topostonserversortoredistributetolists,requirespriorspecificpermissionand/ora
+fee. Request permissions from permissions@acm.org.
+ASE ’20, September 21–25, 2020, Virtual Event, Australia
+© 2020 Association for Computing Machinery.
+ACM ISBN 978-1-4503-6768-4/20/09...$15.00
+https://doi.org/10.1145/3324884.3416542andtracedependenciesback,intoandthroughtheJITcompiler’s
+code, to understand the data and control flows that influenced the
+JITcompiler’sactionsandcausedthegenerationoftheproblem-
+atic code. E.g., for the CVE-2017-5121 bug mentioned above, we
+might want to perform automated analyses to identify which anal-
+yses/transformations within the JIT-compiler led to removal of the
+program’s initialization code, and which data flows and control-
+flow logic influenced those transformations. Such analyses, which
+we refer to as end-to-end analyses, can significantly speed up the
+process of identifying and fixing such problems.
+Unfortunately, existing approaches to (static or dynamic) pro-
+gram analysis do not adequately support such reasoning about dy-
+namiccodemodification.Traditionalprogramrepresentations,such
+ascontrolflowgraphs,cannothandletheeffectsofruntimechanges
+to the code, which require accommodating the possibility of some
+memorylocationshavingdifferentinstructionsatdifferenttimes
+during execution. JIT compilers [ 15,23] and dynamic binary trans-
+lators [34] maintain representations of the code being dynamically
+modified,butnottogetherwiththatofthecodethatperformscode
+modification. Whole-system analyses [ 11,13,21,53,54] perform
+dynamic taint propagation, taking into account explicit informa-
+tion flows via data dependencies but not implicit flows via control
+dependencies. As we discuss later, they also do not take into ac-
+count dependencies that can arise through the act of dynamic code
+modification. Thus, existing approaches to automated reasoning
+about program behaviors suffer from the following shortcomings:
+(a)They do not provide program representations that let us an-
+swerquestionssuchas “Whichcodeinthedynamiccodegen-
+eratoraffected thegenerationof thefaulty applicationcode?”
+or“Whatdataflowsinfluencedthebehaviorofthosecompo-
+nents of the dynamic code generator, and in what ways?”.
+(b)Theydonotsupportnotionsofdependencethatcanallow
+us to reason about the computation in ways that can help
+answer such questions.
+Thispapershowshowthisproblemcanbeaddressedviaaprogram
+representationthatisabletocapturethestructureandevolution
+of code that can change dynamically, together with a notion ofdependency that arises from the process of dynamic code gener-ation and which is not captured by conventional notions of data
+andcontroldependencies.Wealsodiscussanoptimizedrepresen-
+tationthatyields significantimprovementsinspacerequirements.
+Experimentalresultsshowthatourideasmakeitpossibletoreason
+about dynamic code in novel ways, e.g., we can construct back-
+ward dynamic program slices, starting from incorrect dynamically
+generatedJIT-compiledcode,toincludetheJIT-compilerlogicre-
+sponsiblefortheproblem;anddetectsituationswhereadynamic
+3122020 35th IEEE/ACM International Conference on Automated Software Engineering (ASE)
+code generator embeds environmental triggers in dynamically gen-
+eratedcode.Suchend-to-endanalysesarenotpossibleusingcurrent
+approaches to program analysis.
+2 BACKGROUND
+This section briefly discusses some key concepts relevant to our
+ideas. It may be skipped by readers familiar with this material.
+2.1 Interpreters and JIT Compilers
+Aninterpreterisasoftwareimplementationofavirtualmachine
+(VM). Programs are expressed in the VM’s instruction set, with
+eachinstructionencodedasadatastructurethatrecordsrelevant
+informationsuchastheoperation,sourceanddestinationoperands,
+etc. The computation for each operation xin the VM’s instruction
+set is performed by a piece of code called the handler for x. The
+interpreterusesavirtualinstructionpointertoaccesstheVMin-
+structions encoding the input program and a dispatch routine to
+transfer control to appropriate handler code.
+Whileinterpretationoffersanumberofbenefitssuchasportabil-
+ity, it incurs a performance overhead due to the cost of instruction
+decoding and dispatch as well as the limited scope for code opti-
+mizationresultingfromthefactthattheuserprogramsexecutedby
+theinterpreterarenot availableforanalysiswhentheinterpreter
+is compiled to machine code. Additionally, modern dynamic lan-
+guagesareoftenimplementedusinginterpreters,andtheseincur
+additional overheads due to runtime type checking.
+To address this problem, just-in-time (JIT) compilers are widely
+used alongside interpreters to improve performance by compil-
+ingselectedportionsoftheinterpretedprograminto(optimized)
+code at runtime. The general idea is to take frequently-executedportions of the program (identified via runtime profiling), apply
+optimizing transformations, and generate optimized machine code.
+Theseoptimizationsareperformedatruntime,astheprogramis
+beingexecuted, andresults incode thatisdynamically createdor
+modified. Some JIT compilers support multiple levels of runtime
+optimization,wherethedynamicallycreatedcodemaybesubjected
+to additional rounds of optimization as execution progresses [45].
+2.2 Control Flow Graphs
+Program analyses are based on representations of the program’s
+structure;forconcreteness,wefocusoncontrolflowgraphs(CFGs).CFGconstructionforstaticcodeviastaticanalysisiswell-understood[
+3].However,thisapproachisinadequatefordynamiccodebecause
+codecreatedatruntimeisnotavailableforstaticinspection;instead,
+we use dynamic analysis. This has the benefit of being able to han-
+dledynamiccode;itsdrawbackisthattheconstructedCFGmaynot
+contain all of the program’s code due to incomplete code coverage.
+We sketch herehow CFGs for static codecan be constructed from
+an instruction trace obtained via dynamic analysis. The extension
+of this approach to dynamic code is discussed in Section 3.4.
+LetGdenotetheCFGunderconstruction.Weprocessinstruc-
+tionsintheexecutiontraceastheyareencountered.Foreachin-
+struction I,itsproperties(e.g.,whetherornotitisacontroltransfer)
+anditsstatuswithin G(e.g.,whetherornotitisalreadyin G)de-
+terminehowitisprocessed;werefertothisas “processingIinthecontextofG.” If Ihasnotbeenencounteredpreviously,itisadded
+as a new instruction. If Ifollows a conditional or unconditional
+jump,itshouldbeginabasicblock:thus,if Iiscurrentlyin Gand
+is not the first instruction of its block, the block has to be split and
+control flow edges added appropriately.
+Multi-threading introduces additional complexity because ad-
+jacent instructions in the execution trace may be from differentthreads and thus may not represent adjacent instructions in the
+code.Tohandlethis,werequirethateachinstructioninthetrace
+beflaggedwithavalueindicatingthethreadthatexecutedit;we
+refer tothis asthe thread-id of theinstruction. TheCFG construc-
+tionprocessseparatelymaintainsasummaryofthestateofeach
+thread;thissummarycontainsinformationsuchasthecallstack,
+previous instruction seen, current function being reconstructed,
+etc.WhenconstructingtheCFG G,eachinstruction Iinthetrace
+isnowprocessedinthecontextofthestatesummaryforitsthread,
+whichisobtainedfromthethread-idfor I.Thus,thelastinstruction
+from one thread may be appending an instruction to a basic block
+whereas a different thread could be splitting a different block.
+3 REASONING ABOUT DYNAMIC CODE
+This section discusses the concepts underlying our approach to
+representing and reasoning about dynamic code.
+3.1 Design Goals
+In devising program representations that support end-to-end anal-
+ysis of dynamic code, we have the following design goals:
+(1)It should be a natural and scalable generalization of existing
+program representations.
+(2)It should provide a basis for extending existing program
+analyses to handle dynamic code in a natural way.
+(3) It should be precise enough to distinguish between concep-
+tually distinct dynamic code changes.
+The first two goals aim to avoid reinventing the wheel as much
+aspossible.Thethirdismotivatedbythefactthatdynamiccodechanges can be quite complex. For example, JIT compilers typi-
+callyusesharedcodebuffersthatmayberepeatedlyreusedtohold
+different,andpossiblyunrelated,piecesofdynamicallygenerated
+code; different dynamically optimized code fragments may involve
+differentruntimeoptimizations;piecesofdynamicallyoptimized
+codemaysometimesbe“deoptimized”tofreeupspaceintheshared
+code buffer; and such deoptimized code and may later get dynami-
+callyoptimizedagain,possiblywithadifferentsetofoptimizations
+that involve different parts of the JIT compiler. The third goal aims
+to obtain program representations that are able to separate out the
+effects of such complex runtime code changes and allow analyses
+to reason about them.
+3.2 Dynamic Code Modification
+Dynamic code modification can give rise to different versions of
+the program, with different instructions and behaviors, at different
+points in its execution. A representation suitable for end-to-endanalysis of dynamic code should keep track of the different ver-
+sionsofthecoderesultingfromdynamicmodification.Thereare
+two issues to consider here: (1) what constitutes “dynamic code
+313Trace ● ●
+φ0 φ1 φ2…Phases…first instruction 
+modified in φ0first instruction 
+modified in φ1
+Figure 1: Phases
+modification”? and (2) how should such modifications be captured
+in the program representation? We address these questions as fol-
+lows.First,wenotethatingeneral,heuristicapproaches,suchas
+categorizingamemorywriteascodemodificationifittargetsanex-
+ecutable section of the program’s memory, may not be sufficiently
+precise,e.g.,becausepermissionsonmemorypagescanbechanged
+during execution, making a non-executable memory region exe-
+cutable.Wethereforeconsiderawritetoamemorylocation /lscriptas
+“codemodification”onlyif /lscriptispartofsomeinstructionthatissubse-
+quently executed. Second, even small dynamic code modifications
+canresultinarbitrarilylargechangestotheprogram’srepresen-tation and behavior. In the x86 ISA, for example, the arithmeticinstruction “bitwise exclusive or” (opcode: xor; encoding:
+0x32)
+can, by flipping a single bit, be changed to the control transfer
+instruction“jumpshortifbelow”(opcode: jb;encoding: 0x72),with
+potentially large effect on the control flow graph.
+Based on these observations, we build our program’s CFG using
+dynamicanalysis,asdescribedinSection2.2,untilweencounter
+an instruction whose memory locations have been modified. Atthis point we are confronted with a potentially arbitrary change
+to the program’sbehavior and representation. To capturethis, we
+begin construction of a new CFG, which we link to the previously
+constructed CFG using a special type of edge that we call a “dy-
+namic edge.” Each such linked CFG corresponds to a “phase” of the
+program’s execution. We make this notion more precise below.
+Terminology. In some situations, it may make sense to distin-
+guish between code created at runtime prior to being executed
+(“dynamic code generation”) and code modified at runtime after it
+hasalreadybeenexecuted(“dynamiccodemodification”).Theideasdescribedhereapplytoboththesesituations,andweusetheterms
+“generation” and “modification” of dynamic code interchangeably.
+3.3 Concepts and Definitions
+3.3.1 Phases. The idea behind phases is topartition an execution
+ofaprogramintoa sequence offragments φ0,φ1,...,φi,...such
+thatforeach φi,noneofthelocationswrittenbytheinstructionsin
+φiispart ofany instructionexecuted by φi.Eachφiisreferred to
+as aphase. Execution begins in phase φ0with the program’s initial
+code.Whenthefirstdynamicinstructionisencountered,weswitch
+toφ1. Execution continues in φ1(including other instructions that
+may have been created or modified in φ0) until an instruction is
+encountered that was modifiedin φ1, at which point we switch to
+φ2, and so on. This is illustrated in Figure 1. An execution with no
+dynamic code consists of a single phase.
+More formally, given a dynamic instance Iof an instruction in a
+program, let instr_locs(I)denote the set of locations occupied by
+Iandwrite_locs(I)theset oflocations writtenby I.These notions
+extend in a straightforward way to a sequence of instructions S:I0
+I5I1⇒J1
+X ⇒Ydynamic 
+:  modification
+of X to YI1
+I2 I3
+I4
+(a)Static CFGI0 dynamic edge
+G0= CFG(φ0)G1= CFG(φ1)I1
+I2
+I4
+I5J1
+I3
+I4
+(b)Dynamic CFG
+Figure 2: DCFG: An example
+instr_locs(S)=/uniontext
+I∈Sinstr_locs(I)
+write_locs(S)=/uniontext
+I∈Swrite_locs(I)
+Given an execution trace Tfor a program, let T[i] denote the
+ithinstruction in T, andT[i:j] denote the sequence (subtrace)
+T[i],...,T[j]. We define the phases of Tas follows:
+Definition3.1. Givenanexecutiontrace T,thephasesof T,de-
+notedΦ(T), is a sequence φ0,φ1,...,φi,...of subtraces of Tsuch
+that the following hold:
+•φ0=T[0 :k], wherek=max{j|j≥0 and
+write_locs(T[0 :j])/intersectiontextinstr_locs(T[0 :j])=∅};
+•Fori≥0, letφi=T[k:(m−1)], then
+φi+1=T[m:n], wheren=max{j|j≥mand
+write_locs(T[m:j])/intersectiontextinstr_locs(T[m:j])=∅}.
+3.3.2 Dynamic Control Flow Graphs. We use the notion of phases
+to construct control flow graphs for dynamic code: we construct a
+CFGforeachphaseoftheexecution,asdiscussedinSection2.2,and
+linkthemtogetherusingspecialedges,called dynamicedges,that
+represent the control flow from the last instruction of one phase to
+the first instruction of the next phase. We refer to such a CFG as a
+dynamic control flow graph (DCFG). More formally:
+Definition 3.2. Given an execution trace Tfor a program, let
+Φ(T)=φ0,...,φndenote the phases of T, and letGi=(Vi,Ei)
+denotetheCFGconstructedfromthesubtrace ϕi.Thenthedynamic
+control flow graph for Tis given by G=(V,E), where:
+•V=/unionmultitextn
+i=0Viis the disjoint union of the sets of vertices Viof the
+individual phase CFGs Gi; and
+•E=(/unionmultitextni=0Ei)∪Edynisthedisjointunionofthesetsofedges Ei
+together with a set of dynamic edges Edyndefined as follows:
+Edyn=(last(φi),first(φi+1)), wherelast(φi)andfirst(φi+1)de-
+note, respectively, the basic blocks corresponding to the last
+instruction of φiand the first instruction of φi+1.
+Example 3.3. Figure 2 gives a simple example of a DCFG. The
+static CFG of the programunder consideration is shown in Figure
+2(a).Wheninstruction I2isexecuted,itchangesinstruction I1toJ1
+(indicatedbythedashedredarrow),where J1isaconditionalbranch
+with possible successors I3andI5. The following is an execution
+trace for this program along with its phases:
+314Trace: I0I1I2I4/bracehtipupleft/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehtipdownright/bracehtipdownleft /bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehtipuprightJ1I3I4J1I5/bracehtipupleft/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehtipdownright/bracehtipdownleft /bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehext/bracehtipupright
+Phases φ0 φ1
+The first phase, φ0, consists of the instruction sequence I0,I1,I2,I4.
+When control returns to the top of the loop at the end of this se-
+quence, instruction I1is found to have been changed to J1. This
+endsφ0and begins φ1, which comprises the rest of the trace,
+J1,I3,I4,J1,I5. The CFGs corresponding to phases φ0andφ1in
+Figure 2(b)areG0andG1respectively. Finally, the control transfer
+fromφ0toφ1is indicated via a dynamic edge from the basic block
+ofthelastinstructionof φ0tothebasicblockofthefirstinstruction
+inφ1, i.e., from the block for I4inG0to the block for J1inG1.
+The reader may notice, in Example 3.3, that the basic block
+containing I4occurs in both G0andG1. This illustrates a potential
+drawback of a naive implementation of DCFGs, namely, that CFG
+componentsmaybereplicatedacrossdifferentphases.Itispossible
+to implement DCFGs to avoid such replication, but in this case it is
+importanttoensurethatalgorithmsthattraversetheDCFG(e.g.,
+forslicing)donotfollowunrealizablepaths.Thedetailsformerging
+phases are discussed in Section 4; Section 6.3.3 briefly sketches the
+performance improvements we see from implementing sharing of
+DCFG components across phases.
+3.3.3 Codegen Dependencies. Dynamic code modification can in-
+duce a dependency between the code performing the modification
+and the resulting modified code. Consider the following example:
+addi r0, immloc
+mov loc:= r1A Bdynamic code modification
+code modifier modified code
+Inthisexample, Bisaninstructionthataddsanimmediatevalue
+immtotheregister r0;thebytesof Bcontaining immareataddress
+loc.Thus,if loccontainsthevalue5,then B≡‘addi r0,5’.Instruction
+Awrites the contents of register r1to address loc, thereby modify-
+ingB. When Bis executed, the value added to r0depends on the
+value written toaddress locbyA. Thus, theexecution of Aaffects
+the behavior of Bthrough the act of dynamic code modification,
+independent of any data or control dependencies that may exist in
+theprogram.Werefertodependenciesarisinginthiswaydueto
+dynamiccodemodificationas codegendependencies.Moreformally:
+Definition3.4. Givenanexecutiontrace T,adynamicinstance
+of an instruction I≡T[i] is codegen-dependent on a dynamic
+instanceofaninstruction J≡T[j](j<i)ifandonlyif,forsome
+loc∈instr_locs(I), the following hold:
+(1)loc∈write_locs(J), i.e.,Jmodifies the location loc; and
+(2)∀ks.t.j<k<i:loc/nelementwrite_locs(T[k]),i.e.,Jmostrecently
+modifieslocbeforeIis executed.
+While codegen dependencies resemble data dependencies in
+some ways, they differ in one fundamental way. If an instruction I
+isdatadependentonaninstruction J,thenJcanchangethevalues
+used byI, but not the nature of the computation performed by
+I. By contrast, if Iis codegen dependent on J, thenJcan change
+the nature of the computation performed by I, e.g., from an xor
+instruction to a jump-if-below instruction as discussed earlier.Algorithm 1: DCFG Construction (Unoptimized)
+Input:An execution trace T
+Result:A DCFGGforT
+1function instr_starts_new_phase(Instr ,WrittenLocs ):
+2return(instr_locs(Instr)∩WrittenLocs /nequal∅)
+3begin
+4G=∅
+5φ←−∅
+6W=∅
+7Gφ=(∅,∅); addGφtoG
+8fori=0tolen(T)−1do
+9 ifinstr_starts_new_phase(T[i], W) then
+10 φ+=1
+11 W=∅
+12 Gφ=(∅,∅); addGφtoG
+13 processT[i] in the context of Gφ(see Sec. 2.2)
+14 ifinstr_starts_new_phase(T[i], W) then
+15 add a dynamic edge from last block of Gφ−1
+to first block of Gφ
+16 W←−W∪write_locs(T[i])
+3.4 DCFG Construction
+Algorithm1showshowweconstructaDCFGfromanexecution
+trace. The algorithm is based directly on Definition 3.2 and con-structs an unoptimized DCFG. The DCFG consists of a sequenceof CFGs
+{Gφ|φ=0,1,...}, one per phase, linked together by
+dynamic edges; we refer to the index φfor these CFGs as their
+phaseindex.Thealgorithmproceedsasfollows.Weinitializethe
+phase index φto 0 and the DCFG Gto∅. The set Wof memory
+locationswritteninthecurrentphaseisinitializedto ∅.TheCFG
+Gφis initialized to the empty graph and added to G(line 7). We
+theniteratethroughthetrace Tprocessingeachinstruction T[i]in
+turn.IfT[i]beginsanewphase,weincrementthephaseindex(line
+10), reset Wto∅(since no memory locations have been written in
+the new phase that has just begun), initialize the CFG Vφfor the
+newphasetotheemptygraph,andaddthisnew VφtotheDCFG
+G(lines10–12).Wethenprocesstheinstruction T[i]inthecontext
+oftheCFG Gφ,asdiscussedinSection2.2(line13).Atthispoint,if
+T[i] is the first instruction of a phase (line 14), it has been added to
+Gφ, which means Gφhas a basic block for it, so we add a dynamic
+edge from the basic block of the last instruction of the previous
+phasetothebasicblockofthefirstinstructionofthecurrentphase
+(line 15). Finally, we update the set of written memory locations
+by adding in the set of locations written by T[i] (line 16). We then
+continue the process with the next instruction of T.
+4 SPACE OPTIMIZATION OF DCFGS
+DCFGsconstructedusingthestraightforwardapproachdescribed
+in Algorithm 1 may contain redundancies. This is illustrated in
+Figure3,whichshowstheexecutionofaprogramwhereafunction
+fis JIT-compiled and the resulting code is executed, after which a
+different function дis JIT-compiled and executed. Suppose that the
+program’sexecutionbeginsinphase φ0.Thememorywritesthat
+315interp( f ) JIT( f ):
+the resulting 
+code is fJITexec(fJIT)interp(g) JIT(g):
+the resulting code is g
+JITexec(gJIT)execution
+tracephases φ0 φ1 φ2
+Figure 3: Potential redundancies in DCFGs
+create the JIT-compiled code for fare thus in φ0. The execution
+of the JIT-compiled code for ftherefore causes a transition to a
+newphase φ1.Subsequentlyexecutedinstructions,includingthe
+JIT-compiled code for fand the JIT-compilation of д, are then a
+part ofφ1. When the JIT-compiled code for дis executed, there
+is a transition to a new phase φ2. Thus, the JIT-compiler code
+executed when compiling fis part of φ0; while the JIT-compiler
+code executed when compiling дis part of φ1. The control flow
+graphs constructed from these two invocations of the JIT-compiler
+arethereforereplicated,oncein φ0andoncein φ1,meansthatthere
+is potential for a significant amount of redundancy in a naively
+constructed DCFG. In general, the situation described arises if the
+same code is invoked multiple times from different phases.
+Anaturalapproachtoaddressingtheredundancyproblemwould
+be to merge the repeated components of the DCFG. For example, if
+theJITcompilerisinvokedmultipletimesinthecourseofexecution,
+as in Figure 3,we can coalesce the various replicatedcontrol flow
+graphs for the JIT compiler into a single copy and redirect all
+control flow edges accordingly. However, a naive approach to such
+coalescingcanleadtoalossinprecisionofanalysisbypropagatinginformationalongunrealizablepaths,similartotheissueofcontext-
+sensitivity in interprocedural program analysis [32, 40, 43, 51].
+Animportantdifferencebetweenthegeneralproblemofcontext-
+senstiveinterproceduralanalysis(i.e., k-CFA)andtheissueofmerg-
+ingreplicatedcodein DCFGs isthatofthenatureandcomplexity
+of the context relationships that arise. Programs can have arbi-
+trarilycomplexcallgraphs,andincreasing theamountofcontext
+information maintained during interprocedural analyses can there-
+fore increase the precision of analysis, albeit at increased cost [ 22].
+PhasesinaDCFG,ontheotherhand,haveapredictablelinearpro-gression,withphase
+ntransitioningtophase n+1onencountering
+dynamic code. This predictable structure of inter-phase relation-ships means that, given the phase number of a function or basic
+blockinaDCFG,identifyingthephasenumberofthepreviousor
+next phase is straightforward. This allows us to implement this
+optimizationefficientlyatalllevelsofgranularity—namely,instruc-
+tions, basic blocks, edges, and functions—without incurring the
+complexity and cost of general k-CFA.
+Our implementation of merged DCFGs associates a set of phase
+identifiers with each DCFG component (instruction, basic block,and edge). In the simple case, there are Nidentical blocks, each
+containing the same sequence of instructions, that appear in N
+phases
+a1,...,aN. We merge these into a single block, which is
+then associated with a set of phase identifiers {a1,...,aN}. The
+resulting merged block must also account for merging the edges
+into/out of it. An edge that occurs in a single phase gets the phase
+identifierforthatphase.Sharededges,ontheotherhand,areedges
+that connect the same blocks in multiple phases. These are merged0x123  add %rdx, %rcx
+0x126  nop0x127  nop
+0x128  nop
+0x129  jmp .+0x160x123  add %rdx, %rcx0x126  sub %rdx, 0x20x129  jmp .+0x16 0x123  add %rdx, %rcx
+0x126  sub %rdx, 0x20x126  nop
+0x127  nop0x128  nop
+0x129  jmp .+0x16φ=  { 1 }
+φ= {2}φ = {1,2}
+φ = {1,2}φ=  { 1 }
+φ=  { 1 }φ= {2}
+φ= {2}Phase: 1
+Phase: 2
+: "ghost edges"
+φ=  … : phase identifier setsmerge
+Figure 4: Merging sub-parts of a basic block. The dashed
+edges internal to the block are “ghost edges”.
+into a single edge whose set of phase identifiers is the union of the
+phase identifiers for the phases in which that edge appears.
+Merging basic blocks becomes more complex when sharing sim-
+ilar but non-identical blocks. We take advantage of the similarportions of the blocks using a notion of “splitting a block across
+aphase.”Tosplitablockacrossaphaseweintroduceanewtype
+of edge which we call a ghost edge. Conceptually, a ghost edge e
+is an intra-block connector and indicates that, for the given phase
+identifiers associated with e, the two sub-blocks connected by e
+should be treated as a single block. Using ghost edges we can split
+a block, merging the shared components across multiple phases
+whilestillkeepinguniqueportionsoftheblockthatcouldnotbe
+shared. Figure 4 shows an example of merging sub-parts of a block.
+WhentraversingamergedDCFG,atraversalalongtheedgesand
+basic blocks of one phase should not take an edge leading out of a
+shared basic block associated with a different phase if the outgoing
+edge is not shared between the two phases. We use the sets of
+phaseidentifiersassociatedwithbsicblocksandedgestoenforce
+thisrequirementandonlyallowtraversalsacrosscomponentswith
+matching phase identifiers.
+5 APPLICATIONS
+This section discusses a few applications of DCFGs and codegen
+dependencies to reasoning about dynamic code.
+5.1 Program Slicing for Bug Localization and
+Exploit Analysis in JIT Compilers
+Program slicing refers to identifying instructions that (may) affect,
+orbeaffectedby,thevaluecomputedbyaninstructioninaprogram
+[2,30,48]. Slicing can be static or dynamic; and, orthogonally,
+forwardorbackward.Byeliminatinginstructionsthatareprovablyirrelevanttothecomputationofinterest,slicingreducestheamount
+ofcodethathas tobeexaminedinordertoreason aboutit.Inthe
+contextofdynamiccodemodification,DCFGsplayacrucialrolein
+providingcontrolflowinformationneededtoconstructbackward
+slices. Analyses that reason about dynamic code solely through
+datadependencies,e.g.usingtaintpropagation[ 11,13,21,54]ar e
+unable to capture the effects of control dependencies and therefore
+are unsound with respect to slicing.
+Weimplementedbackwarddynamicslicingasanapplicationfor
+evaluating theefficacy ofDCFGs and codegendependencies, with
+thegoalofbuglocalizationandexploitanalysisinJITcompilers.
+316Backwarddynamicslicingaimstoidentifythesetofinstructions
+thatmayhaveaffectedthevalueofavariableorlocationatsome
+particularpointinaparticularexecutionoftheprogram.Ourim-
+plementation is based on Korel’s algorithm for dynamic slicing of
+unstructured programs [ 30]; however, any slicing algorithm for
+unstructured programs would have been adequate.
+InKorel’sslicingalgorithm[ 30],aninstruction Iatposition pin
+atraceT(i.e.,I≡T[p])dependson aninstruction J≡T[q](written
+I/squiggleright(Korel)J) if and only if, for some source operand aofI,Jis the
+last definition ofaat position p. More formally:
+I/squiggleright(Korel)Jiff (∃a source operand aofI):
+[a∈write_locs(J); and
+(∀n:q<n<p:a/nelementwrite_locs(T[n])]
+When processing an instruction I, Korel’s algorithm (lines 5 and
+16 of Fig. 11 [ 30]) marks all instructions Jsuch that I/squiggleright(Korel)J.
+To work with dynamic code, we modify this notion to also take
+codegendependenciesintoaccount,writingtheresultingnotionof
+dependency as I/squigglerightJ:
+I/squigglerightJiffI/squiggleright(Korel)JorIis codegen-dependent on J.
+Our slicing algorithm is identical to Korel’s except for two general-
+izations:
+(1)Codegendependenciesaretakenintoaccountinpropagating
+dependencies. In the marking step of the algorithm (lines 5
+and16ofFig.11[ 30])weusethe /squigglerightrelationratherthanthe
+/squiggleright(Korel)relation used by Korel [30].
+(2)The structure of the DCFG is taken into account by treating
+dynamic edges similarly to jumps (in the terminology used
+by Korel [ 30], this corresponds to the notions of j-entryand
+j-exit).
+5.2 Detecting Environmental Triggers in
+Malware
+Malware sometimes use environmental triggers to evade detection
+by performing malicious actions only if the right environmental
+conditionsaremet,e.g.,ifthedatehassomespecificvalue.Current
+work on detecting such behaviors is geared towards static code,
+e.g.,identifyingconditionalbrancheswithinput-taintedoperands
+[6].Theideaistousedynamictaintanalysistoidentifyconditional
+branchesoftheform‘ ifexprthenbehavior 1elsebehavior 2’where
+expris tainted from (i.e., influenced by) some input values. Once
+suchconditionalshavebeenidentified,othertechniques,e.g.,using
+SMT solvers to generate alternate inputs, can be used to further
+explore the program’s behavior.
+Dynamiccodeopensupotherwaystoimplementenvironmental
+triggers, e.g., by using the environmental input to directly affect
+whatinstructionbytesaregenerated.Thisideacanbeillustrated
+by adapting an example of evasive behavior, described by Brumley
+et al.[6], to use dynamic code instead of a conditional. The code,
+shown in Figure 5, uses bit-manipulation instead of conditionals
+toevaluatethetriggerexpression,therebyrenderinginapplicable
+techniquesthatrelyontaintedconditionals.Thevariable day_bits
+is set to 1 or 0 depending on whether or not the most significant
+bit of the value of the expression day-9is 0, i.e., whether or notthe predicate day≥9is true. Similarly, mth_bits is 1 or 0 de-
+pendingonwhetherornot month≥7istrue.Thus,thevariable
+triggeris1or0dependingonwhethertheenvironmentaltrigger—
+in this example, the predicate day≥9 && month≥7—is true
+or not. The assignment to *(addInstrPtr+11) writes this value
+into the source byte of an assignment to a variable that is usedin a conditional to determine whether the malicious behavior is
+manifested.1Note thatthe conditionalthat controlsthe execution
+ofthe payload() functionisneitherdata-dependentnorcontrol-
+dependent on the input; instead there is a codegen dependency
+betweenthisconditionalandthe patchinginstructions,whichare
+data dependent on the input.
+OurcurrentimplementationgeneralizestheapproachofBrumley
+et al.[6] to incorporate codegen dependencies: we taint the values
+obtainedfromanyenvironmentalinputsofinterest,thenpropagate
+taint in a forward direction. We determine that an environnmental
+trigger is present if either of the following hold:
+(1)A conditional jump instruction with one or more tainted
+operands is executed; or
+(2)Thereisacodegendependencywherethevaluewrittenis
+tainted (equivalently: one or more memory locations con-
+taining an executed instruction are tainted).
+The first condition is that originally used by Brumley et al.[6],
+while the second condition incorporates the effects of dynamic
+codemodification.AnalysisofthecodeshowninFigure5proceeds
+as follows. The values obtained from the call localtime() are
+tainted. This causes the variables day_bits and mth_bits , and
+thence the variable trigger, to become tainted; this tainted value
+is then written to memory via the assignment
+*(addInstrPtr+11) = trigger
+Whenthefunction hide()issubsequentlyexecuted,thelocation
+written by the above assignment is found to be a code location,
+thereby indicating a codegen dependency where the value written
+is tainted. This indicates the presence of an environmental trigger.
+6 EVALUATION
+6.1 Overview
+We built a prototype implementation to evaluate the efficacy of
+our ideas and ran our experiments on a machine with 32 cores
+(@ 3.30 Ghz) and 1 TB of RAM, running Ubuntu 16.04. We used
+Intel’s Pin software (version 3.7) [ 31] for program instrumentation
+and collecting instruction-level execution traces; and XED (version
+8.20.0)[24]forinstructiondecoding.Weiterateovertheinstruction
+tracetoconstruct aDCFGfortheexecution. Weidentifydynamic
+code and determine codegen dependencies using taint analysis: we
+taint writes to memory, with each memory write getting a distinct
+taint label. For each instruction in the trace we check whether any
+ofitsinstructionbytesistainted,inwhichcasetheinstructionis
+flagged as dynamic.
+Our evaluations focused on the following questions:
+1Thiscodereliesontheappropriatebyteofthemodifiedinstructionbeingataspecific
+offset—inthiscase,11bytes—fromthebeginningofthatfunction’scode,andtherefore
+isoviouslyhighlycompiler-andsystem-dependent.Thisisnotatypicalofmalware,
+which are usually launched as system-specific binary executables.
+317void hide() {
+volatile int environmental_trigger = 0;
+if (environmental_trigger) {
+payload(...); // perform malicious action
+}
+}
+void patch() {
+int pg_sz = sysconf(_SC_PAGE_SIZE);
+mprotect((void*) ((((long) &hide) / pg_sz) * pg_sz),
+pg_sz * 2, PROT_READ | PROT_WRITE | PROT_EXEC);
+time_t rawtime;
+struct tm * systime;
+time(&rawtime);systime = localtime(&rawtime);
+int day = systime->tm_mday;
+int day_test = ~(day - 9);
+int day_bits = day_test >> 31; // day_bits == 1 iff day >= 9
+int month = systime->tm_mon+1;
+int mth_test = ~(month - 7);
+int mth_bits = mth_test >> 31; // mth_bits == 1 iff month >= 7
+// trigger == 1 iff (day >= 9 && month >= 7)
+int trigger = day_bits & mth_bits;
+unsigned char* addInstrPtr = ((unsigned char*) &hide);
+*(addInstrPtr+11) = trigger;
+}
+int main() {
+hide();patch();hide();
+return 0;
+}
+Figure 5: Environmental trigger based on dynamic code
+(1)How capable are existing state-of-the-art dynamic analysis
+tools at end-to-end reasoning of dynamic code?
+To answer this question we used two small synthetic bench-
+marks to evaluate three widely-used modern dynamic anal-
+ysis tools: PinPlay [36], angr [44, 47], and Triton [42].
+(2)Howeffectiveareourideasinreasoningaboutdynamiccode
+in scenarios involving problems in real-world software?
+Toevaluatethisquestion,weconsidertwokindsofexperi-
+ments:(1)dynamicslicingforbugreportsandexploitsfor
+the JIT compiler in V8, the JavaScript engine in Google’s
+Chrome browser; and (2) two benchmarks that use dynamic
+code for environmental triggers in malware.
+(3)What is the performance impact of the merging optimizations
+discussed in Section 4?
+The bug/exploit proof-of-concept code used in the slicing
+experimentsmentionedaredeliberatelyconstructedtocrash
+the software quickly, and thus do not reflect typical applica-
+tion behavior. We use the Jetstream benchmarks (Sec. 6.4)
+to more accurately evaluate the impact of our memory opti-
+mizations on typical application code.
+Thecodeforourprototypeimplementationisavailableat https://
+github.com/skdebray/ASE-2020/ and https://www2.cs.arizona.edu
+/projects/lynx-project/Samples/ASE-2020 . Our data samples are
+available at https://www2.cs.arizona.edu/projects/lynx-project
+/Samples/ASE-2020/DATA .
+6.2 Assessing the Capabilities of Existing Tools
+Weevaluatedthecapabilitiesofexistingstate-of-the-arttoolsusing
+threewidely-used moderndynamicanalysis toolsthatimplement
+backwarddynamicslicing,namely:PinPlay[ 36](revision1.29),angr
+[44,47](commitbd3c6d8ongithub),andTriton[ 42](buildno.1397).Our ap-
+proachPinPlay angr Triton
+Synth-
+eticBenchmark 1 Y N N N
+Benchmark 2 Y N N NExploitanalysisV8 OOB to JIT Y X X X
+code pages
+V8 Escapeanalysis bug Y X X X
+LuaJIT exploit Y N N NBug local-izationOOB Read Y X X X
+JIT typeconfusion Y X X X
+Scoping issue Y X X X
+Key:
+Y: Picks up dynamic code generator from backwards
+slice of dynamic code.
+N: Does not pick up dynamic code generator from
+backwards slice of dynamic code.
+X: Crashes or fails to load.
+Table 1: Assessing Existing Dynamic Analysis Tools
+Weinvokedthesetoolstoincorporatesupportforself-modifying
+codeasfollows:wesettheflags smc_support andsmc_strict flags
+totrueforPinPlay,andloadedourprojectwith auto_load_libs
+andsupport_selfmodifying_code set to true for angr.
+To avoid potentially confounding factors such as code size or
+complexity,weconsideredtwosmallsyntheticbenchmarksof15
+and 55 x86 instructions respectively. Both programs are simple
+instructure:oneaddsaconstanttothetargetoperandofajump
+instruction; the other adds a constant to the immediate operand of
+anaddinstruction.Thefixedandunconditionalnatureofthesecode
+modifications means that there is nothing tricky, e.g., no data or
+control dependencies, between the instructions being dynamically
+modified and the instructions performing dynamic modification.
+This allows us to focus entirely on questions of representation and
+analysisofdynamiccode:anyproblemsinanalyzingsuchsimple
+programsrelatedirectlytoshortcomingsintheunderlyingprogram
+representationsand analysisalgorithms whenappliedto dynamic
+code.
+We used the three tools mentioned above, along with our proto-
+type implementation of slicing (Section 5.1) to carry out backward
+dynamic slicing on our synthetic benchmarks. In each case, we
+computed a backward dynamic slice with the slice criterion being
+thevaluecomputedbythefunctionwhosecodewasdynamically
+modified.TheresultsoftheseexperimentsaresummarizedinTable
+1.Itcanbeseenthatwhileallthreetoolssuccessfullyincludedallof
+the relevant non-codegen-dependent instructions in the slices they
+computed, none of them are able to pick up the code that performs
+dynamic modification. Given that soundness for slicing algorithms
+is defined as not excluding any statement that can influence theslicing criterion, this indicates that the resulting slices were un-
+sound. Onfurther investigation, wefound thatthe reason forthis
+is a fundamental limitation of the underlying CFGs constructedby these tools, which do not represent the different versions ofcode resulting from dynamic code modification. By contrast, we
+found that our implementation, using DCFGs and codegen depen-
+dencies,computedslicesthatcorrectlycontainedtheinstructions
+that performed dynamic code modification.
+318Tracing DCFG Construction Slicing
+Test program Ntrace TreadNinstrsNblocksNedgesNphasesTDCFG Nslice Tslice ΔsliceExploit
+analysisV8 OOB to JIT Code Pages 11,134,237 10.68191,613 41,302 117,158 4 146.88 81,986 433.25 57 %
+V8 Escape analysis bug 135,295,168 130.76 245,935 52,929 153,922 31,793.23 120,885 10,193.08 50 %
+LuaJIT Exploit 464,743 0.6018,248 4584 12,606 2 7.47 5,139 7.76 71 %Buglocal-
+izationOOB Read 14,720,437 14.25150,115 31,469 92,254 2 196.29 61,511 579.78 59 %
+JIT Type Confusion 9,663,365 9.49158,849 32,536 93,132 9 130.26 67,765 146.47 57 %
+Scoping issue 7,882,295 7.5699,378 22,394 62,204 4 102.31 47,023 970.95 52 %
+Key:
+Ntrace: No. of instructions in execution trace
+Tread: Time to read trace (seconds)
+Ninstrs: No. of instructions in DCFG
+Nblocks: No. of basic blocks in DCFG
+Nedges: No. of basic blocks in DCFGNphases: No. of phases
+TDCFG: DCFG construction time (seconds)
+Nslice: No. of instructions in slice
+Tslice: Slice construction time (seconds)
+Δslice: Fraction of DCFG removed from slice
+=(Ninstrs−Nslice)/Ninstrs.
+Table 2: Slicing: Performance
+Additionally, to assess the applicability of these tools to real-
+worldsoftwarethatmakesuseofdynamiccode,weevaluatedthem
+onsixbugandexploitreportsfortheV8JITcompiler.Asshown
+in Table 1, none of them were able to successfully analyze these
+examples: they all crashed with internal errors when loading V8.
+All three tools were able to process the LuaJIT example without
+crashing,butnoneoftheslicestheycomputedcontainedtheJIT-
+compiler or exploit code that created the dynamic code.
+6.3 Analysis Efficacy on Real-World Examples
+Toevaluateourapproachonrealworldsoftwarethatusesdynamic
+code,weconsiderthreeapplications:(1)analysisofexploitsinvolv-ingJITcode;(2)buglocalizationinJITcompilers;and(3)detectionoftrigger-basedevasivebehaviorsthatusedynamiccode.Ourgoal
+wastoperformend-to-endanalysesontheseexamples,i.e.,start
+fromtheproblematicdynamiccodeandcomputeabackwarddy-
+namic slice that includes the culprit portions of the dynamic code
+generator where the bug/security exploit originates. The results
+are shown in Table 1.
+6.3.1 Exploit Analysis. Weconsiderthreeexamplesofexploits,two
+of them involving dynamic code in Google’s V8 JavaScript engine:
+(1)maliciousshellcodeoriginatingfromanout-of-bounds(OOB)
+write to the JIT code pages in V8 [9];
+(2)escape analysis bug in V8’s JIT compiler (CVE-2017-5121)
+[38]; and
+(3) malicious bytecode used to escape a LuaJIT sandbox [8].
+For each of these exploits, we used the proof-of-concept code to
+computeaDCFG/backwarddynamicslicestartingfromthedynam-
+ically generated exploit code. Separately, we used the write-up for
+eachexploittodeterminethebugsresponsibleforeachexploit,iden-
+tifyingthebuggy code generatorportionsintheexecution traces
+recordedforeachexploit.Wethencheckedtheslicetodetermine
+whether the buggy generator code is present in the slice.
+The first security exploit we consider entails an OOB write to
+theJITcodepageswithinGoogle’sV8JavaScriptengine[ 9].The
+exploitisaresultofarraytypeambiguitythatallowstheattackerto
+writeandexecutearbitraryshellcode.WeconstructedaDCFGfromanexecutiontraceofthebuggyV8codeandcomputedabackward
+dynamic slice from the first nop shellcode instruction in the nop
+sled in the attack code. Our backward slice correctly included both
+thebuggycodewithinV8thatledtothearraytypeambiguityalong
+with the exploit code that generated the shellcode at runtime.
+The second exploit we examined is discussed in detail by Rabet
+[38]. It arises out of a bug in V8’s escape analysis and causes some
+variableinitializationsintheJIT-optimizedcodetobeincorrectly
+optimized away when performing load reduction. The proof-of-concept code provided causes V8 to crash while executing the
+optimizeddynamiccodeduetoanOOBread.ThewriteupprovidedbyRabetproceedstousethisOOBreadasasteppingstonetowards
+demonstrating arbitrary code execution. For our analysis of thisexample, we built our DCFG from the execution trace recorded
+by Pinandthen wecomputed abackward dynamicslice fromthe
+dynamic instruction prior to the exception that is thrown due to
+the OOB read. We found that the resulting slice correctly included
+thebuggyportionsoftheloadreducerintheescapeanalysisphase
+of V8’s JIT compiler, whose optimizations cause the OOB read.
+Our final example in this category was with malicious Lua byte-
+code being used to escape a sandbox in LuaJIT [ 8]. The proof of
+conceptmaliciousprogramcorruptsbytecodewiththegoalofwrit-
+ing shellcode which prints a message. We followed an approach
+similar tothe one we usedto slice theV8 OOB write, startingour
+slice at the beginning of the NOP sled used in the attack. We found
+that the backward slice computed by our tool correctly picks up
+the Lua code that generates the shellcode.
+Theroleofcodegendependencies. Foreachexploitexampledis-
+cussed,wecomputedslicesstartingata NOPinstructionintheNOP
+sledgeneratedaspartoftheshellcode.Toassesstheroleofcodegendependencies,werecomputedtheseslicesignoringcodegendepen-dencies.Wefoundthat,ineachcase,theresultingsliceconsistedof
+justthe NOPinstructionandnothingelse.By contrast,whencode-
+gen dependencies were considered, the relevant JIT-compiler code
+wasincludedintheslice.Thisdemonstratesthatcodegendependen-
+ciesare fundamentaltoreasoning abouttherelationship betweendynamically generated code and the dynamic code generator that
+created that code.
+319Original Dicing Improvement (%)
+Test program DCFGorigsliceorigDCFGmkslicemkΔDCFGΔsliceΔmkExploit
+analysisV8 OOB to JIT Code Pages 191,613 81,986 90,736 42,317 52.648.453.4
+V8 Escape analysis bug 245,935 120,885 157,847 89,307 35.826.143.4
+LuaJIT Exploit 18,248 5,139 10,354 1,808 43.264.882.5Buglocal-
+izationOOB Read 150,115 61,511 35,261 10,460 59.083.070.3
+JIT Type Confusion 158,849 67,765 188 103 99.999.845.2
+Scoping issue 99,378 47,023 14,896 7,721 85.083.648.2
+Key:
+DCFGorig: No. of instructions in original DCFG ΔDCFG: Improvement in DCFG size due to dicing
+sliceorig: No. of DCFG instructions in original slice =(DCFGorig−DCFGmk)/DCFGorig
+DCFGmk: No. of instructions in DCFG with marker Δslice: Improvement in slice size due to dicing
+slicemk: No. of DCFG instructions in slice with marker =(sliceorig−slicemk)/sliceorig
+Δmk: Fraction of DCFGmkremoved due to dicing
+=(DCFGmk−slicemk)/DCFGmk
+Table 3: Dicing: Performance
+6.3.2 Bug Localization. We consider three JIT compiler bugs from
+Google’sV8JavaScriptenginethatwerepostedto bugs.chromium.org
+and classified as “Type: Bug-Security.”
+(1)Empty jump tables generated by the bytecode generator
+leadingtoout-of-boundreadsthatcrashthegeneratedJIT-
+compiled code [17].
+(2)Atypeconfusionbugthatleadstoacrashafterthedynamic
+code has been generated [18].
+(3)Arrowfunctionscopefixingbug,wherecertainconstructs
+involving a single line arrow function cause a crash [19].
+For each of these bugs we proceeded as follows. To identify the
+problematic code in the JIT compiler, we examined the correspond-
+ingGitHubcommits,togetherwithanyrelevantinformationinthe
+bug report, to determine the code that was changed to fix the bug.
+Wedelineatedtheproblemcodesoidentifiedusingsmall“marker
+code snippets”—i.e., small easily identifiable code snippets that do
+not affect the operation of the JIT compiler—and confirmed thatthe behavior of the buggy JIT compiler was unaffected. We thenused the example code submitted with the bug report to obtain
+anexecution tracedemonstratingthe bug,and usedthistrace, to-
+gether with the DCFG constructed from it, to compute a backward
+dynamicslicestartingfromtheinstructionthatcrashed.Finally,we
+analyzed the resulting slice to determine whether the problematic
+code, as identified above, was included in the slice.
+The results of ourexperiments are summarized in Table 1. Our
+end-to-endanalysiswasabletosuccessfullypickupthebuggycode
+foreach ofthebugs mentionedabovein theslice,allowing oneto
+narrow down the functions involved in V8 that lead to the crash.
+6.3.3 Performance. Table2showstheperformanceofourproto-
+type DCFG-based slicing implementation on our real-world testinputs (the environmental trigger example is omitted because it
+doesnotusebackwardslicing).Theseinputprogramsallinvolve
+computationsofsubstantialsize:thesmallest,LuaJITexploit,has
+atraceof464Kinstructions,whiletheremainingexecutiontraces
+rangefromalmost7.9Minstructions(V8scopingissuebug)to135Minstructions(V8escapeanalysisbug).Thetimetakentoreadthe
+traces (and do nothing else) is roughly 1M instructions/sec.2
+TheDCFGsconstructedtypicallyrangeinsizefromabout22K
+basic blocks and 62K edges (V8 scoping issue bug) to about 41K
+blocks and 117K edges (V8 OOB exploit), with a low of 4.6K blocks
+and12KedgesfortheLuaJITexploitandahighofabout53Kblocks
+and 154K edges for the V8 escape analysis bug. Most of our test
+programshave2−4phases,withtheV8JITtypeconfusionexample
+an outlier with 9 phases. DCFG construction incurs an overhead of
+roughly15×oversimplyreadingatrace:mostofthetestinputstake
+roughly2−3minutes,withthelowesttimebeing7.5secondsforthe
+LuaJITexploitandthehighestbeingabout30minutesfortheV8
+escape analysis bug. Since DCFG construction involves processing
+each instruction in the execution trace, the time taken depends on
+the sizes of both the instruction trace and the DCFG.
+Theoverheadincurredbyslicingrelativetothetimetakenfor
+DCFG construction ranges from 1 .04×for the LuaJIT exploit to
+9.5×fortheV8scopingissuebug,withmostofthetestprograms
+ranging from 3×to 6×. In absolute terms, most of the programs
+takeabout2−10minutesforslicing,withalowofabout8secsfor
+the LuaJIT example and a high of about about 2.8 hours for the V8
+escapeanalysisbug.Slicingisabletoremoveabout50%–60%ofthe
+instructions in the DCFG, with a high of 71% of the instructions
+removed for the LuaJIT exploit. These results indicate that our ap-
+proachisbothpractical(intermsoftime)anduseful(intermsof
+the amount of code removed from the DCFG). Since our approach
+does not fundamentally alter the slicing algorithm, but rather aug-
+mentsittoworkoverDCFGsandusecodegendependencies,itis
+not difficult to adapt our approach to other slicing algorithms with
+different cost-precision characteristics.
+6.3.4 Focusing the analysis: markers and dicing. Givenourobjec-
+tiveoflocalizingproblemsintheJIT-compilercode,itisusefulto
+examine the extent to which our approach is able to reduce the
+amountofactualJIT-compilercodethathastobeconsidered.To
+2OurimplementationusesPintocollectaninstructiontracethatiswrittentoafileon
+disk.Thenumbersreportedhererefertothetimerequiredtoreadsuchinstruction
+trace files; the time taken to record the traces and write the trace files, which depends
+onthetracingtoolusedandisindependentoftheideasdescribedhere,isnotincluded.
+320No. of Instructions No. of Basic Blocks No. of Edges
+Test program Orig Opt Δ(%)Orig Opt Δ(%)Orig Opt Δ(%)Performance
+benchmarksbase64 781,404 308,748 60.5167,925 64,095 61.8308,748 197,042 36.2
+crypto-sha1 1,158,366 319,098 72.5 245,758 65,634 73.3 719,114 202,096 71.9
+date-format 453,177 324,279 28.4 94,417 67,611 28.4278,666 101,902 63.4
+nbody 394,264 284,973 27.7 81,617 58,054 28.9239,080 174,498 27.0
+poker 595,329 366,571 38.4125,709 78,485 37.6365,978 236,562 35.4
+str-unpack 372,862 251,121 32.7 75,164 50,899 32.3215,716 151,980 29.5SecuritybenchmarksV8 OOB to JIT Code Pages 193,339 152,723 21.0 41,302 32,205 22.0117,158 94,568 19.3
+V8 Escape analysis bug 247,264 212,800 13.9 52,929 46,201 12.7153,922 137,974 10.4
+LuaJIT Exploit 21,389 19,436 9.1 4,584 4,153 9.412,606 11,624 7.8
+OOB Read 151,773 133,134 12.3 31,469 27,268 13.3 92,254 82,046 11.1
+JIT Type Confusion 160,526 128,188 20.1 32,536 25,441 21.8 93,132 76,110 18.3
+Scoping issue 101,193 89,675 11.4 22,394 19,910 11.1 62,204 56,382 9.4
+Key:
+Orig: Value in original-representation DCFG
+Opt: Value in optimized-representation DCFG
+Δ: Improvement = (Orig−Opt)/Orig
+Table 4: Impact of representation optimization on DCFG size
+do this, we placed markers—i.e., small code snippets that are un-
+ambiguously identifiable and semantically neutral—in the code as
+close as we were able to the invocation of the JIT compiler. During
+analysis, we excluded the portion of the execution trace before the
+marker. This effectively computed a program dice that excluded
+the front-end parser, byte-code generator, and interpreter.
+Table 3 gives the results of these experiments. The two columns
+labeled ‘Original’ refer to the size of the DCFG and the back-
+wardslicecomputedwithoutmarkers,i.e.,asshowninTable2;the
+columns labeled ‘Dicing’ refer to the size of the DCFG and slice
+when markers are used; the columns labeled ‘Improvement’ show
+the percentage improvement due to dicing. The columns labeled
+ΔDCFGandΔsliceshow, respectively, the reductions in the size of
+theDCFGandtheslicewhenirrelevantcodeisexcluded.Theseare
+intherange35%–85%forDCFGsizeand26%–84%forslicesize.The
+JIT Type Confusion bug sample is an outlier, with almost all of the
+original DCFG and slice eliminated. The final column, labeled Δmk,
+shows the effects of slicing focusing only on the DCFG resultingfrom dicing: these range from about 43% to about 82%. Overall,
+these results show that (1) our approach is effective in focusing on
+the relevant portions of the JIT compiler; and (2) the use of codemarkers to identify entry into the JIT compiler can be helpful in
+zeroing in on the relevant portions of the code being analyzed.
+6.4 Detecting Environmental Triggers
+We use two test programs to evaluate the detection of environmen-
+taltriggersbasedondynamiccode:oneisshowninFigure5,the
+otherisavariantofthisprogramthatusesimplicitflowstofurther
+disguise the influence of environmental values on the trigger code.
+We built two detectors to demonstrate the utility of DCFGs and
+codegendependenciesforthispurpose.Inthefirstcase,wetaint
+theinput sourceand propagatethe taintforwardin theexecution
+trace. If there is a codegen dependency from an instruction with
+tainted operands to an instruction that is later executed, an input-
+dependent value may be influencing the instruction bytes of somedynamic instruction, and we report that there is dynamic input-dependent program behavior. In the second case, we compute a
+backwarddynamicslicewiththeslicingcriterionbeingthedynam-
+ically modified code location at the point where it is executed.
+Ourimplementationscorrectlydetectthatenvironmentalvalues
+influencedynamicprogrambehaviorforourbenchmarks.Toassessthestateoftheart,wetestedtheseprogramsusingtwowidelyused
+analysis tools: S2E, a widely used symbolic execution engine [ 10],
+andangr.Ineachcase,wefoundthattheinputvaluesusedtopatchthefunction
+hide()inFigure5aresilentlyconcretizedandonlythe
+false path is explored. As a result, these tools are unable to identify
+the environment-dependent aspect of the program’s behavior.
+6.5 Space Optimization: The Impact of Merging
+ToevaluatetheeffectofthespaceoptimizationdiscussedinSection
+4, we used a collection of benchmarks from the Jetstream 2 suite
+of Javascript workloads [ 5]:base64[37],crypto-sha1 [26],date-
+format[49],nbody[16],poker[1], andstr-unpack [25]. Theresults
+are shownin Table 4.These benchmarks havesignificantly larger
+DCFGs than the security benchmarks described earlier. This is not
+surprising, since the security benchmarks were submitted as demo
+codeforbugreportsandthusaimedtoquicklymanifestthebugand
+crashorexittheprogram.Theperformancebenchmarksyielded
+significantly higher performance improvements than the security
+benchmarks, with improvements ranging from 27% to 72%.
+Wealso found thattheamountofimprovementincreaseswith
+the size of the unoptimized DCFG.This is shown in Figure 6. This
+indicatesthatthereisasignificantamountofoverlapinthecode
+executed by different phases (e.g., library code, the interpreter and
+JIT compiler), and also that our merged DCFG representation is
+effective in optimizing away the resulting redundancies.
+We did not see a significant difference in execution speed be-
+tween the DCFG implementations with and without this optimiza-
+tion.Theversionusingspace-optimizationwasslightlyfasteron
+average, possibly due to fewer calls to allocate/free routines and
+improved memory locality.
+3210 500 1000 1500
+DCFG size: no. of instructions (x 1000 )020406080Improvemen t (%)
+Key:+ : basic blocks
+x : instructions|||||||||| |0 50 100 150 200 250DCFG  size: no. o f basic blocks (x1000)
+Figure 6: Space optimization improvements vs. DCFG size
+7 SUMMARY AND DISCUSSION
+Our design goals, in Section 3.1, were to devise a program rep-
+resentation that naturally and scalably generalizes existing rep-
+resentations;allowsexistinganalysestobeextendedtodynamic
+codeinasimpleandnaturalway;andispreciseenoughtodistin-
+guishbetweenconceptuallydistinctdynamiccodemodifications.
+DCFGs providea natural generalization ofthe well-known notion
+of control flow graphs to dynamic code and thus satisfy the firstgoal. Section 5.1 shows how we extend slicing to dynamic code
+inastraightforwardway,therebysatisfyingthesecondgoal.For
+the third goal, DCFGs allow us to distinguish the code structure of
+individualJIT-compiledfunctionsbyseparatingoutthedifferent
+codemodificationsindifferentDCFGphases,withthespaceopti-
+mizationsofSection4ensuringscalability;codegendependencies
+then make it possible to identify and reason about the code compo-
+nents and value flows in the dynamic code generator relevant to
+thecodemodificationsineachsuchphase.Asfarasweknow,no
+other existing system can do this.
+8 RELATED WORK
+Anckaert etal.describeaprogramrepresentationfordynamiccode
+that is capable of representing multiple versions of the code as it is
+modified during execution [ 4]. However, this w ork does not have a
+notion of codegen dependencies and as a result is of limited utility
+for applications that involve reasoning aboutcausal relationships
+between the dynamic code generator and the dynamic code.
+Debray and Yadegari discuss reasoning about control dependen-
+ciesininterpretedandJIT-compiledcode[ 52].Whilethegoalsof
+thisworkaresimilartoours,itstechnicaldetailsarequitedifferent.Inparticular,itdoesnotaimtoprovideaprogramrepresentationca-pableofsupportingarbitrarydynamiccode,butinsteadisnarrowly
+focused on control dependency analysis in interpretive systems. It
+also makes assumptions, such as the ability to map each dynam-ically generated instruction to a unique byte-code instruction it
+originatedfrom, thatrender itinapplicable tocontexts notinvolv-
+ing interpreters, such as the dynamic-code-based environmental
+triggers discussed in Sections 5.2 and 6.4.
+Korczynski and Yin discuss identifying code reuse/injections
+usingwhole-systemdynamictaintanalysis[ 29].Whilethisworkcaptures codegen dependencies, it does not propose a program
+representation that can capture the code structure for the different
+phases that arise during execution. As a result, this approach isnot suitable for analyses, such as program slicing, that require
+informationaboutthecontrolflowstructureofthecode.DallaPredaetal.describeanotionofphasestocharacterizethesemanticsofself-
+modifyingcode[ 12],howeverthisworkwasneverimplemented
+and the technical details are very different from ours.
+Thereisalargebodyofliteratureonprogramslicing(e.g.,see
+[30,39,46,50,55]),butallofthisworkfocusesonstaticcode.There
+is a lot of work on dependence and information flow analyses
+(e.g., see [ 20,27,35]), but these typically do not consider end-to-
+end analysis of dynamic code. Several authors have discussed taint
+propagationinJIT-compiledcode,butfocusingontaintpropagationin just the application code rather than on end-to-end analyses [
+13,
+28,41].Whole-systemanalyses[ 11,13,21,53,54]focusonissues
+relating to dynamic taint propagation through the entire computer
+system. Such systems provide end-to-end analyses but typically
+consideronlyexplicitinformationflows( /similarequaldatadependencies),not
+implicitflows(/similarequalcontroldependencies);theyarethusoflimiteduse
+forreasoningaboutbehaviors,suchasconditionaldynamiccode
+modification (i.e., where the dynamic code generated may depend
+conditionally on input and/or environmental values), which are
+common in applications such as JIT compilers.
+Thereareanumberofsystemsthatreasonaboutprogrambehav-
+ior using dynamic analysis, and therefore are able to perform somekindsofanalysisondynamiccode[
+36,42,44,47].Ourexperiments
+indicatethatthesesystemsdonotkeeptrackofmultipleversions
+ofcoderesultingfromdynamiccodemodification,andsocannot
+fully capture the dependencies arising from runtime code changes.
+Caiet al.[7] and Myreen [ 33] discuss reasoning about dynamic
+code for the purposes of program verification using Hoare logic.
+Wehavenotseenanyimplementationstoapplytheirworktowards
+modernsoftwarethatutilizesdynamiccode(i.e.ajavascriptengine).
+Furthermore, our work is more specific in that we seek to provide
+a program representation capable of representing dynamic code.
+9 CONCLUSIONS
+Dynamiccodeisubiquitousintoday’sworld.Unfortuntely,existing
+approaches to program analysis are not adequate for reasoning
+about the behavior of dynamic code. This paper discusses how this
+problem can be addressed via a program representation suitablefor dynamic code as well as a new notion of dependencies that
+can capture dependencies between the dynamic code and the code
+that generated it. Experiments with a prototype implementation of
+backwardsdynamicslicingbasedontheseideasshow,onanumber
+ofreal-worldexamples,thattheseideasmakeitpossibletowork
+backfromthefaultycodetotheJITcompilerlogicthatledtothe
+generation of the faulty code.
+ACKNOWLEDGMENTS
+This research was supported in part by the National Science Foun-
+dation under grant no. 1908313.
+322REFERENCES
+[1][n.d.].Uni-poker Javascript source code. https://browserbench.org/JetStream/
+RexBench/UniPoker/poker.js
+[2]Hiralal Agrawal and Joseph R Horgan. 1990. Dynamic program slicing. In ACM
+SIGPlan Notices, Vol. 25. ACM, 246–256.
+[3]A. V. Aho, R. Sethi, and J. D. Ullman. 1985. Compilers – Principles, Techniques,
+and Tools. Addison-Wesley, Reading, Mass.
+[4]B. Anckaert, M. Madou, and K. De Bosschere. 2006. A Model for Self-Modifying
+Code.LNCS4437, 232–248.
+[5]Saam Barati. 2019. Introducing the JetStream 2 Benchmark Suite. https://webkit.
+org/blog/8685/introducing-the-jetstream-2-benchmark-suite/
+[6]DavidBrumley,CodyHartwig,ZhenkaiLiang,JamesNewsome,DawnSong,and
+HengYin.2008. Automaticallyidentifyingtrigger-basedbehaviorinmalware.
+InBotnet Detection. Springer, 65–88.
+[7]HongxuCai,ZhongShao,andAlexanderVaynberg.2007.Certifiedself-modifying
+code. InACM SIGPLAN Notices, Vol. 42. ACM, 66–77.
+[8]Peter Cawley. 2015. Malicious LuaJIT bytecode. https://www.corsix.org/content/
+malicious-luajit-bytecode
+[9]OliverChang.2017. ExploitingaV8OOBwrite. https://halbecaf.com/2017/05/24/
+exploiting-a-v8-oob-write/
+[10]Vitaly Chipounov, Volodymyr Kuznetsov, and George Candea. 2011. S2E: A
+platform for in-vivo multi-path analysis of software systems. In ACM SIGARCH
+Computer Architecture News, Vol. 39. ACM, 265–278.
+[11]JimChow,BenPfaff,TalGarfinkel,KevinChristopher,andMendelRosenblum.
+2004. Understanding data lifetime via whole system simulation. In USENIX
+Security Symposium. 321–336.
+[12]M. Dalla Preda, R. Giacobazzi, and S. Debray. 2015. Unveiling metamorphism
+byabstractinterpretationofcodeproperties. TheoreticalComputerScience 577
+(April 2015), 74–97.
+[13]William Enck, Peter Gilbert, Seungyeop Han, Vasant Tendulkar, Byung-Gon
+Chun,LandonPCox,JaeyeonJung,PatrickMcDaniel,andAnmolSheth.2014.
+TaintDroid:aninformation-flowtrackingsystemforrealtimeprivacymonitoring
+on smartphones. ACM TOCS 32, 2 (2014).
+[14]TommasoFrassetto,DavidGens,ChristopherLiebchen,andAhmad-RezaSadeghi.
+2017. JITGuard: Hardening Just-in-time Compilers with SGX. In Proc. 2017 ACM
+Conference on Computer and Communications Security. 2405–2419.
+[15]Andreas Gal, Brendan Eich, Mike Shaver, David Anderson, David Mandelin,
+MohammadR.Haghighat,BlakeKaplan,GraydonHoare,BorisZbarsky,Jason
+Orendorff, Jesse Ruderman, Edwin W. Smith, Rick Reitmaier, Michael Bebenita,
+Mason Chang, and Michael Franz.2009. Trace-based Just-in-time Type Special-
+ization for Dynamic Languages. In Proc. PLDI 2009. 465–478.
+[16]Isaac Gouy. [n.d.]. nbody Javascript source code. https://browserbench.org/
+JetStream/SunSpider/n-body.js
+[17]Loki Hardt. 2015. Issue 794825: Security: V8: Empty BytecodeJumpTable may lead
+to OOB read. https://bugs.chromium.org/p/chromium/issues/detail?id=794825
+[18]Loki Hardt. 2017. Issue 794822: Security: V8: JIT: Type confusion in GetSpecializa-
+tionContext. https://bugs.chromium.org/p/chromium/issues/detail?id=794822
+[19]LokiHardt.2018. Issue807096:Security:Arrowfunctionscopefixingbug. https:
+//bugs.chromium.org/p/chromium/issues/detail?id=807096
+[20]Christophe Hauser, Frederic Tronel, Ludovic Mé, and Colin J. Fidge. 2013. Intru-
+sion detection in distributed systems, an approach based on taint marking. In
+Proc. 2013 IEEE International Conference on Communications (ICC). 1962–1967.
+[21]Andrew Henderson, Aravind Prakash, Lok Kwong Yan, Xunchao Hu, Xujiewen
+Wang,RundongZhou,andHengYin.2014. Makeitwork,makeitright,make
+itfast:buildinga platform-neutralwhole-systemdynamicbinaryanalysisplat-
+form. InProceedings of the 2014 International Symposium on Software Testing and
+Analysis. 248–258.
+[22]David Van Horn and Harry G. Mairson. 2007. Relating complexity and precision
+in control flow analysis. In Proc. 12th ACM SIGPLAN International Conference on
+Functional Programming (ICFP). 85–96.
+[23]Hiroshi Inoue, Hiroshige Hayashizaki, Peng Wu, and Toshio Nakatani. 2012.
+Adaptive Multi-level Compilation in a Trace-based Java JIT Compiler. In Proc
+OOPSLA 2012. 179–194.
+[24] Intel Corp. [n.d.]. Intel XED. https://intelxed.github.io.
+[25]Bob Ippolito. [n.d.]. str-unpack Javascript source code. https://browserbench.org/
+JetStream/SunSpider/string-unpack-code.js
+[26]PaulJohnston.[n.d.]. crypto-sha1Javascriptsourcecode. https://browserbench.
+org/JetStream/SunSpider/crypto-sha1.js
+[27]Min Gyung Kang, Stephen McCamant, Pongsin Poosankam, and Dawn Song.
+2011. DTA++: Dynamic Taint Analysis with Targeted Control-Flow Propagation.
+InNDSS.
+[28]Christoph Kerschbaumer, Eric Hennigan, Per Larsen, Stefan Brunthaler, and
+Michael Franz. 2013. Information flow tracking meets just-in-time compilation.
+ACMTransactionsonArchitectureandCodeOptimization(TACO) 10,4(2013),38.
+[29]DavidKorczynskiandHengYin.2017. Capturingmalwarepropagationswith
+codeinjections andcode-reuseattacks. In Proceedingsof the2017ACMSIGSAC
+Conference on Computer and Communications Security. ACM, 1691–1708.[30]BogdanKorel.1997. Computationofdynamicprogramslicesforunstructured
+programs. IEEE Transactions on Software Engineering 23, 1 (1997), 17–34.
+[31]C.-K. Luk, R. Cohn, R. Muth, H. Patil, A. Klauser, G. Lowney, S. Wallace, V. J.
+Reddi, and K. Hazelwood. 2005. Pin: Building Customized Program Analysis
+Tools with Dynamic Instrumentation. In Proc. ACM Conference on Programming
+Language Design and Implementation (PLDI). Chicago, IL, 190–200.
+[32]Florian Martin. 1999. Experimental comparison of call string and functional
+approaches to interprocedural analysis. In International Conference on Compiler
+Construction. Springer, 63–75.
+[33]Magnus O Myreen. 2010. Verified just-in-time compiler on x86. In ACM Sigplan
+Notices, Vol. 45. ACM, 107–118.
+[34]N. Nethercote and J. Seward. 2007. Valgrind: A Framework for HeavyweightDynamic Binary Instrumentation. In Proc. ACM Conference on Programming
+Language Design and Implementation (PLDI). 89–100.
+[35]JamesNewsomeand DawnSong.2005. DynamicTaintAnalysis forAutomatic
+Detection,Analysis,andSignatureGenerationofExploitsonCommoditySoft-
+ware. InNDSS.
+[36]HarishPatil,CristianoPereira,MackStallcup,GregoryLueck,andJamesCownie.
+2010. PinPlay:aframeworkfordeterministicreplayandreproducibleanalysis
+of parallel programs. In Proceedings of the 8th annual IEEE/ACM international
+symposium on Code generation and optimization. ACM, 2–11.
+[37]Martijn Pieters and Samuel Sieb. [n.d.]. base64 Javascript source code. https:
+//browserbench.org/JetStream/SunSpider/base64.js
+[38]Jordan Rabet.2017. Browser securitybeyond sandboxing. MicrosoftWindows
+Defender Research. https:cloudblogs.microsoft.com/microsoftsecure/
+2017/10/18/browser-security-beyond-sandboxing.
+[39]VenkateshPrasadRanganath,TorbenAmtoft,AnindyaBanerjee,JohnHatcliff,
+and Matthew B Dwyer. 2007. A new foundation for control dependence andslicing for modern program structures. ACM Transactions on Programming
+Languages and Systems (TOPLAS) 29, 5 (2007), 27.
+[40]ThomasReps,SusanHorwitz,andMoolySagiv.1995. Preciseinterprocedural
+dataflowanalysisviagraphreachability.In Proceedingsofthe22ndACMSIGPLAN-
+SIGACT symposium on Principles of programming languages. ACM, 49–61.
+[41]Tiark Rompf, Arvind K Sujeeth, Kevin J Brown, HyoukJoong Lee, Hassan Chafi,
+and Kunle Olukotun. 2014. Surgical precision JIT compilers. In Acm Sigplan
+Notices, Vol. 49. ACM, 41–52.
+[42]FlorentSaudelandJonathanSalwan.2015.Triton:ADynamicSymbolicExecution
+Framework. In Symposium surla sécurité des technologies del’information et des
+communications, SSTIC, France, Rennes, June 3-5 2015. SSTIC, 31–54.
+[43]M. Sharir and A. Pnueli. 1981. Two Approaches to Interprocedural Data Flow
+Analysis. In Program Flow Analysis: Theory and Applications, S. S. Muchnick and
+N. D. Jones (Eds.). Prentice-Hall, 189–233.
+[44]YanShoshitaishvili,RuoyuWang,ChristopherSalls,NickStephens,MarioPolino,
+AudreyDutcher,JohnGrosen,SijiFeng,ChristopheHauser,ChristopherKruegel,
+and Giovanni Vigna. 2016. SoK: (State of) The Art of War: Offensive Techniques
+in Binary Analysis. (2016).
+[45]JimSmithandRaviNair.2005. Virtualmachines:versatileplatformsforsystems
+and processes. Elsevier.
+[46]Manu Sridharan, Stephen J. Fink, and Rastislav Bodík. 2007. Thin slicing. InProc. ACM SIGPLAN 2007 Conference on Programming Language Design and
+Implementation. 112–122.
+[47]NickStephens,JohnGrosen,ChristopherSalls,AudreyDutcher,RuoyuWang,
+Jacopo Corbetta, Yan Shoshitaishvili, Christopher Kruegel, and Giovanni Vigna.
+2016.Driller:AugmentingFuzzingThroughSelectiveSymbolicExecution.(2016).
+[48]F.Tip.1995. Asurveyofprogramslicingtechniques. JournalofProgramming
+Languages 3 (1995), 121–189.
+[49]Svend Tofte. [n.d.]. date-format Javascript source code. https://browserbench.
+org/JetStream/SunSpider/date-format-tofte.js
+[50]Mark Weiser. 1984. Program slicing. IEEE Transactions on Software Engineering
+10, 4 (July 1984), 352âĂŞ–357.
+[51]RobertP.WilsonandMonicaS.Lam.1995. EfficientContext-sensitivePointer
+Analysis for C Programs. In Proc. SIGPLAN 1995 Conference on Programming
+Language Design and Implementation (PLDI ’95). 1–12.
+[52]Babak Yadegari and Saumya Debray. 2017. Control Dependencies in Interpretive
+Systems. In International Conference on Runtime Verification . Springer, 312–329.
+[53]Heng Yin and Dawn Song. 2010. Temu: Binary code analysis via whole-system
+layeredannotativeexecution. EECSDepartment,UniversityofCalifornia,Berkeley,
+Tech. Rep. UCB/EECS-2010-3 (2010).
+[54]Heng Yin, Dawn Song, Manuel Egele, Christopher Kruegel, and Engin Kirda.2007. Panorama: capturing system-wide information flow for malware detec-tion and analysis. In Proceedings of the 14th ACM conference on Computer and
+communications security. ACM, 116–127.
+[55]XiangyuZhang,RajivGupta,andYoutaoZhang.2004. EfficientForwardCom-
+putationof DynamicSlices UsingReducedOrdered BinaryDecisionDiagrams.
+InProc. 26th International Conference on Software Engineering. 502–511.
+323

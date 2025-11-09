@@ -1,0 +1,993 @@
+Safe Asynchronous Multicore Memory Operations
+Matko Botin ˇcan, Mike Dodds
+University of Cambridge
+fmatko.botincan, mike.dodds g@cl.cam.ac.ukAlastair F. Donaldson
+Imperial College London
+afd@doc.ic.ac.ukMatthew J. Parkinson
+Microsoft Research Cambridge
+mattpark@microsoft.com
+Abstract —Asynchronous memory operations provide a means
+for coping with the memory wall problem in multicore proces-
+sors, and are available in many platforms and languages, e.g.,
+the Cell Broadband Engine, CUDA and OpenCL. Reasoning
+about the correct usage of such operations involves complex
+analysis of memory accesses to check for races. We present a
+method and tool for proving memory-safety and race-freedom of
+multicore programs that use asynchronous memory operations.
+Our approach uses separation logic with permissions, and our
+tool automates this method, targeting a C-like core language.
+We describe our solutions to several challenges that arose in
+the course of this research. These include: syntactic reasoning
+about permissions and arrays, integration of numerical abstract
+domains, and utilization of an SMT solver. We demonstrate the
+feasibility of our approach experimentally by checking absence
+of DMA races on a set of programs drawn from the IBM Cell
+SDK.
+Index Terms —Software veriﬁcation; Concurrent programs;
+Abstract interpretation; Automated theorem proving
+I. I NTRODUCTION
+Asynchronous memory operations are an important feature
+of modern multicore systems. They provide a means for
+coping with the high cost of shared-memory access (the so-
+called memory wall problem). Using asynchronous operations,
+cores can delegate data-movement to dedicated hardware,
+and continue processing on private memory, to which they
+have fast, contention-free access. These operations are widely
+available, e.g. direct memory access (DMA) operations in the
+Cell Broadband Engine, asynchronous copying in OpenCL,
+and one-sided operations in MPI-2.
+The high performance permitted by asynchronous memory
+operations comes at a price: increased programming complex-
+ity. Erroneous synchronisation within a thread can lead to data
+races, for example when copying a section of memory by an
+asynchronous operation and then writing to or deallocating
+it before the operation completes. The deallocation of the
+memory can happen implicitly when a function returns, or
+when a thread is joined. These problems are compounded
+in a multithreaded setting: incorrectly managed asynchronous
+operations can lead to inter-core data races, where a thread
+running on core iissues an operation to copy data to the
+local memory of core j, while a thread running on core j
+simultaneously accesses this memory.
+Asynchronous operations run concurrently with other
+threads, and have undeﬁned behaviour over written memory
+until synchronised. Consequently, incorrectly-managed asyn-
+chronous copying can lead to highly nondeterministic bugs
+that are extremely difﬁcult to diagnose through simulationand testing. While data races in shared-variable concurrent
+programs are often benign, or intentional, this is virtually
+never the case for races involving asynchronous operations,
+and we regard such races as bugs. Since buggy programs
+may behave entirely correctly on some implementations, while
+failing drastically on others, there is an urgent need for formal
+veriﬁcation techniques in this area.
+In this paper, we present a method and a tool for proving
+safety of multicore programs with fork/join thread-spawning
+and asynchronous memory operations. Our deductive, proof-
+based method uses the following intuition: (1) to successfully
+perform an asynchronous memory operation to move data
+from AtoB, a thread must have permission to read from
+A, and permission to write to B; and (2) upon issuing such
+an operation, the thread loses these permissions until it issues
+a corresponding synchronisation operation that waits until the
+transfer has completed, at which point permissions for Aand
+Bare restored. We present program logic rules for asyn-
+chronous memory operations that formalise these intuitions.
+If it is possible to derive a proof for a multicore program
+using our proof system, then the program is guaranteed to be
+memory-safe and race-free.
+We have developed techniques for automating our veriﬁca-
+tion method, which involves complex ﬂow-, path- and context-
+sensitive analysis. Our approach hinges on symbolic execution
+over an abstract domain of separation logic assertions [3]
+with permissions [4] and array predicates. Using the rules
+of our proof system for entailment checking and abstraction,
+symbolic execution is guided towards a ﬁx-point, yielding a
+safety proof if the program is correct. If the program is buggy,
+the proof attempt will fail, providing feedback which can be
+used to locate the source of the bug.
+We have implemented our method for a C-like language in
+a prototype tool, asyncStar , built on coreStar [5], a modular
+back-end for separation logic analysis and veriﬁcation. Stan-
+dard separation logic abstraction techniques [10] are used to
+automatically infer loop invariants describing heap resources.
+To handle numeric constraints relevant to array manipulation,
+we extend coreStar with a novel technique allowing integra-
+tion of arbitrary numerical domains [9] with separation logic
+abstraction.
+We present an experimental evaluation demonstrating the
+feasibility of the abstraction approach on a number of hand-
+crafted examples, and of the whole method using a set of
+benchmark programs drawn from the IBM Cell Broadband
+Engine SDK [21].In summary, the contributions of the paper are:
+A program logic for multicore programs with threads and
+asynchronous memory operations.
+Solutions to a number of challenges arising when au-
+tomating the reasoning with such a logic, including: syn-
+tactic reasoning about permissions and arrays, integration
+of numerical abstract domains, and utilization of an SMT
+solver.
+asyncStar , a prototype implementation of our method,
+evaluated on a set of industrial benchmarks.
+Asynchronous memory operations are increasingly widely
+used, for example in languages such as CUDA and OpenCL.
+While we have focussed in this paper on the Cell BE archi-
+tecture, the techniques we propose could form the basis of a
+correctness analysis for any similar domain.
+II. B ACKGROUND
+We now introduce asynchronous memory operations via a
+running example, and recap the deﬁnition of a data race in a
+concurrent program. We then motivate the need for techniques
+capable of analysing data races caused by asynchronous mem-
+ory operations. We use our running example to demonstrate
+the subtle nature of bugs that can arise due to this type of race,
+and argue that data races caused by asynchronous operations
+are almost never benign.
+Asynchronous memory operations. Our target memory
+architecture closely resembles the IBM Cell BE. We assume
+a single central CPU core responsible for coordinating and
+distributing tasks (the master , or host), and a number of
+subsidiary cores that can be used to perform asynchronous
+computations ( slave oraccelerator cores). Each core has its
+own local memory, disjoint from other cores. The host core
+has regular access to the system’s main memory, which we
+call host memory , while each accelerator core has its own
+scratchpad memory , also referred to as local memory .
+An accelerator core can access its local memory in a fast,
+contention-free manner using standard load and store instruc-
+tions. The local memory of one core is not directly visible to
+any other cores, including the host. Accelerator cores cannot
+access host memory using standard load and store instructions.
+Instead, the accelerator cores access host memory using special
+get and put operations, which copy a segment of memory
+from and to from the core’s local memory, respectively. get
+and put areasynchronous operations; they each initiate a
+memory transfer, but they do not wait for the transfer to
+complete. In order to be sure that a transfer has ﬁnished, a
+thread must call wait . Each get andput is associated with
+atag. A wait call takes a tag as an argument and blocks
+until all operations associated with that tag have completed.1
+In the Cell architecture, asynchronous memory operations are
+implemented using direct memory access (DMA).
+1In the case of Cell BE, a wait operation only blocks until all operations
+associated with the tag andissued by the core that calls wait have completed.
+This can be realised in our setting by equipping each accelerator core with a
+distinct set of tags.To see how this works in practice, consider the double-
+buffering algorithm dub bufshown in Fig. 1, which is to be
+executed by an accelerator core and is spawned by a host
+thread master . The algorithm reads an array of LMvalues
+from host memory, processes the values locally, and copies
+the result to an output array in host memory. The algorithm
+reads chunks from the input array using get, processes them
+in local memory (we do not show the actual processing code,
+assuming that it does not issue any asynchronous memory
+operations), then copies the result to the output array using
+put. The arguments to getandput are a local address x, a
+host address y, the number of bytes sof data to be copied,
+and a tag t.
+Two internal buffers of size Lare used to store copied
+chunks of the shared array. At any point during execution of
+thewhile loop, one buffer is being ﬁlled with data via a get
+operation, while the other buffer is being processed in-place,
+or its contents are being transferred back to shared memory
+via a put operation. Because local computations and asyn-
+chronous operations execute in parallel, the algorithm achieves
+efﬁciency by overlapping computation with communication.
+Data races. We follow the deﬁnition of a data race given
+in [18]. A program has a data race if the program can be
+executed on a multiprocessor such that two memory accesses
+are performed simultaneously, and:
+the accessed regions of memory overlap
+at least one the accesses is a write
+the accesses are not both for synchronisation purposes
+In general concurrent programs, data races often lead to
+subtle bugs which occur nondeterministically, depending on
+particular thread or process interleavings. Data races can often
+be benign. For instance, it is common for threads to race when
+updating shared variables used for logging [18]. Distinguishing
+between dangerous and benign races is a difﬁcult problem.
+However, we will argue that in an asynchronous setting data-
+races are almost never benign.
+Asynchronous memory operations and data races. In the
+context of asynchronous memory operations, a getoperation
+issued by core ican race with:
+a regular read or write by core ito the associated region
+of local memory
+agetorput issued by core i, accessing an overlapping
+region of local memory
+a regular write access by the host core to the associated
+region of host memory
+aputissued by a core j(possibly equal to i), accessing
+an overlapping region of host memory
+The race scenarios for a put operation are analogous.
+High latency asynchronous operations are typically used to
+transfer large chunks of data between memory spaces. Thus, in
+contrast to data races in shared-variable concurrent programs,
+races caused by asynchronous memory operations are almost
+never benign. Furthermore, the asynchronous nature of get
+andput can lead to particularly subtle bugs. For example, if#deﬁne N ... // Num threads.
+#deﬁne M ... // Num chunks of data to
+//be processed per thread.
+#deﬁne L ... // Size of chunk, in bytes.
+master(char src[len ], char dst[len ]) f
+//‘master’ runs on host.
+tidt [N]; int i ;
+for ( i=0; i <N; i++)f
+t [ i ] = fork(
+dub buf,
+2i,
+src+iML,
+dst+iML);
+g
+for ( i=0; i <N; i++)f
+join( t [ i ]);
+g
+gdub buf(int t , charihead, charohead)f
+char buf [2][ L]; // Two buffers, each of size ‘L’ bytes.
+int cur = 0; // Indices recording which buffers
+int nxt = 1; // are being used for input / output.
+int i = 1;
+charin = ihead; // Pointers to data in host memory.
+charout = ohead;
+get(buf[cur ], in , L, t ); in += L;
+while ( i <M)f
+wait(tˆnxt ); // Wait for previous ‘put’ to complete.
+get(buf[nxt ], in , L, t ˆnxt ); // Get data to process next iteration.
+in += L;
+wait(tˆcur); // Wait for requested data to arrive.
+//hprocess datai
+put(buf[cur ], out, L, t ˆcur );// Put results back to host memory.
+out += L;
+cur = curˆ1; nxt = nxtˆ1; // Switch buffers and
+i += 1; // increase chunk count.
+g
+wait(tˆcur); wait(tˆnxt)
+//hprocess datai
+put(buf[cur ], out, L, t ˆcur); // Put results back to host memory.
+wait(cur);
+g
+Fig. 1. Double-buffering algorithm, adapted from the Cell SDK [21].
+aget operation targeting a region of the stack allocated by
+a function fis not properly synchronised, the operation may
+still be pending after freturns. This can lead to corruption
+of the stack during subsequent calls. Asynchronous operations
+may complete quickly enough that stack corruption is unlikely,
+occurring only rarely, e.g. if bus trafﬁc is sufﬁciently high.
+This means that bugs can be extremely difﬁcult to reliably
+reproduce.
+Patterns of copying can be complex even for simple ex-
+amples, making mistakes hard to avoid. Consider again the
+double-buffering algorithm. The algorithm uses binary vari-
+ables curandnxtto record which buffer is incoming and
+which is outgoing. At each loop iteration the variables swap
+values. Furthermore, at the start of each loop iteration, data
+from one local buffer is being copied back to the input buffer,
+while data in adjacent cells in the input buffer is being copied
+into the other local buffer. At the end of the loop, one local
+buffer is the target of a copy from the input buffer, while
+the other is the source of a copy to the output buffer. The
+potential for confusion is enormous (the authors of this paper
+found avoiding bugs rather tricky when adapting the algorithm
+for presentation here).
+To avoid undeﬁned behaviour caused by races with asyn-
+chronous memory operations, we must be able to ensure that
+the source of an asynchronous operation is not written to, and
+the target neither written to nor read from, until the operation
+is explicitly synchronised via a wait call. For instance, if there
+was no call to wait at the ﬁrst line in the while -loop of dub bufthen the example would exhibit a race which we can observe
+by logging ﬁrst ﬁve asynchronous operations:
+(1) get(buf[cur];in;L;t) // cur=0
+(2) get(buf[nxt];in;L;t^nxt ) // i=0, nxt=1
+(3) wait (t^cur ) // i=0
+(4) put(buf[cur];out;L;t^cur )// i=0, cur=0
+(5) get(buf[nxt];in;L;t^nxt ) // i=1, cur=0
+The operation put at (4) is in race with the operation getat
+(5) because both of them are accessing the same portion of
+the internal buffer.
+Existing techniques for dynamic race detection could be
+readily adapted to apply in the context of asynchronous
+memory operations, and runtime monitoring [20] and system
+simulation [23] have been used to ﬁnd races in Cell BE
+programs. However, such techniques can only detect data
+races. In the remainder of the paper, we describe a method
+which can be used to prove absence of data races due to
+asynchronous memory operations in concurrent programs.
+III. R EASONING ABOUT ASYNCHRONOUS OPERATIONS
+We now use the double buffering example of Fig. 1 to
+provide an overview of our technique for reasoning about race
+freedom of asynchronous memory operations in concurrent
+programs. For reasons of space, we do not present full formal
+details of our approach, and justify its soundness in an
+informal manner.
+By careful analysis of the dub buffunction of Fig. 1, we
+can determine precisely the pattern of copying between thewhile ( i <M)f
+wait(tˆnxt );
+buf[cur]buf[nxt](i-1)LLLin-(i.L)in-Lin(M-i)LM.Lout-((i-1)L)cur
+get(buf[nxt ], in , L, t ˆnxt ); in += L;
+buf[cur]buf[nxt](i-1)LLLin-((i+1)L)in-2Lin-Lin(M-(i+1))LM.Lout-((i-1)L)curnxt
+wait(tˆcur);
+buf[cur]buf[nxt]i.LLLin-((i+1)L)in-Lin(M-(i+1))LM.Lout-((i-1)L)nxt
+put(buf[cur ], out, L, t ˆcur);
+out += L;
+cur = curˆ1; nxt = nxtˆ1;
+i += 1;
+buf[nxt]buf[cur](i-1)LLLin-(i.L)in-Lin(M-i)L(i-1)Lout-((i-1)L)curoutout-Lnxt(M-(i-1))L
+g
+Fig. 2. Sequence of memory reads and writes in the main loop of the
+double-buffering algorithm.
+input and output arrays, and the two buffers local to each
+thread. This pattern of behaviour is illustrated in Fig. 2. In
+this diagram, boxes denote contiguous chunks of memory.
+Labelled arrows inside boxes are used to indicate the size
+of each chunk, while external labels indicate addresses. Grey-
+ﬁlled boxes denote chunks that are subject to pending memory-
+transfer operations, while arrows between grey boxes indicatethe direction of copying. Labels on these arrows denote the
+tag of the operation.
+Reasoning using separation logic. Diagrams such as Fig. 2
+would be laborious and difﬁcult to annotate correctly by
+hand. However, precisely capturing information about shifting
+patterns of reading and writing is essential in establishing
+correctness of an algorithm involving asynchronous memory
+operations.
+We use a program logic, based on separation logic [26],
+to capture precisely the information presented intuitively in
+Fig. 2. Separation logic is a Hoare-style logic for verifying
+programs. Reasoning in it depends on a new logical connective
+– the separating conjunction , ‘’. Formula P1P2asserts that
+memory can be split into two disjoint parts, one satisfying
+P1and the other P2. Reasoning in separation logic is local ,
+meaning that a speciﬁcation must express all the resources a
+program needs to execute without faulting. For example, the
+speciﬁcation
+fPgCfQg
+says that, if the program Cexecutes to termination starting
+with a resource satisfying P, the result will be a resource
+satisfying Q,and that all resources used by Care either
+speciﬁed by Por acquired through explicit resource transfer.
+Locality means that a program can be veriﬁed within a
+small resource, and then substituted into a larger context. This
+property is expressed by the frame andparallel rules2:
+FRAMEfPgCfQg
+fPFgCfQFg
+PARALLELfP1gC1fQ1g f P2gC2fQ2g
+fP1P2gC1kC2fQ1Q2g
+The frame rule allows any speciﬁcation fPgCfQgto be
+extended by an arbitrary frame Fthat is unchanged by the
+C. The parallel rule allows the speciﬁcations for two threads
+to be combined, provided they access disjoint resources.
+Reasoning in separation logic is performed in terms of a
+single thread at once – the local thread . Reasoning is therefore
+said to be thread-local . We can think of the pre- and post-
+condition as denoting the portion of the state of which the
+local thread has ownership . Other running threads may own
+other portions of the state, but the parallel rule ensures that the
+global pattern of ownership is consistent. Note that ownership
+does not preclude sharing; two threads can share a resource
+as long as both only read from it.
+Separation logic is an appropriate approach to verifying
+asynchronous memory copying operations because it deals
+gracefully with ownership and with resource-transfer between
+threads. Separation logic also has a proven history in verifying
+complex algorithms with dynamic patterns of ownership, and
+good tool-support for symbolic execution.
+Representing arrays and pending operations. To reason
+about examples such as the double-buffering algorithm, we
+2Below, we also give rules for thread manipulation using fork andjoin.must be able to precisely capture patterns of resource owner-
+ship and transfer. To do this, we extend separation logic with
+two new assertions, arrandpend .
+arrc(x; s; p; vs )denotes an array of sbytes, starting at
+address x. Parameter pis a permission giving the level
+of access the local thread holds over the array. The
+ﬁnal parameter records that the array holds values vs.
+Subscript crecords where the array is stored: either hfor
+host memory, or `for local scratchpad memory.
+pend(t;O)denotes a setOof pending asynchronous
+memory operations with associated tag t. Each element
+ofOis a tuple recording a particular operation. As well
+as recording the existence of a set of pending operations,
+a thread owning this predicate can access the associated
+resources after the operations complete.
+Using these predicates and the operator, we can represent
+complex states in resource-transferring algorithms.
+Permissions. Permissions are used in separation logic to
+support race-free sharing between threads [4]. They can be
+represented by fractions3in the interval (0;1]. A permission 1
+denotes that the thread has exclusive write access to the array,
+while a permission p2(0;1)records that it has non-exclusive
+read access. Soundness is ensured by the guarantee that the
+sum of all permissions is never more than 1. The permission 1
+can be split into read permissions, which may themselves be
+split further, and split permissions may be joined back together.
+Permissions in array predicates are split and joined according
+to the following rule:
+pq1)(arrc(x; s; q; vs ),
+arrc(x; s; p; vs )arrc(x; s; q p; vs))
+In addition to splitting and joining of permissions, we can also
+split and join array predicates with respect to length:
+xy <(x+s) =)0
+@arrc(x; s; p; vs )()9vs1; vs2: vs=vs1@vs2^
+arrc(x; y x; p; vs 1)arrc(y; x+s y; p; vs 2)1
+A
+(We use @to denote concatenation of array values.)
+Reasoning about get,put and wait .We reason about get
+andput by giving them speciﬁcations based on the arrand
+pend predicates. The speciﬁcation for getis as follows.
+arr`(x; s;1; xs)arrh(y; s; p; ys )pend(t;O)	
+get(x; y; s; t )pend (t;fhyh; x`; s; p; ysig[O )	
+Before calling get, the thread must have read access to the host
+array and write access to the local array. After getcompletes,
+the thread loses the permissions it held for both arrays – it
+cannot safely write to x, as it may be in an inconsistent state.
+Itcancontinue to safely read from y, as long as it holds an
+additional read permission.
+3In order to avoid reasoning about fractional arithmetic, in our tool we
+represent permissions by trees. See xIV-B for details.
+arr`(x; s; 1; xs)arr`(z; s; 1; zs)arrh(y; s;1
+2; ys)pend (t;;)	
+get(x; y; s; t );
+arr`(z; s; 1; zs)arrh(y; s;1
+4; ys)pend 
+t;fhyh; x`; s;1
+4; ysig	
+get(z; y; s; t );
+pend 
+t;fhyh; x`; s;1
+4; ysi;hyh; z`; s;1
+4; ysig	
+Fig. 3. An example proof outline illustrating splitting of permissions and
+framing.
+Intuitively, the arrays are held by the memory controller
+until the operation completes. The pend predicate is updated
+with a tuple recording the new operation (the source address,
+the target address, length, the permission on the source and the
+value of the source; the subscripts `andhindicate in which
+memory spaces the arrays are stored).
+The speciﬁcation for put is analogous to that for get:
+
+arr`(x; s; p; xs )arrh(y; s;1; ys)pend(t;O)	
+put(x; y; s; t )pend (t;fhx`; yh; s; p; xsig[O )	
+In Fig. 3 we illustrate how splitting of permissions and framing
+works when used with speciﬁcations of getandput. Suppose
+that we want to transfer sbytes from the host array yto local
+arrays xandz. To do this we need a write permission for
+arrays xandzand a read permission for array y(which can be
+any fraction greater than 0and less than or equal to 1). Assume
+that we start with the permission1
+2given to the array y. To
+issue the ﬁrst get transferring from ytoxwe can split the
+fraction1
+2into quarters and then frame with arr`(z; s;1; zs)
+andarrh(y; s;1
+4; ys)in order to apply the speciﬁcation. To
+apply the speciﬁcation for the second getwe frame with the
+predicate pend 
+t;fhyh; x`; s;1
+4; ysig
+.
+The wait function ensures that all memory operations as-
+sociated with a particular tag thave completed. All the arrays
+that were sources or targets of these pending operations can be
+safely accessed once the memory operations have completed.
+Consequently, the speciﬁcation of wait returns the arrays held
+by the memory controller to the thread.
+fpend(t;O)g
+wait (t)pend(t;;)
+hxc;yc0;s;p;vsi2O:arrc(x; s; p; vs )arrc0(y; s;1; vs)
+In the post-condition of wait , the set of pending operations for
+the tag tis empty, and for each pending operation recorded
+in the precondition, a pair of arrays has been returned to
+the thread. Note that for each pair of host and scratchpad
+arrays, the values in the arrays are identical, as the copying
+operation has completed. We use , the iterated separating
+conjunction,4to say that the thread holds a pair of arrays for
+each pending operation represented in the precondition.
+4That is,~i2fx;y;z:: g: P,P[x=i ]P[y=i ]P[z=i ]: : :Verifying the double-buffering algorithm. The dub buf
+function can be speciﬁed as follows, using predicates from
+our assertion language:
+arrh(ihead;ML; p; is )arrh(ohead ;ML;1;)
+pend(tag;;)pend(tag+ 1;;)
+dub buf(tag, ihead, ohead)arrh(ihead;ML; p; is )arrh(ohead ;ML;1;)
+pend(tag;;)pend(tag+ 1;;)
+(Here, and elsewhere, we use underscore, ‘ ’, to denote a fresh
+existentially-quantiﬁed variable that is used only once.)
+The pre- and post-conditions both assert that a pair of arrays
+exist at addresses ihead andohead , each of length ML. The
+sets of pending operations on tags tagandtag+ 1are empty.
+Theohead array must have a permission argument 1, meaning
+the algorithm must be able to write to this array. However, the
+ihead array can have an arbitrary permission p2(0;1]as its
+argument, meaning that the thread only requires the ability to
+read. The separating conjunction ‘ ’ is essential in assigning
+the right meaning to this speciﬁcation. Conjoining the array
+predicates withensures that they occupy disjoint portions
+of memory (meaning that the ohead array can be modiﬁed
+without affecting the ihead array).
+The assertions arrandpend can now be used to represent
+invariants of the double-buffering algorithm. Fig. 4 shows the
+invariants for the main loop of the double-buffering algorithm.
+These invariants correspond directly to the intuitive reading of
+the algorithm given by the diagrams in Fig. 2. Furthermore,
+these invariants can be generated automatically by our tool.
+The following assertion (the ﬁrst invariant in Fig. 4) corre-
+sponds to the ﬁrst diagram in Fig. 2:
+buf[cur]7!bcbuf[nxt]7!bn1
+arr`(bn;L;1;) 2
+arrh(in (iL);(i 1)L; p; is 1) 3
+arrh(in;(M i)L; p; is 2) 4
+pend(t^cur;fhinh L; bc
+`;L; p; is pig)pend(t^nxt;;)5
+arrh(out ((i 1)L);ML;1;) 6
+^(is1@isp@is2) =is 7
+Line 1 asserts that buf[cur]andbuf[nxt]point to addresses
+bcandbn. Variables curandnxtare used to choose between
+elements of an array of two buffers, where each buffer has
+sizeL. Line 2 denotes the unused buffer array at bn. Lines 3,
+4 and 6 denote the inandoutarrays. The inarray has a chunk
+of size Lmissing – this is held by the asynchronous copying
+operation and will be returned when the operation completes.
+Line 5 asserts that the t^curtag is being used to copy from the
+host inarray to the local array at bc, but that the t^nxttag is
+unused (it is associated with an empty set of operations). Line
+7 asserts that the concatenation of the two input arrays and
+the values in the pending copy results in the original contents
+of the input array.while ( i <M)f
+wait(tˆnxt );8
+>>>>>><
+>>>>>>:buf[cur]7!bcbuf[nxt]7!bnarr`(bn;L;1;)
+arrh(in (iL);(i 1)L; p; is 1)
+arrh(in;(M i)L; p; is 2)
+pend(t^cur;fhinh L; bc
+`;L; p; is pig)pend(t^nxt;;)
+arrh(out ((i 1)L);ML;1;)
+^(is1@isp@is2) =is9
+>>>>>>=
+>>>>>>;
+get(buf[nxt ], in , L, t ˆnxt );
+in += L;8
+>>>>>>>><
+>>>>>>>>:buf[cur]7!bcbuf[nxt]7!bn
+arrh(in ((i+1)L);(i 1)L; p; is 1)
+arrh(in;(M (i+1))L; p; is 2)
+pend(t^cur;fhinh 2L; bc
+`;L; p; is pig)
+pend(t^nxt;fhinh L; bn
+`;L; p; is0
+pig)
+arrh(out ((i 1)L);ML;1;)
+^(is1@isp@is0
+p@is2) =is9
+>>>>>>>>=
+>>>>>>>>;
+wait(tˆcur);8
+>>>>>><
+>>>>>>:buf[cur]7!bcbuf[nxt]7!bnarr`(bc;L;1;)
+arrh(in ((i+1)L);iL; p; is 1)
+arrh(in;(M (i+1))L; p; is 2)
+pend(t^cur;;)pend(t^nxt;fhinh L; bn
+`;L; p; is pig)
+arrh(out ((i 1)L);ML;1;)
+^(is1@isp@is2) =is9
+>>>>>>=
+>>>>>>;
+put(buf[cur ], out, L, t ˆcur);
+out += L;
+cur = curˆ1; nxt = nxtˆ1;
+i += 1;8
+>>>>>>>>>><
+>>>>>>>>>>:buf[cur]7!bcbuf[nxt]7!bn
+arrh(in (iL);(i 1)L; p; is 1)
+arrh(in;(M i)L; p; is 2)
+pend(t^nxt;fhbn
+`;outh L;L;1;ig)
+pend(t^cur;fhinh L; bc
+`;L; p; is pig)
+arrh((out ((i 1)L);(i 2)L;1; os)
+arrh(out;(M (i 1))L;1; os)
+^(is1@isp@is2) =is9
+>>>>>>>>>>=
+>>>>>>>>>>;
+g
+Fig. 4. Invariants in the main loop of the double-buffering algorithm.
+Reasoning about fork and join. Verifying master (Fig. 1)
+requires rules for fork andjoin.
+f(x):fPgfQg2 
+ `fP[e=x]gt=fork (f;e)fthr(t;f;e)g
+f(x):fPgfQg2 
+ `fthr(t;f;e)gv=join(t)fQ[e;v=x; ret]g
+The rules for fork andjoin essentially extend the P ARALLEL
+rule to handle threads dynamically.  is an environment
+associating functions with their speciﬁcations. Upon forking
+a new thread, the parent thread obtains the assertion thr
+that stores information about passed arguments for program
+variables and gives up ownership of the precondition of thefunction. Joining requires that the executing thread owns the
+thread handle which it then exchanges for the function’s post-
+condition.
+Soundness. We have deﬁned a formal semantics for multicore
+programs with asynchronous memory operations and used this
+to establish the soundness of our method. In particular, if it
+is possible to derive a proof for a multicore program using
+our system then the program is guaranteed to be free of data
+races and memory faults. For reasons of space, we defer a full
+formal presentation of this result to future work.
+IV. A UTOMATION
+We have built a prototype tool, asyncStar , automating our
+approach. asyncStar can check proofs written in our logic,
+and, if supplied with pre- and post-conditions, it can synthesise
+proofs automatically for many examples, including the double-
+buffering algorithm of Fig. 1.
+Approach. TheasyncStar tool uses symbolic execution com-
+bined with shape analysis for separation logic [2], [10]. States
+in a program are represented symbolically by disjunctions
+of separation logic assertions. Statements are then executed
+symbolically over these assertions – that is, assertions are
+updated to reﬂect the abstract effect of the statement. The
+analysis executes until it reaches a ﬁx-point where no new
+symbolic states can be reached.
+Symbolic execution alone does not converge in many cases.
+To ensure termination, symbolic states are abstracted at the
+heads of loops. In asyncStar , abstraction of separation logic
+assertions is based on syntactic summarisation of predicates.
+For example, a linked list of ﬁve nodes might be abstracted
+by a predicate representing a list of unknown length. This
+approach, however, is not ﬂexible enough to abstract away
+numeric constraints arising from loop iterations and array
+manipulation. To deal with such properties we have developed
+a novel technique that allows integration of standard abstract
+interpretation tools.
+A. Tool Architecture
+asyncStar is built on top of coreStar [5], a language-
+independent veriﬁcation tool for separation logic, consisting
+of a symbolic execution engine and a separation logic the-
+orem prover. As input, asyncStar takes a program written
+inVMC (Veriﬁed Multicore C), a fragment of C enriched
+with user-supplied pre- and post-conditions for functions, and
+(optionally) loop invariants. The input program is translated
+into the coreStar intermediate language coreStarIL .asyncStar
+invokes coreStar ’s core engine, which symbolically executes
+the generated coreStarIL program, indicates whether veriﬁca-
+tion succeeded, and returns any inferred invariants. The overall
+architecture of asyncStar is illustrated in Fig. 5.
+coreStar has a language-agnostic internal representation.
+Support for new languages and abstract domains can be added
+by providing logic rules and abstraction rules through text
+input ﬁles. Unlike most tools for shape analysis, coreStar does
+not just deal with heap data. Rather, its analysis allows auto-
+matic reasoning about abstract objects such as threads, pending
+Abstraction  Theorem prover  
+Symbolic execution  
+coreStar  
+Logic rules  
+Abstraction rules  
+VMC frontend  VMC program  Pre-/post -conditions  
+Loop invariants  coreStarIL  program  
+SMT solver  
+APRON  Fig. 5. Architecture of the asyncStar tool
+memory operations and so on. By building on coreStar , we
+were able to develop and test asyncStar rapidly, avoiding re-
+development of existing features.
+To implement our approach using coreStar , we developed a
+front-end which accommodates VMC programs and our logic
+for reasoning about asynchronous memory operations, and
+extended coreStar ’s abstraction engine. Developing the front-
+end involved three major efforts: translating VMC programs
+into coreStar ’s intermediate representation (time consuming
+but straightforward), developing a syntactic encoding of per-
+missions (seexIV-B) and writing logic rules for reasoning
+about arrays with permissions and pending asynchronous
+memory operations (technically involved and thus omitted in
+this paper). Extending coreStar ’s core engine required two
+major pieces of work: extending coreStar ’s symbolic execution
+with abstraction for ﬁrst-order domains such as arithmetic (see
+xIV-C), and adding support for external SMT solvers (see
+xIV-D).
+B. Reasoning Syntactically About Permissions
+Permissions are fundamental to our approach, allowing
+control over reading and writing for memory shared between
+threads and pending operations. In xIII, we represented permis-
+sions by fractions from the interval (0;1]and permission join-
+ing by addition. However, arithmetic reasoning is expensive in
+coreStar , requiring calls to an SMT solver (see xIV-D). Hence,
+in our implementation we actually use the binary tree share
+model [12]. Permission splitting and joining can be reasoned
+about syntactically using coreStar ’s rewrite engine, without
+recourse to arithmetic.
+In [12], permissions are represented by binary trees with
+boolean-valued leaves and unlabelled internal nodes. Maxi-
+mum permission (1 in the numerical model, corresponding to
+write permission) is represented by a single true-valued leaf.
+Splitting maximum permission results in a pair of two-leaf
+trees, representing read permissions. One tree has a true left
+and false right leaf, while the other is the other way round,and further splits result in larger trees. Minimum permission
+is represented by a single false-valued leaf.
+We have encoded these binary trees using coreStar ’s ex-
+pression language. For example, we might have the following
+expression representing a tree with three leaves:
+branch (leafT;branch (leafT;leafF))
+Note that branch ,leafT andleafF have no semantics in
+coreStar ; they are treated syntactically, as uninterpreted func-
+tions.
+C. Abstraction in Pure Domains
+InasyncStar , we extend coreStar ’s syntactic abstraction
+with support for abstraction over numerical properties. Our
+approach uses external tools to implement standard abstract
+interpretation [9], in which consecutive abstract assertions are
+joined (and if necessary, widened).
+Approach to abstraction in coreStar .IncoreStar , the sym-
+bolic execution is performed on the control-ﬂow graph of the
+input program. Each node in a program’s control-ﬂow graph
+is associated with a set of separation logic assertions. Each
+set represents an abstract state consisting of the disjunction of
+its elements. By symbolically executing an iteration of a loop,
+starting from the current abstract state, coreStar constructs a
+new set of candidate assertions. coreStar checks whether each
+candidate is contained within any of the existing assertions and
+if not, adds the candidate assertion to the set. Containment
+is deﬁned via separation logic entailment: an assertion cis
+contained within an assertion aifc`a.5
+Abstraction is applied to candidate assertions before check-
+ing for containment. Prior to asyncStar , the abstraction in
+coreStar was entirely based on syntactic rewriting of predi-
+cates. For example, suppose we had a predicate node(x; y)
+representing a node at address xwith next pointer y, and a
+predicate lseg(x; y)representing a linked list starting at yand
+ending with a pointer to y. We might write the following rules
+for abstraction:
+node(x; x0)node(x0;nil) lseg(x;nil)
+lseg(x; x0)node(x0;nil) lseg(x;nil)
+lseg(x; x0)lseg(x0;nil) lseg(x;nil)
+By applying these rules, the inﬁnite family of assertions
+representing lists of ﬁnite length will be collapsed into a single
+assertion. This approach works well for reasoning about heap
+resources, but often fails for concrete values in the ﬁrst-order,
+orpure, part of the assertion.
+For example, consider the following code fragment which
+sets all the elements of an array aof size nto0.
+int i = 0;
+while ( i <n)f
+(a+i) = 0;
+i++;
+g
+5Such queries are decided by the separation logic theorem prover.After the k-th iteration of the loop, symbolic execution will
+generate the candidate assertion
+kdef=9vs :i=k^arr(a;n;1; vs):
+The prior abstract state will consist of the set of assertions
+f1; : : : ; k 1g. The analysis will not terminate, because
+there exists no j < k such that k`j. Achieving
+convergence requires abstraction of numerical properties.
+Pure abstraction. InasyncStar , we handle such numerical
+abstraction by using abstract interpretation. As in abstract
+ﬁx-point calculation, the pure parts of the existing and the
+candidate assertion are joined and (optionally) employed to
+widen the existing pure assertion. The obtained abstraction is
+then used to replace the original pure parts of the assertions. In
+our example, joining the pure parts of jandk(forj < k )
+in the polygonal domain yields jik. After widening and
+intersecting with the upper bound we obtain jin. After
+replacing the original pure parts of jandkthe following
+entailment holds and thus the analysis converges:
+kin^arr(a;n;1; vs)`jin^arr(a;n;1; vs)
+Our approach applies to abstracting the pure part of sepa-
+ration logic assertions in anyabstract domain. The join and
+widening operators are assumed to be provided by an exter-
+nal tool for abstract interpretation. asyncStar has a modular
+interface allowing the calling of such tools during the ﬁxed
+point calculation. In our experiments, we used the APRON
+tool [22].
+D. SMT Utilisation
+coreStar ’s theorem prover was not designed to reason about
+pure domains such as arithmetic. It reasons purely syntac-
+tically, knowing nothing about the semantics of interpreted
+symbols such as +, and thus cannot establish even simple
+facts like (a+b) = (b+a). For arithmetic reasoning, and to
+reason about arrays, we call an external SMT solver following
+the approach proposed in [7]. Calling the SMT solver is
+expensive, as we transfer the entire proof-state to the solver
+using the SMT-LIB2 format [1]. We only call the solver in
+three scenarios: (1) when only pure assertions remain to be
+proved, in which case they are sent to the solver; (2) when
+proof search is stuck, in which case the solver is invoked to
+establish new equalities between terms; (3) when we wish to
+check whether proof rules with pure guards apply. Queries are
+memoised to further reduce the expense of solver calls.
+V. E XPERIMENTS
+We evaluated asyncStar using a set of benchmarks drawn
+from the Cell Broadband Engine SDK, which represent pro-
+totypical patterns used in Cell programs. We also considered
+a selection of hand-crafted programs. The Cell benchmarks
+comprise Euler integration-based particle simulation ( particle-
+sim), array processing algorithms using single, double and
+triple buffering with shared buffers for input and output as in
+the example ofxII (1-/2-/3-buffer ) and with separate buffers
+(1-/2-/3-buffer-IO ). All benchmarks consist of a master threadrunning on the host that divides array processing among slave
+threads running on accelerator cores.
+The hand-crafted benchmarks do notexhibit asynchronous
+memory operations and are instead designed to assess the
+effectiveness of our abstraction framework in isolation. Bench-
+marks with preﬁx ‘array’ perform an operation on elements of
+an input array. We consider left-to-right (‘countup’) and right-
+to-left (‘countdown’) processing of the array, and where ele-
+ments to be processed are contiguous (sufﬁx ‘1’), or separated
+bynbytes (sufﬁx ‘n’). Benchmarks with preﬁx ‘control-ﬂow’
+exhibit the same control-ﬂow as the buffering benchmarks but
+do not contain transfers or processing.
+Figure 6 shows experimental results obtained on a per-
+sonal laptop with 2.8GHz Intel Core2 Duo CPU and 4GB
+RAM under the Windows 7 operating system. We used the
+SMT solver Z3 and the polygonal abstract domain from the
+APRON numerical abstract library. For each benchmark, we
+give the number of symbolic states, the total execution time
+(in seconds), and the percentage of execution time spent on
+computations by the abstract domain library (%AI) and the
+SMT solver (%SMT). For Cell benchmarks we also apply
+asyncStar to buggy versions obtained by removing a wait
+operation. asyncStar fails to ﬁnd a proof for these examples
+and prints details of the failed proof attempt, from which the
+bug can be recovered.
+For all benchmarks the user is only required to specify
+function pre- and post-conditions; loop invariants and interme-
+diate assertions are synthesised automatically. If the analysis
+succeeds, it proves memory-safety and race-freedom. In the
+failing case, the user can examine the proof state and look for
+information exposing the source of the problem.
+The results demonstrate that our technique can prove or
+refute our benchmark set within reasonable time bounds. We
+observe that spatial reasoning is not a bottleneck per se
+(nor is numerical abstraction), but the arithmetical constraints
+(arising from proof rules guards and arithmetic in the code)
+discharged to the SMT solver are. We anticipate that in future
+the expense of SMT utilisation can be signiﬁcantly reduced by
+optimisations in our implementation, such as better caching of
+queries.
+VI. R ELATED WORK
+In prior work, we presented a preliminary outline of our
+veriﬁcation technique [6].
+asyncStar is built on coreStar [5], which inherits its ap-
+proach from jStar [11] and a series of prior tools: syntactic
+reasoning in separation logic was pioneered in SmallFoot [2];
+coreStar ’s generation of loop invariants uses on shape anal-
+ysis based on separation logic [10]. Our approach to pure
+abstraction is similar to that of [25]. These prior tools achieved
+performance by hard-coding their domain into the tool. In
+contrast, coreStar ’s core is designed as a modular back-
+end, intended for use in experiments with veriﬁcation. This
+approach is validated by our success in quickly building a
+prototype on top of coreStar .BenchmarkCorrect
+Symbolic Total%AI %SMTstates time
+particle-sim 564 331 <1 98
+1-buffer 67 13 <1 89
+1-buffer-IO 80 31 <1 94
+2-buffer 259 1268 <1 >99
+2-buffer-IO 286 1871 <1 >99
+3-buffer 412 7681 <1 >99
+3-buffer-IO 443 8416 <1 >99
+BenchmarkBuggy
+Symbolic Total%AI %SMTstates time
+particle-sim 58 27 2 97
+1-buffer 32 7<1 92
+1-buffer-IO 36 16 <1 96
+2-buffer 82 318 <1 >99
+2-buffer-IO 88 389 <1 >99
+3-buffer 113 618 <1 >99
+3-buffer-IO 121 663 <1 >99
+BenchmarkCorrect
+Symbolic Total%AI %SMTstates time
+array-countup-1 23 0.42 3 28
+array-countup-n 27 0.49 1 34
+array-countdown-1 31 1.08 3 53
+array-countdown-n 34 1.17 2 56
+control-ﬂow-sb 21 0.44 3 11
+control-ﬂow-db 58 1.56 4 14
+control-ﬂow-tb 138 6.85 18 21
+Fig. 6. Experimental results obtained using asyncStar to analyse correct and
+buggy benchmarks
+An approach to checking DMA races for Cell BE using
+bounded model checking (BMC) and k-induction has been
+proposed in [14], [15] and implemented as the S CRATCH
+tool [16]. The technique has been extended with abstract in-
+terpretation to automatically infer loop invariants [13]. Unlike
+our method, this technique can only be applied to sequential
+software: safety of DMA races is checked with respect to one
+thread. Extending BMC to concurrent programs would not
+scale well as it would involve thread interleaving at a global
+scope. In contrast, our technique veriﬁes threads in a modular
+fashion and can be used to prove safety in the presence of
+dynamic thread creation.
+General-purpose techniques for race detection ( e.g. [17],
+[24], [27]) could be adapted to handle asynchronous memory
+operations, and runtime monitoring [20] and system simula-
+tion [23] have been applied directly in this setting. However,
+none of these techniques can prove absence of races, which is
+the contribution of our work.
+In [19], session types are used for synthesis of low-level
+data-movement code, allowing the generation asynchronous
+memory operations that are race-free by construction. We view
+this approach as complimentary to our approach.VII. C ONCLUSIONS AND FUTURE WORK
+We have presented a novel method and tool for verifying the
+memory safety of multicore programs that use asynchronous
+memory operations. Our approach allows full veriﬁcation
+of industrial benchmarks from the IBM Cell SDK, which
+is beyond the reach of current techniques based on model
+checking.
+We plan to extend asyncStar to take into account alignment
+restrictions associated with data transfers. In the Cell BE
+architecture, DMA operations must operate on 16-byte aligned
+pointers, otherwise behaviour is undeﬁned. Misalignment can
+lead to subtle errors, which are an ideal candidate for veriﬁ-
+cation. We also plan to evaluate our technique on benchmarks
+from other domains where asynchronous memory operations
+are important.
+We are exploring the use of abduction [8] to reduce the
+need to annotate functions with speciﬁcations. Our analysis
+uses frame inference to divide resources into operation pre-
+conditions and frames unaffected by the operation. Abduction
+generates antiframes , consisting of the minimal extra resource
+needed for the operation to execute without error. Antiframes
+can be pushed to the start of a function, automatically gen-
+erating function preconditions. Our preliminary experiments
+using this technique can discover a full speciﬁcation for the
+single-buffer benchmark.
+ACKNOWLEDGEMENTS
+This work was supported by the EPSRC, RAEng and the
+Gates trust. We are grateful to George Russell, John Wickerson
+and the anonymous reviewers for their insightful comments on
+an earlier draft of this work.
+REFERENCES
+[1] C. Barrett, A. Stump, and C. Tinelli. The SMT-LIB standard: Version
+2.0. Technical report, 2010.
+[2] J. Berdine, C. Calcagno, and P. W. O’Hearn. Smallfoot: Modular
+automatic assertion checking with separation logic. In FMCO , 2005.
+[3] J. Berdine, C. Calcagno, and P. W. O’Hearn. Symbolic execution with
+separation logic. In APLAS , 2005.
+[4] R. Bornat, C. Calcagno, P. W. O’Hearn, and M. J. Parkinson. Permission
+accounting in separation logic. In POPL , 2005.[5] M. Botin ˇcan, D. Distefano, M. Dodds, R. Griore, Naud ˇzi¯unien ˙e, and
+M. Parkinson. coreStar : The core of jstar . In Boogie: First Interna-
+tional Workshop on Intermediate Veriﬁcation Languages , 2011.
+[6] M. Botin ˇcan, M. Dodds, A. F. Donaldson, and M. J. Parkinson. Auto-
+matic safety proofs for asynchronous memory operations. In PPOPP ,
+pages 313–314. ACM, 2011.
+[7] M. Botin ˇcan, M. J. Parkinson, and W. Schulte. Separation logic
+veriﬁcation of C programs with an SMT solver. ENTCS , 254, 2009.
+[8] C. Calcagno, D. Distefano, P. W. O’Hearn, and H. Yang. Compositional
+shape analysis by means of bi-abduction. In POPL , 2009.
+[9] P. Cousot and R. Cousot. Abstract interpretation: a uniﬁed lattice model
+for static analysis of programs by construction or approximation of
+ﬁxpoints. In POPL , 1977.
+[10] D. Distefano, P. W. O’Hearn, and H. Yang. A local shape analysis based
+on separation logic. In TACAS , 2006.
+[11] D. Distefano and M. J. Parkinson. jStar: Towards practical veriﬁcation
+for Java. In OOPSLA , 2008.
+[12] R. Dockins, A. Hobor, and A. W. Appel. A fresh look at separation
+algebras and share accounting. In APLAS , 2009.
+[13] A. F. Donaldson, L. Haller, and D. Kroening. Strengthening induction-
+based race checking with lightweight static analysis. In VMCAI , 2011.
+[14] A. F. Donaldson, D. Kroening, and P. R ¨ummer. Automatic analysis of
+scratch-pad memory code for heterogeneous multicore processors. In
+TACAS , 2010.
+[15] A. F. Donaldson, D. Kroening, and P. R ¨ummer. Automatic analysis of
+DMA races using model checking and -induction. Formal Methods in
+System Design , 39(1):83–113, 2011.
+[16] A. F. Donaldson, D. Kroening, and P. R ¨ummer. Scratch: a tool for
+automatic analysis of dma races. In PPOPP , pages 311–312. ACM,
+2011.
+[17] D. Engler and K. Ashcraft. RacerX: Effective, static detection of race
+conditions and deadlocks. In SOSP , 2003.
+[18] J. Erickson, M. Musuvathi, S. Burckhardt, and K. Olynyk. Effective
+data-race detection for the kernel. In OSDI , 2010.
+[19] K. Honda, V . T. Vasconcelos, and N. Yoshida. Type-directed compilation
+for multicore programming. ENTCS , 241, 2009.
+[20] IBM. Example Library API Reference, version 3.1 , July 2008.
+[21] IBM. Cell BE resource center, 2009.
+http://ibm.com/developerworks/power/cell .
+[22] B. Jeannet and A. Min ´e. Apron: A library of numerical abstract domains
+for static analysis. In CAV, 2009.
+[23] M. Kistler and D. Brokenshire. Detecting race conditions in asyn-
+chronous DMA operations with full system simulation. In ISPASS . IEEE,
+2011.
+[24] M. Naik, A. Aiken, and J. Whaley. Effective static race detection for
+Java. In PLDI . ACM, 2006.
+[25] S. Qin, G. He, C. Luo, and W.-N. Chin. Loop invariant synthesis in a
+combined domain. In ICFEM , 2010.
+[26] J. C. Reynolds. Separation logic: A logic for shared mutable data
+structures. In LICS , 2002.
+[27] S. Savage, M. Burrows, G. Nelson, P. Sobalvarro, and T. Anderson.
+Eraser: A dynamic data race detector for multithreaded programs.
+ACMTOCS , 15(4), 1997.

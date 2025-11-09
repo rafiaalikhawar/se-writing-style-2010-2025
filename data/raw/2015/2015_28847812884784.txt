@@ -1,0 +1,1158 @@
+DOUBLE TAKE : Fast and Precise Error Detection via
+Evidence-Based Dynamic Analysis
+T ongping Liu∗
+Dept. of Computer Science
+University of T exas
+at San Antonio
+San Antonio, TX 78249
+T ongping.Liu@utsa.eduCharlie Curtsinger∗
+Dept. of Computer Science
+Grinnell College
+1116 8th Ave.
+Grinnell, IA 50112
+curtsinger@grinnell.eduEmery D. Berger
+College of Information and
+Computer Sciences
+University of Massachusetts
+Amherst
+Amherst, MA 01003
+emery@cs.umass.edu
+ABSTRACT
+Programs written in unsafe languages like C and C++ often suffer
+from errors like buffer overﬂows, dangling pointers, and memoryleaks. Dynamic analysis tools like V algrind can detect these er-
+rors, but their overhead—primarily due to the cost of instrumenting
+every memory read and write—makes them too heavyweight foruse in deployed applications and makes testing with them painfullyslow. The result is that much deployed software remains suscepti-
+ble to these bugs, which are notoriously difﬁcult to track down.
+This paper presents evidence-based dynamic analysis , an ap-
+proach that enables these analyses while imposing minimal over-
+head (under 5%), making it practical for the ﬁrst time to performthese analyses in deployed settings. The key insight of evidence-
+based dynamic analysis is that for a class of errors, it is possible to
+ensure that evidence that they happened at some point in the pastremains for later detection. Evidence-based dynamic analysis al-lows execution to proceed at nearly full speed until the end of an
+epoch (e.g., a heavyweight system call). It then examines program
+state to check for evidence that an error occurred at some time dur-ing that epoch. If so, it rolls back execution and re-executes thecode with instrumentation activated to pinpoint the error.
+We present D
+OUBLE TAKE , a prototype evidence-based dynamic
+analysis framework. D OUBLE TAKE is practical and easy to de-
+ploy, requiring neither custom hardware, compiler, nor operatingsystem support. We demonstrate D
+OUBLE TAKE ’s generality and
+efﬁciency by building dynamic analyses that ﬁnd buffer overﬂows,
+memory use-after-free errors, and memory leaks. Our evaluation
+shows that D OUBLE TAKE is efﬁcient, imposing under 5% over-
+head on average, making it the fastest such system to date. It isalso precise: D
+OUBLE TAKE pinpoints the location of these errors
+to the exact line and memory addresses where they occur, providing
+valuable debugging information to programmers.
+*This work was initiated and partially conducted while Liu and Curtsinger
+were PhD students at the University of Massachusetts Amherst.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than theauthor(s) must be honored. Abstracting with credit is permitted. To copy otherwise, orrepublish, to post on servers or to redistribute to lists, requires prior speciﬁc permissionand/or a fee. Request permissions from permissions@acm.org.
+ICSE ’16, May 14 - 22, 2016, Austin, TX, USA
+© 2016 Copyright held by the owner/author(s). Publication rights licensed to ACM.ISBN 978-1-4503-3900-1/16/05. . . $15.00
+DOI:
+http://dx.doi.org/10.1145/2884781.2884784Categories and Subject Descriptors
+D.2.5 [Software Engineering]: Testing and Debugging–Debugging
+Aids, Monitors, Tracing; D.2.4 [Software Engineering]: Soft-ware/Program V eriﬁcation–Reliability
+Keywords
+Dynamic Analysis, Software Quality, Testing, Debugging, LeakDetection, Buffer Overﬂow Detection, Use-After-Free Detection
+1. INTRODUCTION
+Dynamic analysis tools are widely used to ﬁnd bugs in appli-
+cations. They are popular among programmers because of their
+precision—for many analyses, they report no false positives—and
+can pinpoint the exact location of errors, down to the individualline of code. Perhaps the most prominent and widely used dynamicanalysis tool for C/C++ binaries is V algrind [28]. V algrind’s mostpopular use case, via its default tool, MemCheck, can ﬁnd a wide
+range of memory errors, including buffer overﬂows, use-after-free
+errors, and memory leaks.
+Unfortunately, these dynamic analysis tools often impose sig-
+niﬁcant performance overhead that precludes their use outside of
+testing scenarios. An extreme example is the widely-used tool V al-
+grind. Across the SPEC CPU2006 benchmark suite, V algrind de-grades performance by almost 17× on average (geometric mean);
+its overhead ranges from 4.5× and 42.8×, making it often too slow
+to use even for testing (see Table 5).
+While faster dynamic analysis frameworks exist for ﬁnding par-
+ticular errors (leveraging compiler support to reduce overhead),they sacriﬁce precision while continuing to impose substantial over-head that would impede their use in deployed settings. The current
+state-of-the-art, Google’s AddressSanitizer, detects buffer overﬂows
+and use-after-free errors, but slows applications by around 30% [38].AddressSanitizer also identiﬁes memory leaks but only at the endof program execution, which is not necessarily useful for servers orother long-lived applications.
+Because of their overhead, this class of dynamic analysis tools
+can generally only be used during testing. However, they are lim-ited by deﬁnition to the executions that are tested prior to deploy-ment. Even exhaustive testing regimes will inevitably fail to un-
+cover these errors, which are notoriously difﬁcult to debug.
+This paper presents an approach called evidence-based dynamic
+analysis that is based on the following key insight: it is often possi-
+ble to discover evidence that an error occurred or plant markers that
+ensure that such evidence exists. By combining evidence place-
+ment with checkpointing and infrequent checking, we can run app-
+2016 IEEE/ACM 38th IEEE International Conference on Software Engineering
+   911
+plications at nearly full speed in the common case (no errors). If
+we ﬁnd an error, we can use the checkpoint to roll back and re-
+execute the program with instrumentation activated to pinpoint the
+exact cause of the error.
+Certain errors, including the ones we describe here, naturally ex-
+hibit a monotonicity property: when an error occurs, evidence that
+it happened tends to remain or even grow so that it can be discov-
+ered at a later point during execution. When this evidence is not
+naturally occurring or not naturally monotonic, it can be forced toexhibit this property by planting what we call tripwires to ensure
+later detection. A canonical example of such a tripwire is a ran-
+dom canary value placed in unallocated space between heap ob-
+jects [11]. A corrupted canary is incontrovertible evidence that a
+buffer overﬂow occurred at some time in the past.
+This paper presents a prototype evidence-based dynamic analy-
+sis framework called D
+OUBLE TAKE that locates such errors with
+extremely low overhead and no false positives. D OUBLE TAKE
+checkpoints program state and performs most of its error analysesonly at epoch boundaries (what we call irrevocable system calls) orwhen segfaults occur; these occur relatively infrequently, amortiz-
+ing D
+OUBLE TAKE ’s overhead.
+If D OUBLE TAKE ﬁnds evidence of an error at an epoch bound-
+ary or after a segmentation violation, it re-executes the application
+from the most recent checkpoint. During re-execution, D OUBLE -
+TAKE enables instrumentation to let it precisely locate the source
+of the error. For example, for buffer overﬂows, D OUBLE TAKE sets
+hardware watchpoints on the tripwire memory locations that werefound to be corrupted. During re-execution, D
+OUBLE TAKE pin-
+points exactly the point where the buffer overﬂow occurred.
+We have implemented D OUBLE TAKE as a drop-in library that
+can be linked directly with the application, without the need tomodify code or even recompile the program. D
+OUBLE TAKE works
+without the need for custom hardware, compiler, or OS support.
+Using D OUBLE TAKE as a framework, we have built three dif-
+ferent analyses that attack three of the most salient problems forunsafe code: a buffer overﬂow detector (as described above), ause-after-free detector, and a memory leak detector. These anal-yses can all run concurrently. By virtue of being evidence-based,
+they have a zero false positive rate, precisely pinpoint the error lo-
+cation, and operate with extremely low overhead: for example, with
+D
+OUBLE TAKE , buffer overﬂow analysis alone operates with virtu-
+ally no overhead. When all three of these analyses are enabled,
+DOUBLE TAKE ’s average overhead is under 5%.
+For all of the analyses we have implemented, D OUBLE TAKE is
+the fastest detector of these errors to date, providing compellingevidence for the promise of evidence-based dynamic analyses. Itsoverhead is already low enough to dramatically speed testing and
+often low enough to enable the use of these formerly-prohibitive
+analyses in deployed settings. This work thus promises to signiﬁ-cantly extend the reach of dynamic analyses.
+Contributions
+The contributions of this paper are the following:
+1. It introduces evidence-based dynamic analysis, a new anal-
+ysis technique that combines checkpointing with evidence
+gathering and instrumented replay to enable precise error de-
+tection with extremely low overhead.
+2. It presents D OUBLE TAKE , a prototype framework that im-
+plements evidence-based dynamic analyses for C/C++ pro-grams: each of the analyses we have built using D
+OUBLE -
+TAKE – detecting buffer overﬂows, use-after-frees, and mem-
+ory leaks – are the fastest reported to date.
+
+
+	
+
+ 
+
+ 	
+
+
+
+
+
+Figure 1: Overview of D OUBLE TAKE in action: execution is
+divided into epochs at the boundary of irrevocable system calls.Each epoch begins by taking a snapshot of program state. Exe-cution runs at nearly full-speed during epochs. Evidence-based
+analysis takes place once an epoch ends, replaying execution
+from the previous snapshot until it pinpoints the exact locationwhere the error is introduced. Relatively-long epochs amortizethe cost of snapshots and analysis, keeping overhead low.
+Outline
+This paper ﬁrst provides an overview of the basic operation of
+DOUBLE TAKE in Section 2. Section 3 details the dynamic anal-
+yses we have built using D OUBLE TAKE . Section 4 describes key
+implementation details. Section 5 evaluates D OUBLE TAKE ’s effec-
+tiveness, performance, and memory overhead, and compares theseto the state of the art. Section 6 describes how users can add new
+analyses to D
+OUBLE TAKE , and discusses limitations of evidence-
+based analysis and the detectors implemented to date. Section 7
+describes key related work and Section 8 concludes.
+2. OVERVIEW
+DOUBLE TAKE is an efﬁcient dynamic analysis framework for a
+class of errors that exhibit or can be forced to exhibit a monotonic-
+ityproperty: evidence of the error is persistent and can be gathered
+after-the-fact. With D OUBLE TAKE , program execution is divided
+into epochs, during which execution proceeds at full speed (Fig-ure 1). At the beginning of an epoch, D
+OUBLE TAKE checkpoints
+program state. Epochs end only when the application issues an irre-
+vocable system call (e.g., a socket read); most system calls are not
+irrevocable (see Section 4.3 for full details). Once an epoch ends,
+DOUBLE TAKE checks the program state for evidence of memory
+errors. Because epochs are relatively long-lived, the cost of check-pointing and error analysis is amortized over program execution.If D
+OUBLE TAKE ﬁnds an error, it re-executes code executed from
+the previous epoch with additional instrumentation to pinpoint theexact cause of the error.
+To demonstrate D
+OUBLE TAKE ’s effectiveness, we have imple-
+mented detection tools for three of the most important classes oferrors in C and C++ code: heap buffer overﬂows, use-after-free er-rors, and memory leaks (Section 3 describes these in detail). All
+detection tools share the following core infrastructure that D
+OU-
+BLE TAKE provides.
+2.1 Efﬁcient Recording
+At the beginning of every epoch, D OUBLE TAKE saves a snap-
+shot of program registers and all writable memory. An epoch ends
+when the program attempts to issue an irrevocable system call, butmost system calls do not end the current epoch. D
+OUBLE TAKE
+also records a small amount of system state at the beginning of
+each epoch (e.g., ﬁle offsets), which lets it unroll the effect of sys-
+912tem calls that modify this state when re-execution is required.
+During execution, D OUBLE TAKE manages various types of sys-
+tem calls in an effort to reduce the number of epochs, which Sec-
+tion 4.3 discusses. In practice, D OUBLE TAKE limits the number of
+epoch boundaries, amortizing the cost of program state checks. Thekind of checks employed depend on the particular dynamic analy-sis being performed; Section 3 describes the details of the analyses
+we have built on top of D
+OUBLE TAKE .
+2.2 Lightweight Replay
+When program state checks indicate that an error occurred dur-
+ing the current epoch, D OUBLE TAKE replays execution from the
+last checkpoint to pinpoint the error’s root cause. D OUBLE TAKE
+ensures that all program-visible state, including system call results
+and memory allocations and deallocations, is identical to the orig-
+inal run. During replay, D OUBLE TAKE returns cached return val-
+ues for most system calls, with special handling for some cases.
+Section 4 describes in detail how D OUBLE TAKE records and re-
+executes system calls.
+2.3 Deterministic Memory Management and
+Tripwire Support
+To be able to ﬁnd the exact location of errors, D OUBLE TAKE
+requires that the replayed sequence of memory addresses gener-ated by the underlying heap allocator be identical to the recorded
+sequence. That is, the allocator must be deterministic: given the
+same sequence of malloc andfree requests, it must provide the
+same addresses for allocated objects. D
+OUBLE TAKE relies on this
+determinism to be able to place instrumentation at the locations of
+compromised tripwires.
+Unfortunately, current system-supplied memory allocators are
+non-deterministic: they are not guaranteed to provide the samesequence of object addresses. These allocators grow the heap ondemand by invoking mmap (or a similar call on other operating
+systems) to obtain memory from the system. However, becauseof address-space layout randomization—now implemented on allmodern operating systems to increase security— mmap almost al-
+ways returns different addresses when invoked. This effect meansthat heap addresses in a replayed execution would likely differ from
+the original.
+D
+OUBLE TAKE therefore replaces the default heap allocator with
+a custom deterministic heap built with the H EAP LAYERS frame-
+work [4]. In addition to providing repeatable sequences of ad-dresses, D
+OUBLE TAKE ’s heap provides a number of other use-
+ful features that improve D OUBLE TAKE ’s efﬁciency and simplify
+building analyses using it:
+•Efﬁciency via large chunk allocation. The D OUBLE TAKE
+heap obtains memory from the operating system in large chunks
+and satisﬁes all memory allocations from them, reducing thenumber of system calls that D
+OUBLE TAKE must track and
+thus lowering its overhead.
+•Simpliﬁed tripwire installation. DOUBLE TAKE ’s heap also
+makes the process of implanting tripwires easier. For exam-ple, detection tools can easily interpose on heap operations toalter memory allocation requests or defer the reuse of freedmemory, and can mark the status of each object in metadata
+(e.g., via a dedicated object header that the heap provides for
+this purpose).
+•Efﬁcient tripwire checking. Finally, D
+OUBLE TAKE ’s heap
+makes tripwire checking far more efﬁcient. It maintains a
+shadow bitmap to identify the locations and status of heap
+	 	
+ 	
+	
+	
+ 	
+	
+	
+ 	 	
+Figure 2: Heap organization used to provide evidence of buffer
+overﬂow errors. Object headers and unrequested space withinallocated objects are ﬁlled with canaries; a corrupted canary
+indicates an overﬂow occurred.
+canaries, which allows it to use vectorized bit operations toperform efﬁcient checking at the end of each epoch.
+Section 4.3 presents full details of D
+OUBLE TAKE ’s heap imple-
+mentation.
+2.4 Pinpointing Error Locations
+During replay, D OUBLE TAKE lets detection tools set hardware
+watchpoints during re-execution to pinpoint error locations (i.e.,
+on an overwritten canary). Modern architectures make availablea small number of watchpoints (four on x86). Each watchpoint
+can be conﬁgured to pause program execution when a speciﬁc byteor word of memory is accessed. While watchpoints are primarilyused by debuggers, D
+OUBLE TAKE uses them to speed error loca-
+tion during re-execution.
+DOUBLE TAKE ’s watchpoints are particularly useful in combina-
+tion with heap canaries. For example, during re-execution, D OU-
+BLE TAKE ’s buffer overﬂow and use-after-free detectors place a watch-
+point at the location of the overwritten canary to trap the instruc-
+tion(s) responsible for the error.
+3. ANALYSES
+To demonstrate D OUBLE TAKE ’s generality and efﬁciency, we
+implement a range of error-detection tools as evidence-based dy-
+namic analyses. In particular, we implement the following threedetection tools with D
+OUBLE TAKE :
+•Heap buffer overﬂow detection (§3.1): when an application
+writes outside the bounds of an allocated object,
+•Use-after-free detection (§3.2): when an application writes
+to freed memory (i.e., through a dangling pointer ), and
+•Memory leak detection (§3.3): when a heap object becomes
+inaccessible but has not been explicitly freed.
+For each of these tools, we describe the evidence that D OU-
+BLE TAKE observes or places to detect these errors, and how re-
+execution and error isolation proceeds once an error is detected.Note that because these analyses are orthogonal, they can all beused simultaneously.
+3.1 Heap Buffer Overﬂow Detection
+Heap buffer overﬂows occur when programs write outside the
+bounds of an allocated object. D OUBLE TAKE reports an error when
+it discovers that a canary value has been overwritten. When it ﬁndsan overwritten canary, the detector places watchpoints during re-
+execution to identify the instruction responsible for the overﬂow.
+Evidence-Based Error Detection
+Figure 2 presents an overview of the approach used to locate buffer
+overﬂows. Our buffer overﬂow detector places canaries between
+913
+	
+ 	
+
+
+ 
+	
+	
+
+Figure 3: Evidence-based detection of dangling pointer (use-
+after-free) errors. Freed objects are deferred in a quarantinein FIFO order and ﬁlled with canaries. A corrupted canaryindicates that a write was performed after an object was freed.
+heap objects so that an overﬂow from one object into an adjacent
+one can be detected.
+In addition, the overﬂow detector ﬁlls any remaining empty space
+inside allocated objects with canaries; D
+OUBLE TAKE ’s allocator
+rounds all object size requests up to the nearest power of two. Thisapproach lets D
+OUBLE TAKE identify small overﬂows that would
+otherwise be missed because they did not actually go beyond theobject’s allocated space; these overﬂows are typically missed by
+existing tools.
+At memory deallocation time (calls to free ordelete), D
+OU-
+BLE TAKE checks for buffer overﬂows in objects whose requested
+size is less than a power of two. It defers the checking of power-of-two sized objects to the end of the current epoch.
+At the end of each epoch, D
+OUBLE TAKE checks whether any
+canaries have been overwritten (including those for exact power-
+of-two requests). If it ﬁnds any overwritten canaries, it has incon-trovertible evidence that a buffer overﬂow has occurred. D
+OUBLE -
+TAKE then triggers a re-execution to locate the exact point in the
+program when the overﬂow happened.
+Re-Execution and Error Isolation
+DOUBLE TAKE installs a watchpoint at the address of the corrupted
+canary before re-execution. When the program is re-executed, anyinstruction that writes to this address will trigger the watchpoint.The operating system will deliver a SIGTRAP signal to D
+OUBLE -
+TAKE before the instruction is executed. By handling this signal,
+DOUBLE TAKE reports the complete call stack of the trapped in-
+struction by invoking the backtrace function.
+3.2 Use-After-Free Detection
+Use-after-free or dangling pointer overﬂow errors occur when
+an application continues to access memory through pointers thathave been passed to free ordelete. Writes to freed memory can
+overwrite the contents of other live objects, leading to unexpectedprogram behavior. Like the buffer overﬂow detector, our use-after-
+free detector uses canaries to detect writes to freed memory. When
+a use-after-free error is detected, D
+OUBLE TAKE reports the alloca-
+tion and deallocation sites of the object, and all instruction(s) thatwrote to the object after it was freed.
+Evidence-Based Error Detection
+Figure 3 illustrates how we detect use-after-free errors using D OU-
+BLE TAKE . Our use-after-free detector delays the re-allocation of
+freed memory. We adopt the approach used by AddressSanitizerof maintaining a FIFO quarantine list [38]. In our implementation,objects are released from the quarantine list when the total size ofquarantined objects exceeds 16 megabytes, or when there are morethan 1,024 quarantined objects. (Note that all thresholds used by
+the detector are easily conﬁgurable.)The detector overwrites the ﬁrst 128 bytes of all objects in the
+quarantine list (which have all been freed by the program) with ca-
+nary values. This threshold strikes a compromise between error de-
+tection and efﬁciency. We have found empirically that ﬁlling largerobjects with canaries (i.e., going beyond 128 bytes to the full sizeof allocated objects) introduces substantial overhead during normal
+execution, but is unlikely to catch any additional errors. This is be-cause large objects often consist of a header followed by a buffer.
+A prematurely reused object is likely to have its prologue scram-
+bled by a constructor, while the remainder of the object (the buffercontents) may remain unmodiﬁed for a long time.
+Before an object can be returned to the program heap, D
+OUBLE -
+TAKE veriﬁes that no canaries have been overwritten. It also checks
+all canaries in the entire heap at epoch boundaries. In either case, ifa canary has been overwritten, the detector knows that a use-after-free error has occurred. It then immediately triggers re-executionto identify the cause of this error.
+Re-Execution and Error Isolation
+During re-execution, the use-after-free detector interposes on malloc
+andfree calls to ﬁnd the allocation and deallocation sites of the
+overwritten object. The detector records a call stack for both sitesusing the backtrace function. The detector also installs a watch-
+point at the address of the overwritten canary. As with buffer over-
+ﬂow detection, any writes to the watched address will generate a
+SIGTRAP signal. When this signal is triggered, the detector reports
+information about the object’s allocation and deallocation sites, aswell as call stack and line number information for the instructions
+responsible for the use-after-free error.
+3.3 Memory Leak Detection
+Heap memory is leaked when it becomes inaccessible without
+being freed. Memory leaks can signiﬁcantly degrade program per-
+formance due to an increased memory footprint. Our leak detec-
+tor identiﬁes possible unreachable allocated objects at the end of
+each epoch. Allocation sites can help users ﬁx memory leaks, butcollecting this information for allmalloc calls in normal execution
+would unnecessarily slow down the program for the common case
+(no memory leaks). Instead, D
+OUBLE TAKE only records the al-
+location sites of leaked memory during re-execution, and adds no
+overhead for normal execution.
+Evidence-Based Error Detection
+Unlike the previously-described detectors, memory leak detectiondoes not need tripwires. Instead, the evidence of a memory leak is
+latent in the heap organization itself.
+Our detector ﬁnds memory leaks using the same marking ap-
+proach as conservative garbage collection [42]. The marking phase
+performs a breadth-ﬁrst scan of reachable memory using a workqueue. Initially, all values in registers, globals, and the stack that
+look like pointers are added to the work queue. Any eight-byte
+aligned value that falls within the range of allocated heap memoryis treated as a pointer.
+At each step in the scan, the detector takes the ﬁrst item off the
+work queue. Using the heap metadata located before each object,the detector ﬁnds the bounds of each object. Each object has aheader containing a marked bit and an allocated bit. If the marked
+bit is set, this object has already been visited. The detector thenremoves this object and moves on to the next item in the queue.
+If the object is allocated but not yet marked, the detector marks it
+as reachable by setting the marked bit and adds all pointer values
+within the object’s bounds to the work queue. Once the work queueis empty, D
+OUBLE TAKE ends its scan.
+914DOUBLE TAKE then traverses the entire heap to ﬁnd any leaked
+objects: these are allocated but unmarked (unreachable). If it ﬁnds
+memory leaks, re-execution begins. Note that using this approach,
+our detector can also ﬁnd potential dangling pointers (that is, reach-able freed objects). This option is disabled by default because, un-like other applications, potential dangling pointer detection couldproduce false positives.
+Re-Execution and Error Isolation
+During re-execution, the leak detector checks the results of eachmalloc call. When the allocation of a leaked object is found, the
+detector records the call stack using the backtrace function. At
+the end of the epoch re-execution, the detector reports the last callstack for each leaked object since the last site is responsible for thememory leak.
+4. IMPLEMENTATION DETAILS
+DOUBLE TAKE is implemented as a library for Linux applica-
+tions. It can be linked directly or at runtime using the LD_PRELOAD
+mechanism. D OUBLE TAKE is thus convenient to use: there is no
+need to change or recompile applications, to use a specialized hard-ware platform, run inside a virtual machine, or modify the OS.
+At startup, D
+OUBLE TAKE begins the ﬁrst epoch. This epoch
+continues until the program issues an irrevocable system call (see
+Section 4.3 for details). Before an irrevocable system call, D OU-
+BLE TAKE checks program state for evidence of errors. The details
+are presented in Section 3.
+If no errors are found, D OUBLE TAKE ends the current epoch,
+issues the irrevocable system call, and begins a new epoch. Ifit ﬁnds evidence of an error, D
+OUBLE TAKE enters re-execution
+mode. D OUBLE TAKE will then re-execute with instrumentation
+activated and report the lines of code responsible for the error(s).
+The remainder of this section describes the implementation of
+DOUBLE TAKE ’s core functionality.
+4.1 Startup and Shutdown
+At program startup, D OUBLE TAKE performs initialization and
+starts the ﬁrst epoch. D OUBLE TAKE needs to get in early to inter-
+pose on system calls and install its own heap implementation. It
+accomplishes this by marking its own initialization function with
+the constructor attribute. Since D OUBLE TAKE must wrap library
+functions that eventually invoke with system calls, as described inSection 4.3, it collects the addresses of all intercepted functionsduring this initialization phase. D
+OUBLE TAKE acquires memory
+from the OS to hold its heap, collects the names and ranges of allglobals by analyzing /proc/self/maps, installs signal handler for
+segmentation violations, and prepares the data structure for record-ing and handling system calls.
+D
+OUBLE TAKE must postpone the checkpointing of program state
+(and thus the beginning of the ﬁrst epoch) until just before execu-tion enters the application enters its main function. This delay is
+necessary to let key low-level startup tasks complete. For exam-ple, C++ performs its initialization for the standard stream after the
+execution of constructor functions (including, in this case, D
+OU-
+BLE TAKE itself). Because D OUBLE TAKE relies on streams to re-
+port any errors it detects, by deﬁnition it cannot start the ﬁrst epoch
+before that point. To make this all possible, we interpose on the
+libc_start_main function, and pass a custom main function im-
+plemented by D OUBLE TAKE that performs a snapshot just before
+entering the application’s real main routine.
+DOUBLE TAKE treats program termination as the end of the ﬁnal
+epoch. As with any other epoch, if it ﬁnds evidence of program er-rors, D
+OUBLE TAKE re-executes the program to pinpoint the exactCategory Functions
+Repeatable getpid, sleep, pause
+Recordable mmap, gettimeofday, time, clone ,open
+Revocable write, read
+Deferrable close, munmap
+Irrevocable fork, exec, exit, lseek, pipe, flock, socket
+related system calls
+Table 1: System calls handled by D OUBLE TAKE . All unlisted
+system calls are conservatively treated as irrevocable, and end
+the current epoch. Section 4.3 describes how D OUBLE TAKE
+handles calls in each category.
+causes of errors. This logic is embedded in a ﬁnalizer marked with
+the deconstructor attribute that D OUBLE TAKE installs.
+4.2 Epoch Start
+At the beginning of each epoch, D OUBLE TAKE takes a snapshot
+of program state. D OUBLE TAKE saves all writable memory (stack,
+heap, and globals) from the main program and any linked libraries,
+and saves the register state of each thread with the getcontext
+function. To reduce the cost of snapshots, D OUBLE TAKE does
+not checkpoint any read-only memory. To identify all writable
+mapped memory, D OUBLE TAKE processes the /proc/self/map
+ﬁle, which on Linux identiﬁes every mapped memory region andits attributes (other operating systems implement similar function-ality). D
+OUBLE TAKE also records the ﬁle positions of all open
+ﬁles, which lets programs issue read andwrite system calls with-
+out ending the current epoch. D OUBLE TAKE uses the combination
+of saved memory state, ﬁle positions and registers to rollback exe-cution if it ﬁnds evidence of an error.
+4.3 Normal Execution
+Once a snapshot has been written, D OUBLE TAKE lets the pro-
+gram execute normally but interposes on heap allocations/deallo-cations and system calls in order to set tripwires and support re-execution.
+System Calls
+DOUBLE TAKE ends each epoch when the program attempts to is-
+sue an irrevocable system call. However, most system calls cansafely be re-executed or undone to enable re-execution.
+D
+OUBLE TAKE divides system calls into ﬁve categories, shown
+in Table 1. System calls could be intercepted using ptrace, but this
+would add unacceptable overhead during normal execution. In-stead, D
+OUBLE TAKE interposes on all library functions that may
+issue system calls except those in the ﬁrst category:
+•Repeatable system calls do not modify system state, and re-
+turn the same result during normal execution and re-execution.No special handling is required for these calls.
+•Recordable system calls may return different results if they
+are re-executed. D
+OUBLE TAKE records the result of these
+system calls during normal execution, and returns the savedresult during re-execution. Some recordable system calls,such as mmap, change the state of underlying OS.
+•Revocable system calls modify system state, but D
+OUBLE -
+TAKE can save the original state beforehand and restore it
+prior to re-execution. Most ﬁle I/O operations fall into this
+915category. For example, although write modiﬁes ﬁle con-
+tents, D OUBLE TAKE can write the same content during re-
+execution. The write function also changes the current ﬁle
+position, but the ﬁle position can be restored to the saved one
+using lseek prior to re-execution.
+At the beginning of each epoch, D OUBLE TAKE saves all ﬁle
+descriptors of opened ﬁles in a hash table. Maintaining thishash table helps to identify whether a read andwrite call
+is operating on sockets or not, because socket communica-
+tions must be treated as irrevocable system calls. In addition,
+D
+OUBLE TAKE must save stream contents returned by fread
+in order to support re-execution.
+•Deferrable system calls will irrevocably change program
+state, but can safely be delayed until the end of the current
+epoch. D OUBLE TAKE delays all calls to munmap andclose,
+and executes these system calls before starting a new epochwhen there is no need to re-execute the program.
+•Irrevocable system calls change internally-visible program
+state, and cannot be rolled back and re-executed. D
+OUBLE -
+TAKE ends the current epoch before these system calls.
+DOUBLE TAKE reduces the number of irrevocable system calls
+by observing their arguments; in some cases, they are not neces-sarily irrevocable. For example, when fcntl invoked with F_GET,
+D
+OUBLE TAKE treats it as a repeatable system call since it is sim-
+ply a read of ﬁle system state. However, it treats this call as irre-
+vocable if invoked with F_SET, since the call then actually updates
+the ﬁle system. Similarly, lseek is repeatable when called with
+theSEEK_CUR ﬂag with offset 0, which simply returns the current
+position in the ﬁle. However, lseek is irrevocable when given the
+arguments SEEK_SET orSEEK_END, which change the current offset
+of a ﬁle.
+Memory Management
+As described in Section 2.3, D OUBLE TAKE intercepts memory al-
+locations and deallocations to implant tripwires, identify heap cor-
+ruption, and facilitate re-execution. D OUBLE TAKE replaces the de-
+fault heap with a ﬁxed-size BiBOP-style allocator with per-thread
+subheaps and power-of-two size classes. We built this heap usingthe H
+EAP LAYERS framework [4].
+DOUBLE TAKE implants tripwires differently for different anal-
+yses. To detect heap-based buffer overﬂows, D OUBLE TAKE places
+canaries along with each heap object. In order to ﬁnd use-after-free errors, D
+OUBLE TAKE postpones the reuse of freed objects by
+putting them into a quarantine list and ﬁlling them with canaries.
+For memory leak detection, there is no need to implant tripwires,
+because the evidence of a leak can be found without them.
+To identify heap corruption, D OUBLE TAKE maintains a bitmap
+that records the locations of all heap canaries. The bitmap recordsevery word of heap memory that contains a canary, which will be
+checked at the end of each epoch. If any of these words are modi-
+ﬁed, D
+OUBLE TAKE notiﬁes the detection tool.
+To speed re-execution, D OUBLE TAKE uses its heap allocator to
+satisfy memory requests from the application and corresponding li-
+braries, and maintains a separate heap for internal use only. For ex-
+ample, the memory that D OUBLE TAKE uses to record system calls
+results is allocated from its internal heap and there is no need toreplay these allocations during re-execution. Any additional mem-ory allocations during the replay phase are also satisﬁed from its
+internal heap.4.4 Epoch End
+Each epoch ends when the program issues an irrevocable sys-
+tem call. At the end of each epoch, D OUBLE TAKE checks program
+state for errors. These analysis-speciﬁc error checks are described
+in Section 3. The scanning process is extremely efﬁcient: check-ing 512MB of program state for all of these analyses takes just 60
+milliseconds. It also has minimal impact on latency, because it is
+piggybacked on relatively expensive system calls.
+If an error is found during the scan, D
+OUBLE TAKE rolls back
+execution to the immediately-preceding epoch, and switches to re-execution mode. If no error is found, D
+OUBLE TAKE issues any
+deferred system calls, clears the logs for all recorded system calls,and begins the next epoch.
+4.5 Rollback
+If an error is found, D OUBLE TAKE rolls back program state be-
+fore re-executing the epoch. This rollback must be handled with
+care. If the rollback is caused by a segmentation fault, D OUBLE -
+TAKE must return from the signal handler before switching to the
+saved program state. D OUBLE TAKE changes the saved context to
+return to a custom rollback function, exits the signal handler, andthen initiates rollback outside the signal handler. During rollback,
+the saved state of all writable memory is copied back, which alsorecovers the status of its heap. Restoring the saved stack can over-write live values on the current program stack, so D
+OUBLE TAKE
+must switch to a temporary stack during the rollback phase. D OU-
+BLE TAKE also recovers the ﬁle positions of opened ﬁles so that all
+read/write calls can be issued normally during re-execution.
+DOUBLE TAKE then sets hardware watchpoints on all corrupted
+addresses in order to report the root causes of buffer overﬂows or
+dangling pointers. Since debug registers are not directly accessible
+in user mode, D OUBLE TAKE utilizes the perf_event_open call
+to load watched addresses into the debug registers. D OUBLE TAKE
+also sets a SIGTRAP handler for watchpoints so that it will get noti-
+ﬁed when these addresses are overwritten (e.g., during buffer over-
+ﬂows or uses of freed objects).
+Once all watchpoints have been placed, D OUBLE TAKE uses the
+setcontext call to restore register state and begin the re-execution.
+4.6 Re-Execution
+During re-execution, D OUBLE TAKE repeats all memory opera-
+tions (allocations, deallocations and accesses) while tracking pre-
+cise information related to memory errors, handles system callsdepending on their type, and handles signals triggered by watch-points.
+Memory operation tracking: During replay, D
+OUBLE TAKE
+enables tracking of precise information in the memory allocator: allallocations and deallocations record their calling context so thesecan be reported later, if needed. Note that recording call sites dur-
+ing ordinary execution would be prohibitively expensive, imposing
+20–30% overhead. D
+OUBLE TAKE only imposes this overhead dur-
+ing re-execution once D OUBLE TAKE has detected a memory error.
+Replaying system calls: DOUBLE TAKE replays the saved re-
+sults of recordable system calls from the log collected during nor-
+mal execution while avoiding invoking actual system calls; that is,
+their execution is simulated. All deferred system calls are convertedto no-ops while the program is re-executing. D
+OUBLE TAKE issues
+other types of system calls normally.
+Trapping on watchpoints: Finally, D OUBLE TAKE handles traps
+caused by accesses to watchpoints. Inside the trap handler, D OU-
+BLE TAKE ﬁrst determines which watchpoint caused the current
+trap if there are multiple watchpoints. It also ﬁlters out any ac-cesses from D
+OUBLE TAKE itself. D OUBLE TAKE prints the call-
+916site stack of the instruction responsible for a buffer overﬂow or
+use-after-free errors and their memory allocation (or deallocation)
+sites. For memory leaks, D OUBLE TAKE reports the allocation call-
+site of the leaked object.
+5. EV ALUATION
+We evaluate D OUBLE TAKE to demonstrate its efﬁciency, in terms
+of execution time, memory overhead, and effectiveness at detectingerrors. All experiments are performed on a quiescent Intel Core
+2 dual-processor system with 16GB of RAM, running on Linux3.13.0-53-generic with glibc-2.19. Each processor is a 4-core
+64-bit Intel Xeon, operating at 2.33GHz with a 4MB shared L2cache and a 32KB per-core L1 cache. All programs are built as 64-
+bit executables using LLVM 3.2 with the clang front-end and -O2
+optimizations. All evaluations on SPEC CPU2006 are exercised
+with the “ref” (reference) input set.
+5.1 Runtime Overhead
+We evaluate D OUBLE TAKE ’s execution time and memory over-
+head across all of the C and C++ SPEC CPU2006 benchmarks, 19in total. We compare D
+OUBLE TAKE with the previous state-of-
+the-art tool, Google’s AddressSanitizer [38]. As mentioned earlier,
+AddressSanitizer can detect buffer overﬂows and use-after-free er-
+rors, but it only detects memory leaks at the end of execution. Bycontrast, D
+OUBLE TAKE detects all of these errors at the end of ev-
+ery epoch.
+In our evaluation, D OUBLE TAKE discovered several memory
+leaks, which trigger rollback and error identiﬁcation. To isolatenormal execution overhead, we disable D
+OUBLE TAKE ’s rollback
+in our evaluation. That is, our runs with D OUBLE TAKE incur all
+of the overhead of ordinary tracking (including implanting of trip-
+wires and examining state) but do not measure the time to rollback
+and locate errors; in general, this cost is low and in any event doesnot affect bug-free execution, which is the common case. For eachbenchmark, we report the average runtime of three runs.
+Figure 4 presents execution time overhead results for D
+OUBLE -
+TAKE and AddressSanitizer. On average, D OUBLE TAKE imposes
+only 4% overhead with all three error detectors enabled. When
+use-after-free detection (DP) is disabled, D OUBLE TAKE exhibits
+no observable overhead. AddressSanitizer has an average runtime
+overhead over 30%; recall that AddressSanitizer only performs leak
+detection at the end of program execution, while D OUBLE TAKE
+performs it every epoch.
+For 17 out of 19 benchmarks, D OUBLE TAKE outperforms Ad-
+dressSanitizer. For 14 benchmarks, D OUBLE TAKE ’s runtime over-
+head with all detectors enabled is under 3%. Unsurprisingly, both
+DOUBLE TAKE and AddressSanitizer substantially outperform V al-
+grind on all benchmarks.
+Four of the benchmarks have higher than average overhead for
+DOUBLE TAKE and AddressSanitizer ( 400.perlbench, 403.gcc,
+464.h264ref, and 483.xalancbmk). Both D OUBLE TAKE and Ad-
+dressSanitizer substantially increase these applications’ memoryfootprints (see Table 2). We attribute their increased execution time
+to this increased memory footprint and its corresponding increased
+cache and TLB pressure.
+D
+OUBLE TAKE ’s use-after-free detection adds roughly 4% run-
+time overhead, but only gcc andh264ref run with more than 20%
+overhead. As described in Section 3.2, all freed objects are ﬁlled
+with canaries (up to 128 bytes). D OUBLE TAKE spends a substan-
+tial amount of time ﬁlling freed memory with canaries for applica-
+tions with a large number of malloc andfree calls. Thus, D OU-
+BLE TAKE runs much slower for the application gcc when the de-
+tection of use-after-free errors is enabled. h264ref adds signiﬁcantoverhead on D OUBLE TAKE because of its large number of epochs.
+Table 4 presents detailed benchmark characteristics. The “Pro-
+cesses” column shows the number of different process invocations(by calling fork). The number of epochs is signiﬁcantly lower than
+the number of actual system calls, demonstrating D
+OUBLE TAKE ’s
+effectiveness at reducing epochs via its lightweight system call han-dling. The benchmarks with the highest overhead share the follow-ing characteristics: they consist of a substantial number of epochs
+(e.g., perlbench andh264ref) or are unusually malloc-intensive
+(e.g., gcc, omnetpp, and xalancbmk).
+Runtime Overhead Summary: For nearly all of the bench-
+marks we examine, D
+OUBLE TAKE substantially outperforms the
+state of the art. For most benchmarks, D OUBLE TAKE ’s runtime
+overhead is under 3%.
+5.2 Memory Overhead
+We measure program memory usage by recording the peak phys-
+ical memory usage. Virtual memory consumption is generally not
+relevant for 64-bit platforms. D OUBLE TAKE ’s pre-allocated heap
+and internal heap consume 8GB of virtual memory space. We
+compute peak physical memory usage by periodically collectingprocess-level information (on Linux, this is available in the pseudo-
+ﬁle/proc/self/smaps), and summing the proportional set sizes
+of memory segments.
+Figure 5 presents memory overhead for D
+OUBLE TAKE and Ad-
+dressSanitizer (Table 2 has full details). On average, both acrossthe benchmark suite and when broken down by footprint (large (>
+100MB) and small (< 100MB)), D
+OUBLE TAKE imposes consid-
+erably lower memory overhead than AddressSanitizer. D OUBLE -
+TAKE imposes lower memory overhead than AddressSanitizer on
+all but three benchmarks: perlbench, h264, and namd.
+We drill down to explore the application and analysis character-
+istics that contribute to D OUBLE TAKE ’s memory overhead:
+•Number of epochs: Much of D OUBLE TAKE ’s memory over-
+head comes from the snapshot of writable memory taken atthe beginning of each epoch. However, the ﬁrst snapshot isoften small because the heap is almost empty before the main
+routine. For example, the benchmarks bzip2, mcf, sjeng,
+milc, and lbm run in a single epoch, and accordingly exhibit
+very low memory overhead.
+•System call logs: System call logs introduce additional mem-
+ory overhead that depends on the number of recorded systemcalls.
+•Analysis-speciﬁc overhead: Other sources of memory over-
+head are analysis-speciﬁc. Buffer overﬂow detection addscanaries between heap objects, which can increase memoryusage for programs with many small allocations. For thisanalysis, D
+OUBLE TAKE also maintains a bit map that marks
+the placement of canaries: for each eight-bytes word of theheap, D
+OUBLE TAKE adds a bit to mark whether this word
+has the canaries or not. Finally, use-after-free detection addsconstant-size memory overhead by delaying memory reuse.
+Note that any similar dynamic analyses must impose similar
+overheads.
+Memory Overhead Summary: On average, D
+OUBLE TAKE im-
+poses lower memory overhead than AddressSanitizer. For largefootprint applications, it increases memory consumption for appli-cations by 72% on average.
+917$$!&$!($!*$!,%%!&%!(%!*%!,&
+($$!	
+($%!	 &($'!
+
+(&-!
+
+(()!	()*!(),!
+(*&!	(*(!&*((+%!(+'!
+(,'!
+	(''!
+(((!((+!()$!()'!(+$!	
+(,&!'
+
+
+	
+	&!'
+Figure 4: Runtime overhead of D OUBLE TAKE (OF = Buffer Overﬂow Detection, ML = Memory Leak Detection, DP = Dangling
+Pointers Detection) and AddressSanitizer, normalized to each benchmark’s original execution time. With all detections enabled,
+DOUBLE TAKE only introduces 4% performance overhead on average.
+$)%$%)
+($$!	
+($%!	 &($'!
+
+(&-!
+
+(()!	()*!(),!
+(*&!	(*(!&*((+%!(+'!
+(,'!
+	(''!
+(((!((+!()$!()'!(+$!	
+(,&!'
+
+	
+
+
+
+
+'(
+Figure 5: Memory overhead of D OUBLE TAKE and AddressSanitizer.
+5.3 Effectiveness
+We evaluate the effectiveness of D OUBLE TAKE on a range of
+applications, including synthetic test cases, standard benchmarks,
+and real-world applications.
+Synthetic test cases and benchmarks: We ﬁrst evaluate D OU-
+BLE TAKE on 3 synthetic test cases, 26 test cases from the NIST
+SAMA TE Reference Dataset Project. This corpus includes 14 caseswith buffer overﬂows and 12 cases without overﬂows [17]. We alsoevaluate D
+OUBLE TAKE on 19 C/C++ benchmarks from the SPEC
+CPU2006 benchmark suite.
+For heap overﬂows, D OUBLE TAKE detects all known overﬂows
+in one synthetic test case and 14 test cases of SAMA TE suite.For the 12 cases without overﬂows in SAMA TE suite, D
+OUBLE -
+TAKE has no false positives. For the SPEC CPU2006 benchmarks,
+DOUBLE TAKE did not ﬁnd any heap buffer overﬂows and use-
+after-frees, which is the same result found with AddressSanitizer.However, D
+OUBLE TAKE detected a signiﬁcant number of memory
+leaks in perlbench andgcc of SPEC CPU2006, which we veriﬁed
+using V algrind’s Memcheck tool.
+Real applications: We also ran D OUBLE TAKE with a variety of
+applications with known or implanted errors (see Table 3). To ver-ify the effectiveness of D
+OUBLE TAKE ’s buffer overﬂow detection,
+we collected applications from evaluations of prior tools, Bugzilla,and bugbench [16, 20, 23, 43], including bc,gcc-4.4.7, gzip,
+libHX, polymorph, and vim-6.3.
+In every case, D
+OUBLE TAKE detected all known or converted
+errors. Converted errors are existing global or array overﬂows that
+DOUBLE TAKE currently cannnot detect; we converted these to heap
+overﬂows to verify its effectiveness. D OUBLE TAKE also identiﬁed			
+			  !	!"#" "" " !"!				  ! 
+				&'&&&&&'(&"
+		
+!###	$$'*"
+!'+
+
+	
+	!
+###	$$'*"
+!')
+Figure 6: An example report by D OUBLE TAKE for buffer
+overﬂow identiﬁcation.
+memory leaks in gcc-4.4.7 andvim-6.3, which we conﬁrmed
+with V algrind. To evaluate the detection of use-after-free errors,
+we manually injected errors on real applications, such as vim-7.3,
+lsandwc.D OUBLE TAKE identiﬁed all of these memory errors.
+Note that the errors observed in these applications are triggered
+only by speciﬁc inputs. In the common case, these applications per-form as expected. This is exactly the case for which D
+OUBLE TAKE
+is ideal, since its low overhead is designed to make it feasible to use
+it in deployed settings.
+Detailed reporting: DOUBLE TAKE reports precise information
+aimed at helping programmers identify the exact causes of different
+memory errors, as shown in Figure 6. For buffer overﬂows, D OU-
+BLE TAKE reports the call sites and line numbers of the overﬂow
+and the original memory allocation. For memory leaks, D OUBLE -
+TAKE reports the last call site of its memory allocation. For use-
+after-frees error, D OUBLE TAKE reports both allocation and deallo-
+cation call sites, and the instruction(s) that wrote to the object after
+it was freed.
+Note that D OUBLE TAKE can identify more errors than Address-
+918Memory Usage (MB)
+Benchmark Original Address D OUBLE
+Sanitizer T AKE
+large footprint (> 100MB)
+400.perlbench 656 1481 1834
+401.bzip2 870 1020 989
+403.gcc 683 2293 1791
+429.mcf 1716 1951 2000
+458.sjeng 179 220 212
+471.omnetpp 172 538 299
+473.astar 333 923 479
+483.xalancbmk 428 1149 801
+433.milc 695 1008 917
+447.dealII 514 2496 1724
+450.soplex 441 1991 1104
+470.lbm 418 496 477
+geometric mean +117% +72%
+small footprint (< 100MB)
+445.gobmk 28 137 66
+456.hmmer 24 256 82
+462.libquantum 66 144 132
+464.h264ref 65 179 247444.namd 46 79 96
+453.povray 3 133 37
+482.sphinx3 45 181 103geometric mean +395% +208%
+overall geometric mean +194% +114%
+Table 2: AddressSanitizer and D OUBLE TAKE memory usage,
+in megabytes. The top section lists memory overhead for large-
+footprint applications (over 100 MB), while the bottom section
+presents overhead for small-footprint applications. D OUBLE -
+TAKE ’s memory overhead is generally less than AddressSani-
+tizer’s.
+Sanitizer. D OUBLE TAKE can track up to four buffer overﬂows or
+use-after-free errors during the same epoch because its isolation is
+based on the use of hardware debugging registers. AddressSani-
+tizer always stops at the detection of the ﬁrst such error.
+Effectiveness Summary: Across the applications we examine,
+DOUBLE TAKE detects all known or injected errors with no false
+positives. D OUBLE TAKE is as effective at ﬁnding errors as Ad-
+dressSanitizer, but with much lower performance and memory over-
+head. It also provides more detailed reports for these errors.
+6. DISCUSSION
+This section discusses how users of D OUBLE TAKE can extend
+it to ﬁnd other errors, and describes limitations of evidence-baseddynamic analyses in general and of the error detectors implementedto date.
+Application Description LOC Error Type
+bc basic calculator 12K Known Overﬂow
+gzip compress or expand ﬁles 5K Converted Overﬂow
+libHX common library 7K Known Overﬂow
+polymorph ﬁlename converter 0.4K Converted Overﬂow
+vim-6.3 text editor 282K Known Overﬂow
+gcc-4.7 GNU Compiler Collection 5784K Unknown leaks
+vim-6.3 text editor 282K Unknown leak
+ls directory listing 3.5K Implanted UAF
+wc word count 0.6K Implanted UAF
+vim-7.4 text editor 332K Implanted UAF
+Table 3: Error detection: D OUBLE TAKE detects both known
+(injected and non-injected) and previously unknown errors onthe above applications (any reported errors are real, as D
+OU-
+BLE TAKE has a zero false positive rate).Benchmark Processes Epochs Syscalls # Mallocs
+400.perlbench 3 43 60068 360605640
+401.bzip2 6 6 968 168
+403.gcc 9 9 155505 28458514
+429.mcf 1 1 24443 5
+445.gobmk 5 5 2248 658034
+456.hmmer 2 2 46 2474268
+458.sjeng 1 1 23 5
+462.libquantum 1 1 11 179
+464.h264ref 3 825 2592 146827
+471.omnetpp 1 1 19 267168472
+473.astar 2 2 102 4799955
+483.xalancbmk 1 1 123706 135155557
+433.milc 1 1 12 6517
+444.namd 1 1 470 1324
+447.dealII 1 1 8131 151332314
+450.soplex 2 2 37900 310619
+453.povray 1 1 25721 2461141
+Table 4: Benchmark characteristics.
+6.1 Extending DOUBLE TAKE
+The D OUBLE TAKE framework can be extended to discover other
+program errors that exhibit the required monotonicity property: evi-dence of an error persists or can be made to persist after its occur-
+rence. This paper presents its use to detect heap buffer overﬂows,
+use-after-free errors, and memory leaks; other potential use casesinclude invalid frees, double frees, and null dereferences.
+To extend D
+OUBLE TAKE to detect new errors, users must imple-
+ment at most three functions: (1) an optional tripwire installation
+function to force errors to leave evidence for later detection whenrequired, (2) a detection function that identiﬁes when an error has
+occurred, and (3) a precise instrumentation function that can pin-
+point the cause of an error during re-execution.
+6.2 Limitations
+While D OUBLE TAKE can effectively identify a range of impor-
+tant errors, there are errors that remain out of its scope. By its na-ture, evidence-based dynamic analyses cannot detect errors if thereis no evidence that they occurred, or it is not practical to force evi-dence of their existence. For example, D
+OUBLE TAKE cannot de-
+tect problems caused exclusively by memory reads, which leaveno evidence that an error occurred. Evidence-based analysis alsodepends on errors being generally monotonic: once an error hasoccurred, its evidence needs to persist until the end of the epochin order to ensure detection. In addition, D
+OUBLE TAKE currently
+operates exclusively over the heap, and cannot detect errors withinglobal variables or on the stack; it is also currently limited to single-threaded applications.
+The analyses we have built using D
+OUBLE TAKE (heap buffer
+overﬂows, use-after-free errors, and memory leaks) have no falsepositives, but they can have false negatives. If an overﬂow touchesmemory only in adjacent objects and skips over canaries, D
+OU-
+BLE TAKE ’s end-of-epoch scan will not reveal any evidence of the
+overﬂow. While extremely unlikely, a buffer overﬂow or dangling
+pointer write that writes the exact same data as our random ca-
+nary value will also escape detection. Both the buffer overﬂow anduse-after-free detectors can detect errors only on writes. To reduceoverhead, the use-after-free detector only places canaries in the ﬁrst
+128 bytes of freed objects. If a write to freed memory goes beyond
+this threshold, the current detector will not ﬁnd it.
+The memory leak detector will not produce false positives, but
+can yield false negatives. The leak detector may miss leaks when adata value accidentally aliases the pointers of a leaked heap object,
+though in practice this is unlikely, especially on 64-bit architec-
+919Valgrind Execution Time Overhead
+Benchmark Overhead Benchmark Overhead
+400.perlbench 20.5× 458.sjeng 20.3×
+401.bzip2 16.8× 471.omnetpp 13.9×
+403.gcc 18.7× 473.astar 11.9×
+429.mcf 4.5× 433.milc 11.0×
+445.gobmk 28.9× 444.namd 24.9×
+456.hmmer 13.8× 450.dealII 42.8×
+Table 5: Valgrind’s execution time overhead across the SPEC
+benchmark suite. Valgrind imposes on average 17× overhead
+(geometric mean), making it prohibitively high for use in de-
+ployment and quite expensive even for testing purposes.
+tures. If a leaked object was not allocated in the current epoch,
+DOUBLE TAKE ’s re-execution will not be able to ﬁnd the object’s
+allocation site (a limitation shared by AddressSanitizer). In prac-
+tice, D OUBLE TAKE ’s epochs are long enough to collect allocation
+site information for all leaks detected during our evaluation.
+7. RELATED WORK
+Dynamic Instrumentation: Dynamic instrumentation based er-
+ror detection tools include V algrind’s Memcheck tool, Dr. Mem-
+ory, Purify, Intel Inspector, and Sun Discover [8, 14, 18, 28, 32].These tools use dynamic instrumentation engines, such as Pin, V al-grind, and DynamiRIO [7, 24, 28], and can detect memory leaks,
+use-after-free errors, uninitialized reads, and buffer overﬂows. Like
+D
+OUBLE TAKE , these tools are easy to use because they do not re-
+quire recompilation; unlike D OUBLE TAKE , they impose consider-
+able overhead: programs run with V algrind take 20 ×longer than
+usual (see Table 5), and Dr. Memory introduces 10× runtime over-
+head. D OUBLE TAKE issigniﬁcantly faster than prior dynamic in-
+strumentation tools (under 5% performance overhead).
+Several dynamic analysis tools leverage static analysis to reduce
+the amount and thus the overhead of instrumentation [1, 12, 13,27, 33, 38]. AddressSanitizer represents the previous state of the
+art. It relies on a compiler (e.g., LLVM) to instrument (and opti-mize away) memory accesses. During execution, AddressSanitizerbehaves much like D
+OUBLE TAKE : it intercepts heap allocations
+and deallocations to place canaries and delay the reuse of freedheap objects, and reports errors such as buffer overﬂows or use-after-frees. AddressSanitizer’s instrumentation lets it detect out-of-bound reads and overﬂows on stack or global variables, which
+D
+OUBLE TAKE does not. However, AddressSanitizer cannot ﬁnd
+errors in code that was not compiled with AddressSanitizer en-abled, which includes most libraries; D
+OUBLE TAKE detects heap
+object overﬂows, dangling pointer writes, and leaks in the wholeprogram (libraries included) without recompilation. AddressSan-
+itizer checks for leaked objects only during shutdown, whereas
+D
+OUBLE TAKE detects leaks during execution, enabling leak detec-
+tion in long-running applications. D OUBLE TAKE introduces sig-
+niﬁcantly lower overhead than AddressSanitizer even though D OU-
+BLE TAKE ’s analysis covers library code. Checking only for illegal
+writes, AddressSanitizer incurs approximately 30% overhead ver-
+sus 4% overhead with D OUBLE TAKE .
+Interposition: DOUBLE TAKE uses library interposition exclu-
+sively during normal execution. More expensive instrumentation is
+only introduced after an error has been detected. BoundsChecker
+interposes on Windows heap library calls to detect memory leaks,use-after-free errors and buffer overﬂows [26]. Many prior ap-proaches use a mix of library interposition and virtual memorytechniques to detect memory errors [3, 5, 9, 15, 21, 25, 30, 31, 35,
+43], though their overhead is much higher than D
+OUBLE TAKE ’s.Record and replay: Several replay-based approaches target soft-
+ware debugging and/or fault tolerance [6, 19, 36, 37, 39, 40]. Flash-
+back supports replay debugging by employing a shadow process to
+checkpoint the state of an application, and recording the results of
+system calls to facilitate the replay. Triage uses replay to automatethe failure diagnosis process for crashing bugs [40]. Both Flash-back and Triage need custom kernel support.
+Aftersight is the related work that is closest in spirit to D
+OUBLE -
+TAKE [10]. It separates analysis from normal execution by log-
+ging inputs to a virtual machine and exporting them to a separatevirtual machine for detailed (slow) analysis that can run ofﬂine orconcurrently with application execution. Aftersight monitors appli-
+cations running in a virtual machine, which adds some amount of
+workload-dependent overhead. VM-based recording alone adds ad-ditional runtime overhead, an average of 5% on the SPEC CPU2006benchmarks. Aftersight’s dynamic analyses are ofﬂoaded to unusedprocessors, which may not be available in some deployments. Un-
+like Aftersight, D
+OUBLE TAKE does not require the use of a virtual
+machine, does not rely on additional processors for dynamic anal-
+yses, and incurs lower average overhead.
+Speck is another replay-based system focused on security check-
+ing, including taint analysis and virus scanning [29]. Security checksgenerally require applications to halt immediately upon detectingan error, functionality that D
+OUBLE TAKE by design does not pro-
+vide. Other systems have focused on reducing the performanceoverhead of recording [2, 22, 34, 41].
+8. CONCLUSION
+This paper introduces evidence-based dynamic analysis, a new
+lightweight dynamic analysis technique. Evidence-based dynamicanalysis works for errors that naturally leave evidence of their oc-currence, or can be forced to do so. These errors include key prob-
+lems for C and C++ programs: buffer overﬂows, dangling-pointer
+errors, and memory leaks. Evidence-based dynamic analysis is fastbecause it lets the application run at full speed until an error isdetected; execution is then rolled back and replayed with instru-mentation at the point where the evidence was found, pinpointing
+the error. We present D
+OUBLE TAKE , an evidence-based dynamic
+analysis framework, and implement these analyses using it. The
+resulting analyses are the fastest to date, imposing on average un-der 5% overhead. These results demonstrate the effectiveness and
+efﬁciency of this approach, which promises to speed testing and
+dramatically increase the reach of dynamic analysis by extendingit to deployed settings. D
+OUBLE TAKE is available for download at
+http://github.com/plasma-umass/DoubleTake .
+9. ACKNOWLEDGEMENTS
+This material is based upon work supported by the National Sci-
+ence Foundation under Grant No. CNS-1525888. Charlie Curtsingerwas supported by a Google PhD Research Fellowship. We thankBobby Powers for his implementation efforts, which have signif-icantly improved the D
+OUBLE TAKE codebase. We thank Kostya
+Serebryany for his assistance with our evaluation of AddressSan-itizer, and Qiang Zeng, Dinghao Wu and Peng Liu for providingthe test cases used in their Cruiser paper. We also thank Scott Ka-plan and John Vilk for their suggestions and comments during thedevelopment of D
+OUBLE TAKE .
+92010. REFERENCES
+[1] P . Akritidis, M. Costa, M. Castro, and S. Hand. Baggy
+bounds checking: an efﬁcient and backwards-compatible
+defense against out-of-bounds errors. In Proceedings of the
+18th conference on USENIX security symposium, SSYM’09,
+pages 51–66, Berkeley, CA, USA, 2009. USENIXAssociation.
+[2] G. Altekar and I. Stoica. ODR: Output-deterministic replay
+for multicore debugging. In Proceedings of the ACM
+SIGOPS 22nd Symposium on Operating Systems Principles,
+SOSP ’09, pages 193–206, New Y ork, NY , USA, 2009.
+ACM.
+[3] H. Ayguen and M. Eddington. DUMA - Detect Unintended
+Memory Access.
+http://duma.sourceforge.net/ .
+[4] E. D. Berger, B. G. Zorn, and K. S. McKinley. Composing
+high-performance memory allocators. In Proceedings of the
+ACM SIGPLAN 2001 conference on Programming language
+design and implementation, PLDI ’01, pages 114–124, New
+Y ork, NY , USA, 2001. ACM.
+[5] M. D. Bond and K. S. McKinley. Bell: Bit-encoding online
+memory leak detection. In Proceedings of the 12th
+International Conference on Architectural Support for
+Programming Languages and Operating Systems, ASPLOS
+XII, pages 61–72, New Y ork, NY , USA, 2006. ACM.
+[6] T. C. Bressoud and F. B. Schneider. Hypervisor-based fault
+tolerance. In Proceedings of the Fifteenth ACM Symposium
+on Operating Systems Principles, SOSP ’95, pages 1–11,
+New Y ork, NY , USA, 1995. ACM.
+[7] D. Bruening, T. Garnett, and S. Amarasinghe. An
+infrastructure for adaptive dynamic optimization. In
+Proceedings of the international symposium on Code
+generation and optimization: feedback-directed and runtimeoptimization, CGO ’03, pages 265–275, Washington, DC,USA, 2003. IEEE Computer Society.
+[8] D. Bruening and Q. Zhao. Practical memory checking with
+dr. memory. In Proceedings of the 9th Annual IEEE/ACM
+International Symposium on Code Generation andOptimization, CGO ’11, pages 213–223, Washington, DC,USA, 2011. IEEE Computer Society.
+[9] J. Caballero, G. Grieco, M. Marron, and A. Nappa.
+Undangle: early detection of dangling pointers inuse-after-free and double-free vulnerabilities. In Proceedings
+of the 2012 International Symposium on Software Testingand Analysis, ISSTA 2012, pages 133–143, New Y ork, NY ,USA, 2012. ACM.
+[10] J. Chow, T. Garﬁnkel, and P . M. Chen. Decoupling dynamic
+program analysis from execution in virtual environments. In
+USENIX 2008 Annual Technical Conference on Annual
+Technical Conference, A TC’08, pages 1–14, Berkeley, CA,USA, 2008. USENIX Association.
+[11] C. Cowan, C. Pu, D. Maier, H. Hinton, J. Walpole, P . Bakke,
+S. Beattie, A. Grier, P . Wagle, and Q. Zhang. Stackguard:Automatic adaptive detection and prevention of
+buffer-overﬂow attacks. In In Proceedings of the 7th USENIX
+Security Symposium, pages 63–78, 1998.
+[12] Frank Ch. Eigler. Mudﬂap: pointer use checking for C/C++.
+Red Hat Inc., 2003.
+[13] N. Hasabnis, A. Misra, and R. Sekar. Light-weight bounds
+checking. In Proceedings of the Tenth International
+Symposium on Code Generation and Optimization, CGO’12, pages 135–144, New Y ork, NY , USA, 2012. ACM.
+[14] R. Hastings and B. Joyce. Purify: Fast detection of memoryleaks and access errors. In In Proc. of the Winter 1992
+USENIX Conference, pages 125–138, 1991.
+[15] M. Hauswirth and T. M. Chilimbi. Low-overhead memory
+leak detection using adaptive statistical proﬁling. In
+Proceedings of the 11th International Conference on
+Architectural Support for Programming Languages and
+Operating Systems, ASPLOS XI, pages 156–164, New Y ork,NY , USA, 2004. ACM.
+[16] T. Hoger. "vim: heap buffer overﬂow".
+https:
+//bugzilla.redhat.com/show_bug.cgi?id=455455 .
+[17] Information Technology Laboratory, Software and Systems
+Division. Nist samate reference dataset project.
+http://samate.nist.gov/SRD/ , 2013.
+[18] Intel Corporation. Intel inspector xe 2013. http:
+//software.intel.com/en-us/intel-inspector-xe ,
+2012.
+[19] S. T. King, G. W. Dunlap, and P . M. Chen. Debugging
+operating systems with time-traveling virtual machines. InProceedings of the Annual Conference on USENIX Annual
+Technical Conference, A TEC ’05, pages 1–1, Berkeley, CA,
+USA, 2005. USENIX Association.
+[20] L. Kundrak. Buffer overﬂow in bzip2’s bzip2recover.
+https:
+//bugzilla.redhat.com/show_bug.cgi?id=226979 .
+[21] D. Lea. The GNU C library.
+http://www.gnu.org/software/libc/libc.html .
+[22] D. Lee, B. Wester, K. V eeraraghavan, S. Narayanasamy,
+P . M. Chen, and J. Flinn. Respec: efﬁcient online
+multiprocessor replay via speculation and externaldeterminism. In Proceedings of the ﬁfteenth edition of
+ASPLOS on Architectural support for programming
+languages and operating systems, ASPLOS XV , pages
+77–90, New Y ork, NY , USA, 2010. ACM.
+[23] S. Lu, Z. Li, F. Qin, L. Tan, P . Zhou, and Y . Zhou. Bugbench:
+Benchmarks for evaluating bug detection tools. In In
+Workshop on the Evaluation of Software Defect DetectionTools, 2005.
+[24] C.-K. Luk, R. Cohn, R. Muth, H. Patil, A. Klauser,
+G. Lowney, S. Wallace, V . J. Reddi, and K. Hazelwood. Pin:Building customized program analysis tools with dynamicinstrumentation. In Proceedings of the 2005 ACM SIGPLAN
+Conference on Programming Language Design andImplementation, PLDI ’05, pages 190–200, New Y ork, NY ,USA, 2005. ACM.
+[25] Mac OS X Develper Library. Enabling the malloc debugging
+features.
+https://developer.apple.com/library/
+mac/#documentation/performance/Conceptual/
+ManagingMemory/Articles/MallocDebug.html .
+[26] Microfocus. Micro focus devpartner boundschecker.
+http://www.microfocus.com/store/devpartner/boundschecker.aspx
+, 2011.
+[27] G. C. N. Necula, M. Scott, and W. Westley. Ccured:
+Type-safe retroﬁtting of legacy code. In Proceedings of the
+Principles of Programming Languages, pages 128–139,
+2002.
+[28] N. Nethercote and J. Seward. V algrind: a framework for
+heavyweight dynamic binary instrumentation. InProceedings of the 2007 ACM SIGPLAN conference onProgramming language design and implementation, PLDI’07, pages 89–100, New Y ork, NY , USA, 2007. ACM.
+[29] E. B. Nightingale, D. Peek, P . M. Chen, and J. Flinn.
+Parallelizing security checks on commodity hardware. In
+921Proceedings of the 13th International Conference on
+Architectural Support for Programming Languages and
+Operating Systems, ASPLOS XIII, pages 308–318, New
+Y ork, NY , USA, 2008. ACM.
+[30] G. Novark, E. D. Berger, and B. G. Zorn. Exterminator:
+automatically correcting memory errors with highprobability. In Proceedings of the 2007 ACM SIGPLAN
+Conference on Programming Language Design and
+Implementation (PLDI), pages 1–11, New Y ork, NY , USA,
+2007. ACM Press.
+[31] G. Novark, E. D. Berger, and B. G. Zorn. Efﬁciently and
+precisely locating memory leaks and bloat. In Proceedings of
+the 2009 ACM SIGPLAN Conference on ProgrammingLanguage Design and Implementation, PLDI ’09, pages
+397–407, New Y ork, NY , USA, 2009. ACM.
+[32] Oracle Corporation. Sun memory error discovery tool
+(discover).
+http://docs.oracle.com/cd/E18659_01/
+html/821-1784/gentextid-302.html .
+[33] parasoft Company. Runtime Analysis and Memory Error
+Detection for C and C++, 2013.
+[34] S. Park, Y . Zhou, W. Xiong, Z. Yin, R. Kaushik, K. H. Lee,
+and S. Lu. PRES: probabilistic replay with executionsketching on multiprocessors. In Proceedings of the ACM
+SIGOPS 22nd symposium on Operating systems principles,
+SOSP ’09, pages 177–192, New Y ork, NY , USA, 2009.ACM.
+[35] B. Perens. Electric Fence.
+http://perens.com/FreeSoftware/ElectricFence/ .
+[36] F. Qin, J. Tucek, J. Sundaresan, and Y . Zhou. Rx: Treating
+bugs as allergies—a safe method to survive software failures.InProceedings of the Twentieth ACM Symposium on
+Operating Systems Principles, SOSP ’05, pages 235–248,New Y ork, NY , USA, 2005. ACM.
+[37] M. Ronsse and K. De Bosschere. RecPlay: a fully integrated
+practical record/replay system. ACM Trans. Comput. Syst.,
+17(2):133–152, May 1999.
+[38] K. Serebryany, D. Bruening, A. Potapenko, and D. Vyukov.
+AddressSanitizer: a fast address sanity checker. InProceedings of the 2012 USENIX conference on AnnualTechnical Conference, USENIX A TC’12, pages 28–28,
+Berkeley, CA, USA, 2012. USENIX Association.
+[39] S. M. Srinivasan, S. Kandula, C. R. Andrews, and Y . Zhou.
+Flashback: a lightweight extension for rollback and
+deterministic replay for software debugging. In Proceedings
+of the annual conference on USENIX Annual Technical
+Conference, A TEC ’04, pages 3–3, Berkeley, CA, USA,
+2004. USENIX Association.
+[40] J. Tucek, S. Lu, C. Huang, S. Xanthos, and Y . Zhou. Triage:
+Diagnosing production run failures at the user’s site. InProceedings of Twenty-ﬁrst ACM SIGOPS Symposium onOperating Systems Principles, SOSP ’07, pages 131–144,
+New Y ork, NY , USA, 2007. ACM.
+[41] K. V eeraraghavan, D. Lee, B. Wester, J. Ouyang, P . M. Chen,
+J. Flinn, and S. Narayanasamy. DoublePlay: parallelizing
+sequential logging and replay. In Proceedings of the sixteenth
+international conference on Architectural support forprogramming languages and operating systems, ASPLOS
+XVI, pages 15–26, New Y ork, NY , USA, 2011. ACM.
+[42] P . R. Wilson. Uniprocessor garbage collection techniques. In
+Proceedings of the International Workshop on Memory
+Management, IWMM ’92, pages 1–42, London, UK, UK,1992. Springer-V erlag.[43] Q. Zeng, D. Wu, and P . Liu. Cruiser: concurrent heap buffer
+overﬂow monitoring using lock-free data structures. InProceedings of the 32nd ACM SIGPLAN conference on
+Programming language design and implementation, PLDI
+’11, pages 367–377, New Y ork, NY , USA, 2011. ACM.
+922

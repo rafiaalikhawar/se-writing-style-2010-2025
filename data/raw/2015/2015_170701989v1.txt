@@ -1,0 +1,1607 @@
+Cooperative Kernels: GPU Multitasking for Blocking Algorithms
+(Extended Version)
+Tyler Sorensen
+Imperial College London
+London, UK
+t.sorensen15@imperial.ac.ukHugues Evrard
+Imperial College London
+London, UK
+h.evrard@imperial.ac.ukAlastair F. Donaldson
+Imperial College London
+London, UK
+alastair.donaldson@imperial.ac.uk
+ABSTRACT
+There is growing interest in accelerating irregular data-parallel
+algorithms on GPUs. These algorithms are typically blocking , so
+they require fair scheduling. But GPU programming models (e.g.
+OpenCL) do not mandate fair scheduling, and GPU schedulers are
+unfair in practice. Current approaches avoid this issue by exploit-
+ing scheduling quirks of today’s GPUs in a manner that does not
+allow the GPU to be shared with other workloads (such as graphics
+rendering tasks). We propose cooperative kernels , an extension to
+the traditional GPU programming model geared towards writing
+blocking algorithms. Workgroups of a cooperative kernel arefairly
+scheduled, and multitasking is supported via a small set of language
+extensions through which the kernel and scheduler cooperate. We
+describe a prototype implementation of a cooperative kernel frame-
+work implemented in OpenCL 2.0 and evaluate our approach by
+porting a set of blocking GPU applications to cooperative kernels
+and examining their performance under multitasking. Our pro-
+totype exploits no vendor-specific hardware, driver or compiler
+support, thus our results provide a lower-bound on the efficiency
+with which cooperative kernels can be implemented in practice.
+CCS CONCEPTS
+•Software and its engineering →Multiprocessing / multi-
+programming / multitasking ; Semantics; •Computing method-
+ologies →Graphics processors ;
+KEYWORDS
+GPU, cooperative multitasking, irregular parallelism
+1 INTRODUCTION
+The Needs of Irregular Data-parallel Algorithms. Many inter-
+esting data-parallel algorithms are irregular : the amount of work to
+be processed is unknown ahead of time and may change dynami-
+cally in a workload-dependent manner. There is growing interest in
+accelerating such algorithms on GPUs [ 2–5,7,8,12,14,15,17,20,
+22,26,27,30,32]. Irregular algorithms usually require blocking syn-
+chronization between workgroups, e.g. many graph algorithms use
+a level-by-level strategy, with a global barrier between levels; work
+stealing algorithms require each workgroup to maintain a queue,
+typically mutex-protected, to enable stealing by other workgroups.
+To avoid starvation, a blocking concurrent algorithm requires
+fairscheduling of workgroups. For example, if one workgroup
+©2017 Copyright held by the owner/author(s). Publication rights licensed to Associa-
+tion for Computing Machinery.
+killkill
+forkgather time
+timeexecution time3 2 1 0
+Graphics request 2CU
+Graphics terminatedHost CPU GPU Compute Units (CU)
+graphics graphicsFigure 1: Cooperative kernels can flexibly resize to let other
+tasks, e.g. graphics, run concurrently
+holds a mutex, an unfair scheduler may cause another workgroup
+to spin-wait forever for the mutex to be released. Similarly, an
+unfair scheduler can cause a workgroup to spin-wait indefinitely at
+a global barrier so that other workgroups do not reach the barrier.
+A Degree of Fairness: Occupancy-bound Execution. The cur-
+rent GPU programming models—OpenCL [ 13], CUDA [ 19] and
+HSA [ 11], specify almost no guarantees regarding scheduling of
+workgroups, and current GPU schedulers are unfair in practice.
+Roughly speaking, each workgroup executing a GPU kernel is
+mapped to a hardware compute unit .1The simplest way for a GPU
+driver to handle more workgroups being launched than there are
+compute units is via an occupancy-bound execution model [ 7,27]
+where, once a workgroup has commenced execution on a compute
+unit (it has become occupant ), the workgroup has exclusive access
+to the compute unit until it finishes execution. Experiments suggest
+that this model is widely employed by today’s GPUs [2, 7, 20, 27].
+The occupancy-bound execution model does not guarantee fair
+scheduling between workgroups: if all compute units are occupied
+then a not-yet-occupant workgroup will not be scheduled until
+some occupant workgroup completes execution. Yet the execution
+model does provide fair scheduling between occupant workgroups,
+which are bound to separate compute units that operate in parallel.
+Current GPU implementations of blocking algorithms assume the
+occupancy-bound execution model, which they exploit by launch-
+ing no more workgroups than there are available compute units [ 7].
+Resistance to Occupancy-bound Execution. Despite its practi-
+cal prevalence, none of the current GPU programming models
+actually mandate occupancy-bound execution. Further, there are
+reasons why this model is undesirable. First, the execution model
+does not enable multitasking, since a workgroup effectively owns a
+compute unit until the workgroup has completed execution. The
+1In practice, depending on the kernel, multiple workgroups might map to the same
+compute unit; we ignore this in our current discussion.arXiv:1707.01989v1  [cs.PL]  6 Jul 2017GPU cannot be used meanwhile for other tasks (e.g. rendering). Sec-
+ond, energy throttling is an important concern for battery-powered
+devices [ 31]. In the future, it will be desirable for a mobile GPU
+driver to power down some compute units, suspending execution
+of associated occupant workgroups, if the battery level is low.
+Our assessment, informed by discussions with a number of indus-
+trial practitioners who have been involved in the OpenCL and/or
+HSA standardisation efforts (including [ 10,23]), is that GPU ven-
+dors (1) will not commit to the occupancy-bound execution model
+they currently implement, for the above reasons, yet (2) will not
+guarantee fair scheduling using preemption. This is due to the high
+runtime cost of preempting workgroups, which requires managing
+thread local state (e.g. registers, program location) for all workgroup
+threads (up to 1024 on Nvidia GPUs), as well as shared memory ,
+the workgroup local cache (up to 64 KB on Nvidia GPUs). Vendors
+instead wish to retain the essence of the simple occupancy-bound
+model, supporting preemption only in key special cases.
+For example, preemption is supported by Nvidia’s Pascal archi-
+tecture [ 18], but on a GTX Titan X (Pascal) we still observe star-
+vation: a global barrier executes successfully with 56 workgroups,
+but deadlocks with 57 workgroups, indicating unfair scheduling.
+Our Proposal: Cooperative Kernels. To summarise: blocking al-
+gorithms demand fair scheduling, but for good reasons GPU ven-
+dors will not commit to the guarantees of the occupancy-bound
+execution model. We propose cooperative kernels , an extension to
+the GPU programming model that aims to resolve this impasse.
+A kernel that requires fair scheduling is identified as cooperative ,
+and written using two additional language primitives, offer _killand
+request _fork, placed by the programmer. Where the cooperative
+kernel could proceed with fewer workgroups, a workgroup can
+execute offer _kill, offering to sacrifice itself to the scheduler. This
+indicates that the workgroup would ideally continue executing, but
+that the scheduler may preempt the workgroup; the cooperative
+kernel must be prepared to deal with either scenario. Where the
+cooperative kernel could use additional resources, a workgroup
+can execute request _fork to indicate that the kernel is prepared to
+proceed with the existing set of workgroups, but is able to benefit
+from one or more additional workgroups commencing execution
+directly after the request _fork program point.
+The use of request _fork andoffer _killcreates a contract between
+the scheduler and the cooperative kernel. Functionally, the sched-
+uler must guarantee that the workgroups executing a cooperative
+kernel are fairly scheduled, while the cooperative kernel must be ro-
+bust to workgroups leaving and joining the computation in response
+tooffer _killandrequest _fork. Non-functionally, a cooperative ker-
+nel must ensure that offer _killis executed frequently enough such
+that the scheduler can accommodate soft-real time constraints, e.g.
+allowing a smooth frame-rate for graphics. In return, the scheduler
+should allow the cooperative kernel to utilise hardware resources
+where possible, killing workgroups only when demanded by other
+tasks, and forking additional workgroups when possible.
+Cooperative kernels allow for cooperative multitasking (see Sec. 6),
+used historically when preemption was not available or too costly.
+Our approach avoids the cost of arbitrary preemption as the state of
+a workgroup killed via offer _killdoes not have to be saved. Previous
+cooperative multitasking systems have provided yield semantics,where a processing unit would temporarily give up its hardware
+resource. We deviate from this design as, in the case of a global
+barrier, adopting yield would force the cooperative kernel to block
+completely when a single workgroup yields, stalling the kernel until
+the given workgroup resumes. Instead, our offer _killallows a ker-
+nel to make progress with a smaller number of workgroups, with
+workgroups potentially joining again later via request _fork.
+Figure 1 illustrates sharing of GPU compute units between a
+cooperative kernel and a graphics task. Workgroups 2 and 3 of
+the cooperative kernel are killed at an offer _killto make room
+for a graphics task. The workgroups are subsequently restored to
+the cooperative kernel when workgroup 0 calls request _fork. The
+gather time is the time between resources being requested and the
+application surrendering them via offer _kill. To satisfy soft-real
+time constraints, this time should be low; our experimental study
+(Sec. 5.4) shows that, in practice, the gather-time for our applications
+is acceptable for a range of graphics workloads.
+The cooperative kernels model has several appealing properties:
+(1)By providing fair scheduling between workgroups, coopera-
+tive kernels meet the needs of blocking algorithms, including
+irregular data-parallel algorithms.
+(2)The model has no impact on the development of regular (non-
+cooperative) compute and graphics kernels.
+(3)The model is backwards-compatible: offer _killandrequest _fork
+may be ignored, and a cooperative kernel will behave exactly
+as a regular kernel does on current GPUs.
+(4)Cooperative kernels can be implemented over the occupancy -
+bound execution model provided by current GPUs: our proto-
+type implementation uses no special hardware/driver support.
+(5)If hardware support for preemption isavailable, it can be lever-
+aged to implement cooperative kernels efficiently, and coopera-
+tive kernels can avoid unnecessary preemptions by allowing
+the programmer to communicate “smart” preemption points.
+Placing the primitives manually is straightforward for the rep-
+resentative set of GPU-accelerated irregular algorithms we have
+ported so far. Our experiments show that the model can enable
+efficient multitasking of cooperative and non-cooperative tasks.
+In summary, our main contributions are: cooperative kernels , an
+extended GPU programming model that supports the scheduling
+requirements of blocking algorithms (Sec. 3); a prototype implemen-
+tation of cooperative kernels on top of OpenCL 2.0 (Sec. 4); and
+experiments assessing the overhead and responsiveness of the coop-
+erative kernels approach over a set of irregular algorithms (Sec. 5),
+including a best-effort comparison with the efficiency afforded by
+hardware-supported preemption available on Nvidia GPUs.
+We begin by providing background on OpenCL via two motivat-
+ing examples (Sec. 2). At the end we discuss related work (Sec. 6)
+and avenues for future work (Sec. 7).
+2 BACKGROUND AND EXAMPLES
+We outline the OpenCL programming model on which we base
+cooperative kernels (Sec. 2.1), and illustrate OpenCL and the sched-
+uling requirements of irregular algorithms using two examples: a
+work stealing queue and frontier-based graph traversal (Sec. 2.2).1kernel work_stealing( global Task *queues) {
+2 int queue_id = get_group_id();
+3 while (more_work(queues)) {
+4 Task *t = pop_or_steal(queues, queue_id);
+5 if(t)
+6 process_task(t, queues, queue_id);
+7 }
+8}
+Figure 2: An excerpt of a work stealing algorithm in OpenCL
+2.1 OpenCL Background
+An OpenCL program is divided into host anddevice components.
+A host application runs on the CPU and launches one or more
+kernels that run on accelerator devices—GPUs in the context of this
+paper. A kernel is written in OpenCL C, based on C99. All threads
+executing a kernel start at the same entry function with identical
+arguments. A thread can call get_global _idto obtain a unique id,
+to access distinct data or follow different control flow paths.
+The threads of a kernel are divided into workgroups . Functions
+get_local _idandget_group _idreturn a thread’s local id within its
+workgroup and the workgroup id. The number of threads per work-
+group and number of workgroups are obtained via get_local _size
+andget_num _groups . Execution of the threads in a workgroup can
+be synchronised via a workgroup barrier. A global barrier (synchro-
+nising all threads of a kernel) is notprovided as a primitive.
+Memory Spaces and Memory Model. A kernel has access to four
+memory spaces. Shared virtual memory (SVM) is accessible to all
+device threads and the host concurrently. Global memory is shared
+among all device threads. Each workgroup has a portion of local
+memory for fast intra-workgroup communication. Every thread has
+a portion of very fast private memory for function-local variables.
+Fine-grained communication within a workgroup, as well as
+inter-workgroup communication and communication with the host
+while the kernel is running, is enabled by a set of atomic data types
+and operations. In particular, fine-grained host/device communica-
+tion is via atomic operations on SVM.
+Execution Model. OpenCL [ 13, p. 31] and CUDA [ 19] specifically
+make no guarantees about fair scheduling between workgroups
+executing the same kernel. HSA provides limited, one-way guaran-
+tees, stating [ 11, p. 46]: “Work-group A can wait for values written
+by work-group B without deadlock provided ... (if) A comes after B
+in work-group flattened ID order” . This is not sufficient to support
+blocking algorithms that use mutexes and inter-workgroup barriers,
+both of which require symmetric communication between threads.
+2.2 Motivating Examples
+Work Stealing. Work stealing enables dynamic balancing of tasks
+across processing units. It is useful when the number of tasks to be
+processed is dynamic, due to one task creating an arbitrary number
+of new tasks. Work stealing has been explored in the context of
+GPUs [ 3,30]. Each workgroup has a queue from which it obtains
+tasks to process, and to which it stores new tasks. If its queue is
+empty, a workgroup tries to steal a task from another queue.
+Figure 2 illustrates a work stealing kernel. Each thread receives
+a pointer to the task queues, in global memory, initialized by the1kernel graph_app( global graph *g,
+2 global nodes *n0, global nodes *n1) {
+3 int level = 0;
+4 global nodes *in_nodes = n0;
+5 global nodes *out_nodes = n1;
+6 int tid = get_global_id();
+7 int stride = get_global_size();
+8 while (in_nodes.size > 0) {
+9 for (int i = tid; i < in_nodes.size; i += stride)
+10 process_node(g, in_nodes[i], out_nodes, level);
+11 swap(&in_nodes, &out_nodes);
+12 global_barrier();
+13 reset(out_nodes);
+14 level++;
+15 global_barrier();
+16 }
+17 }
+Figure 3: An OpenCL graph traversal algorithm
+host to contain initial tasks. A thread uses its workgroup id (line 2)
+as a queue id to access the relevant task queue. The pop_or_steal
+function (line 4) pops a task from the workgroup’s queue or tries
+to steal a task from other queues. Although not depicted here,
+concurrent accesses to queues inside more _work andpop_or_steal
+are guarded by a mutex per queue, implemented using atomic
+compare and swap operations on global memory.
+If a task is obtained, then the workgroup processes it (line 6),
+which may lead to new tasks being created and pushed to the
+workgroup’s queue. The kernel presents two opportunities for spin-
+waiting: spinning to obtain a mutex, and spinning in the main kernel
+loop to obtain a task. Without fair scheduling, threads waiting for
+the mutex might spin indefinitely, causing the application to hang.
+Graph Traversal. Figure 3 illustrates a frontier-based graph tra-
+versal algorithm; such algorithms have been shown to execute
+efficiently on GPUs [ 2,20]. The kernel is given three arguments in
+global memory: a graph structure, and two arrays of graph nodes.
+Initially, n0contains the starting nodes to process. Private variable
+level records the current frontier level, and in_nodes andout_nodes
+point to distinct arrays recording the nodes to be processed during
+the current and next frontier, respectively.
+The application iterates as long as the current frontier contains
+nodes to process (line 8). At each frontier, the nodes to be pro-
+cessed are evenly distributed between threads through stride based
+processing. In this case, the stride is the total number of threads, ob-
+tained via get_global _size. A thread calls process _node to process
+a node given the current level, with nodes to be processed during
+the next frontier being pushed to out_nodes . After processing the
+frontier, the threads swap their node array pointers (line 11).
+At this point, the GPU threads must wait for all other threads
+to finish processing the frontier. To achieve this, we use a global
+barrier construct (line 12). After all threads reach this point, the
+output node array is reset (line 13) and the level is incremented.
+The threads use another global barrier to wait until the output node
+is reset (line 15), after which they continue to the next frontier.
+The global barrier used in this application is not provided as
+a GPU primitive, though previous works have shown that such a
+global barrier can be implemented [ 27,34], based on CPU barrierdesigns [ 9, ch. 17]. These barriers employ spinning to ensure each
+thread waits at the barrier until all threads have arrived, thus fair
+scheduling between workgroups is required for the barrier to oper-
+ate correctly. Without fair scheduling, the barrier threads may wait
+indefinitely at the barrier, causing the application to hang.
+The mutexes and barriers used by these two examples appear
+to run reliably on current GPUs for kernels that are executed with
+no more workgroups than there are compute units. This is due to
+the fairness of the occupancy-bound execution model that current
+GPUs have been shown, experimentally, to provide. But, as dis-
+cussed in Sec. 1, this model is not endorsed by language standards
+or vendor implementations, and may not be respected in the future.
+In Sec. 3.2 we show how the work stealing and graph traversal
+examples of Figs. 2 and 3 can be updated to use our cooperative
+kernels programming model to resolve the scheduling issue.
+3 COOPERATIVE KERNELS
+We present our cooperative kernels programming model as an
+extension to OpenCL. We describe the semantics of the model
+(Sec. 3.1), presenting a more formal operational semantics in Ap-
+pendix A and discussing possible alternative semantic choices in
+Appendix B, use our motivating examples to discuss programmabil-
+ity (Sec. 3.2) and outline important nonfunctional properties that
+the model requires to work successfully (Sec. 3.3).
+3.1 Semantics of Cooperative Kernels
+As with a regular OpenCL kernel, a cooperative kernel is launched
+by the host application, passing parameters to the kernel and speci-
+fying a desired number of threads and workgroups. Unlike in a reg-
+ular kernel, the parameters to a cooperative kernel are immutable
+(though pointer parameters can refer to mutable data).
+Cooperative kernels are written using the following extensions:
+transmit , a qualifier on the variables of a thread; offer _killand
+request _fork, the key functions that enable cooperative scheduling;
+andglobal _barrier andresizing _global _barrier primitives for inter-
+workgroup synchronisation.
+Transmitted Variables. A variable declared in the root scope of
+the cooperative kernel can optionally be annotated with a new
+transmit qualifier. Annotating a variable vwith transmit means
+that when a workgroup uses request _fork to spawn new work-
+groups, the workgroup should transmit its current value for vto
+the threads of the new workgroups. We detail the semantics for
+this when we describe request _fork below.
+Active Workgroups. If the host application launches a cooperative
+kernel requesting Nworkgroups, this indicates that the kernel
+should be executed with a maximum ofNworkgroups, and that as
+many workgroups as possible, up to this limit, are desired. However,
+the scheduler may initially schedule fewer than Nworkgroups, and
+as explained below the number of workgroups that execute the
+cooperative kernel can change during the lifetime of the kernel.
+The number of active workgroups —workgroups executing the
+kernel—is denoted M. Active workgroups have consecutive ids in
+the range[0,M−1]. Initially, at least one workgroup is active; if
+necessary the scheduler must postpone the kernel until some com-
+pute unit becomes available. For example, in Fig. 1: at the beginningof the execution M=4; while the graphics task is executing M=2;
+after the fork M=4again.
+When executed by a cooperative kernel, get_num _groups re-
+turns M, the current number of active workgroups. This is in con-
+trast to get_num _groups for regular kernels, which returns the
+fixed number of workgroups that execute the kernel (see Sec. 2.1).
+Fair scheduling isguaranteed between active workgroups; i.e.
+if some thread in an active workgroup is enabled, then eventually
+this thread is guaranteed to execute an instruction.
+Semantics for offer_kill.Theoffer _killprimitive allows the coop-
+erative kernel to return compute units to the scheduler by offering
+to sacrifice workgroups. The idea is as follows: allowing the sched-
+uler to arbitrarily and abruptly terminate execution of workgroups
+might be drastic, yet the kernel may contain specific program points
+at which a workgroup could gracefully leave the computation.
+Similar to the OpenCL workgroup barrier primitive, offer _kill,
+is a workgroup-level function—it must be encountered uniformly
+by all threads in a workgroup.
+Suppose a workgroup with id mexecutes offer _kill. If the work-
+group has the largest id among active workgroups then it can
+be killed by the scheduler, except that workgroup 0 can never be
+killed (to avoid early termination of the kernel). More formally, if
+m<M−1orM=1then offer _killis a no-op. If instead M>1and
+m=M−1, the scheduler can choose to ignore the offer, so that
+offer _killexecutes as a no-op, or accept the offer, so that execution
+of the workgroup ceases and the number of active workgroups M
+is atomically decremented by one. Figure 1 illustrates this, showing
+that workgroup 3is killed before workgroup 2.
+Semantics for request _fork.Recall that a desired limit of Nwork-
+groups was specified when the cooperative kernel was launched,
+but that the number of active workgroups, M, may be smaller than
+N, either because (due to competing workloads) the scheduler did
+not provide Nworkgroups initially, or because the kernel has given
+up some workgroups via offer _killcalls. Through the request _fork
+primitive (also a workgroup-level function), the kernel and sched-
+uler can collaborate to allow new workgroups to join the computa-
+tion at an appropriate point and with appropriate state.
+Suppose a workgroup with id m≤Mexecutes request _fork.
+Then the following occurs: an integer k∈[0,N−M]is chosen by
+the scheduler; knew workgroups are spawned with consecutive
+ids in the range[M,M+k−1]; the active workgroup count Mis
+atomically incremented by k.
+Theknew workgroups commence execution at the program
+point immediately following the request _fork call. The variables
+that describe the state of a thread are all uninitialised for the threads
+in the new workgroups; reading from these variables without first
+initialising them is an undefined behaviour. There are two excep-
+tions to this: (1) because the parameters to a cooperative kernel
+are immutable, the new threads have access to these parameters
+as part of their local state and can safely read from them; (2) for
+each variable vannotated with transmit , every new thread’s copy
+ofvis initialised to the value that thread 0 in workgroup mheld
+forvat the point of the request _fork call. In effect, thread 0 of the
+forking workgroup transmits the relevant portion of its local state
+to the threads of the forked workgroups.Figure 1 illustrates the behaviour of request _fork. After the
+graphics task finishes executing, workgroup 0calls request _fork,
+spawning the two new workgroups with ids 2and 3. Workgroups 2
+and 3join the computation where workgroup 0called request _fork.
+Notice that k=0is always a valid choice for the number of
+workgroups to be spawned by request _fork, and is guaranteed if
+Mis equal to the workgroup limit N.
+Global Barriers. Because workgroups of a cooperative kernel are
+fairly scheduled, a global barrier primitive can be provided. We
+specify two variants: global _barrier andresizing _global _barrier .
+Our global _barrier primitive is a kernel-level function: if it ap-
+pears in conditional code then it must be reached by allthreads
+executing the cooperative kernel. On reaching a global _barrier , a
+thread waits until all threads have arrived at the barrier. Once all
+threads have arrived, the threads may proceed past the barrier with
+the guarantee that all global memory accesses issued before the
+barrier have completed. The global _barrier primitive can be imple-
+mented by adapting an inter-workgroup barrier design, e.g. [ 34],
+to take account of a growing and shrinking number of workgroups,
+and the atomic operations provided by the OpenCL 2.0 memory
+model enable a memory-safe implementation [27].
+Theresizing _global _barrier primitive is also a kernel-level func-
+tion. It is identical to global _barrier , except that it caters for coop-
+eration with the scheduler: by issuing a resizing _global _barrier the
+programmer indicates that the cooperative kernel is prepared to
+proceed after the barrier with more or fewer workgroups.
+When all threads have reached resizing _global _barrier , the num-
+ber of active workgroups, M, is atomically set to a new value, M′
+say, with 0<M′≤N. IfM′=Mthen the active workgroups
+remain unchanged. If M′<M, workgroups[M′,M−1]are killed.
+IfM′>Mthen M′−Mnew workgroups join the computation after
+the barrier, as if they were forked from workgroup 0. In particular,
+thetransmit -annotated local state of thread 0 in workgroup 0 is
+transmitted to the threads of the new workgroups.
+The semantics of resizing _global _barrier can be modelled via
+calling request _fork andoffer _kill, surrounded and separated by
+calls to a global _barrier . The enclosing global _barrier calls ensure
+that the change in number of active workgroups from MtoM′
+occurs entirely within the resizing barrier, so that Mchanges atom-
+ically from a programmer’s perspective. The middle global _barrier
+ensures that forking occurs before killing, so that workgroups
+[0,min(M,M′)−1]are left intact.
+Because resizing _global _barrier can be implemented as above,
+we do not regard it conceptually as a primitive of our model. How-
+ever, in Sec. 4.2 we show how a resizing barrier can be implemented
+more efficiently through direct interaction with the scheduler.
+3.2 Programming with Cooperative Kernels
+A Changing Workgroup Count. Unlike in regular OpenCL, the
+value returned by get_num _groups is not fixed during the lifetime
+of a cooperative kernel: it corresponds to the active group count M,
+which changes as workgroups execute offer _kill, and request _fork.
+The value returned by get_global _sizeis similarly subject to change.
+A cooperative kernel must thus be written in a manner that is robust
+to changes in the values returned by these functions.In general, their volatility means that use of these functions
+should be avoided. However, the situation is more stable if a coop-
+erative kernel does not call offer _killandrequest _fork directly, so
+that only resizing _global _barrier can affect the number of active
+workgroups. Then, at any point during execution, the threads of
+a kernel are executing between some pair of resizing barrier calls,
+which we call a resizing barrier interval (considering the kernel
+entry and exit points conceptually to be special cases of resizing
+barriers). The active workgroup count is constant within each resiz-
+ing barrier interval, so that get_num _groups andget_global _size
+return stable values during such intervals. As we illustrate below
+for graph traversal, this can be exploited by algorithms that perform
+strided data processing.
+Adapting Work Stealing. In this example there is no state to trans-
+mit since a computation is entirely parameterised by a task, which
+is retrieved from a queue located in global memory. With respect
+to Fig. 2, we add request _fork andoffer _killcalls at the start of
+the main loop (below line 3) to let a workgroup offer itself to be
+killed or forked, respectively, before it processes a task. Note that
+a workgroup may be killed even if its associated task queue is not
+empty, since remaining tasks will be stolen by other workgroups. In
+addition, since request _fork may be the entry point of a workgroup,
+the queue id must now be computed after it, so we move line 2 to
+be placed just before line 4. In particular, the queue id cannot be
+transmitted since we want a newly spawned workgroup to read its
+own queue and not the one of the forking workgroup.
+Adapting Graph Traversal. Figure 4 shows a cooperative version
+of the graph traversal kernel of Fig. 3 from Sec. 2.2. On lines 12
+and 15, we change the original global barriers into a resizing barri-
+ers. Several variables are marked to be transmitted in the case of
+workgroups joining at the resizing barriers (lines 3, 4 and 5): level
+must be restored so that new workgroups know which frontier
+they are processing; in_nodes andout_nodes must be restored so
+that new workgroups know which of the node arrays to use for
+input and output. Lastly, the static work distribution of the original
+kernel is no longer valid in a cooperative kernel. This is because
+the stride (which is based on M) may change after each resizing
+barrier call. To fix this, we re-distribute the work after each resizing
+barrier call by recomputing the thread id and stride (lines 7 and
+8). This example exploits the fact that the cooperative kernel does
+not issue offer _killnorrequest _fork directly: the value of stride ob-
+tained from get_global _sizeat line 8 is stable until the next resizing
+barrier at line 12.
+Patterns for Irregular Algorithms. In Sec. 5.1 we describe the
+set of irregular GPU algorithms used in our experiments, which
+largely captures the irregular blocking algorithms that are available
+as open source GPU kernels. These all employ either work stealing
+or operate on graph data structures, and placing our new constructs
+follows a common, easy-to-follow pattern in each case. The work
+stealing algorithms have a transactional flavour and require little
+or no state to be carried between transactions. The point at which
+a workgroup is ready to process a new task is a natural place for
+offer _killandrequest _fork, and few or no transmit annotations are
+required. Figure 4 is representative of most level-by-level graph
+algorithms. It is typically the case that on completing a level of1kernel graph_app( global graph *g,
+2 global nodes *n0, global nodes *n1) {
+3 transmit int level = 0;
+4 transmit global nodes *in_nodes = n0;
+5 transmit global nodes *out_nodes = n1;
+6 while (in_nodes.size > 0) {
+7 int tid = get_global_id();
+8 int stride = get_global_size();
+9 for (int i = tid; i < in_nodes.size; i += stride)
+10 process_node(g, in_nodes[i], out_nodes, level);
+11 swap(&in_nodes, &out_nodes);
+12 resizing_global_barrier();
+13 reset(out_nodes);
+14 level++;
+15 resizing_global_barrier();
+16 }
+17 }
+Figure 4: Cooperative version of the graph traversal kernel
+of Fig. 3, using a resizing barrier and transmit annotations
+the graph algorithm, the next level could be processed by more or
+fewer workgroups, which resizing _global _barrier facilitates. Some
+level-specific state must be transmitted to new workgroups.
+3.3 Non-Functional Requirements
+The semantics presented in Sec. 3.1 describe the behaviours that
+a developer of a cooperative kernel should be prepared for. How-
+ever, the aim of cooperative kernels is to find a balance that allows
+efficient execution of algorithms that require fair scheduling, and
+responsive multitasking, so that the GPU can be shared between
+cooperative kernels and other shorter tasks with soft real-time
+constraints. To achieve this balance, an implementation of the coop-
+erative kernels model, and the programmer of a cooperative kernel,
+must strive to meet the following non-functional requirements.
+The purpose of offer _killis to let the scheduler destroy a work-
+group in order to schedule higher-priority tasks. The scheduler
+relies on the cooperative kernel to execute offer _killsufficiently
+frequently that soft real-time constraints of other workloads can
+be met. Using our work stealing example: a workgroup offers itself
+to the scheduler after processing each task. If tasks are sufficiently
+fast to process then the scheduler will have ample opportunities
+to de-schedule workgroups. But if tasks are very time-consuming
+to process then it might be necessary to rewrite the algorithm so
+that tasks are shorter and more numerous, to achieve a higher rate
+of calls to offer _kill. Getting this non-functional requirement right
+is GPU- and application-dependent. In Sec. 5.2 we conduct experi-
+ments to understand the response rate that would be required to
+co-schedule graphics rendering with a cooperative kernel, main-
+taining a smooth frame rate.
+Recall that, on launch, the cooperative kernel requests Nwork-
+groups. The scheduler should thus aim to provide Nworkgroups if
+other constraints allow it, by accepting an offer _killonly if a com-
+pute unit is required for another task, and responding positively to
+request _fork calls if compute units are available.4 PROTOTYPE IMPLEMENTATION
+Our vision is that cooperative kernel support will be integrated
+in the runtimes of future GPU implementations of OpenCL, with
+driver support for our new primitives. To experiment with our
+ideas on current GPUs, we have developed a prototype that mocks
+up the required runtime support via a megakernel , and exploits
+the occupancy-bound execution model that these GPUs provide to
+ensure fair scheduling between workgroups. We emphasise that an
+aim of cooperative kernels is to avoid depending on the occupancy-
+bound model. Our prototype exploits this model simply to allow
+us to experiment with current GPUs whose proprietary drivers we
+cannot change. We describe the megakernel approach (Sec. 4.1) and
+detail various aspects of the scheduler component of our implemen-
+tation (Sec. 4.2).
+4.1 The Megakernel Mock Up
+Instead of multitasking multiple separate kernels, we merge a set of
+kernels into a megakernel—a single, monolithic kernel. The megak-
+ernel is launched with as many workgroups as can be occupant
+concurrently. One workgroup takes the role of the scheduler,2and
+the scheduling logic is embedded as part of the megakernel. The
+remaining workgroups act as a pool of workers. A worker repeat-
+edly queries the scheduler to be assigned a task. A task corresponds
+to executing a cooperative or non-cooperative kernel. In the non-
+cooperative case, the workgroup executes the relevant kernel func-
+tion uninterrupted, then awaits further work. In the cooperative
+case, the workgroup either starts from the kernel entry point or
+immediately jumps to a designated point within the kernel, de-
+pending on whether the workgroup is an initial workgroup of the
+kernel, or a forked workgroup. In the latter case, the new work-
+group also receives a struct containing the values of all relevant
+transmit -annotated variables.
+Simplifying Assumptions. For ease of implementation, our pro-
+totype supports multitasking a single cooperative kernel with a sin-
+gle non-cooperative kernel (though the non-cooperative kernel can
+be invoked many times). We require that offer _kill,request _fork
+andresizing _global _barrier are called from the entry function of a
+cooperative kernel. This allows us to use goto andreturn to direct
+threads into and out of the kernel. With these restrictions we can
+experiment with interesting irregular algorithms (see Sec. 5). A
+non-mock implementation of cooperative kernels would not use
+the megakernel approach, so we did not deem the engineering ef-
+fort associated with lifting these restrictions in our prototype to be
+worthwhile.
+4.2 Scheduler Design
+To enable multitasking through cooperative kernels, the runtime
+(in our case, the megakernel) must track the state of workgroups, i.e.
+whether a workgroup is waiting or computing a kernel; maintain
+consistent context states for each kernel, e.g. tracking the number
+of active workgroups; and provide a safe way for these states to be
+modified in response to request _fork/offer _kill. We discuss these is-
+sues, and describe the implementation of an efficient resizing barrier.
+2We note that the scheduler requirements given in Sec. 3 are agnostic to whether the
+scheduling logic takes place on the CPU or GPU. To avoid expensive communication
+between GPU and host, we choose to implement the scheduler on the GPU.We describe how the scheduler would handle arbitrary combina-
+tions of kernels, though as noted above our current implementation
+is restricted to the case of two kernels.
+Scheduler Contexts. To dynamically manage workgroups execut-
+ing cooperative kernels, our framework must track the state of
+each workgroup and provide a channel of communication from
+the scheduler workgroup to workgroups executing request _fork
+andoffer _kill. To achieve this, we use a scheduler context structure,
+mapping a primitive workgroup id the workgroup’s status, which
+is either available or the id of the kernel that the workgroup is cur-
+rently executing. The scheduler can then send cooperative kernels
+aresource message , commanding workgroups to exit at offer _kill,
+or spawn additional workgroups at request _fork. Thus, the sched-
+uler context needs a communication channel for each cooperative
+kernel. We implement the communication channels using atomic
+variables in global memory.
+Launching Kernels and Managing Workgroups. To launch a
+kernel, the host sends a data packet to the GPU scheduler con-
+sisting of a kernel to execute, kernel inputs, and a flag indicating
+whether the kernel is cooperative. In our prototype, this host-device
+communication channel is built using fine-grained SVM atomics.
+On receiving a data packet describing a kernel launch K, the
+GPU scheduler must decide how to schedule K. Suppose Krequests
+Nworkgroups. The scheduler queries the scheduler context. If
+there are at least Navailable workgroups, Kcan be scheduled
+immediately. Suppose instead that there are only Na<Navailable
+workgroups, but a cooperative kernel Kcis executing. The scheduler
+can use Kc’s channel in the scheduler context to command Kcto
+provide N−Naworkgroups via offer _kill. Once Nworkgroups
+are available, the scheduler then sends Nworkgroups from the
+available workgroups to execute kernel K. If the new kernel Kis
+itself a cooperative kernel, the scheduler would be free to provide
+Kwith fewer than Nactive workgroups initially.
+If a cooperative kernel Kcis executing with fewer workgroups
+than it initially requested, the scheduler may decide make extra
+workgroups available to Kc, to be obtained next time Kccalls
+request _fork. To do this, the scheduler asynchronously signals Kc
+through Kc’s channel to indicate the number of workgroups that
+should join at the next request _fork command. When a workgroup
+wofKcsubsequently executes request _fork, thread 0 of wupdates
+the kernel and scheduler contexts so that the given number of new
+workgroups are directed to the program point after the request _fork
+call. This involves selecting workgroups whose status is available ,
+as well as copying the values of transmit -annotated variables to
+the new workgroups.
+An Efficient Resizing Barrier. In Sec. 3.1, we defined the seman-
+tics of a resizing barrier in terms of calls to other primitives. It is
+possible, however, to implement the resizing barrier with only one
+call to a global barrier with request _fork andoffer _killinside.
+We consider barriers that use the master/slave model [ 34]: one
+workgroup (master) collects signals from the other workgroups
+(slaves) indicating that they have arrived at the barrier and are
+waiting for a reply indicating that they may leave the barrier. Once
+the master has received a signal from all slaves, it replies with a
+signal saying that they may leave.Table 1: Blocking GPU applications investigated
+App. barriers kill fork transmit LoC inputs
+color 2 / 2 0 0 4 55 2
+mis 3 / 3 0 0 0 71 2
+p-sssp 3 / 3 0 0 0 42 1
+bfs 2 / 2 0 0 4185 2
+l-sssp 2 / 2 0 0 4196 2
+octree 0 / 0 1 1 0213 1
+game 0 / 0 1 1 0308 1
+Pannotia Lonestar GPU work stealing
+Incorporating request _fork andoffer _killinto such a barrier is
+straightforward. Upon entering the barrier, the slaves first execute
+offer _kill, possibly exiting. The master then waits for Mslaves (the
+number of active workgroups), which may decrease due to offer _kill
+calls by the slaves, but will not increase. Once the master observes
+thatMslaves have arrived, it knows that all other workgroups are
+waiting to be released. The master executes request _fork, and the
+statement immediately following this request _fork is a conditional
+that forces newly spawned workgroups to join the slaves in waiting
+to be released. Finally, the master releases all the slaves: the original
+slaves and the new slaves that joined at request _fork.
+This barrier implementation is sub-optimal because workgroups
+only execute offer _killonce per barrier call and, depending on order
+of arrival, it is possible that only one workgroup is killed per barrier
+call, preventing the scheduler from gathering workgroups quickly.
+We can reduce the gather time by providing a new query function
+for cooperative kernels, which returns the number of workgroups
+that the scheduler needs to obtain from the cooperative kernel. A
+resizing barrier can now be implemented as follows: (1) the master
+waits for all slaves to arrive; (2) the master calls request _fork and
+commands the new workgroups to be slaves; (3) the master calls
+query , obtaining a value W; (4) the master releases the slaves, broad-
+casting the value Wto them; (5) workgroups with ids larger than
+M−Wspin, calling offer _killrepeatedly until the scheduler claims
+them—we know from query that the scheduler will eventually do
+so. We show in Sec. 5.4 that the barrier using query greatly reduces
+the gather time in practice.
+5 APPLICATIONS AND EXPERIMENTS
+We discuss our experience porting irregular algorithms to cooper-
+ative kernels and describe the GPUs on which we evaluate these
+applications (Sec. 5.1). For these GPUs, we report on experiments to
+determine non-cooperative workloads that model the requirements
+of various graphics rendering tasks (Sec. 5.2). We then examine the
+overhead associated with moving to cooperative kernels when mul-
+titasking is notrequired (Sec. 5.3), as well as the responsiveness and
+throughput observed when a cooperative kernel is multi-tasked
+with non-cooperative workloads (Sec. 5.4). Finally, we compare
+against a performance model of kernel-level preemption, which we
+understand to be what current Nvidia GPUs provide (Sec. 5.5).
+5.1 Applications and GPUs
+Table 1 gives an overview of the 7 irregular algorithms that we
+ported to cooperative kernels. Among them, 5 are graph algorithms,based on the Pannotia [ 4] and Lonestar [ 2] GPU application suites,
+using global barriers. We indicate how many of the original number
+of barriers are changed to resizing barriers (all of them), and how
+many variables need to be transmitted. The remaining two algo-
+rithms are work stealing applications: each required the addition
+ofrequest _fork andoffer _killat the start of the main loop, and no
+variables needed to be transmitted (similar to example discussed in
+Sec. 3.2). Most graph applications come with 2 different data sets
+as input, leading to 11 application/input pairs in total.
+Our prototype implementation (Sec. 4) requires two optional
+features of OpenCL 2.0: SVM fine-grained buffers and SVM atomics.
+Out of the GPUs available to us, from ARM, AMD, Nvidia, and Intel,
+only Intel GPUs provided robust support of these features.
+We thus ran our experiments on three Intel GPUs: HD 520,
+HD 5500 and Iris 6100. The results were similar across the GPUs,
+so for conciseness, we report only on the Iris 6100 GPU (driver
+20.19.15.4463) with a host CPU i3-5157U. The Iris has a reported 47
+compute units. Results for the other Intel GPUs are presented in
+Appendix C.
+5.2 Sizing Non-cooperative Kernels
+Enabling rendering of smooth graphics in parallel with irregular
+algorithms is an important use case for our approach. Because our
+prototype implementation is based on a megakernel that takes over
+the entire GPU (see Sec. 4), we cannot assess this directly.
+We devised the following method to determine OpenCL work-
+loads that simulate the computational intensity of various graphics
+rendering workloads. We designed a synthetic kernel that occupies
+all workgroups of a GPU for a parameterised time period t, invoked
+in an infinite loop by a host application. We then searched for a
+maximum value for tthat allowed the synthetic kernel to execute
+without having an observable impact on graphics rendering. Using
+the computed value, we ran the host application for Xseconds,
+measuring the time Y<Xdedicated to GPU execution during
+this period and the number of kernel launches nthat were issued.
+We used X≥10in all experiments. The values (X−Y)/nandX/n
+estimate the average time spent using the GPU to render the display
+between kernel calls (call this E) and the period at which the OS
+requires the GPU for display rendering (call this P), respectively.
+We used this approach to measure the GPU availability required
+for three types of rendering: light, whereby desktop icons are
+smoothly emphasised under the mouse pointer; medium , whereby
+window dragging over the desktop is smoothly animated; and heavy ,
+which requires smooth animation of a WebGL shader in a browser.
+Forheavy we used WebGL demos from the Chrome experiments [ 6].
+Our results are the following: P=70msandE=3msfor light;
+P=40ms,E=3msfor medium; and P=40ms,E=10msfor
+heavy. For medium and heavy, the 40msperiod coincides with the
+human persistence of vision. The 3msexecution duration of both
+light and medium configurations indicates that GPU computation
+is cheaper for basic display rendering compared with more complex
+rendering.
+5.3 The Overhead of Cooperative Kernels
+Experimental Setup. Invoking the cooperative scheduling primi-
+tives incurs some overhead even if no killing, forking or resizingTable 2: Cooperative kernel slowdown w/o multitasking
+overall barrier wk.steal.
+mean max mean max mean max
+1.07 1 .23‡1.06 1 .20⋄1.12 1 .23‡
+‡octree,⋄color G3_circuit
+actually occurs, because the cooperative kernel still needs to inter-
+act with the scheduler to determine this. We assess this overhead
+by measuring the slowdown in execution time between the original
+and cooperative versions of a kernel, forcing the scheduler to never
+modify the number of active workgroups in the cooperative case.
+Recall that our mega kernel-based implementation merges the
+code of a cooperative and a non-cooperative kernel. This can reduce
+the occupancy for the merged kernel, e.g. due to higher register
+pressure, This is an artifact of our prototype implementation, and
+would not be a problem if our approach was implemented inside
+the GPU driver. We thus launch both the original and cooperative
+versions of a kernel with the reduced occupancy bound in order to
+meaningfully compare execution times.
+Results. Tab. 2 shows the geometric mean and maximum slow-
+down across all applications and inputs, with averages and maxima
+computed over 10 runs per benchmark. For the maximum slow-
+downs, we indicate which application and input was responsible.
+The slowdown is below 1.25 even in the worst case, and closer to 1
+on average. We consider these results encouraging, especially since
+the performance of our prototype could clearly be improved upon
+in a native implementation.
+5.4 Multitasking via Cooperative Scheduling
+We now assess the responsiveness of multitasking between a long-
+running cooperative kernel and a series of short, non-cooperative
+kernel launches, and the performance impact of multitasking on
+the cooperative kernel.
+Experimental Setup. For a given cooperative kernel and its in-
+put, we launch the kernel and then repeatedly schedule a non-
+cooperative kernel that aims to simulate the intensity of one of the
+three classes of graphics rendering workload discussed in Sec. 5.2.
+In practice, we use matrix multiplication as the non-cooperative
+workload, with matrix dimensions tailored to reach the appropriate
+execution duration. We conduct separate runs where we vary the
+number of workgroups requested by the non-cooperative kernel,
+considering the cases where one, a quarter, a half, and all-but-one,
+of the total number of workgroups are requested. For the graph
+algorithms we try both regular and query barrier implementations.
+Our experiments span 11 pairs of cooperative kernels and inputs,
+3 classes of non-cooperative kernel workloads, 4 quantities of work-
+groups claimed for the non-cooperative kernel and 2 variations of
+resizing barriers for graph algorithms, leading to 240 configurations.
+We run each configuration 10 times, in order to report averaged per-
+formance numbers. For each run, we record the execution time of
+the cooperative kernel. For each scheduling of the non-cooperative
+kernel during the run, we also record the gather time needed by
+the scheduler to collect workgroups to launch the non-cooperative
+kernel, and the non-cooperative kernel execution time..1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris octree
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris bfs usa
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris color G3-circuit
+gather time (W/O query)
+gather time
+light task
+heavy taskFigure 5: Example gather time and non-cooperative timing results
+Responsiveness. Figure 5 reports, on three configurations, the av-
+erage gather and execution times for the non-cooperative kernel
+with respect to the quantity of workgroups allocated to it. A loga-
+rithmic scale is used for time since gather times tend to be much
+smaller than execution times. The horizontal grey lines indicates
+the desired period for non-cooperative kernels. These graphs show
+a representative sample of our results; the full set of graphs for all
+configurations is provided in Appendix C.
+The left-most graph illustrates a work stealing example. When
+the non-cooperative kernel is given only one workgroup, its execu-
+tion is so long that it cannot complete within the period required
+for a screen refresh. The gather time is very good though, since the
+scheduler needs to collect only one workgroup. The more work-
+groups are allocated to the non-cooperative kernels, the faster it
+can compute: here the non-cooperative kernel becomes fast enough
+with a quarter (resp. half) of available workgroups for light (resp.
+heavy) graphics workload. Inversely, the gather time increases since
+the scheduler must collect more and more workgroups.
+The middle and right graphs show results for graph algorithms.
+These algorithms use barriers, and we experimented with the reg-
+ular and query barrier implementations described in Sec. 4.2. The
+execution times for the non-cooperative task are averaged across
+all runs, including with both types of barrier. We show separately
+the average gather time associated with each type of barrier. The
+graphs show a similar trend to the left-most graph: as the number of
+non-cooperative workgroups grows, the execution time decreases
+and the gather time increases. The gather time is higher on the
+rightmost figure as the G3 circuit input graph is rather wide than
+deep, so the graph algorithm reaches resizing barriers less often
+than for the USA road input of the middle figure for instance. The
+scheduler thus has fewer opportunities to collect workgroups and
+gather time increases. Nonetheless, scheduling responsiveness can
+benefit from the query barrier: when used, this barrier lets the
+scheduler collect all needed workgroups as soon as they hit a resiz-
+ing barrier. As we can see, the gather time of the query barrier is
+almost stable with respect to the number of workgroups that needs
+to be collected.
+Performance. Figure 6 reports the overhead brought by the sched-
+uling of non-cooperative kernels over the cooperative kernel ex-
+ecution time. This is the slowdown associated with running the
+ 0.2 0.4 0.6 0.8 1 1.2 1.4 1.6
+1 N/4 N/2 N-1median overhead
+workgroups 5 25 125 625
+1 N/4 N/2 N-1median period (ms)
+workgroupsheavy
+medium
+lightFigure 6: Performance impact of multitasking cooperative
+and non-cooperative workloads, and the period with which
+non-cooperative kernels execute
+cooperative kernel in the presence of multitasking, vs. running
+the cooperative kernel in isolation (median over all applications
+and inputs). We also show the period at which non-cooperative
+kernels can be scheduled (median over all applications and inputs).
+Our data included some outliers that occur with benchmarks in
+which the resizing barrier are not called very frequently and the
+graphics task requires half or more workgroups. For example, a
+medium graphics workload for bfs on the rmat input has over an
+8×overhead when asking for all but one of the workgroups. As
+Figure 6 shows, most of our benchmarks are much better behaved
+than this. In future work is required to examine the problematic
+benchmarks in more detail, possibly inserting more resizing calls.
+We show results for the three workloads listed in Sec. 5.2. The
+horizontal lines in the period graph correspond to the goals of the
+workloads: the higher (resp. lower) line corresponds to a period of
+70ms(resp. 40ms) for the light (resp. medium and heavy) workload.
+Co-scheduling non-cooperative kernels that request a single
+workgroup leads to almost no overhead, but the period is far too
+high to meet the needs of any of our three workloads; e.g. a heavy
+workload averages a period of 939ms. As more workgroups are ded-
+icated to non-cooperative kernels, they execute quickly enough to
+be scheduled at the expected period. For the light and medium work-
+loads, a quarter of the workgroups executing the non-cooperative
+kernel are able to meet their goal period (70 and 40msresp.). How-
+ever, this is not sufficient to meet the goal for the heavy workloadTable 3: Overhead of kernel level preemption vs cooperative
+kernels for three graphics workloads
+g. workload kernel-level cooperative resources
+light 1.04 1.04 N/4
+medium 1.08 1.08 N/4
+heavy 1.33 1.47 N/2
+(giving a median period of 104ms). If half of the workgroups are al-
+located to the non-cooperative kernel, the heavy workload achieves
+its goal period (median of 40ms). Yet, as expected, allocating more
+non-cooperative workgroups increases the overhead of the cooper-
+ative kernel. Still, heavy workloads meet their period by allocating
+half of the workgroups, incurring a slow down of less than 1.5 ×
+(median). Light and medium workloads meet their period with only
+a small overhead; 1.04 ×and 1.08×median slowdown respectively.
+5.5 Comparison with Kernel-Level Preemption
+Nvidia’s recent Pascal architecture provides hardware support for
+instruction-level preemption [ 18,25], however, preemption of en-
+tire kernels, but not of individual workgroups is supported. Intel
+GPUs do not provide this feature, and our OpenCL prototype of
+cooperative kernels cannot run on Nvidia GPUs, making a direct
+comparison impossible. We present here a theoretical analysis of
+the overheads associated with sharing the GPU between graphics
+and compute tasks via kernel-level preemption.
+Suppose a graphics workload is required to be scheduled with
+period Pand duration D, and that a compute kernel requires time
+Cto execute without interruption. If we assume the cost of preemp-
+tion is negligible (e.g. Nvidia have reported preemption times of 0.1
+msfor Pascal [ 25], because of special hardware support), then the
+overhead associated with switching between compute and graphics
+every Ptime steps is P/(P−D).
+We compare this task-level preemption overhead model with our
+experimental results per graphics workload in Tab. 3. We report the
+overhead of the configuration that allowed us to meet the deadline
+of the graphics task. Based on the above assumptions, our approach
+provides similar overhead for low and medium graphics workloads,
+however, has a higher overhead for the high workload.
+Our low performance for heavy workloads is because the graph-
+ics task requires half of the workgroups, crippling the cooperative
+kernel enough that request _fork calls are not issued as frequently.
+Future work may examine how to insert more resizing calls in these
+applications to address this. These results suggest that a hybrid
+preemption scheme may work well. That is, the cooperative ap-
+proach works well for light and medium tasks; on the other hand,
+heavy graphics tasks benefit from the coarser grained, kernel-level
+preemption strategy. However, the preemption strategy requires
+specialised hardware support in order to be efficient.
+6 RELATED WORK
+Irregular Algorithms and Persistent kernels. There has been a
+lot of work on accelerating blocking irregular algorithms using
+GPUs, and on the persistent threads programming style for long-
+running kernels [ 2–5,7,8,12,14,15,17,20,22,26,27,30,32].
+These approaches rely on the occupancy-bound execution model,flooding available compute units with work, so that the GPU is
+unavailable for other tasks, and assuming fair scheduling between
+occupant workgroups, which is unlikely to be guaranteed on future
+GPU platforms. As our experiments demonstrate, our cooperative
+kernels model allows blocking algorithms to be upgraded to run in
+a manner that facilitates responsive multitasking.
+GPU Multitasking and Scheduling. Hardware support for pre-
+emption has been proposed for Nvidia GPUs, as well as SM-draining
+whereby workgroups occupying a symmetric multiprocessor (SM; a
+compute unit using our terminology) are allowed to complete until
+the SM becomes free for other tasks [ 28]. SM draining is limited
+the presence of blocking constructs, since it may not be possible to
+drain a blocked workgroup. A follow-up work adds the notion of
+SMflushing , where a workgroup can be re-scheduled from scratch
+if it has not yet committed side-effects [ 21]. Both approaches have
+been evaluated using simulators, over sets of regular GPU ker-
+nels. Very recent Nvidia GPUs (i.e. the Pascal architecture) support
+preemption, though, as discussed in Sec. 1 and Sec. 5.5, it is not
+clear whether they guarantee fairness or allow tasks to share GPU
+resources at the workgroup level [18].
+CUDA and OpenCL provide the facility for a kernel to spawn
+further kernels [ 19]. This dynamic parallelism can be used to imple-
+ment a GPU-based scheduler, by having an initial scheduler kernel
+repeatedly spawn further kernels as required, according to some
+scheduling policy [ 16]. However, kernels that uses dynamic paral-
+lelism are still prone to unfair scheduling of workgroups, and thus
+does not help in deploying blocking algorithms on GPUs.
+Cooperative Multitasking. Cooperative multitasking was offered
+in older operating systems (e.g. pre 1995 Windows) and is still used
+by some operating systems, such as RISC OS [ 24]. Additionally,
+cooperative multitasking can be efficiently implemented in today’s
+high-level languages for domains in which preemptive multitasking
+is either too costly or not supported on legacy systems [29].
+7 CONCLUSIONS AND FUTURE WORK
+We have proposed cooperative kernels , a small set of GPU program-
+ming extensions that allow long-running, blocking kernels to be
+fairly scheduled and to share GPU resources with other workloads.
+Experimental results using our megakernel-based prototype show
+that the model is a good fit for current GPU-accelerated irregular
+algorithms. The performance that could be gained through a native
+implementation with driver support would be even better. Avenues
+for future work include seeking additional classes of irregular al-
+gorithms to which the model might (be extended to) apply (to),
+investigating implementing native support in open source drivers,
+and integrating cooperative kernels into template- and compiler-
+based programming models for graph algorithms on GPUs [ 20,33].
+ACKNOWLEDGMENTS
+We are grateful to Lee Howes, Bernhard Kainz, Paul Kelly, Christo-
+pher Lidbury, Steven McDonagh, Sreepathi Pai, and Andrew Richards
+for insightful comments throughout the work. We thank the FSE
+reviewers for their thorough evaluations and feedback. This work
+is supported in part by EPSRC Fellowship EP/N026314, and a gift
+from Intel Corporation.REFERENCES
+[1]J. Alglave, M. Batty, A. F. Donaldson, G. Gopalakrishnan, J. Ketema, D. Poetzl,
+T. Sorensen, and J. Wickerson. GPU concurrency: Weak behaviours and pro-
+gramming assumptions. In ASPLOS , pages 577–591. ACM, 2015.
+[2] M. Burtscher, R. Nasre, and K. Pingali. A quantitative study of irregular programs
+on GPUs. In IISWC , pages 141–151. IEEE, 2012.
+[3] D. Cederman and P. Tsigas. On dynamic load balancing on graphics processors.
+InEGGH , pages 57–64, 2008.
+[4] S. Che, B. M. Beckmann, S. K. Reinhardt, and K. Skadron. Pannotia: Understanding
+irregular GPGPU graph applications. In IISWC , pages 185–195, 2013.
+[5] A. A. Davidson, S. Baxter, M. Garland, and J. D. Owens. Work-efficient parallel
+GPU methods for single-source shortest paths. In IPDPS , pages 349–359, 2014.
+[6] Google. Chrome Experiments. https://www.chromeexperiments.com.
+[7]K. Gupta, J. Stuart, and J. D. Owens. A study of persistent threads style GPU
+programming for GPGPU workloads. In InPar , pages 1–14, 2012.
+[8] P. Harish and P. J. Narayanan. Accelerating large graph algorithms on the GPU
+using CUDA. In HiPC , pages 197–208, 2007.
+[9]M. Herlihy and N. Shavit. The Art of Multiprocessor Programming . Morgan
+Kaufmann Publishers Inc., 2008.
+[10] L. W. Howes. Personal communication. Editor of the OpenCL 2.0 specification.
+10 September 2016.
+[11] HSA Foundation. HSAIL virtual ISA and programming model, compiler writer,
+and object format (BRIG), February 2016. http://www.hsafoundation.com/
+standards/.
+[12] R. Kaleem, A. Venkat, S. Pai, M. W. Hall, and K. Pingali. Synchronization trade-
+offs in GPU implementations of graph algorithms. In IPDPS , pages 514–523,
+2016.
+[13] Khronos Group. The OpenCL specification version: 2.0 (rev. 29), July 2015.
+https://www.khronos.org/registry/cl/specs/opencl-2.0.pdf.
+[14] M. Méndez-Lojo, M. Burtscher, and K. Pingali. A GPU implementation of
+inclusion-based points-to analysis. In PPoPP , pages 107–116, 2012.
+[15] D. Merrill, M. Garland, and A. S. Grimshaw. High-performance and scalable
+GPU graph traversal. TOPC , 1(2):14, 2015.
+[16] P. Muyan-Özçelik and J. D. Owens. Multitasking real-time embedded GPU
+computing tasks. In PMAM , pages 78–87, 2016.
+[17] S. Nobari, T. Cao, P. Karras, and S. Bressan. Scalable parallel minimum spanning
+forest computation. In PPoPPP , pages 205–214, 2012.
+[18] NVIDIA. NVIDIA Tesla P100, 2016. Whitepaper WP-08019-001_v01.1.
+[19] Nvidia. CUDA C programming guide, version 7.5, July 2016.
+[20] S. Pai and K. Pingali. A compiler for throughput optimization of graph algorithms
+on GPUs. In OOPSLA , pages 1–19, 2016.
+[21] J. J. K. Park, Y. Park, and S. A. Mahlke. Chimera: Collaborative preemption for
+multitasking on a shared GPU. In ASPLOS , pages 593–606, 2015.
+[22] T. Prabhu, S. Ramalingam, M. Might, and M. W. Hall. EigenCFA: accelerating
+flow analysis with GPUs. In POPL , pages 511–522, 2011.
+[23] A. Richards. Personal communication. CEO of Codeplay Software Ltd. 2 Sep-
+tember 2016.
+[24] RISC OS. Preemptive multitasking. http://www.riscos.info/index.php/
+Preemptive_multitasking.
+[25] R. Smith and Anandtech. Preemption improved: Fine-grained preemp-
+tion for time-critical tasks, 2016. http://www.anandtech.com/show/10325/
+the-nvidia-geforce-gtx-1080-and-1070-founders-edition-review/10.
+[26] S. Solomon, P. Thulasiraman, and R. K. Thulasiram. Exploiting parallelism in
+iterative irregular maxflow computations on GPU accelerators. In HPCC , pages
+297–304, 2010.
+[27] T. Sorensen, A. F. Donaldson, M. Batty, G. Gopalakrishnan, and Z. Rakamaric.
+Portable inter-workgroup barrier synchronisation for GPUs. In OOPSLA , pages
+39–58, 2016.
+[28] I. Tanasic, I. Gelado, J. Cabezas, A. Ramírez, N. Navarro, and M. Valero. Enabling
+preemptive multiprogramming on GPUs. In ISCA , pages 193–204, 2014.
+[29] M. Tarpenning. Cooperative multitasking in c++. Dr. Dobb’s J. , 16(4), Apr. 1991.
+[30] S. Tzeng, A. Patney, and J. D. Owens. Task management for irregular-parallel
+workloads on the GPU. In HPG, pages 29–37, 2010.
+[31] N. Vallina-Rodriguez and J. Crowcroft. Energy management techniques in
+modern mobile handsets. IEEE Communications Surveys and Tutorials , 15(1):
+179–198, 2013.
+[32] V. Vineet, P. Harish, S. Patidar, and P. J. Narayanan. Fast minimum spanning
+tree for large graphs on the GPU. In HPG, pages 167–171, 2009.
+[33] Y. Wang, A. A. Davidson, Y. Pan, Y. Wu, A. Riffel, and J. D. Owens. Gunrock:
+a high-performance graph processing library on the GPU. In PPoPP , pages
+11:1–11:12, 2016.
+[34] S. Xiao and W. Feng. Inter-block GPU communication via fast barrier synchro-
+nization. In IPDPS , pages 1–12, 2010.A OPERATIONAL SEMANTICS FOR
+COOPERATIVE KERNELS
+In Sec. 3.1 we presented the semantics of cooperative kernels rel-
+atively informally, using English, to provide the intuition behind
+our programming model. We now back this up with a more for-
+mal presentation as an operational semantics for an abstract GPU
+programming model.
+States. LetLbe a set of local states that abstractly captures the
+private memory associated with a thread executing a GPU kernel.
+LetStmts denote the set of all possible statements that a thread can
+execute. We do not detail the structure of these statements, except
+that we assume sequential composition of statements is provided by
+the;separator, and that the offer _kill,request _fork,global _barrier
+andresizing _global _barrier primitives from our cooperative ker-
+nels programming model are valid statements.
+Athread state is then a pair(l,ss), where l∈Landss∈Stmts .
+Thelcomponent captures the valuation of all the thread’s private
+memory, and the sscomponent captures the remaining statements
+to be executed by the thread. Let ThreadStates denote the set of all
+thread states.
+Assuming that d>0threads per workgroup were requested on
+kernel launch, a workgroup state is ad-tuple((l0,ss0), . . . ,(ld−1,ssd−1)),
+where each(li,ssi)is the thread state for the ith thread in the work-
+group(0≤i<d).
+Assuming that N>0was specified as the maximum number of
+workgroups that should execute the cooperative kernel, a kernel
+state is then a pair
+(σ,(w0, . . . , wM−1,⊥, . . . ,⊥|    {z    }
+N−M))
+where:σrepresents the shared state of the kernel; M≤Nis the
+number of active workgroups; wiis the workgroup state for active
+workgroup i(0≤i<M); and N−Moccurrences of⊥indicate
+absent workgroups. Let SharedStates denote the set of all possible
+shared states. We regard workgroup-local storage as being part of
+the shared state of a kernel.
+Thread-level transitions. We leave the semantics for thread-level
+transitions abstract, assuming a binary relation →tauonSharedStates×
+ThreadStates . If(σ,(l,ss))→ τ(σ′,(l′,ss′)), this indicates that if a
+thread is in local state (l,ss), the thread can transition to local state
+(l′,ss′), changing the shared state from σtoσ′in the process.
+All we require is that (σ,(l,ss))→ τ(σ′,(l′,ss′))ifsshas the
+form special();tt, where special is one of offer _kill,request _fork,
+global _barrier orresizing _global _barrier . This is because we shall
+specifically define the meaning of the new primitives introduced
+by our programming model.
+Memory synchronisation. GPUs are known to have relaxed mem-
+ory models [ 1]. To abstractly account for this, we assume that the
+shared state component σis not simply a mapping from locations
+to values, but instead captures all the intricacies of GPU memory
+that can lead to this relaxed behaviour. We also assume a function
+sync which, given a kernel state κ, returns a set of kernel states. The
+idea is that each κ′∈sync(κ)is a possible kernel state that can be
+reached from κby stalling until all stores to memory and loads from
+memory to thread-local storage have completed. All we require isthat sync does not modify the number of active workgroups nor
+the component of a thread state that determines which statements
+remain to be executed.
+Operational semantics rules. Figure 7 presents the rules of our
+operational semantics, defining a relation →on kernel states.
+Rule Thread-Step defines the semantics for thread making a
+single execution step, delegating to the abstract →τrelation to
+determine how the thread’s local state and the shared state com-
+ponent change. For simplicity, this rule ignores the semantics of
+intra-workgroup barriers, which are not our focus here.
+Rule Kill-No-Op reflects the fact that when a workgroup reaches
+offer _kill, this can always be treated as a no-op. Whether a scheduler
+implementation accepts offer _killcalls or not depends on competing
+workloads and how the scheduler has been designed to meet the
+non-functional requirements discussed in Sec. 3.3, but in general
+the programmer should always be prepared for the possibility that
+a workgroup survives after calling offer _kill.
+The case where a workgroup’s offer to be killed is accepted by
+the scheduler is captured by rule Kill. Because we have adopted a
+semantics where workgroup 0 is never killed and where only the
+workgroup with the highest id can be killed, the rule only fires if
+M>0and workgroup M−1has reached offer _kill. The rule has
+the effect of replacing the workgroup state for wM−1with⊥.
+Recall that offer _killis a workgroup-level function: the same
+syntactic request _fork call must be reached by all threads in a work-
+group. This is captured in our rules by requiring in both Kill-No-Op
+andKill that every thread is ready to execute offer _killfollowed
+by an identical statement ss. Neither rule applies until all threads in
+a workgroup reach request _fork, and the workgroup gets stuck if
+multiple threads in a workgroup reach request _fork with different
+subsequent statements.
+TheFork rule similarly requires all threads in a workgroup to
+reach request _fork with identical following statements. A nonde-
+terministic number of new workgroups, k, is selected to be forked,
+where k∈[0,N−M]. Importantly, k=0is always a legitimate
+choice, in which case request _fork has no effect on the number of
+workgroups that are executing. In the case where k>0,knew
+workgroup states are created, where each workgroup inherits the
+local state of thread 0 in wi, the workgroup executing the fork
+call. After request _fork, all threads in all workgroups, including
+the new threads, proceed to execute the sequence of statements ss
+that followed request _fork.
+A simplification here is that we do not model transmission of par-
+ticular annotated variables from thread 0 of the forking workgroup,
+instead specifying that the entire local state of the workgroup is
+transmitted. Extending the semantics to transmit only annotated
+variables would be straightforward but verbose, requiring the local
+memory component of a thread state to be split into two: the part
+of the local state to be transmitted (modelling transmit -annotated
+variables), and the rest of the local state.
+TheBarrier rule requires that every thread executing the ker-
+nel reaches global _barrier an identical following statement. This
+reflects that fact that global _barrier is a kernel-level function. Each
+thread then skips over the global _barrier call, and the sync function
+is applied to yield a set of kernel states that can arise due to memorywi(j)=(l,ss) (σ,(l,ss))→ τ(σ′,(l′,ss′)) w′
+i=wi[j7→(l′,ss′)]
+(σ,(. . . ,wi, . . .))→(σ′,(. . . ,w′
+i, . . .))(Thread-Step )
+∀j.wi(j)=(lj,offer _kill();ss) w′
+i=((l0,ss), . . . ,(ld−1,ss))
+(σ,(. . . ,wi, . . .))→(σ,(. . . ,w′
+i, . . .))(Kill-No-Op )
+∀j.wM−1(j)=(lj,offer _kill();ss) M>0
+(σ,(. . . ,wM−2,wM−1,⊥, . . . ,⊥))→(σ,(. . . ,wM−2,⊥,⊥, . . . ,⊥))(Kill)
+∀j.wi(j)=(lj,request _fork();ss) w′
+i=((l0,ss), . . . ,(ld−1,ss)) k∈[0,N−M] ∀a∈[0,k−1].wM+a=((l0,ss), . . . ,(l0,ss))
+(σ,(. . . ,wi, . . . , wM−1,⊥, . . . ,⊥))→(σ,(. . . ,w′
+i, . . . , wM−1,wM, . . . , wM+k−1,⊥, . . . ,⊥))
+(Fork )
+∀i.∀j.wi(j)=(li,j,global _barrier();ss) ∀i.∀j.w′
+i(j)=(li,j,ss)
+κ∈sync((σ,(w′
+0, . . . , w′
+M−1,⊥, . . . ,⊥))
+(σ,(w0, . . . , wM−1,⊥, . . . ,⊥))→κ(Barrier )
+∀i.∀j.wi(j)=(li,j,resizing _global _barrier();ss)
+∀j.w′
+0(j)=(l1,j,global _barrier();request _fork();global _barrier();global _barrier();ss)
+∀i,1.∀j.w′
+i(j)=(li,j,global _barrier();global _barrier();offer _kill();global _barrier();ss)
+(σ,(w0, . . . , wM−1,⊥, . . . ,⊥))→(σ,(w′
+0, . . . , w′
+M−1,⊥, . . . ,⊥))(Resizing-Barrier )
+Figure 7: Abstract operational semantics for our cooperative kernels language extensions
+synchronization taking place. An arbitrary member of this set is
+selected as the next kernel state.
+Despite its apparent complexity, the Resizing-Barrier rule sim-
+ply implements the rewriting of resizing _global _barrier in terms
+ofglobal _barrier ,offer _killandrequest _fork discussed in Sec. 3.1.
+B ALTERNATIVE SEMANTIC CHOICES
+The semantics of cooperative kernels has been guided by the prac-
+tical applications we have studied (described in Sec. 5.1). We now
+discuss several cases where we might have taken different and also
+reasonable semantic decisions.Killing order. We opted for a semantics whereby only the active
+workgroup with the highest id can be killed. This has an appealing
+property: it means that the ids of active workgroups are contiguous,
+which is important for processing of contiguous data. The coopera-
+tive graph traversal algorithm of Fig. 4 illustrates this: the algorithm
+is prepared for get_global _sizeto change after each resizing barrier
+call, but depends on the fact that get_global _idreturns a contiguous
+range of thread ids.
+A disadvantage of this decision is that it may provide sub-optimal
+responsiveness from the point of view of the scheduler. Suppose the
+scheduler requires an additional compute unit, but the active thread
+with the largest id is processing some computationally intensivework and will take a while to reach offer _kill. Our semantics means
+that the scheduler cannot take advantage of the fact that another
+active workgroup may invoke offer _killsooner.
+Cooperative kernels that do not require contiguous thread ids
+might me more suited to a semantics in which workgroups can
+be killed in any order, but where workgroup ids (and thus thread
+global ids) are not guaranteed to be contiguous.
+Keeping one workgroup alive. Our semantics dictate that the
+workgroup with id 0 will not be killed if it invokes offer _kill. This
+avoids the possibility of the cooperative kernel terminating early
+due to the programmer inadvertently allowing all workgroups to
+be killed, and the decision to keep workgroup 0 alive fits well with
+our choice to kill workgroups in descending order of id.
+However, there might be a use case for a cooperative kernel
+reaching a point where it would be acceptable for the kernel to
+exit, although desirable for some remaining computation to be per-
+formed if competing workloads allow it. In this case, a semantics
+where all workgroups can be killed via offer _killwould be appro-
+priate, and the programmer would need to guard each offer _kill
+with an id check in cases where killing all workgroups would be
+unacceptable. For example:
+if(get_group _id0!= 0) offer_kill();
+would ensure that at least workgroup 0 is kept alive.
+Transmission of partial state from a single thread. Recall from
+the semantics of request _fork that newly forked workgroups in-
+herit the variable valuation associated with thread 0 of the forking
+workgroup, but only for transmit -annotated variables. Alternative
+choices here would be to have forked workgroups inherit values
+forallvariables from the forking workgroup, and to have thread
+iin the forking workgroup provide the valuation for thread iin
+each spawned workgroup, rather than having thread 0 transmit the
+valuation to all new threads.
+We opted for transmitting only selected variables based on the
+observation that many of a thread’s private variables are dead at
+the point of issuing request _fork orresizing _global _barrier , thus
+it would be wasteful to transmit them. A live variable analysis
+could instead be employed to over-approximate the variables that
+might be accessed by newly arriving workgroups, so that these are
+automatically transmitted.
+In all cases, we found that a variable that needed to be transmitted
+had the property of being uniform across the workgroup. That is,
+despite each thread having its own copy of the variable, each thread
+is in agreement on the variable’s value. As an example, the level,
+in_nodes andout_nodes variables used in Fig. 4 are all stored in
+thread-private memory, but all threads in a workgroup agree on
+the values of these variables at each resizing _global _barrier call.
+As a result, transmitting the thread 0’s valuation of the annotated
+variables is equivalent to (and more efficient than) transmitting
+values on a thread-by-thread basis. We have not yet encountered a
+real-world example where our current semantics would not suffice.C GRAPHS FOR MULTITASKING
+EXPERIMENTS
+We present the full set of graphs exemplified by the examples in
+Fig. 5; for completeness we reproduce those graphs here too.
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 color ecology
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 color G3-circuit
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 mis ecology
+gather time (W/O query)
+gather time
+light task
+heavy task.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 mis G3-circuit
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 sssp usa-road
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 sssp rmat20
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 sssp usa-ny
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 bc 1k-128k
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 bc 2k-1M
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 bfs rmat22
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 bfs usa
+gather time (W/O query)
+gather time
+light task
+heavy task.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris color ecology
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris color G3-circuit
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris mis ecology
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris mis G3-circuit
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris sssp usa-road
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris sssp rmat20
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris sssp usa-ny
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris bc 1k-128k
+gather time (W/O query)
+gather time
+light task
+heavy task.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris bc 2k-1M
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris bfs rmat22
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris bfs usa
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 color ecology
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 color G3-circuit
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 mis ecology
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 mis G3-circuit
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 sssp usa-road
+gather time (W/O query)
+gather time
+light task
+heavy task.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 sssp rmat20
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 sssp usa-ny
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 bc 1k-128k
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 bc 2k-1M
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 bfs rmat22
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 bfs usa
+gather time (W/O query)
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 octree
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD5500 game
+gather time
+light task
+heavy task.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris octree
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsIris game
+gather time
+light task
+heavy task
+.1110high (40)low (70)1000
+ 
+1 N/4 N/2 N-1time (ms)
+number of non-cooperative workgroupsHD520 octree
+gather time
+light task
+heavy task

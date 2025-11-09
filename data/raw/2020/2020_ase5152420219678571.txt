@@ -1,0 +1,926 @@
+Automated V eriﬁcation of Go Programs via
+Bounded Model Checking
+Nicolas Dilley
+Department of Computing
+University of Kent
+Canterbury, United Kingdom
+nd315@kent.ac.ukJulien Lange
+Department of Computer Science
+Royal Holloway, University of London
+Egham, United Kingdom
+julien.lange@rhul.ac.uk
+Abstract —The Go programming language offers a wide range
+of primitives to coordinate lightweight threads, e.g., channels,
+waitgroups, and mutexes — all of which may cause concurrencybugs. Static checkers that guarantee the absence of bugs areessential to help programmers avoid these costly errors beforetheir code is executed. However existing tools either miss toomany bugs or cannot handle large programs. To address theselimitations, we propose a static checker for Go programs whichrelies on performing bounded model checking of their concurrentbehaviours. In contrast to previous works, our approach dealswith large codebases, supports programs that have staticallyunknown parameters, and is extensible to additional concurrencyprimitives. Our work includes a detailed presentation of theextraction algorithm from Go programs to models, an algorithmto automatically check programs with statically unknown param-eters, and a large scale evaluation of our approach. The lattershows that our approach outperforms the state-of-the-art.
+Index T erms—Go, concurrency, static veriﬁcation, behavioural
+types, model checking
+I. I NTRODUCTION
+Developing concurrent software is particularly difﬁcult be-
+cause concurrency-related bugs are often difﬁcult to detect.
+Typically these bugs do not occur in every execution (e.g., dueto non-determinism or because they depend on the program’sarguments) and some may not be easily observable (e.g., theymight only affect the memory footprint of the program).
+Message-passing concurrency, as supported natively by the
+Go programming language, offers a higher level of abstractionthan traditional shared memory-based concurrency. Howeverbugs are still a common problem in message-passing soft-ware [31] and it is thus essential to develop reliable static
+checkers that can rule out these bugs. Static veriﬁcation hasthe advantage of ruling out bugs for every execution and to
+do this before the code is executed and released.
+Amongst recent works on static checkers for Go, we distin-
+guish those that aim for soundness, e.g., using a behaviouraltype approach [5], [7], [20], [21], [25], and those that aim forcompleteness, e.g., GCatch [22]. Existing checkers based onbehavioural types tend to raise too many false alarms, do notscale to large codebases, and support a very limited subset ofGo. In contrast, GCatch can handle large codebases, has a lowrate of false alarm, but tends to miss many bugs. Additionally,it is not easy to predict the type of bugs it misses.In this work, we build on the behavioural types approach
+ﬁrst formalised in [20], where models that represent the com-munication structure (behavioural types) are extracted fromGo programs. These models over-approximate their programsand can be veriﬁed using an off-the-shelf model checker.
+Our work builds on our earlier prototype [5] which uses
+Promela as a behaviour type language. Our extension consistsof a combination of four key insights.
+(1) To deal with programs whose concurrent structure depends
+on arguments that are decided at run-time, we extract pa-
+rameterised behavioural types (i.e., models) from programs.
+These models can then be veriﬁed up-to user-provided bounds.
+Tracking parameters that affect the concurrent structure ofprograms allows us to decrease the number of false alarms,which plagued earlier behavioural types-based approaches.
+(2) To deal with large codebases, we divide Go programs into
+independently veriﬁable components. This allows us to verify
+a large project like Kubernetes [19] (more than 3 million LoC)in 26 minutes. Most projects are checked under 4 minutes.
+(3) Our approach supports programs that coordinate over the
+three main concurrency primitives (channels, waitgroups, mu-
+texes), and can easily be extended to support more primitives.
+(4) Our approach is explicit wrt. the subset of Go it supports,
+and which constructs are over-approximated. Additionally,
+our tool returns conﬁdence levels when it is applied to pa-rameterised programs. Hence, it is easier for developers tounderstand the risk and potential cause of false alarms.
+We describe the technical insights of our approach using a
+bug our tool discovered in the wild with Example 1.
+Example 1. The program in Figure 1 is adapted from
+code found on the GitHub repository of trillian [11], a
+veriﬁable data store developed at Google. At line 10, function
+preload() spawns|trees| worker goroutines which send
+the result of DoSomeWork() over channel ch. To limit the
+number of concurrent threads, each goroutine acquires a token(receive at line 11) before executing DoSomeWork(), and
+returns it (send at line 14) before terminating. Note that theparent thread ﬁlls channel limitCh with tokens at lines 4-5.
+At line 18 the parent thread spawns another goroutine that
+waits for the worker goroutines to ﬁnish using a waitgroup
+10162021 36th IEEE/ACM International Conference on Automated Software Engineering (ASE)
+DOI 10.1109/ASE51524.2021.000932021 36th IEEE/ACM International Conference on Automated Software Engineering (ASE) | 978-1-6654-0337-5/21/$31.00 ©2021 IEEE | DOI: 10.1109/ASE51524.2021.9678571
+978-1-6654-0337-5/21/$31.00  ©2021  IEEE
+1func preload(trees []string,nint){
+2 ch := make(chan string,n )// new chan with capacity n
+3 limitCh := make(chan int, runtime.NumCPU())
+4 for i := 0; i < runtime.NumCPU(); i++ {
+5 limitCh <- 1 // send token on chan limitCh
+6 }
+7 var wg sync.WaitGroup
+8 for _, t := range trees {
+9 wg.Add(1) // increment wg counter
+10 go func(v string){ // spawn goroutine
+11 <-limitCh // receive token before starting work
+12 s := DoSomeWork(v)
+13 ch <- s
+14 limitCh <- 1 // return token
+15 wg.Done() // decrement wg counter
+16 }(t)
+17 }
+18 go func() { // spawn goroutine
+19 wg.Wait() // wait for wg to reach 0
+20 close(ch) // set ch to closed
+21 }()
+22 for s: =range ch { // receive message from ch
+23 ifIsError(s) {
+24 return
+25 }
+26 }
+27}
+Fig. 1: Example of a blocking bug, adapted from [11].
+(wg). When all goroutines have invoked wg.Done(), opera-
+tionwg.Wait() succeeds, and channel ch isclosed.
+After spawning |trees|+1 goroutines, the parent is ready
+to consume the data sent on ch via a range loop on ch
+(line 22). This construct iterates over each element sent on ch
+until the channel is closed. If a message contains an error
+(i.e.,isError(s) returns true), preload() returns.
+Figure 1 contains a subtle bug that leads to several gorou-
+tines becoming permanently stuck. Consider the case where
+0<runtime.NumCPU() and0<n<|trees|−1. The num-
+ber of send actions on channel ch is greater than its capacity,
+hence some worker goroutines will be blocked at line 13until the parent thread receives some messages (line 22). Ifpreload() returns (line 24) before consuming all messages,
+it may leave up to |trees|−runtime.NumCPU() gorou-
+tines permanently blocked.
+Blocked goroutines are problematic even when the program
+as a whole is not stuck. They cannot be garbage collected,hence they silently consume resources until the whole programterminates. For instance, if function preload is called often
+with the “wrong” arguments, this would affect signiﬁcantlythe memory footprint of the program.
+Programs like Example 1 are difﬁcult to reason about
+because they use several coordination mechanisms in non-trivial ways which makes it hard to enumerate all possibleinterleavings. This is particularly challenging when the numberof spawned goroutines and/or the capacity of channels areunknowns, as the programmer has to think of how differentvalues will affect the possible executions.
+Our main insight to verify these programs in a scal-
+able way is to ﬁrst identify the parameters which directlyaffect their concurrent structures, e.g., |trees| ,n, and
+runtime.NumCPU() in Example 1. Given such parameters,
+we extract parameterised models from Go code which arethen veriﬁed using bounded model checking. We use Spinas a back-end, but our approach is not necessarily boundto it. Given a user-deﬁned set of values, we model-checkevery possible instantiation of a parameterised model. Our toolreturns the result of each veriﬁcation, as well as an aggregatescore that helps distinguishing false alarms from real bugs.
+Contributions § III describes a novel algorithm to extract
+parameterised behavioural types from Go code. § IV de-
+scribes a bounded model checking technique to verify these
+behavioural types. We have implemented these algorithms ina tool,
+GOMELA [6], outlined in § V. In § VI, we give a
+thorough experimental evaluation of GOMELA against related
+work [7], [22]. Out of 78 real-world buggy programs, weshow that
+GOMELA detects 46 bugs (at least 1.54× more
+than other tools). Additionally, we demonstrate the scalabilityof our approach using 99 most starred Go repositories fromGitHub.
+II. P
+RELIMINARIES
+We review key aspects of the Go programming language,
+and give a brief overview of Spin and Promela (the modelchecker and language we use to verify Go programs).
+A. Go programs and their properties
+A Go program consists of a list of declarations of functions,
+structures (struct, on which one can deﬁne methods),
+and interfaces (i.e., sets of method signatures which can beimplemented by structures). The special function main() is
+the entry point of the program.
+Go is known for its distinctive support for concurrent pro-
+gramming, advocating for message passing instead of sharedmemory. Go natively supports channels (chan) over whichlightweight threads (a.k.a. goroutines) coordinate their tasks.The standard library also offers two popular concurrencyprimitives: waitgroups and mutexes.
+Figure 2 gives an overview of the control-ﬂow constructs
+and concurrency operations of interest in this work. The ﬁrstpart of the ﬁgure lists control-ﬂow constructs. Call f(
+a)is a
+blocking call to function f, while gof(a)spawns function f
+in a concurrent thread of execution. By convention we write
+afor a (possibly empty) sequence a1,...,a k(withk≥0).
+Conditionals (if-then-else) and traditional iterations (for loops)
+are standard. Note that while loops do not exist in Go. Go
+additionally provides constructs to range over collections orchannels. A fori,x:=rangel{
+s}block executes sfor
+eachxinl(iis bound to the index of xin the collection). A
+forx:=range ch{s}block executes sfor every message
+received from ch, and exits when ch is closed and empty.
+Instruction ch:=make( chan T,e)creates a new channel
+ch of capacity e(an integer expression). A channel carries
+a single type (T) of messages. If eevaluates to 0, the
+channel is synchronous (both send and receive actions areblocking), otherwise it is asynchronous (send actions are non-blocking as long as the channel has not reached full capacity).Instruction ch<−esendseonch, while<−chreceives from
+ch. Invoking close( ch)closes ch. Receiving on a closed
+1017f(a) Call fwith arguments a
+gof(a) Spawn fwith arguments a
+ifethens1elses2 Conditional
+fori:=e1;e2;r{s} For loop
+fori,x :=rangel{s} Iteration over collection l
+◦ forx:=range ch{s} Iteration over channel ch
+ch:=make(chan T,e) Declare a chan. with capacity e
+◦• ch<−e Sendeover ch
+◦<−ch Receive on channel ch
+•close(ch ) Close channel ch
+◦ select{case αi:si}i∈I Guarded choice
+var wgsync.WaitGroup Declare a waitgroup wg
+• wg.Add(e ) Addetowg
+• wg.Done() Decrement wg by1
+◦ wg.Wait() Wait until wg reaches 0
+var musync.Mutex Declare a Mutex mu
+var musync.RWMutex Declare a RWmutex mu
+◦ mu.Lock() Lock mutex/RWmutex
+• mu.Unlock() Lock mutex/RWmutex
+◦ mu.RLock() Lock for read access
+• mu.RUnlock() Unlock read access
+Fig. 2: Key statements in Go, some may be blocking (◦) and/or
+may trigger a run-time error (•).
+channel is non-blocking, but sending on, or closing, a closed
+channel triggers a runtime error. A select statement allows
+a goroutine to wait for several operations (e.g., send/receiveon a channel). It blocks until one of its cases succeeds, thenexecutes the corresponding branch. A select statement may
+contain a default branch which is executed if all other
+branches are blocked.
+Instruction var wgsync.WaitGroup creates a new
+waitgroup wg. Operation wg.Add(e)addse(which evaluates
+to a positive or negative integer) to the waitgroup’s counter,while wg.Done() decrements the counter by 1. Operation
+wg.Wait() blocks until wg’s counter reaches 0. A waitgroup
+whose counter becomes negative triggers a runtime error.
+Go’s standard library provides Mutex andRWMutex.
+The former is used to protect a critical section with exclu-sive access, i.e., both writers and readers use mu.Lock()
+and mu.Unlock(). The latter allows several readers to
+access a critical section (but at most one writer). Read-ers use mu.RLock() and mu.RUnlock(). Both primitives
+trigger a runtime error when invoking mu.Unlock() or
+mu.RUnlock() on an unlocked mutex.
+Concurrency bugs in Go: We distinguish between blocking
+bugs and safety bugs. Blocking bugs occur when a goroutine is
+permanently stuck waiting for a blocking operation to succeed,e.g., a receive waiting for a message to be sent. Potentiallyblocking operations are marked with ◦in Figure 2. Blocking
+bugs are often referred to as goroutine leaks in the Go
+community. Blocked goroutines may notably cause the wholeprogram to get stuck (global deadlock) or lead to memoryleaks, as they cannot be garbage collected, see Example 1.
+Safety bugs occur when an operation is unexpectedly in-
+voked on a concurrency primitive (and triggers a run-time er-ror), e.g., sending on a closed channel causes a run-time error.Operations that may trigger a run-time error are marked with1func main() {
+2 var wg sync.WaitGroup
+3 someList := []int{1, 2, 3}
+4 for range someList {
+5 go func() {
+6 wg.Done() // may trigger a run-time error
+7 }()
+8 wg.Add(1)
+9 }
+10 wg.Wait()
+11}
+Fig. 3: Negative counter bug, adapted from [18].
+•in Figure 2. Observe that all three concurrency primitives
+we consider can trigger such errors.
+Example 2. Figure 3, adapted from kubernetes [18],
+shows a typical safety bug. This program spawns several
+worker goroutines. Each goroutine invokes wg.Done() once
+they have completed their job. However, the parent threadinvokes wg.Add(1) after spawning each goroutine. In an
+execution where, e.g., the ﬁrst worker goroutine ﬁnishes its jobquickly, it may decrement wg before it is incremented, thus
+may trigger a run-time error (“panic: sync: negativeWaitGroup counter”).
+F ocus of this work: For the sake of space and clarity, the
+core of this paper focuses on the subset of Go identiﬁed byFigure 2. We explain how our tool handles additional features(e.g., structs, methods, and anonymous functions) in § V.
+Our aim is to develop a technique that is sound for a
+well-understood subset of Go. The language features ourapproach does not currently support are: programs that re-
+cursively spawn goroutines or create concurrency primitives,virtual method calls, higher-order functions, mutable/mutatedconcurrency primitives (e.g., channel variables that are re-assigned), and collections containing concurrency primitives.
+B. Promela as a behavioural type language
+The crux of our technique is to over-approximate Go pro-
+grams with behavioural types [20] — where each Go function
+is assigned a type codifying its interactions with concurrencyprimitives — thus abstracting away from non-concurrencyrelated constructs but preserving the concurrent behaviours.Our approach has three key differences compared to earlierworks. (i) We use a subset of Promela (the language of Spin)as our behavioural type language. This has the advantage ofgiving us a direct implementation strategy, while keeping theextraction function relatively abstract. (The model extractionwe present in § III can easily be adapted to other modellinglanguages that feature processes communicating over chan-nels.) (ii) While the work in [20] and its extensions [7], [21]abstract away from all computational aspect, our behavioural
+types do keep track of some data when it directly affects the
+structure of the concurrent programs. (iii) We support the threemain concurrency primitives of Go.
+Spin [14] veriﬁes models speciﬁed in Promela wrt. prop-
+erties expressed in linear temporal logic (L TL). A Promela
+1018model consists of a set of processes that interact over channels.
+Promela processes are declared using proctype f(p){S}
+where fis the name of the process, pis a list of (typed)
+parameters, and Sis a list of Promela statements.
+Promela statements and expressions include basic Boolean
+and arithmetic expressions, as well as declarations and instanti-ations of variables and structures. Statement run f(
+e)spawns
+a new instance of process fwith arguments e. Channels are a
+special data-type over which processes can communicate. Forexample, chan c[2]of{bool} creates a new channel c
+with capacity 2that can carry Boolean values. Like goroutines
+in Go, processes may send expressions /angbracketleft
+e/angbracketrightover channel ch
+with ch!/angbracketlefte/angbracketright. They can receive messages with ch?/angbracketleftx/angbracketright which
+binds the received values to variables x. We omit the payload
+/angbracketlefte/angbracketrightof a send/receive when it is not relevant.
+Promela provides two types of control-ﬂow constructs:
+loops and branching. Loop for n..m{S} repeats statements
+Sform−n+1 iterations. Branching constructs encode (pos-
+sibly non-deterministic) choices between several behaviours.Promela uses if anddo constructs to encode choices, but we
+use a graphical (automata/statechart-like) notation in this paperfor the sake of readability. The branches of a choice may beguarded or not. A guarded branch is labelled with [g]or[g]α/S
+wheregis a guard (Boolean expression), αis either a send
+or receive action, and Sis a Promela instruction. A guarded
+branch is ﬁreable when its guard gholds and a matching event
+forαis available (if αis speciﬁed). Upon ﬁring, instruction
+Sis executed. Unguarded branches (labelled with τ) can ﬁre
+(silently) at any point.
+Spin checks properties of Promela models that are encoded
+either via an L TL formula and/or using assertions (error states)in the model. Spin checks that all possible executions ofthe model validate the L TL formula and/or that no executionreaches an error state. Spin explores all possible states of amodel, hence models must be ﬁnite-state, e.g., they cannot
+spawn inﬁnitely many processes.
+III. E
+XTRACTING P ARAMETERISED MODELS
+We describe our approach to extract several models from
+a Go program. For each Go function that does not take a
+concurrency primitive as parameter we generate a model. Eachfunction becomes an entry points to a model that can beveriﬁed independently. This strategy allows us to decomposethe veriﬁcation of large programs into smaller pieces. Besidesthe beneﬁt wrt. scalability, this decomposition allows our toolto detect some partial deadlocks and to give function-levelfeedback when a bug is detected by the model checker.
+The model extraction is done via three procedures: (i)a
+top level procedure translates declarations of Go functionsto Promela processes; (ii) procedure E
+S(s)identiﬁes the
+concurrency parameters in Go statements s;(iii) procedure
+TS(s)extracts a (parameterised) model from Go statements s.
+The models we generate consists of two types of Promela
+processes: a)primitive processes which model concurrency
+primitives (channels, waitgroups, mutexes) and b)function
+processes which model Go functions and goroutines.A. Extracting concurrency parameters
+Our goal is to identify the computational elements of
+a function that affect its concurrent structure, i.e., integerexpressions in the source program that affect the number ofspawned goroutines, the number of exchanged messages, andthe values held in the counters of waitgroups.
+We deﬁne function E
+E(e)which extracts the concurrency
+parameters from a Go expression e, by computing its free
+variables and other unknown references. We give the deﬁnitionE
+E(e)for the key cases below:
+EE(e)/defines⎧
+⎪⎪⎪⎪⎪⎪⎨
+⎪⎪⎪⎪⎪⎪⎩∅ ifeis an integer literal
+{x} ifeis an integer variable
+E
+E(e1)∪EE(e2)ife=e1⊗e2with⊗∈{+,*,...}
+{l} ife=lore=len(l)
+{f.a} ife=f(a)
+The ﬁrst two cases deal with integer literals and variables. The
+third case applies EE(ei)recursively on arithmetic expressions.
+The fourth case deals with collections which are abstracted tothe name of the collection itself. The ﬁnal case deals withfunction calls for which we generate a fresh name, basedon the name of the function — these will become globalparameters in the generated models. We extend the deﬁnitionofE
+E(e)to list of expressions in the natural way.
+Next, we deﬁne ES(s)which extracts concurrency parame-
+ters from expressions that occur in selected Go statements.
+1) If s=ch:=make( chan T,e), thenES(s)/definesEE(e), i.e.,
+the parameters that set the capacity of the channel.
+2) If s=wg.Add(e), thenES(s)/definesEE(e), i.e., we return the
+parameters that set the delta added to the waitgroup.3) If s=for i:=e
+1;e2;r{s}, we apply heuristics
+depending on the shape of the loop to identify a variablethat can represent the number of iterations. For instance, ifs=fori:=0 ;i<e;i++{
+s}, thenES(s)/definesEE(e)∪ES(s)
+wheneis either a variable, a constant, or an integer literal.
+4) If s=fori,x:=rangel{s}, thenES(s)/defines{l}∪
+ES(s), i.e., we abstract a collection to its size.
+5) If s=f(a)ors=gof(a), we ﬁrst extract the concur-
+rency parameter of f. Assume we have funcf(xT)T{s}
+such that ES(s)=Y. Then we construct the sub-sequence of
+arguments whose position match a concurrency parameter off, i.e.,
+b=[ai|xi∈Y,1≤i≤k].We haveES(s)/definesEE(b).
+6) For select, conditionals, and range over channels, we applyE
+E(s)recursively following the abstract syntax tree, e.g., if
+s=ifethens1elses2, thenES(s)/definesES(s1)∪ES(s2).
+We say that a for loop is dynamic if its body syntactically
+(and inter-procedurally) contains a statement of the formgof(
+a). We deﬁne two families of concurrency parameters:
+mandatory and optional.A n optional parameter xis only used
+as bounds of a non-dynamic for-loop, i.e., Cases (3) or (4)
+above when the loop is not dynamic. All other parametersare mandatory. We will see below that mandatory parameters
+must be instantiated to construct models that can be veriﬁed
+1019ISR
+ACD
+Xch.rcving ?ch.snding ?
+[n=0]ch.sync !/angbracketleft1,0/angbracketrightch.rcving ?
+⎧
+⎨
+⎩ch.snding ?,
+ch.close ?,
+ch.enq ?⎫
+⎬
+⎭[n<k ]ch.enq ?/n++
+[n> 0]ch.deq !/angbracketleft0,n/angbracketright/n--[n> 0]ch.deq !/angbracketleft0,n/angbracketright/n--
+[k>0][k=0]
+ch.close ?ch.close ?
+W
+X[n+i≥0]wg.update ?i/n+=i
+[n=0]wg .wait !
+[n+i< 0]wg.update ?iUR
+W
+Xmu.rlock ?/r++[r=1]mu.runlock ?mu.rlock ?/r++ [r>1]mu.runlock ?/r--
+mu.lock ?
+mu.unlock ?
+{mu.unlock ?,mu.runlock ?}
+Fig. 4: Primitive processes for channels (left), waitgroups (middle), and mutexes (right).
+effectively. Instantiating optional parameters is not necessary,
+but helps discard false alarms (see § IV).
+Example 3. Letsbe the body of preload() from Figure 1.
+We extract three concurrency parameters from these state-
+ments, i.e., ES(s)={n,trees,runtime.NumCPU }. These
+are all mandatory parameters. The ﬁrst two are instantiated at
+every invocation to preload, and runtime.NumCPU is a
+global (implicit) parameter (instantiated once per model).
+B. Primitive processes: channel, waitgroup, and mutex
+We describe Promela processes which model the main con-
+currency primitives of the Go language (channels, waitgroups,
+and mutexes). Each of these processes use several Promelachannels and variables stored in a structured data type. Thedeclaration of a concurrency primitive in Go is translated tospawning the corresponding primitive process in Promela.
+a) Channels: Figure 4 (left) gives a graphical represen-
+tation of the Promela process (channel process) that models aGo channel. This process monitors all channel interactions: itkeeps track of the state of the channel to detect any safety bug.Interactions over asynchronous Go channels are fully mediatedby the channel process; interactions over Go synchronouschannels also rely on Promela’s own synchronous channels.
+The channel process uses two (local) variables: krepresent
+the capacity of the buffer (k =0 when the channel is syn-
+chronous), and nis the number of messages currently stored
+in the buffer (note that n≤k).
+The channel process interacts with its environment via
+six synchronous Promela channels: sync is a channel which
+directly models the corresponding synchronous Go channel;
+snding andrcving monitor sending and receive actions on
+the synchronous channel; enq anddeq model enqueue (send)
+and dequeue (receive) operations on asynchronous channels;
+close is used to receive closing requests. Only channels sync
+anddeq carry payloads, i.e., pairs /angbracketleftc,n/angbracketrightwherecrepresents
+the state of the channel (c =1 if the channel is closed, c=0
+otherwise) and nis the number of messages in the channel.
+The behaviour of the channel process depends on its
+capacity (k ). Ifk=0, the channel is synchronous and the
+channel process merely monitors sending and receiving actionson channel ch. Goroutine processes send on snding (resp.
+rcving ) whenever they send (resp. receive) on channel sync
+(see § III-D). If k>0, the channel is asynchronous and allinteractions over that channel are mediated via the channelprocess. When the channel is not full (n< k), it is ready to
+enqueue more messages (via enq ); as long as the channel is
+not empty, it is ready to emit messages (via deq ).
+Synchronous and asynchronous channels behave equiva-
+lently once they are closed. Sending on a closed channel(via sync orenq ), or closing it again (via close ), leads to
+the error state. It is always possible to receive from a closedchannel, the channel process is always ready to match suchrequests on ch.sync orch.deq . In § III-D, we show that all
+function processes are always ready to interact with either thesynchronous or asynchronous version of a channel process.
+b) Waitgroups: Figure 4 (middle) gives a representa-
+tion of the Promela waitgroup process, representing a Go
+waitgroup. The process uses one local variable and twosynchronous Promela channels: wait andupdate . V ariable n
+represents the current number of threads wg is waiting for.
+Whenn=0 , it is ready to ﬁre wg.wait!(thus unblocking
+a process waiting on it). Other processes interact with thewaitgroup by adding value iton(wherei∈Z). Any update
+that renders nnegative leads to the error state.
+c) Mutex: Figure 4 (right) gives an automata representa-
+tion of the mutex process, representing a mutex mu . We use
+the same process to model Go’s Mutex (traditional mutex)
+andRWMutex (read/write mutex).
+The mutex process models interactions over a Go mutex
+using one local variable (r ) and four synchronous Promela
+channels. Channel lock (resp. unlock ) is used to take (resp.
+release) the lock of a traditional mutex. Channel rlock (resp.
+runlock ) is used to take (resp. release) the lock of a read/write
+mutex. V ariable rkeeps track of the number of readers that
+have acquired the read-only lock. Unlocking a mutex that isnot locked leads to the error state.
+C. Function processes: declaration and call sites
+Given a Go program, we generate a Promela model for each
+of its functions that does not take any concurrency primitive
+as parameter and that initialises at least one concurrency
+primitive in its body. For instance the program in Figure 1 willproduce one Promela model, whose entry point correspondsto function preload(). Given such a function, we analyse
+all the functions it invokes (inter-procedurally), and for eachinvoked function that takes at least one concurrency primitive,
+1020func InnerFunc(ch1 chan int,xmap[string]int,yint){ s}
+func OuterFunc(...) {
+// ...
+InnerFunc(ch2, 10, 20)// ...goInnerFunc(ch2, z, z *2)
+// ...
+}
+init { // model entry point
+// ...
+run OuterFunc(...)
+}proctype InnerFunc(ChannelProcess ch1, int x,chan ret) {
+T
+S(s)
+ret!0
+}proctype OuterFunc(...) {
+// ...chan ret1 = [1] of{bool}
+run InnerFunc(ch2, 10, ret1)
+ret1?0// ...chan ret2 = [1] of{bool}
+run InnerFunc(ch2, z, ret2)
+run (ret2?0)
+// ...
+}
+Fig. 5: Blocking vs. concurrent function calls in Go (top) and
+their models in Promela (bottom).
+we model it with a Promela function process, which we include
+in the model of the entry point function.
+Function declarations: Our models abstract away from
+non-concurrency related aspects, hence deﬁnitions of func-
+tion processes include only parameters of their correspondingGo functions that pertain to concurrency. Given a functionsignature func ExFunction(..., x T,...) parameter
+xis abstracted away if xis not a concurrency parameter
+ofExFunction or if Tis not the type of a concurrency
+primitive. Each parameter xwhose type is a concurrency
+primitive is mapped to one primitive process. Each parameterxthat is a concurrency parameter is mapped to an integer
+parameter, e.g., if the type of xis a collection in Go, it is
+mapped to an int in Promela (corresponding to the size of
+the collection).
+We illustrate the approach with the Go program in Figure 5
+(top). Assume OuterFunc does not take any concurrency
+primitive as parameter, hence it becomes the entry pointof a Promela model. Because InnerFunc is invoked by
+OuterFunc, the model will also contain a (function) processdeﬁnition corresponding to its declaration.
+Assume x is the only concurrency parameter of
+InnerFunc, i.e., y/∈E
+S(s). Then, InnerFunc is mapped
+to a Promela process which takes three parameters: (i)aChannelProcess (ch1) structure which implements the
+channel process discussed in § III-B; (ii) an integer (x) whichcorresponds to the length of the map parameter; and (iii) the
+return channel, i.e., a buffered Promela channel with capacity1(ret) which is used to model blocking function calls, as
+we explain below. The body of a function process consistsin the translation of the body of its Go counterpart — usingT
+S(s), see § III-D and § III-E — followed by a send on ret
+(notifying that the function has returned).Call sites: Our translation deals with statements of the form
+f(a)orgof(a)as follows. If fis an external function or if it
+takes a concurrency primitive as a parameter, the correspond-ing call site is skipped. In the former case, we optimistically
+assume that fis not buggy; in the latter case, fis an entry
+point to its own model which is veriﬁed independently.
+If the declaration of fis available, then we translate both
+f(
+a)andgof(a)to the creation of a new Promela channel
+followed by the spawning of a new function process. Forblocking calls, the process spawning is followed by a blockingreception on the return channel, otherwise we spawn a receiv-ing process which will garbage collect the send messages, e.g.,run (ret2?0). We illustrate this aspect with the translationof calls to InnerFunc in Figure 5.
+D. Operations on concurrency primitives
+All operations on channels, waitgroups, and mutexes are
+translated to Promela operations that interact with one of theprimitive processes. Figure 6 (top half) gives an overview ofthe mapping from Go operations to Promela using a graphicalrepresentation of the latter.
+Translating channel operations is slightly more involved as
+the bounds of Go channels might not be known at compile-time, hence a function process taking a channel chas a param-
+eter needs to be ready to send or receive on a synchronous oran asynchronous version of ch. As a consequence, both send
+and receive are modelled as composite Promela operations. Asend operation (ch <−e) is translated to a guarded choice
+between two branches that represent an operation on a syn-chronous channel, or an asynchronous one. In the synchronouscase, the process synchronises directly with another by sendingon the (synchronous) Promela channel ch.sync , then notifying
+the channel process over ch.snding . The process sends a pair
+/angbracketleft0,0/angbracketrightover ch.sync (where the ﬁrst 0means that the channel
+is not closed, and second is the number of messages storedon the channel). In the asynchronous case, the process sendsa message to its corresponding channel process over channelch.enq . Notice that in both cases, we abstract away from the
+data sent over the channel (expression eis not modelled).
+A receive operation (< −ch) is modelled in the dual way.
+The process executing the receive operation may either receivea pair/angbracketleftc,n/angbracketrightfrom another process over ch.sync or from the
+channel process over ch.deq . We assume that variables cand
+nare fresh. They are unused for simple receive operations but
+are necessary when channels are ranged over.
+Closing a channel (close( ch)) is translated as a Promela
+send operation over channel ch.close .
+Go operations on waitgroups (wg .Add(e),wg.Done(),
+wg.Wait()) are translated to send and receive actions on
+the Promela channels of the corresponding waitgroup process(using channels wg.update orwg.wait ). Note that wg.Add(e)
+may increment or decrement the waitgroup counter by (theevaluation of) e, hence it is necessary to translate eto Promela.
+Function T
+E(e)is a partial function from Go expressions to
+Promela expressions (when ecannot be translated, it aborts).
+1021ch<−e
+ch.enq !ch.sync !/angbracketleft0,0/angbracketrightch.snding !
+<−ch
+ch.deq ?/angbracketleftc,n/angbracketrightch.sync ?/angbracketleftc,n/angbracketright ch.rcving !
+close(ch ) ch.close !
+wg.Add(e ) wg.update !TE(e)
+wg.Done() wg.update !/angbracketleft−1/angbracketright
+wg.Wait() wg.wait ?
+mu.Lock() mu.lock !
+mu.Unlock() mu.unlock !
+mu.RLock() mu.rlock !
+mu.RUnlock() mu.runlock !
+fori:=e1;e2;r{s}
+withn∈E S(i:=e 1;e2;r)
+fori,x :=rangel{s}
+withn∈E E(l)
+wheresis dynamicfor 1..n{TS(s)}τ τ
+fori:=e1;e2;r{s}
+withb∈E S(i:=e 1;e2;r)
+fori,x :=rangel{s}
+withb∈E E(l)
+wheresisnot dynamicTS(s)
+for 1..n{TS(s)}[b=∗]
+[b=n]τ
+ττ
+forx:=range ch{s}
+wheresisnot dynamic
+TS(s)ch.deq ?/angbracketleftc,n/angbracketrightch.sync ?/angbracketleftc,n/angbracketright ch.rcving !
+[c>0∧n=0]
+[c=0∨n>0]τ
+ifethens1elses2TS(s1)
+TS(s2)τ
+τ
+select{case αi:si}
+where 1≤i≤nTS(α1)
+TS(αn)TS(s1)
+TS(sn)
+Fig. 6: Overview of the translation function TS(s).
+The translation of Go operations on mutexes to Promela is
+straightforward. Each operation is mapped to a send on the
+corresponding Promela channel of the mutex process.
+E. Control ﬂow and branching constructs
+The control ﬂow and branching constructs of Go are over-
+approximated naturally by Promela’s own constructs. Figure 6
+(bottom half) gives an overview of the mapping from Goconstructs to Promela constructs using a graphical notation.
+Traditional for loops and loops over collections are trans-
+lated differently depending on whether they are dynamic, see§ III-A. When a loop is dynamic, its number of iterationsmust be known before checking the model (e.g., the boundsare constant or they are instantiated by some concurrencyparameters). Hence such loops are translated to Promela’s own(ﬁnite) iteration constructs. When a loop is not dynamic, thenit behaves as a ﬁxed loop (as above) or as a non-deterministicloop (i.e., a loop that executes an arbitrary number of times).To enable this behaviour, we use special value ∗to ﬂag
+a concurrency parameter as unspeciﬁed. When a bound isunspeciﬁed, the number of iterations is non-deterministic; if itis provided at model checking time, a ﬁxed for-loop is used.
+Afor loop that ranges over a channel chexecutes its body
+every time a message is received on ch (until the channel
+is empty and closed). To encode this behaviour in Promela,we use a similar technique to the translation of the receiveoperation (see second line of Figure 6). After each receiveoperation the values of variables candnare tested, c=1
+means that the channel is closed, while nis the number of
+messages held in it. Note that because such a loop might beexecuted an arbitrary number of times, they can be translatedonly when the loop is not dynamic (we abort otherwise).
+Go conditionals are mapped to internal choices with two
+branches (i.e., a choice with two unguarded branches). Aselect block is translated to a choice in Promela, where each
+branch is either unguarded or guarded by the translation of asend or receive operation, each branch leads to the translationof the bodies
+si. For send/receive operations, we use the
+construction given in the ﬁrst two lines of Figure 6. Anybranch of the select block that is default or guarded
+by a timeout is mapped to an unguarded branch (τ ).
+Note that in general the translation of loops, if-then-else,
+and select statements over -approximates the behaviour of a Go
+program, e.g., while only one branch of a Go if-then-else maybe taken, both branches are ﬁreable in its generated model.
+IV . V
+ERIFYING MODELS
+We describe our approach to verify the models generated
+from Go programs in § III. We break down this descriptionin two steps: properties of valuated models and automatedgeneration of valuations.
+A. Properties of valuated models
+Given a Go program P, we generate several models such
+that each model M has a (possibly empty) list of concurrency
+parameters that are either mandatory or optional. We say that
+a model M isvaluated if all its mandatory parameters are
+instantiated by values in Nand all its optional parameters
+are instantiated by values in {∗} ∪ N. Recall that setting a
+concurrency parameter to ∗allows some loops to iterate an
+arbitrary number of times, see Figure 6.
+Given a model M with mandatory parameters
+xand op-
+tional parameters y, and vectors u∈N|x|andv∈({∗}∪ N)|y|.
+We write M[x:=u,y:=v]for the valuation of M where
+eachxi(resp.yi) is replaced by value ui(resp.vi).
+Properties: We consider four properties, corresponding to
+the types of errors discussed in § II-A. All of these propertiesare either speciﬁed as Promela processes not reaching theirend states, or reaching an error state. Assume M is a val-
+uated model, we deﬁne the following properties. M|=φ
+MD
+(model deadlock) holds whenever no execution in M leads
+to a situation where all goroutine processes are stuck. Since
+1022function verify(S,φ,M)
+x←mandatory (M)
+y←optional(M)
+V←{(u,v)|u∈S|x|,v∈({∗}∪S)|y|}
+whileV/negationslash=∅do
+(u,v)←pickMax (V)
+b←M[x:=u,y:=v]|=φ
+ifb∨∗/∈vthen
+Δ(u·v)←b
+V←V\{(u,w)∈V|v/followsequalw}
+otherwise
+V←V\{(u,v)}
+returnΔ
+Algorithm 1: V eriﬁcation of model M with property φ
+and values S. Auxiliary function mandatory (M)(resp.
+optional(M)) computes the mandatory (resp. optional)
+concurrency parameters of M. Function pickMax(V)re-
+turns a maximal element of set Vwrt./followsequal.
+several models may be extracted from a given program, φMD
+can identify some partial deadlocks in the source program.
+M|=φCS (channel safety) holds whenever no execution
+inM leads to a situation where a channel process reaches
+its error state (i.e., sending on/closing a closed channel).M|=φ
+WS (waitgroup safety) holds whenever no execution
+inM leads to a situation where a waitgroup process reaches
+its error state (i.e., the waitgroup reaches a negative number).M|=φ
+MS(mutex safety) holds whenever no execution in M
+leads to a situation where a mutex process reaches its errorstate (i.e., an unlocking operation is invoked on an unlockedmutex).
+We aim for a sound veriﬁcation approach, i.e., any be-
+haviour of the source program can be simulated by theextracted model (assuming a precise valuation). Since eachGo entry-point function Pis over-approximated by its model,
+for any of the properties φabove, we should have that M|=φ
+implies that P|=φ, whenever the parameters of PandM are
+instantiated to the same values. The reverse implication doesnot hold, i.e., if M/negationslash|=φwe cannot conclude that P/negationslash|=φ.
+B. Automated generations of model valuations
+Next we present a technique to perform a bounded veriﬁ-
+cation of a parameterised model (up-to a ﬁnite set of possiblevalues). Hereafter we assume a set S∈Ngiven by the user,
+from which values of concurrency parameters are selected.
+We deﬁne a partial ordering /followsequalon the set ({∗}∪S)
+k(with
+k∈N) to identify a valuation that subsumes another.
+(v1,...,v k)/followsequal(u1,...,u k)⇐⇒ ∀1≤i≤k:vi∈{ui,∗}
+Algorithm 1 describes our approach to verify a model M for
+a property φ(e.g., absence of deadlock), wrt. values in S.
+The algorithm returns a map Δthat records the result of the
+veriﬁcation by mapping valuations to Booleans. For instanceifΔ(1,2) =/latticetopfor a model M with concurrency parameters
+x
+1andx2, then property φholds for M[x1:=1,x2:=2 ] .
+Algorithm 1 starts by computing the list of mandatory and
+optional parameters ( xandyrespectively). Then it computesthe setVof all possible valuations for these parameters (only
+optional parameters may be set to ∗). The algorithm then
+repetitively checks the property φon model M where the
+parameters are instantiated with a maximal element from V
+(wrt. the /followsequal-ordering). After each veriﬁcation the set Vis
+updated, removing all valuations that are subsumed by thecurrent valuation if it was successful, or the current valuationotherwise. We only record in Δthose veriﬁcations that are
+successful or that do not involve any optional parameter set to∗. Indeed when a veriﬁcation with a parameter yset to∗fails,
+it is likely to be a false alarm. This will be “compensated”by further veriﬁcations where yis instantiated to values in
+S. In contrast, if a veriﬁcation with a parameter yset to∗
+succeeds, then fewer veriﬁcations will be performed (i.e., thatveriﬁcation subsumes all instantiations of y).
+Note that if M does not contain any parameter (
+x=y=/epsilon1)
+thenVis initialised to {/epsilon1}, i.e., the singleton set containing
+the empty vector.
+For each map Δobtained from Algorithm 1, we compute
+a score based on the ratio of failed veriﬁcations over the totalnumber of recorded veriﬁcations, i.e.,
+score(Δ) =|{
+v∈dom(Δ)|Δ(v)=⊥}|
+|dom(Δ)|
+We use this score to indicate a conﬁdence level wrt. resultsof the veriﬁcation. The higher the score, the more likely it isthat we discovered a real bug.
+Example 4. Given the program in Figure 1 our translation
+will generate one model with three mandatory parameters (cor-
+responding to |trees| ,m, and runtime.NumCPU()). As-
+suming we are checking for φ
+MD and we set S={0,1,2,3},
+Algorithm 1 will perform 43veriﬁcations, 45 of which are
+successful (/latticetop ). Hence we obtain a score of 45/64/similarequal0.7.
+Example 5. Consider the (correct) program in Figure 7,
+which consists of two threads that exchange xmessages
+over channel a(the value of xis unknown at compile-time).
+Our approach generates a unique model M for it, with one
+parameter x. Assuming we are checking for φMD and we set
+S={0,1,2,3}, Algorithm 1 performs ﬁve veriﬁcations, one
+for each element in {∗} ∪S. The case where x:=∗fails
+since both for-loops are modelled as loops that can terminate
+(independently) after an arbitrary number of iterations. Hence,that valuated model contains executions that lead to a deadlock(where either loops is waiting for a send or receive). However,whenxis given a concrete value both loops iterate the same
+number of times, and thus each send/receive action is matched.
+Thus we obtain a map Δcontaining four elements, s.t.
+Δ(i)=/latticetopfor0≤i≤3. Hence, we have score(Δ) =
+0/4=0 ,
+i.e., no recorded veriﬁcation failed.
+V. I MPLEMENT A TION
+We have implemented our approach in a tool ( GOMELA )
+which extracts models from Go code, and uses Spin as abackend to automatically verify models up-to user provided
+10231func sender(a chan int,xint){
+2 for i: =0 ;i<x ;i + +{// sends x times
+3 a< -i
+4 }
+5}
+6func receiver(a chan int,xint){
+7 for i: =0 ;i<x ;i + +{// receives x times
+8 <-a
+9 }
+10}
+11func main() {
+12 x, _ := strconv.Atoi(os.Args[1])
+13 a: =make(chan int)
+14 gosender(a, x)
+15 receiver(a, x)
+16}
+Fig. 7: Program with an optional concurrency parameter.
+bounds. GOMELA analyses a Go codebase package by pack-
+age, and relies on Go’s ast library for the front-end parsing.
+Unlike [7], [22], our analysis is done on the surface language,
+rather than its lower-level representation (SSA). In addition tothe language constructs listed in Figure 2, our tool handlesstructures, methods, and anonymous functions.
+Go structures that contain concurrency primitives are anal-
+ysed inter-procedurally and ﬂattened into a list of their primi-tives. We do not support dynamic data-structures (e.g., linkedlists) nor struct embedding.
+A method mon struct S,func(xS)m(
+yT)T{s},i s
+processed in two steps. First, they are normalised into afunction named S_m whose parameters are the conjunction
+of the primitives contained in receiver xand the parameters
+yof method m. Second, the declaration of S_m is dealt
+with like a normal function declaration, and each call siteis normalised in a consistent way.
+GOMELA aborts when it
+encounters virtual method calls (when the method parametersinclude concurrency primitives). Anonymous functions arenormalised to (freshly) named functions, after computing theirclosures (limited to concurrency primitives and concurrencyparameters). Hence they are dealt with like other Go functions.
+GOMELA supports break statements and defer state-
+ments (when they do not occur under conditionals/loops). Bothconstructs are implemented using Promela’s goto instruc-
+tions.
+We have implemented heuristics to speed up the veriﬁcation.
+Notably we omit loops that do not contain concurrency-relatedoperations and we model-check all properties (see IV -A) atonce instead of one-by-one, c.f. Algorithm 1.
+VI. E
+MPIRICAL EV ALUA TION
+We structure our evaluation into two research questions that
+aim at evaluating the real-world usability of our approach.
+RQ1: How does GOMELA compare to the state-of-the-art? To
+answer this question we compare our tool against GCatch and
+Godel2 on a dataset of 78 buggy Go programs.RQ2: How does
+GOMELA scale to real-world programs? To
+answer this question we analysed 99 most starred Go projectson GitHub with
+GOMELA . We measure the number/parametersof models generated and the veriﬁcation run-times. We alsoreport on the error scores obtained for four properties.
+RQ1: How does
+GOMELA compare to the state-of-the-art?
+Here we focus on programs which contain bugs related
+to channels, waitgroups, or mutexes. We have collected a
+set of buggy programs, that consists of blocking examplesfrom [7], [33], and six additional programs with intricateconcurrency patterns (all benchmarks are available online [6],[9]). These programs range from 12 to 298 LoC (mean: 83,median: 70). We evaluate
+GOMELA on this set, against the
+state-of-the-art static checkers: GCatch [22] and Godel2 [7].We omit benchmarks from [7] that contain data-races or donot contain any bugs. We focus on the benchmarks from [33]that contain blocking bugs as
+GOMELA does not target other
+bugs. To ensure that our experiments are precise, we only usethe bug kernels from [33]. It is not always straightforward
+to distinguish false alarms from real bugs raised by thesetools, hence we could not conﬁdently evaluate their respectiveperformance on the real bugs listed [33].
+Figures 8 and 9 give the results of our experiments. For
+GOMELA , a program is reported as a true positive if at least one
+veriﬁcation returns false, and false positive if all veriﬁcations
+return true (no bug found), all properties are checked with S=
+{0,1,3}. For GCatch and Godel2, a true positive is a correctly
+identiﬁed buggy program, while a false positive corresponds
+to a missed bug. For each tool, an example is unsupported if
+the tool aborts or crashes. Overall GOMELA has the highest
+rate of true positive (58.97%), followed by GCatch (38.46%)and Godel2 (19.23%). While GCatch never crashes/aborts, itmisses 61.54% of the bugs. Our experiments show that Godel2has very limited supports for real-world examples.
+Figure 9 shows how the three tools perform wrt. execution
+time for true positives. From left to right, the ﬁrst group ofexamples are all four benchmarks that contain a blockingbug from [7]. The second group of programs include: theprogram in Figure 3; a program with a blocking range-over-channel, see Figure 10 (right); a program (FindAll())adapted from a bug report in Google’s gops project [10],
+[27]; a program with a circular dependency and a boundedfor-loop, see Figure 10 (left); a program invoking functionpreload() from Figure 1; and a buggy version of Figure 7
+where receiver receives x+1 times.
+The third group consists of the 68 blocking programs
+from the GoKer benchmark suite [33], which are all adaptedfrom real-world programs. This suite is mainly aimed atevaluating run-time bug detectors. We modiﬁed 29 of them
+to meet limitations of the front-end of
+GOMELA and Godel2.
+Our modiﬁcations consists in inlining concurrency primitivedeclarations, inlining higher-order functions, and replacingvirtual method calls by static ones.
+GCatch is the fastest tool (all processed within 5s) and most
+examples are veriﬁed by
+GOMELA within 10s. For readability,
+we have omitted GOMELA ’s run-time for preload() (120s
+for 27 veriﬁcations). Observe that GOMELA is the only tool
+that can process correctly all programs in the second group of
+1024(a) GOMELA (b) GCatch (c) Godel2
+Fig. 8: Proportion of true/false positives in 78 buggy programs, unsupported indicates that the tool has aborted or crashed.
+Fig. 9: Run-times for true positives in 78 buggy programs.
+Figure 9. Godel2 identiﬁes the last program of this group as
+buggy, but also raises a false alarm for the non-buggy version,i.e., the program in Figure 7.
+RQ2: How does
+GOMELA scale to real-world programs?
+To evaluate the scalability of our approach we ran GOMELA
+on 99 most starred Go projects on GitHub. For each project, we
+cloned it locally and generated models for each of its packages.Each model was then veriﬁed, wrt. the properties described in§ IV -A, using our automated approach with S={0,1,3}.
+Our measurements for scalability are in Table I. The key
+factors that affect the run-time of
+GOMELA on a given project
+is the number of models it generates and how many parametersthese projects have.
+GOMELA only generates a model when it
+detects at least one concurrency primitive. Table I (top) showsthat most projects and packages only give rise to a singlemodel, but some produce more than one hundred models. Thetable also shows that 75% of these models have at most 3concurrency parameters (hence they require at most |S|
+3veri-
+ﬁcations). The last row shows the number of states as reportedby Spin when verifying it. This metric is representative of thenumber of goroutines and the number concurrency operationscontained in the source program. Overall
+GOMELA generated
+3175 models, out of which 99 were not valid Promela (due tolimitations of our aliasing analysis) and were rejected by Spin,22 contained >5concurrency parameters and 70 contained
+at least one valuation that took >30 seconds to verify (we
+omitted these in the next phase).
+Table I (bottom) shows the run-time for the remaining 2984
+models we veriﬁed. More than 75% of projects can be veriﬁedunder 3m26s, and a model valuation is veriﬁed under 3.60s onaverage (we set a timeout of 30s per valuation). This suggeststhat our approach does scale to real-world Go.T ABLE I: Project sizes and veriﬁcation run-times.
+Project sizes mean std 25% 50% 75% max
+models per project 42.91 64.24 5 19 50 339
+models per package 3.83 8.27 1 1 3 159parameters per models 2.18 2.29 1 1 3 42states per valuation 7970 156k 17 45 151 7.8 mil
+Run-time
+per project 3m48s 7m5s 20s 1m4s 3m26s 35m5s
+per model 4.56s 28.78s 2.56s 2.80s 3.33s 19m9s
+per valuation 3.60s 1.90s 2.62s 3.11s 3.87s 19s
+T ABLE II: V eriﬁcation scores for generated models.
+All scores mean std 25% 50% 75% max
+model deadlock φMD 0.025 0.15 0 0 0 1
+channel safety φCS 00 0 0 00
+mutex safety φMS 0.002 0.048 0 0 0 1
+waitgroup safety φWS 0.0006 0.019 0 0 0 0.667
+Strictly positive scores (occurrences)
+model deadlock (81) 0.89 0.20 0.75 1 1 1
+channel safety (0) 0 0 0 0 0 0
+mutex safety (9) 0.869 0.15 0.75 1 1 1
+waitgroup safety (3) 0.59 0.104 0.45 0.67 0.67 0.67
+Table II (top) shows the score computed for the 2984 mod-
+els. As expected from mature projects on GitHub, GOMELA
+reports few concurrency bugs; this suggests that it has a
+reasonable false alarm rate. Table II (bottom) focuses on themodels for which at least one valuation violated a property.We manually veriﬁed a randomly selected sample of thesemodels. Out of 10 reported model deadlocks we analysed, 6were real bugs and 4 were false alarms (due to higher-orderfunctions and tricky aliasing). Out of 9 mutex errors, all werefalse alarms (all due to higher-order functions). Finally, the3 reports of waitgroup error were real bugs.
+VII. R
+ELA TED WORK
+Static checkers are available as part of the Go ecosystem,
+e.g., the native go vet command, staticcheck [15],
+and tools based on Go’s language server [12], but all thesetools rely on syntactical checks (linters) that cannot detectconcurrency bugs that require a semantic analysis.
+The Go library also includes a runtime global deadlock
+detector and a runtime data-race detector. Sulzmann and
+10251func parseFiles(files []os.File) {
+2 ch := make(chan string)
+3 for file := range files {
+4 goparseFile(ch, file)
+5 }
+6 for v: =range ch { // blocked
+7 fmt.Println(v)
+8 }
+9}
+10
+11func parseFile(ch chan string, file os.File) {
+12 ch <- parseToken(file)
+13}1func main() {
+2 a: =make(chan int)
+3 b: =make(chan int)
+4 for i: =0 ;i<3 ;i + +{
+5 go func() {
+6 <-b // blocked
+7 a< -1
+8 }()
+9 }
+10 <-a // blocked
+11 b< -1
+12}
+Fig. 10: Examples of buggy programs caught by GOMELA , missed by GCatch [22], and unsupported by Godel2 [7].
+Stadtmüller [29], [30] have proposed techniques for run-time
+analyses of Go programs based on vector clocks.
+GCatch [22] combines several static bug detectors and
+includes a novel detector for blocking bugs ( BMOC ). This
+detector relies on approximating possible executions and usesan SMT -solver to determine whether they lead to blockingbugs. GCatch is accompanied by GFix which aims at repairingbugs involving at most two goroutines and a single channel.GCatch has a better front-end that
+GOMELA (fewer crashes)
+notably because it relies on the SSA representation of Goprogram. As a consequence Go programs must be compiled(all their dependencies met) before fed into GCatch.
+Several works propose static checkers based on tech-
+niques from programming languages theory, e.g., behaviouraltypes [7], [20], [21], [25], abstract interpretation [24], andforkable regular expressions [28]. None of these supportprograms with concurrency parameters. The work by Gabetand Y oshida [7] is the latest in the behavioural type series. Itdetects channel and mutex-related bugs and data-races, but ithas limited applicability. Our work builds on our earlier proto-type [5] which uses Promela as a behaviour type language. Inthis work, we have extended it with an inter -procedural extrac-
+tion of concurrency parameters, support for more concurrencyprimitives (waitgroup and mutex), support for structures andmethods, an automated veriﬁcation algorithm (Algorithm 1),and an evaluation of our approach on real-world Go code.
+There is a growing body of surveys of Go programs and
+tools. Dilley and Lange [4] show that channels are usedoften and intensively in Go projects. Tu et al. [31] showthat message-passing concurrency is as error-prone as tradi-tional shared-memory concurrency. Y uan et al. [33] proposea benchmark suite of concurrency bugs in Go on which theycompare the performance of goleak [32] (a run-time goroutine
+leak detector), go-deadlock [26] (a run-time deadlock detectors
+for locks), and Gong [20] (a static checker).
+Software model checking has a long history, see [16] for
+a comprehensive survey. While other general purpose modelcheckers have support for inter-process communication [3],[23], we found that Spin is closest to Go and thus allows anearly one-to-one translation from Go. Spin has notably beenused to verify multi-threaded Java programs [13] and multi-threaded C programs [34]. Our approach is related to otherspecialised bounded model checkers for C, C++, and Java,e.g., CBMC [1], [17], ESBMC [8], and JBMC [2]. Thesecheckers use symbolic execution techniques (e.g., unrollingloopsktimes) to detect low-level bugs.
+VIII. C
+ONCLUSIONS AND FUTURE WORK
+We described a novel approach to verifying Go programs
+using bounded model checking of parameterised behaviouraltypes. This approach scales well to real-world Go code,and outperforms the competition on 78 buggy programs.Remarkably, all false alarms we discovered were due tolimitations of our front-end rather than over-approximation inour veriﬁcation approach.
+The key remaining challenges are to develop scalable tech-
+niques to deal with virtual method calls, to develop heuristicsto deal with models with high number of parameters, and todevelop techniques to help automate the identiﬁcation of falsealarms. In the shorter term, we also would like to improve ourfront-end analysis so that more Go programs can be analysedwithout manual modiﬁcations.
+A
+CKNOWLEDGMENT
+We thank Rumyana Neykova, Tiago Cogumbreiro, and the
+anonymous reviewers for their insightful feedback on earlierversions of this work.
+R
+EFERENCES
+[1] E. M. Clarke, D. Kroening, and F. Lerda. A tool for checking ANSI-
+C programs. In TACAS, volume 2988 of Lecture Notes in Computer
+Science, pages 168–176. Springer, 2004.
+[2] L. C. Cordeiro, P . Kesseli, D. Kroening, P . Schrammel, and M. Trtík.
+JBMC: A bounded model checking tool for verifying java bytecode. In
+CA V (1), volume 10981 of Lecture Notes in Computer Science, pages
+183–190. Springer, 2018.
+[3] S. Cranen, J. F. Groote, J. J. A. Keiren, F. P . M. Stappers, E. P . de Vink,
+W . Wesselink, and T. A. C. Willemse. An overview of the mCRL2toolset and its recent advances. In TACAS, volume 7795 of Lecture
+Notes in Computer Science, pages 199–213. Springer, 2013.
+[4] N. Dilley and J. Lange. An empirical study of messaging passing
+concurrency in Go projects. In SANER, pages 377–387. IEEE, 2019.
+[5] N. Dilley and J. Lange. Bounded veriﬁcation of message-passing
+concurrency in Go using promela and spin. In PLACES@ETAPS, volume
+314 of EPTCS, pages 34–45, 2020.
+[6] N. Dilley and J. Lange. Gomela. https://github.com/nicolasdilley/
+gomela-ase21/, 2021.
+[7] J. Gabet and N. Y oshida. Static race detection and mutex safety and
+liveness for Go programs (artifact). Dagstuhl Artifacts Ser ., 6(2):12:1–
+12:3, 2020.
+1026[8] M. Y . R. Gadelha, F. R. Monteiro, J. Morse, L. C. Cordeiro, B. Fischer,
+and D. A. Nicole. ESBMC 5.0: an industrial-strength C model checker.
+InASE, pages 888–891. ACM, 2018.
+[9] Automated V eriﬁcation of Go Programs via Bounded Model Checking(Artifact). Zenodo, 2021.
+[10] Google. Findall code. https://github.com/google/gops/blob/
+6fb0d860e5fa50629405d9e77e255cd32795967e/goprocess/gp.go#L29,2020.
+[11] Google. preload code. https://github.com/google/trillian/blob/
+c92fa63aaa6c133eb8383f2727524421bea420c4/storage/cache/subtree_cache.go#L108, 2021.
+[12] gopls, the Go language server. https://github.com/golang/tools/tree/master/gopls.
+[13] K. Havelund and T. Pressburger. Model checking JA V A programs using
+JA V A pathﬁnder. STTT, 2(4):366–381, 2000.
+[14] G. J. Holzmann. The model checker SPIN. IEEE Trans. Software Eng.,
+23(5):279–295, 1997.
+[15] D. Honnef. Staticcheck. https://staticcheck.io/.[16] R. Jhala and R. Majumdar. Software model checking. ACM Comput.
+Surv., 41(4):21:1–21:54, 2009.
+[17] D. Kroening and M. Tautschnig. CBMC - C bounded model checker -
+(competition contribution). In TACAS, volume 8413 of Lecture Notes in
+Computer Science, pages 389–391. Springer, 2014.
+[18] Kubernetes. Generatenodemap code. https://github.com/kubernetes/
+kubernetes/blob/d70ee902fddc682863a3cc4f0d8eac0223ebf70b/test/e2e/storage/vsphere/nodemapper.go#L62, 2021.
+[19] Kubernetes. Kubernetes (k8s). https://github.com/kubernetes/kubernetes,
+2021.
+[20] J. Lange, N. Ng, B. Toninho, and N. Y oshida. Fencing off Go: liveness
+and safety for channel-based programming. In POPL, pages 748–761.
+ACM, 2017.
+[21] J. Lange, N. Ng, B. Toninho, and N. Y oshida. A static veriﬁcation
+framework for message passing in Go using behavioural types. In ICSE,
+pages 1137–1148. ACM, 2018.
+[22] Z. Liu, S. Zhu, B. Qin, H. Chen, and L. Song. Automatically detectingand ﬁxing concurrency bugs in Go software systems. In Proceedings
+of the 26th ACM International Conference on Architectural Supportfor Programming Languages and Operating Systems, ASPLOS 2021,page 616–629, New Y ork, NY , USA, 2021. Association for ComputingMachinery.
+[23] J. Magee and J. Kramer. Concurrency - state models and Java programs.
+Wiley, 1999.
+[24] J. Midtgaard, F. Nielson, and H. R. Nielson. Process-local static analysis
+of synchronous processes. In SAS, volume 11002 of Lecture Notes in
+Computer Science, pages 284–305. Springer, 2018.
+[25] N. Ng and N. Y oshida. Static deadlock detection for concurrent Go by
+global session graph synthesis. In CC, pages 174–184. ACM, 2016.
+[26] sasha s. go-deadlock. https://github.com/sasha-s/go-deadlock.
+[27] C. Siebenmann. Even in Go, concurrency is still not easy (with
+an example). https://utcc.utoronto.ca/~cks/space/blog/programming/GoConcurrencyStillNotEasy, 2020-09.
+[28] K. Stadtmüller, M. Sulzmann, and P . Thiemann. Static trace-based
+deadlock analysis for synchronous mini-go. In APLAS, volume 10017
+ofLecture Notes in Computer Science, pages 116–136, 2016.
+[29] M. Sulzmann and K. Stadtmüller. Trace-based run-time analysis of
+message-passing Go programs. In Haifa V eriﬁcation Conference, volume
+10629 of Lecture Notes in Computer Science, pages 83–98. Springer,
+2017.
+[30] M. Sulzmann and K. Stadtmüller. Two-phase dynamic analysis of
+message-passing Go programs based on vector clocks. In PPDP, pages
+22:1–22:13. ACM, 2018.
+[31] T. Tu, X. Liu, L. Song, and Y . Zhang. Understanding real-world
+concurrency bugs in Go. In ASPLOS, pages 865–878. ACM, 2019.
+[32] Uber. goleak. https://github.com/uber-go/goleak.
+[33] T. Y uan, G. Li, J. Lu, C. Liu, L. Li, and J. Xue. Gobench: A benchmark
+suite of real-world Go concurrency bugs. In CGO, pages 187–199. IEEE,
+2021.
+[34] A. Zaks and R. Joshi. V erifying multi-threaded C programs with SPIN.
+InSPIN, volume 5156 of Lecture Notes in Computer Science, pages
+325–342. Springer, 2008.
+1027

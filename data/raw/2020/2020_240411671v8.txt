@@ -1,0 +1,1333 @@
+A Study of Undefined Behavior Across Foreign
+Function Boundaries in Rust Libraries
+Ian McCormack
+Carnegie Mellon University
+Pittsburgh, PA, USA
+icmccorm@cs.cmu.eduJoshua Sunshine
+Carnegie Mellon University
+Pittsburgh, PA, USA
+sunshine@cs.cmu.eduJonathan Aldrich
+Carnegie Mellon University
+Pittsburgh, PA, USA
+jonathan.aldrich@cs.cmu.edu
+Abstract —Developers rely on the static safety guarantees of
+the Rust programming language to write secure and performant
+applications. However, Rust is frequently used to interoperate
+with other languages which allow design patterns that conflict
+with Rust’s evolving aliasing models. Miri is currently the only
+dynamic analysis tool that can validate applications against these
+models, but it does not support finding bugs in foreign functions,
+indicating that there may be a critical correctness gap across the
+Rust ecosystem. We conducted a large-scale evaluation of Rust
+libraries that call foreign functions to determine whether Miri’s
+dynamic analyses remain useful in this context. We used Miri
+and an LLVM interpreter to jointly execute applications that
+call foreign functions, where we found 46 instances of undefined
+or undesired behavior in 37 libraries. Three bugs were found
+in libraries that had more than 10,000 daily downloads on
+average during our observation period, and one was found in
+a library maintained by the Rust Project. Many of these bugs
+were violations of Rust’s aliasing models, but the latest Tree
+Borrows model was significantly more permissive than the earlier
+Stacked Borrows model. The Rust community must invest in
+new, production-ready tooling for multi-language applications to
+ensure that developers can detect these errors.
+Index Terms —Rust, interoperation, undefined behavior, alias-
+ing, bugs, foreign functions
+I. I NTRODUCTION
+The Rust programming language has become increasingly
+popular due to its static safety guarantees, which provide
+security benefits comparable to garbage collection without
+additional run-time overhead [1], [2]. However, Rust is also
+frequently used in interoperation with languages that do not
+provide similar assurances. To call foreign functions, devel-
+opers must use a subset of unsafe features to bypass Rust’s
+restrictions. If these features are used incorrectly, they can
+break Rust’s aliasing rules. The Rust compiler relies on these
+rules to optimize code. If they are broken, optimizations
+may be applied incorrectly, which can introduce security
+vulnerabilities.
+Miri [3] is a widely-used Rust interpreter that uses dy-
+namic analysis to detect violations of Rust’s aliasing model.
+A limitation of Miri is that it cannot detect these errors
+across foreign function boundaries. However, one of the most
+common reasons for using Rust’s unsafe features is to call
+foreign functions [4], [5], [6], [7], [8]. We seek to determine
+whether the differences between Rust and other languages are
+leading to errors in practice.•RQ1 : What types of errors occur in Rust libraries that
+call foreign functions?
+The Rust community has proposed two aliasing models:
+Stacked Borrows [9] and Tree Borrows [10]. The goal of
+these models is to "strike a balance" [9] between performance
+and usability by providing a set of rules that developers must
+follow to ensure that compile-time optimizations are applied
+correctly [11]. Since Stacked Borrows and Tree Borrows both
+provide rules of this kind, we ask a second research question:
+•RQ2 : Which of Rust’s aliasing models permits more real-
+world programs with foreign function calls?
+To answer these questions, we created MiriLLI: a tool which
+combines Miri with an LLVM interpreter to jointly exe-
+cute programs and detect undefined behavior across foreign
+function boundaries. We used MiriLLI to conduct a large-
+scale study of 9,130 test cases from 957 Rust libraries that
+call foreign functions. We identified 46 unique instances of
+undefined or undesirable behavior from 37 libraries. Of the
+90 test cases that violated Stacked Borrows, 66% (59) did not
+violate Tree Borrows.
+Our results indicate that Rust’s restrictions on aliasing,
+mutability, and initialization make it easy to inadvertently
+introduce undefined behavior when calling foreign functions.
+Developers can take immediate steps to avoid these errors by
+auditing their use of certain types at foreign callsites. However,
+the Rust Project must invest in new, production-ready tooling
+to ensure that these errors can be easily detected.
+Overview: In Section II, we compare Rust’s semantics
+with C and C++, and we describe the resources and best
+practices that Rust developers use to interoperate with these
+languages. In Section III, we document our methodology for
+sampling and evaluating test cases from Rust libraries that
+call foreign functions, and we describe the challenges that
+we encountered when implementing MiriLLI. In Section IV,
+we describe each type of bug that we found. We discuss the
+implications of our findings in Section V. We review prior
+work on Rust interoperation in Section VI, we discuss threats
+to validity in Section VII, and we conclude in Section VIII.
+Our dataset, the Appendix, and the source for MiriLLI are
+available in our replication package1.
+1https://doi.org/10.5281/zenodo.12727039arXiv:2404.11671v8  [cs.SE]  2 Apr 2025II. B ACKGROUND
+Rust’s safety restrictions begin at the level of a value, which
+is valid for a particular scope. A value’s type implements traits
+that define how it behaves. For example, all types have move
+semantics by default, meaning that each value has a unique
+owner. However, values with the Copy trait have no owner and
+can be freely duplicated. Ownership can be transferred through
+assignment or borrowed by creating a reference. References
+are either mutable, taking the form &mut T, or immutable,
+with the form &T. Mutable references have move semantics,
+but immutable references can be copied. Each reference has
+alifetime , which is the portion of the program over which it
+will be used. Rust’s borrow checker statically enforces that the
+lifetime of a reference must not exceed the scope or lifetime
+of the value that it borrows. A value can have a single mutable
+reference or many immutable references that are active within
+a given context [12], but not both at the same time.
+These restrictions prevent safety issues, but they can also
+make it impossible to implement certain design patterns. When
+developers need to bypass Rust’s restrictions, they can use the
+unsafe keyword to enable a set of additional features that are
+not restricted by the borrow checker. These features include
+dereferencing raw pointers, accessing the fields of union types,
+modifying static mutable state, implementing unsafe traits,
+and calling unsafe functions—including those written in other
+languages [13]. The Rust compiler can assume that programs
+that use unsafe code will follow the rules of its aliasing model.
+Programs that violate these rules have undefined behavior , so
+they may be optimized incorrectly. This can lead to differences
+in behavior that can cause security vulnerabilities [14] in
+practice.
+A. Rust’s Aliasing Model
+Rust developers can avoid these issues by ensuring that
+their programs adhere to the rules of Rust’s aliasing model.
+The Tree Borrows [10] model provides the latest definition of
+these rules. Under this model, each pointer has provenance that
+determines its permission to read or write to a location [15].
+Each location is associated with a tree that tracks all valid per-
+missions to its contents. When a location is borrowed, a branch
+is created in the tree that holds a new permission to access
+the location. When a pointer is used, its permission is checked
+against the tree to ensure that it is valid and that it permits
+the kind of access that takes place. Each type of access will
+have a different effect on the tree depending on the position of
+each permission in the tree relative to the permission used for
+the access. With respect to a given permission, an access is
+considered a child access if it requires that permission or any
+of its descendants; otherwise, it is a foreign access . Accessing
+a location using an invalid permission is undefined behavior.
+There are three categories of aliasing violations under Tree
+Borrows that we observed in our investigation. Figure 1
+provides minimal examples of each one. We refer to the first
+category as an expired permission error. Under Tree Borrows,
+writing to a memory location may cause other permissions
+to that location to expire (or transition to Disabled , in termsFig. 1: Minimal examples of the categories of Stacked and
+Tree Borrows violations that we observed in our evaluation.
+Statements that trigger undefined behavior are highlighted in
+red.
+(a) A minimal example of an expired permission error. The table on
+the righthand side shows the tree of permissions for the local variable
+xbefore and after writing with yon line 5.
+1let mut x = 0;
+2let y = & mut x;
+3let y = y as*mut _;
+4let z = & mut x;
+5unsafe { *y = 1; }
+6*z = 0;Active x
+Reserved → Active y
+Reserved → Disabled z
+(b) A minimal example of an insufficient permission error.
+1let x = 0;
+2 ub(&x);
+3fnub(x: * const u8) {
+4 let x = x as*mut _;
+5 unsafe {*x = 1 };
+6 }
+(c) A minimal example of a protected permission error.
+1unsafe fn free(x: & mut u8, layout: Layout) {
+2 dealloc(x as*mut _, layout);
+3 }
+(d) A minimal example of an access out-of-bounds error under
+Stacked Borrows that is accepted under Tree Borrows.
+1let x: & mut i32 = & mut (0, 0).0;
+2let x = (x as*mut i32).offset(1);
+3unsafe {*x = 1 };
+of the model). Using one of these expired permissions is
+undefined behavior. We provide a minimal example of this
+in Figure 2, where the variable xis mutably borrowed twice;
+once by yand again by z. However, we also store a copy
+ofyas a raw pointer ( *mut). Rust’s borrow checker does
+not place aliasing restrictions on raw pointers, so it assumes
+thatzhas exclusive, mutable access from when it is created
+on line 4 until it is used on line 6. Writing through yon
+line 5 breaks this assumption, so writing through zis now
+undefined behavior. In terms of the model, the permissions
+foryandzare children of the permission for x. Both receive
+aReserved permission, which has the capability to become a
+unique Active permission for writing to x. When a Reserved
+permission is used for a write access, it becomes an Active
+permission, and all foreign Reserved permissions become
+Disabled , canceling their reservations. Since zis adjacent to
+y, the write on line 5 is a foreign access.
+The second category of undefined behavior is an insufficient
+permission error. This type of error occurs when a reference
+or pointer with a read-only permission is used to write to
+memory. This occurs in Figure 1b on line 5, where the function
+ubwrites through a pointer that was cast from an immutable
+reference ( &x) on line 2. Under Tree Borrows, this reference
+is given a Frozen permission, which is read-only. Casting a
+reference into a raw pointer does not change its permission,
+2and neither does casting a pointer between const andmut.
+The third type of undefined behavior that we observed
+is a protected permission error. We provide an example in
+Figure 1c, where the function free receives a mutable refer-
+ence. This reference encodes the promise that ownership will
+eventually be returned to the caller. However, this promise is
+broken when the reference is cast into a raw pointer and used
+to free the underlying allocation. In terms of Tree Borrows,
+when a reference-type value is passed as an argument to a
+function, it becomes protected , making it undefined behavior
+for it to transition to Disabled —even if it is never accessed
+after this point. When a function returns, the permissions of
+its arguments are no longer protected.
+1) Differences from Stacked Borrows: Tree Borrows re-
+places the Stacked Borrows [9] model, which uses a stack to
+track the active permissions to each location. Under Stacked
+borrows, a reference cannot be offset and used to access
+locations outside of the range it originally borrowed. Figure 1d
+shows an example of this access out-of-bounds error; the
+dereference on line 3 is invalid, since xonly borrowed the
+first element of the tuple. This pattern is allowed under Tree
+Borrows; a valid permission can be used to access any location
+within the bounds of its allocation. Tree Borrows also delays
+asserting that the permission of a reference is valid until it is
+used for the first time, whereas Stacked Borrows asserts that a
+reference is valid immediately when it is created. However,
+Tree Borrows is less permissive than Stacked Borrows for
+certain aliasing patterns due to the semantics of its Reserved
+permission, justifying our second research question.
+B. Rust vs. C and C++
+Rust shares several other categories of undefined behavior
+with current C [16] and C++ [17] standards, such as accessing
+memory that has been freed, accessing beyond the bounds
+of an allocation, creating a data race, reading uninitialized
+memory, and accessing a value at an unaligned address [18].
+However, C and C++ have different rules related to initial-
+ization, aliasing, and mutability that may conflict with Rust’s
+expectations.
+1) Initialization: In both C and C++, accessing an unini-
+tialized object produces an “indeterminate value”, which is
+undefined behavior.2However, there are a few exceptions.
+Static and thread-local variables are initialized immediately at
+the beginning of their lifetime, and both the unsigned char
+andbyte types are allowed to store indeterminate values. It
+is also safe to create a reference to an uninitialized value.
+Rust’s borrow checker prevents variables from being used
+until they are initialized, and no primitive types tolerate
+indeterminate values in safe contexts. However, Rust’s stan-
+dard library provides MaybeUninit<T> , which represents
+an instance of Tthat may or may not be initialized. Once
+an instance has been fully initialized, the unsafe function
+MaybeUninit<T>::assume_init will unwrap the outer
+struct to produce the value inside. It is undefined behavior
+to call assume_init ifTis not fully initialized.
+2C23 §6.2.4.6-7; C++23 §6.7.4.12) Aliasing & Mutability: Neither C nor C++ statically
+restricts aliasing, but the standards for each language allow
+implementations to make type-directed assumptions about
+aliasing. In both languages, it is considered undefined behavior
+for a pointer to one type to refer to a value of another
+type if the two types differ.3However, differences do not
+include qualifiers, so two parameters of types int *and
+const int *can alias.
+In Rust, both variables and references have distinct, con-
+nected capabilities for mutation. Variables are immutable by
+default, only mutable variables can be mutably borrowed, and
+only mutable references can be used for mutation. In C and
+C++, variables are mutable by default, and the capability to
+mutate memory is determined by the mutability of the object
+being pointed to, regardless of the pointer’s type.4If a variable
+was declared as mutable, then a const pointer can be cast into
+a mutable pointer and used to write to it.
+3) Provenance: Both C and C++ allow pointers to be
+converted to and from integers with a size equal to the word
+size of the current architecture.5Implementations may track
+the provenance, or origin of pointers to inform compile-time
+optimizations [19]. However, neither of the current standards
+for C or C++ defines if or how provenance should be preserved
+across these conversions, though several models have been
+proposed [20]. Rust’s pointers have provenance [15], but the
+specifics of Rust’s provenance model are undecided.
+Miri has multiple methods for handling provenance across
+pointer-to-integer conversion. By default, when a pointer is
+converted to an integer, its tag is added to a set of tags
+that have been “exposed” by pointer-to-integer conversion.
+When integers are converted back into pointers, their allocation
+identifier is reconstructed from their address, but they receive
+a “wildcard” provenance value [21]. Under Stacked Borrows,
+when a memory access occurs using a wildcard tag, Miri
+eagerly interprets it as being equivalent to any tag in the stack
+that permits the access. The current implementation of Tree
+Borrows does not support this behavior yet; all accesses with
+wildcard tags are allowed and do not affect the state of the
+tree. Alternatively, developers can enable strict provenance ,
+which treats integer-to-pointer conversion as an error.
+C. Interoperation
+Developers can access foreign functions and static variables
+using Rust’s foreign function interface. Declarations, or “bind-
+ings,” for each of these objects are written in extern blocks,
+which take an optional qualifier to indicate the Application
+Binary Interface (ABI) used by the foreign library. Developers
+can also use the extern keyword to change the ABI of a
+function defined in Rust so that it can be called from other
+languages. Only a subset of Rust’s types are guaranteed to be
+compatible with foreign ABIs. Both structs and enums must
+be annotated with the #[repr(C)] attribute to ensure that
+their layout is compatible with C. Bindings are not validated
+3C23 §6.5.7; C++23 §7.2.1.11
+4C23 §6.7.4.1.7; C++23 §9.2.9.2.3
+5C23 §6.3.2.3.5-6; C++23 §6.7.1.10.4-5
+3against their definitions, but tools such as bindgen [22] and
+CXX [23] can automatically generate bindings from headers.
+Several dynamic analysis tools can find undefined behavior
+in multi-language Rust applications. Valgrind [24] is capable
+of detecting spatial and temporal memory errors, as well as
+incompatibilities with size and alignment. Many of the LLVM
+Project’s sanitizers are also compatible with Rust [25]. Each
+of these tools is available as a plugin for Cargo, Rust’s build
+tool. Miri can call foreign functions from natively compiled
+shared libraries using libffi [26], but it does not support passing
+certain argument types to native functions, and it cannot find
+undefined behavior that is triggered in foreign code.
+III. M ETHODOLOGY
+We seek to determine whether the differences between Rust
+and other languages lead to undefined behavior in practice.
+First, we analyzed all libraries published on crates.io—Rust’s
+central package repository—to find the subset with test cases
+that produce LLVM bitcode for C or C++ libraries during their
+build process. We describe this stage in Section III-A. Then,
+we created MiriLLI, which can run these test cases and detect
+undefined behavior. MiriLLI extends Miri to interoperate with
+LLI [27], an LLVM interpreter. Both Miri and LLI are included
+within the Rust toolchain; LLI is part of the LLVM backend.
+MiriLLI uses each interpreter to jointly execute programs
+defined across LLVM’s intermediate representation (LLVM
+IR) and Rust’s mid-level intermediate representation (MIR).
+In Section III-B, we outline the architecture of our tool and
+describe how we resolved the differences in semantics between
+each interpreter. In Section III-C, we describe our method
+for deduplicating test results to identify unique instances of
+undefined behavior and our approach to reporting bugs.
+A. Sampling
+We evaluated our design on all compatible Rust libraries
+with test cases that called foreign functions. Rust libraries are
+referred to as “crates,” and they can be published at crates.io.
+We used a snapshot of the crates.io database taken on Septem-
+ber 20th, 2023. It contained 125,804 unique crates, of which
+96% (121,015) had at least one valid published version. We
+compiled each crate using version 1.74 (nightly-2023-09-25)
+of the Rust toolchain, matching the version used by MiriLLI.
+This was necessary to ensure that we could use an unmodified
+version of Miri as a control to identify tests that would
+normally fail due to lack of support for foreign function calls.
+It would have been infeasible to maintain separate versions
+of MiriLLI for multiple toolchains without compromising the
+consistency of our results, since Miri depends on APIs that
+changed significantly throughout our evaluation. There is no
+standard method for using a version of Miri compiled with
+one toolchain to execute programs compiled with another
+toolchain, and there is no guarantee that Miri would behave
+as expected under these conditions.
+Of all valid crates, 67% (84,106) compiled without inter-
+vention. Of the crates that compiled, 36% (44,661) had unit
+tests and 9% (11,120) produced LLVM bitcode files, leaving3% (3,785) of crates with both unit tests and LLVM bitcode.
+Then, we used an unmodified version of Miri to execute all of
+the unit tests from this subset of crates to determine which tests
+called foreign functions. Of the 88,637 tests that we identified,
+53% (47,189) passed, 41% (36,766) failed, 4% (3,869) timed
+out after five minutes, and 1% (1,178) had been manually
+disabled. Tests can be disabled using the #[ignore] attribute
+or with conditional compilation directives.
+Of the tests that failed in Miri, 63% (23,116) failed due
+to foreign function calls. We executed this subset under both
+Stacked and Tree Borrows using an initial build of our tool
+to determine which tests called foreign functions. Of all
+potentially viable test cases, 39% (9,130) called a foreign
+function we could execute. These tests originated from 25%
+(957) of the crates with both test cases and bitcode. Our
+sample only includes crates that statically link to foreign code
+in their default configuration; it does not include crates that
+default to dynamic linking or statically link in non-default
+configurations. However, the 957 crates that we identified were
+more than enough to find meaningful answers to our research
+questions. We used this sample to conduct our final evaluation.
+We also partially measured the distribution of crates that
+interact with foreign code. When we compiled each crate, we
+used an early lint pass to examine the abstract syntax tree
+and record the locations of all function declarations with a
+foreign ABI. We used data from this pass to identify 2,516
+crates that declared a foreign function. This represents only
+2.1% of all valid crates. However, 12,564 (10.4%) of all valid
+crates had a version that directly depended on at least one prior
+version of a crate that declared a foreign function binding. The
+maximum number of dependents for any crate that declared
+foreign functions was 6,411, with a mean of 11.0 dependents
+and a standard deviation of 171.8 dependents.
+B. Implementation
+We illustrate the data flow between each of the core com-
+ponents of MiriLLI in Figure 2. As indicated at the bottom
+of the Figure, MiriLLI requires Clang [28] to be set as the
+default C and C++ compiler and configured to emit LLVM
+bitcode during the build process for the library under test.
+Other than this requirement, using MiriLLI is identical to using
+an unmodified version of Miri.
+When MiriLLI encounters a foreign function call in a Rust
+program, it looks for a corresponding definition in the LLVM
+module. After finding a definition, the function’s arguments
+are passed through a translation function, which lowers them
+into the representation used by LLI. There are two translation
+functions indicated by the arrows in the middle of Figure 2;
+one from Miri’s representation to LLI’s (left) and another from
+LLI’s representation to Miri’s (right). Miri passes the translated
+arguments to LLI, which creates a new thread to execute the
+function. Then, Miri sets the current current Rust thread to join
+on this new LLVM thread. After the LLVM thread terminates,
+its return value is passed back through the translation layer
+and given to the Rust thread, which continues to execute.
+A similar process is used when an LLVM thread calls a
+4Fig. 2: The architecture of MiriLLI.
+Rust
+SourceRust
+MIRRust Compiler
+C/C++
+SourceLLVM
+IRClangMiri
+Value Translation FunctionsThread
+ManagerShimsMemory
+Foreign Function Interface
+LLI LLVM Thread State
+Rust function. Although Miri is single-threaded, it supports
+concurrency by non-deterministically stepping through multi-
+ple simulated “threads” of execution. LLI did not originally
+support any form of multithreading, but we modified it to be
+compatible with Miri’s implementation. We support calling
+foreign functions from parallel Rust threads, but we do not
+support multithreading within LLVM. We implemented the
+Rust interface to LLI as an extension of Inkwell: a high-level
+Rust encapsulation for LLVM [29].
+Nearly all of Miri’s mechanisms for detecting undefined
+behavior are built into the core functions of the interpreter
+and do not require additional instrumentation of the source
+program. However, to detect aliasing violations, Miri config-
+ures the Rust compiler to insert “retag” instructions, which are
+used by its implementations of Stacked and Tree Borrows. We
+did not need to insert these instructions into the LLVM IR of
+foreign functions, since we treat LLVM pointers as equivalent
+to Rust’s raw pointers.
+We enabled LLI to detect undefined behavior by replacing
+several of its core operations with foreign function calls that
+use Miri to execute equivalent operations. As indicated by the
+labels next to “Miri” in Figure 2, all operations related to
+managing threads, accessing memory, and executing “shim”
+implementations of intrinsics and system calls are handled
+by Miri—for both interpreters. LLI manages its own local
+state for LLVM threads and implements the interpretation
+functions for each instruction, but Miri controls the process of
+taking a step for each thread. This architecture allowed us to
+extend Miri to detect errors in foreign function calls “for free”
+without having to reimplement its dynamic analyses within
+LLI. However, we had to address two additional difficulties to
+increase test coverage.
+a) Translation: Rust’s MIR uses different calling con-
+ventions and represents values differently than LLVM IR, sowe could not rely on a function’s definition to have the same
+signature as its binding. However, foreign function bindings
+are also allowed to be incorrect, so we could not wholly trust
+type information to guide our conversion, either. Additionally,
+neither Rust nor LLVM has a formal model of its ABI that
+we could use as an oracle. When implementing our value
+translation functions, we settled on a conservative approach
+that supports the most common ABI differences while still
+being able to detect certain instances of incorrect bindings.
+We maintain the invariant that the size of a typed value on
+one side of the boundary must be equal to the size of the type
+expected by the other side. We provide a formal model of
+our value conversion functions in Section 2 of the Appendix.
+It demonstrates that conversion will fail when a difference in
+size is detected, which we report as undefined behavior.
+Conversion is trivial for primitive types, since they have
+a canonical representation in Rust and LLVM. We also al-
+low implicit casts between pointers and integers at foreign
+boundaries, which was necessary for 526 test cases from
+70 crates. When aggregate types are passed by value, we
+require both the size and number of fields to match unless
+the aggregate is passed as an integer or by reference. However,
+we also frequently observed functions that expected individual
+aggregates to pass through multiple parameters, with one pa-
+rameter for each field. This occurred only with homogeneous
+aggregates, where every field is identical and lacks padding.
+To accommodate this, we treat each field in a homogeneous
+aggregate as a separate argument if the entire aggregate cannot
+be passed as a single parameter. We apply this transformation
+only if the number of fixed parameters is greater than or equal
+to the number of remaining arguments plus the number of
+fields in the aggregate. This was necessary for 2% (156) of
+our test cases from 15% (140) of crates.
+Products lack a canonical form between Rust and LLVM,
+so we do not support passing them as variadic arguments
+to LLVM or as arguments from LLVM to Miri’s shims for
+system calls. Each of these types of functions lacks the type
+information that we need to guide our conversion. When an
+opaque pointer from LLVM is passed to one of Miri’s shims,
+we assign it the type *mut u8. However, if it points to stack or
+static memory with a size equal to that of a primitive type, we
+assign it to point to that type. This may lead to false positive
+alignment errors when we cannot resolve an underlying type,
+and Rust expects a type other than u8.
+b) Initialization: Miri tracks which bits are initialized
+in each allocation and reports an error when uninitialized
+memory is read. However, LLVM will read uninitialized
+memory for the purpose of propagating undef andpoison
+values, which represent the result of an indeterminate or
+invalid computation. If a single bit needs to be set within an
+uninitialized byte, instead of writing a zeroed byte with the
+individual bit set, LLVM will load the uninitialized byte, set
+only that bit, and then write it back [30], [31]. These accesses
+are considered undefined behavior by Miri, but we treat them
+as false positives. We implemented two modes that allow us
+to identify true positive uninitialized reads of Rust-allocated
+5memory in LLVM. By default, we allow load instructions
+to read uninitialized bytes. However, MiriLLI can also be
+configured to treat uninitialized reads as errors while zero-
+initializing all LLVM-allocated stack and heap memory. Tests
+that read uninitialized memory must be run in each mode to
+ensure a complete evaluation. We cannot detect true positive
+uninitialized reads that occur outside of interactions with Rust,
+but these errors can be found with other tools [24], [32] and
+are beyond the scope of our evaluation.
+C. Evaluation
+We used MiriLLI to execute each of the 9,130 viable test
+cases that we identified in Section III-A. The version of
+MiriLLI at this point was based on the same version of the
+Rust’s nightly toolchain (1.74.0) that we used in earlier stages
+of data collection. We set the global C and C++ compilers to
+version 16 of Clang and disabled optimizations. We collected
+data using Amazon EC2 on-demand instances provisioned
+through CloudBank [33]. We used c6a.2xlarge instances
+during the initial stages of data collection, but we switched
+toc6a.xlarge instances when using MiriLLI. It is single-
+threaded, so fewer resources were necessary. All commands
+were executed in a Docker container running Ubuntu 23.04.
+a) Executing Tests: We executed each viable test natively
+and in MiriLLI under both Stacked Borrows and Tree Borrows.
+We configured Tree Borrows to treat values of the Unique<T>
+type as having the semantics of a mutable borrow. Without
+this configuration option, only the values of type Unique<T>
+within Box<T> are treated this way. We disabled isolation
+to allow executing non-deterministic operations and enabled
+symbolic alignment checking. By default, Miri will report
+an error if the address of a pointer is not a multiple of the
+requested alignment of the type of value being read or written
+through it. However, the base address of an allocation is not
+guaranteed to be a multiple of the requested alignment, so it is
+possible for a misaligned pointer to be “aligned” by chance.
+Symbolic checking avoids these false negatives by ensuring
+that the pointer’s offset from the base address is a multiple of
+the alignment of the value being read and that the alignment of
+the allocation is greater than the alignment of the value. We
+ignored unaligned accesses in LLVM to prioritize detecting
+Rust-specific errors.
+On average, across each memory mode, 61% of tests
+terminated due to an unsupported operation, 19% passed,
+10% timed out, 1% failed, and 9% had a potential bug. A
+“bug” includes both undefined behavior and other undesired
+behaviors, such as memory leaks. Of the 61% of unsupported
+operations, 56% were dynamically linked functions and inline
+assembly, which are out of scope. An additional 27% were
+atomic instructions and floating point types that LLI does not
+implement, 12% were due to types that are not supported by
+our value conversion layer (discussed in III-B), and 5% were
+shims that Miri does not fully implement.
+b) Deduplicating Errors: We reason about bugs in terms
+of test outcomes, where an outcome includes the results of
+a single test under both aliasing models. We deduplicatedoutcomes based on exit codes, stack traces, and error logs to
+avoid filing redundant bug reports. Prior to deduplication, we
+modified the error logs to remove unnecessary elements, such
+as references to specific memory addresses. We also included
+more or less detail in stack traces, depending on the location
+of an error. For foreign errors, we used the subset of the stack
+trace up to the Rust boundary to avoid deduplicating errors
+that appeared to be identical but were caused by mistakes at
+different callsites. When an error occurred in Rust, we only
+used the first line of the stack trace, since few of these errors
+were caused by LLVM.
+After deduplication, we had 394 errors to investigate. Mul-
+tiple factors lead to the number of bugs being significantly
+smaller than the number of deduplicated test outcomes. Our
+method of deduplication was conservative, we ignored errors
+from crates that had been unpublished since the start of our in-
+vestigation, and we only reported Stacked Borrows violations
+that were also Tree Borrows violations. We also observed false
+positives related to alignment and accesses through addresses
+that we do not emulate (e.g., stdout ). Additional manual
+investigation was necessary to fully diagnose certain aliasing
+bugs (e.g. #32), since MiriLLI currently does not record the
+source locations of valid updates to the state of the borrow
+tracker when they occur in LLVM. Miri typically provides a
+trace of the history of each permission involved in a aliasing
+violation; only partial traces were available for certain bugs.
+c) Reporting Errors: Not all errors are undefined behav-
+ior, and not all instances of undefined behavior are readily
+exploitable. However, we still attempted to follow ethical
+vulnerability disclosure practices by reporting bugs privately
+via email before creating public reports. When we found a
+bug, we examined its crate’s Cargo.toml and the GitHub
+profile of its repository’s owner to find a way to contact its
+maintainers privately. If we were unsuccessful, we logged a
+public issue. We also logged issues if we had not received a
+response after at least one month or if the type of error did
+not appear to be exploitable. Our reports typically included
+a representative test case, the output from MiriLLI, and a
+minimal example where applicable. When a fix was trivial, we
+also filed a pull request. Section 1 of our Appendix includes
+metadata for each library and links to our contributions.
+IV. R ESULTS
+We found 46 bugs in 37 crates. All appear to be new. As of
+December 13th, 2024, 28 of the bugs have been confirmed and
+fixed, and none have been identified as security vulnerabilities.
+Bugs occurred slightly more frequently in LLVM than in Rust;
+23 occurred in LLVM, 17 occurred in Rust, and six were
+related to incorrect bindings. The majority (32) were found
+in crates with less than 100 average daily downloads in the
+six months prior to our snapshot of crates.io. However, we
+discovered three Tree Borrows violations in separate crates that
+each had more than 10,000 average daily downloads. We found
+several additional errors that occurred in Rust and did not
+meaningfully involve foreign code. These errors are excluded
+from the counts here, but they appear in our raw dataset.
+6TABLE I: Counts of each unique error grouped by category,
+the location of the fix, and the location of the error.
+Category
+Fix Error Allocation Ownership Typing Total:
+Binding Binding - - 6 6
+Binding LLVM - 3 - 3
+LLVM LLVM - 3 - 3
+Rust LLVM 1 16 - 17
+Rust Rust 9 2 6 17
+Total: 10 24 12 46
+We found 90 tests from 37 crates where Stacked Borrows
+violations occurred in foreign code. However, 66% (59) of
+these tests passed or encountered an unsupported operation
+under Tree Borrows. This is mainly because 50% (45) had
+invalid range errors similar to the minimal example shown
+earlier in Figure 1d. For example, we observed that slices of
+an array would be cast into raw pointers, passed across the FFI,
+and then offset beyond the range that they initially borrowed.
+This is considered undefined behavior under Stacked Borrows,
+but it is valid under Tree Borrows. This provides our answer
+toRQ2 ; Tree Borrows accepts more real-world programs that
+call foreign functions than Stacked Borrows due to differences
+in handling pointer arithmetic.
+Now, we answer RQ1 by identifying three categories of
+undefined or undesirable behavior that occur in Rust libraries
+that call foreign functions. We describe Ownership errors in
+Section IV-A, which include all violations of Tree Borrows
+and accesses out-of-bounds. We describe Typing errors in
+Section IV-B, which include incorrect foreign function bind-
+ings and uninitialized values. We describe Allocation errors
+in Section IV-C, which include both memory leaks and cross-
+language deallocation. Table I shows the number of bugs in
+each category, grouped by the location of the error and the
+location where a fix would need to be applied. We refer to
+each bug using a unique numerical ID corresponding to tables
+in Section 1 of the Appendix.
+A. Ownership
+We found 24 Ownership bugs from 20 crates. These include
+17 Tree Borrows violations and seven accesses out-of-bounds.
+a) Const-Correctness: We found 10 insufficient permis-
+sion errors caused by incorrectly casting immutable references
+to mutable raw pointers. In Bug #41, a chain of casts was used
+to convert &self into a mutable raw pointer. This pointer
+still had read-only Frozen permission, so mutating through it
+across the FFI triggered an insufficient permission error. There
+were seven bugs with equivalent errors. The remaining three
+bugs occurred due to foreign function bindings that incorrectly
+declared pointers as const instead of mut, leading developers
+to pass pointers derived from immutable references instead of
+mutable ones.
+b) Self-Reference: In Rust, it is possible, but nontrivial,
+to implement self-referential patterns using safe encapsulations
+of unsafe operations [34]. Bug #32 demonstrates how a self-
+referential pattern can be implemented incorrectly. We found
+this bug in an encapsulation of a C library implementingFig. 3: A minimal example of Bug #32: an incorrect encap-
+sulation of a self-referential pattern.
+1 // Rust Encapsulation
+2struct Alloc {
+3- cache: i32,
++ cache: UnsafeCell<i32>,
+4 buffer: * mut i32,
+5 }
+6fnopen(a: & mut Alloc 11) -> i32 {
+7-let cache = & mut a.cache as*mut _;2
++let cache = a.cache.get() ;1
+8 a.buffer = cache;
+9 let b = & mut *a; 23
+10 unsafe {
+11 ffi::open(b.buffer 12);
+12 - b.cache 3
++ *b.cache.get() 2
+13 }
+14 }
+15 // C API
+16 void open( int *buffer 12) { // ffi::open
+17 *buffer = 1;
+18 }
+(a) Tables illustrating the (simplified) subtree of permissions for
+location of the field “ a.cache ” before (to the left of the arrow)
+and after (to the right of the arrow) the write access on line 17.
+Reserved → Active 1
+Reserved → Active 2
+Reserved → Disabled 3Reserved∗→ Active 1
+Reserved∗2
+a minimal file system for embedded applications. It used
+separate structs to represent the state of the file system and
+its configuration. The configuration held a mutable reference
+to the state, but both objects were contained in a parent struct
+representing the entire file system. Rust held a single mutable
+reference to the parent, which became invalid when the state
+was mutated through the configuration by a foreign function.
+Figure 3 provides a minimal example of the bug and our
+fix. Lines we removed are highlighted in redand marked with
+“-”, while lines we added are highlighted in green and marked
+with a “+”. Tags within a circle indicate the state of the tree
+prior to the fix, while tags within a square represent the state
+of the tree after the fix. When a tag is on a line, it indicates that
+the pointer or reference on that line has a permission within
+the subtree corresponding to the tag. The tables at the bottom
+display the state of the tree before and after the write access
+on line 17.
+The Rust encapsulation for open initializes the field buffer
+of the struct Alloc on line 8 with a mutable raw pointer cast
+from a mutable reference to the field cache . The struct is
+mutably borrowed again on line 9. Each of these borrows,
+indicated by 2and 3, corresponds to an adjacent Reserved
+branch in the tree. The reference assigned to b, which has
+permission 3, is used to access the field buffer , which has
+permission 2. The pointer in this field is passed into the
+foreign function ffi::open . Across the FFI, a write access
+occurs on line 17 using permission 2. This is a child access
+relative to 1and 2, so they transition to Active . However,
+it is foreign access relative to 3, so this permission becomes
+7Fig. 4: A minimal example of the incorrect encapsulations of
+cyclic aliasing patterns that we observed in Bugs #31 and #35.
+1 // Rust Encapsulation
+2impl Compression {
+3 fnnew() -> Self {
+4 let mut stream = Box::new(Stream::default());
+5 +let stream = Box::into_raw(stream);
+6 unsafe {
+7 - ffi::init(stream.as_mut()); 1
++ ffi::init(stream); 1
+8 }
+9 Compression { stream }
+10 }
+11
+12 fncompress(& mut self 22) {
+13 unsafe {
+14 -self .stream.data = 0; 2
++ (* self .stream).data = 0; 1
+15 - ffi::compress( self .stream.as_mut()); 2
++ ffi::compress( self .stream); 1
+16 }
+17 }
+18 }
+19 // C API
+20 void init(Stream* s 11) { // ffi::init
+21 s->state = malloc( sizeof (State));
+22 s->state->stream = s;
+23 }
+24 void compress(Stream* s 21) { // ffi::compress
+25 int data = s->state->stream->data; 11
+26 }
+(a) Tables illustrating the (simplified) subtree of permissions for
+location of the field stream.data before (to the left of the arrow)
+and after (to the right of the arrow) the write access on line 14.
+Reserved → Disabled 1
+Reserved → Active 2Active 1
+Reserved → Disabled 2
+Disabled . This leads to an expired permission error on line 12
+when 3is used for a read access in Rust.
+We fixed this bug by wrapping parts of the state in an
+UnsafeCell , which can be mutated through shared refer-
+ences. In Figure 3, we change the first field of Alloc to
+UnsafeCell<i32> and replace the mutable borrow assigned
+toa.buffer with a.cache.get() . This expression does
+not perform a retag, so both aandcache share permission
+1. Since acontains an UnsafeCell , the mutable borrow
+assigned to bon line 9 associates the tag 2with a special
+Reserved∗permission that can tolerate foreign writes. Con-
+sequently, this permission is no longer disabled by the write
+through 1on line 17, so the read access on line 12 is valid.
+c) Multiple Mutable Aliasing: Expired permission errors
+occurred when pointers derived from mutable references were
+copied into the foreign heap. We found this type of bug in five
+separate libraries. The most notable examples were Bug #31
+from bzip2 and Bug #35 from flate2 , which are both
+popular compression libraries. In particular, flate2 is ac-
+tively maintained by the Rust project and averaged more than
+130,000 downloads per day during our observation period.
+Figure 4 shows a minimal example of the cyclic aliasing
+pattern used by each library. We use the same notation as
+Figure 3. The structs Stream andState carry pointers toeach other. Both are encapsulated in Rust by a Compression
+object, which carries a heap-allocated instance of Stream
+within a Box. The Rust function new allocates memory for
+aStream object and passes a mutable reference carrying the
+Reserved permission 1toffi::init . This foreign function
+copies the pointer it receives to the Stream object into a
+newly allocated State instance on line 22, creating a cyclic
+structure. Later, when the function compress is called, it
+creates an adjacent Reserved permission 2. Mutating through
+this permission on line 14 causes 1to become Disabled ,
+making it undefined behavior to read using 1in the body of
+ffi:compress on line 25.
+To fix each error, we unwrapped the Box using into_raw
+and stored a raw pointer to the allocation within the
+Compression struct. We modified the API so that this
+raw pointer would be used for every access to the alloca-
+tion, ensuring that the cyclic structure would remain valid.
+This corresponds to permission 1in Figure 4, which re-
+mains Active through each access. We also had to mod-
+ifyCompression ’s implementation of Drop to rewrap this
+pointer using Box::into_raw to avoid a memory leak.
+Bug #33 also involved a mutable reference being copied into
+the foreign heap, but we needed a different approach to fix it.
+It occurred in the same file system library as Bug #32, which
+avoided creating heap allocations in Rust as a constraint of
+the embedded application context. Instead of using a Box<T>
+to allocate the equivalent of the Stream object in Figure 4,
+the Rust encapsulation passed around a mutable reference
+to a stack allocation. Similar to Bugs #31 and Bug #35,
+once the reference was created, it was passed to a foreign
+initialization function that copied the reference into a foreign
+heap allocation. After the initialization function returned, the
+mutable reference was moved into a RefCell<& mut T>. This
+performed a reborrow, creating a new Reserved permission
+as a child of the Reserved permission held by the foreign
+heap. Both of these permissions could be used interchangeably
+for read accesses but not for write accesses. If the foreign
+parent permission was mutated first, it would invalidate the
+child permission. If the child permission was mutated first,
+then both permissions would become Active , but the next
+mutation through the parent permission would cause the child
+permission to become Frozen , making future write accesses
+through the child permission undefined behavior.
+To fix this error, we stored the mutable borrow as a
+RefCell<* mut T>, which prevented new child permissions
+from being created. However, the type Twas a struct, and
+certain foreign functions required pointers to its members.
+Reborrowing is typically necessary to create a reference to a
+member of a struct, but this creates a new permission, which
+we needed to avoid. Instead, we used Rust’s addr_of_mut!
+macro, which creates a pointer to a location without borrowing
+it.6Together, these two changes ensure that all memory ac-
+cesses on each side of the boundary use the same permission.
+6Rust 1.82.0 provided native syntax: &raw mut
+8The authors of Tree Borrows [10] found an equivalent bug in
+test cases for the Rust toolchain and applied the same fix.
+d) Protection: We found one protected permission error
+equivalent to the example in Figure 1c. In Bug #25, a Rust
+function attempted to use a foreign function to grow a heap-
+allocated array of values. The foreign function was passed a
+pointer derived from a reference-type argument to the Rust
+encapsulation. Similar to Figure 1c, when this pointer was
+used to reallocate the array, its protected permission became
+Disabled , which is undefined behavior. We fixed this bug by
+changing the function to receive a raw pointer instead. Raw
+pointers do not receive protectors, so they can be used for
+deallocation.
+e) PhantomData: Rust’s PhantomData<T> behaves
+like an instance of T, but it can be created without
+providing a concrete value. However, a value of type
+PhantomData<UnsafeCell<T>> does not behave like an
+UnsafeCell<T> ; it cannot be mutated through immutable
+references [35]. In Bug #30, the type Opaque was declared
+as an alias for PhantomData<UnsafeCell<* mut T>>. It
+was used to represent foreign types in Rust without having to
+declare their layout on both sides of the FFI boundary. Since
+Opaque did not contain a concrete instance of UnsafeCell ,
+raw pointers derived from &Opaque received a read-only
+permission, leading to an insufficient permission error when
+they were used for a write access in foreign code. We proposed
+fixing this error by removing PhantomData , but other con-
+tributors are still discussing the correct fix. The relationship
+between PhantomData andUnsafeCell is not yet settled,
+so this pattern may be allowed in the future.
+f) Access Out-of-Bounds: We found seven access out-of-
+bounds errors in unique crates. Bugs #19 and #20 were found
+in two encapsulations for libdecnumber , which is part of
+the GCC toolchain [36]. This library often used the following
+pattern to iterate over arrays of integers:
+for (; *curr==0 && curr+3 < end;) curr+=4;
+The first term in the conjunction will execute before the second
+term, but if the second term is false, then the first term is
+an access out-of-bounds or an uninitialized read. This was
+fixed by swapping the order of each term. Bug #23 was
+found in a disassembler that incorrectly implemented several
+instructions, leading to an access out-of-bounds into adjacent
+static arrays. This error was fixed once the correct semantics
+were implemented.
+None of these errors meaningfully involve Rust. However,
+the remaining errors were caused by Rust encapsulations
+that did not adequately enforce the preconditions of foreign
+function calls. Bug #18 involved the following API, which
+redirected its arguments to foreign functions based on the value
+of the parameter size :
+fnexpand(ex_key: & mut [u8], key: &[u8], size: KeySize)
+For example, passing KeySize::K128 would call a foreign
+function that assumed that ex_key andkey would each be
+128 bytes long. However, this invariant was not enforced bythe encapsulation; it was possible to cause an access out-of-
+bounds error by passing a KeySize larger than the length of
+either key. We did not propose a fix for this bug, as it could
+require significant changes to the API.
+Bug #22 involved a foreign function that expected to receive
+a pointer to a string with six characters. It was allocated
+with CString::new(Vec::with_capacity(6)) , exposed
+as a raw pointer using into_raw , and correctly deallocated
+after the call using from_raw . However, the implementation
+ofCString::new appends a null-terminator to the vector
+and then converts it into a value of type Box<[u8]> using
+into_boxed_slice , which shortens the capacity of a vector
+to be equal to its length. The intended capacity was six, but
+into_boxed_slice shortened it to one, appending a null-
+terminator. The encapsulation did not validate that the length
+of the CString instance was correct, leading to an access out-
+of-bounds when the C codebase read beyond the first character.
+We fixed this error by initializing the CString with a constant
+of the correct length.
+B. Typing
+We found 12 bugs from 12 crates that involved typing
+or initialization. Some were caused by incorrect use of
+MaybeUninit<T> , while others involved incorrect foreign
+function bindings.
+a) Incomplete Initialization: We found five bugs that
+involved partial initialization. In Bug #45, an uninitialized
+instance of a struct Tcontaining an array of values was created
+using MaybeUninit<T> and passed across the FFI to be
+initialized. The foreign call only initialized the first element
+of the array to zero. The remaining uninitialized elements
+would never be read by C, since every iteration stopped at the
+null terminator. Miri reported these initialization patterns as
+an error when MaybeUninit<T>::assume_init was called.
+We fixed this bug by zero-initializing the entire array in Rust.
+Bug #46 seemed to involve an equivalent pattern;
+MaybeUninit<T>::assume_init triggered an error for a
+struct that was initialized by a foreign function. However,
+the function properly zero-initialized the struct using memset .
+After examining the LLVM bytecode of the foreign function,
+we found that all 88 bytes of the struct were initialized on
+the LLVM stack, but only the first 80 bytes were copied back
+into Rust. These missing bytes corresponded to padding fields,
+which were never directly accessed by the foreign library.
+Optimizations had been disabled, but LLVM still removed
+this unnecessary write access. We fixed Bug #46 by zero-
+initializing the padding fields before calling assume_init .
+b) Incorrect Bindings: We found six crates with one or
+more incorrect foreign function bindings. All of these incorrect
+bindings had been written manually. Three of these crates
+had bindings with missing return types. In Bug #5, a binding
+was declared in a unit test without its 32-bit integer return
+type. The C implementation used this to return a status code
+indicating if one of its integer parameters was within bounds.
+The remaining three bugs involved bindings with incorrect
+integer types, which led to incomplete initialization. In Bug #6,
+9a function was declared to return a 32-bit integer, but its C
+implementation returned a boolean value. In Bug #4, the last
+parameter of a function was declared as a 32-bit integer, but
+the C implementation expected size_t . The width of size_t
+is architecture-dependent, so this binding was only correct for
+32-bit architectures. To fix this bug, multiple prior releases
+needed to be patched to use Rust’s usize type, which has
+similar semantics.
+C. Allocation
+We found 10 issues related to allocation in 10 distinct
+libraries. These include nine memory leaks and one new cross-
+language deallocation bug.
+a) Memory Leaks: Rust’s Box<T> andCString use
+similar APIs to encapsulate heap allocations. For each type,
+the function into_raw consumes an instance and produces
+a pointer to its interior heap allocation. To avoid a memory
+leak, this pointer must be reconstituted in its wrapper type
+using the function from_raw . We found four leaks caused by
+calling into_raw on either Box<T> orCString without later
+calling from_raw . Each type was used to allocate memory for
+a foreign function call, and each bug was fixed by adding a
+call to from_raw after the function returned. The remaining
+five leaks were of memory that had been allocated by C. Most
+were caused by neglecting to call a destructor that had been
+exposed by the C API. However, in Bug #10, the C API did
+not expose a destructor, since it had been designed based on
+the assumption that users would be able to call free . We
+could not use Rust’s allocator API to fix this, since that could
+lead to invalid cross-language deallocation.
+b) Cross-Language Deallocation: It is potentially unde-
+fined behavior to free a pointer allocated by C in Rust, or
+vice versa, since each language’s binary may use a differ-
+ent allocator. We found one new example of cross-language
+deallocation. In Bug #1, a pointer to a heap-allocated string
+was returned to Rust by a foreign function call and stored
+as aCow<&’ static [u8]> , which will lazily clone its data
+when mutated. This wrapper type is an enumeration with two
+variants; Cow::Borrowed receives a reference to a value,
+while Cow::Owned takes ownership of a value, deallocating
+it when it goes out of scope. When this Cow was dropped, it
+deallocated the C heap memory using Rust’s allocator. There
+was no immediate fix for this bug, since the C API did not
+expose a destructor.
+V. D ISCUSSION
+Our findings indicate that it is easy to inadvertently in-
+troduce undefined behavior in Rust libraries that call foreign
+functions. The errors we found can be prevented with careful
+auditing, but it seems likely that many will persist until
+the Rust community develops a production-ready method for
+finding aliasing violations in multi-language applications. We
+provide the following recommendations:
+a) For Rust Developers: Awareness is key to avoiding
+improper use of unsafe features. Developers who depend on
+foreign code should validate their tests with language-agnosticbug-finding tools, such as LLVM’s sanitizers or Valgrind,
+which can detect memory leaks (e.g #10) and accesses out-of-
+bounds (e.g. #23). Developers who maintain foreign function
+bindings should consider that the infrequent cost of generating
+and committing bindings may be preferable to writing them by
+hand without assistance, which can lead to errors. When heap
+objects are accessed on each side of the foreign boundary, it
+is helpful to be aware of where each object is created, how
+many references it has, where these references are stored, and
+what capabilities they require. Each of these attributes can
+influence the correct design for an encapsulation. For example,
+Bug #33 was fixable by casting a reference into a pointer,
+while Bugs #35 and #31 required unwrapping a Box.
+b) For The Rust Project: The Rust community is in dire
+need of a production-ready solution for finding aliasing bugs
+in multi-language applications. Although our approach was
+capable of finding real-world bugs, its scalability is limited
+due to the requirement of implementing shims for system
+calls and the lack of a formal specification for the ABIs
+implemented by Rust, Clang, and LLVM. Instrumenting a
+shared, intermediate format is likely to be the most effective
+approach. The Krabcake project [37] (announced concurrently
+with MiriLLI) is developing an extension to Valgrind [24] that
+will provide support for detecting aliasing violations, but it is
+not yet capable of replicating our results. The Rust community
+should invest resources into completing a prototype imple-
+mentation to evaluate in real-world applications. However,
+Valgrind can also incur significant runtime overhead. Our
+future work will involve creating an LLVM sanitizer that can
+detect aliasing violations, providing the performance necessary
+to find these errors at scale with fuzzing tools. We also expect
+that sophisticated static analysis tools would help developers
+avoid undefined behavior at foreign boundaries by issuing
+warnings for functions that copy pointers or mutate through
+pointers derived from immutable references.
+VI. R ELATED WORK
+Foreign function calls are a common use case for unsafe
+code, but they have been understudied in prior work.
+a) Surveys of the Rust Ecosystem: Studies that examine
+how unsafe code is used in Rust libraries have consistently
+found that foreign function calls are a significant use case for
+unsafe code [4], [5]. In particular, Evans et al. [4] surveyed all
+published crates in September of 2018 and found that 22.5%
+of all unsafe function calls were to foreign functions. Rust
+developers also view foreign function calls as a central use
+case for unsafe code. Fulton et al. [6] interviewed 16 Rust
+developers and surveyed 178 developers, finding that nearly
+half of their participants used foreign function calls. Both
+Höltervennhoff et al. [7] and McCormack et al. [8] focused
+specifically on Rust developers who use unsafe code, and each
+found that the majority of participants used Rust’s FFI.
+b) Types of Bugs & Undefined Behavior: Prior studies
+have examined open source contributions to categorize errors
+caused by unsafe code. Most considered foreign function calls
+to be out of scope, and none described aliasing violations in
+10terms of Stacked or Tree Borrows. Both Qin et al. [38] and
+Xu et al. [39] examined bug and vulnerability reports from
+open source projects and found examples of allocation and
+typing errors that are similar to the ones that we discovered.
+Xu et al. [39] did encounter errors related to foreign function
+calls, but they were primarily “straightforward” issues related
+to application-specific invariants, layout, and alignment. Cui et
+al. [40] evaluated a taxonomy of 19 safety properties required
+by unsafe functions, but they made it an explicit design goal
+to exclude foreign functions.
+c) Bug-finding Tools & Verifiers: Prior approaches to
+static analysis [41], [38], [42], [43] have found a wide variety
+of bugs caused by improper use of unsafe code, but few
+approaches scale beyond Rust. Li et al. [44] applied dataflow
+analysis on LLVM IR and detected several memory leaks
+and cross-language deallocation errors in Rust libraries. We
+replicated several of the bugs they encountered. Hu et al. [45]
+modified several existing Rust analysis tools, including Miri,
+to analyze multi-language programs defined in a custom
+intermediate representation. However, they did not consider
+aliasing violations. Lei et al. [46] took a similar approach
+using WebAssembly as the target language, but their evaluation
+did not use Miri or consider aliasing issues, either. Recent
+deductive verifiers based on the RustBelt [47] model have
+used compositional verification [48] and automated proof
+search [49] to verify unsafe code, but none of these approaches
+reason about Stacked or Tree Borrows or have explicit support
+for foreign function calls.
+VII. T HREATS TO VALIDITY
+Construct Validity: We disabled compile-time optimiza-
+tions in both Rust and LLVM to avoid missing bugs. However,
+we did not evaluate whether optimization would have had any
+effect on our results, and we did not determine whether any
+of the bugs that we found had an effect on native execution.
+Internal Validity: We did not use the same hardware
+when investigating the source of each bug as we did for
+large-scale data collection. Our value translation layer cannot
+detect when a binding uses an incorrect type that happens to
+have the correct layout, which may have caused us to miss
+bugs. Errors in Miri or other components of Rust’s nightly
+toolchain may have affected the correctness of our results.
+Since we manually investigated each bug, we have no reason
+to believe that these errors and their fixes are specific to any
+particular version of Rust’s toolchain, with the exception of
+Tree Borrows violations. The model was still evolving during
+our evaluation.
+Several of our bug reports are still pending responses,
+so we cannot be entirely certain that all of our results are
+novel or true positives. However, we did exclude bugs from
+our evaluation that had already been reported. We did not
+independently confirm that these bugs were absent from test
+cases that did not call foreign functions, but we have no reason
+to believe that any would have been detected by an unmodified
+version of Miri at the time of our evaluation.External Validity: Crates that could not compile with our
+nightly toolchain were excluded from our evaluation, even if
+they would have otherwise been compatible with MiriLLI.
+Limited support for certain features, such as dynamically
+linked libraries, also prevented us from achieving high test
+coverage; 61% of tests terminated due to an unsupported oper-
+ation and 10% timed out. Additionally, the majority of libraries
+we examined linked against C, and not C++. Crates that failed
+to compile using our nightly toolchain were excluded from
+the evaluation, as well as crates that overrode the system’s
+default C and C++ compiler. However, these limitations did not
+prevent us from answering our research questions. Our goal
+was not to create a production-ready tool, but to understand
+the types of errors that can occur in Rust libraries that call
+foreign functions. The bugs that occur in general may differ
+in unexpected ways from those found with our setup.
+VIII. C ONCLUSION
+We conducted a large-scale evaluation to investigate the
+types of undefined behavior that occur in Rust libraries that
+call foreign functions. We created MiriLLI—a dynamic analy-
+sis tool that combines two existing interpreters—and we used
+it to find 46 bugs in 37 libraries. Though many of these bugs
+were aliasing violations, Rust’s Tree Borrows aliasing model
+was more permissive in this context than the earlier Stacked
+Borrows model. To ensure that these errors are easy to detect,
+the Rust project should invest in new dynamic analysis tools
+that can accommodate multi-language applications.
+ACKNOWLEDGMENT
+We thank Tomas Dougan for contributing to the implemen-
+tation of MiriLLI. This material is based on work supported
+by the Department of Defense and the National Science Foun-
+dation under Grant Nos. CCF-1901033, DGE1745016, and
+DGE2140739. Results presented in this paper were obtained
+using CloudBank [33], which is supported by the National
+Science Foundation under Grant No. CNS-1925001. Any
+opinions, findings, conclusions, or recommendations expressed
+in this material are those of the authors and do not necessarily
+reflect the views of the Department of Defense or the National
+Science Foundation.
+REFERENCES
+[1] Stack Overflow. (2024, Jul.) Stack Overflow developer survey 2024.
+[Online]. Available: https://survey.stackoverflow.co/2024/
+[2] R. Pereira, M. Couto, F. Ribeiro, R. Rua, J. Cunha, J. P. Fernandes,
+and J. Saraiva, “Energy efficiency across programming languages: how
+do energy, time, and memory relate?” in Proceedings of the 10th ACM
+SIGPLAN International Conference on Software Language Engineering ,
+ser. SLE ’17. New York, NY , USA: Association for Computing
+Machinery, 2017, p. 256–267.
+[3] Rust Community. Miri. [Online]. Available: https://github.com/rust-lan
+g/miri
+[4] A. N. Evans, B. Campbell, and M. L. Soffa, “Is Rust used safely by
+software developers?” in Proceedings of the ACM/IEEE 42nd Interna-
+tional Conference on Software Engineering , ser. ICSE ’20. New York,
+NY , USA: ACM, 2020, p. 246–257.
+[5] V . Astrauskas, C. Matheja, F. Poli, P. Müller, and A. J. Summers,
+“How do programmers use unsafe Rust?” Proceedings of the ACM on
+Programming Languages , vol. 4, no. OOPSLA, Nov. 2020.
+11[6] K. R. Fulton, A. Chan, D. V otipka, M. Hicks, and M. L. Mazurek,
+“Benefits and drawbacks of adopting a secure programming language:
+Rust as a case study,” in Seventeenth Symposium on Usable Privacy
+and Security , ser. SOUPS ’21. USENIX Association, Aug. 2021, pp.
+597–616.
+[7] S. Höltervennhoff, P. Klostermeyer, N. Wöhler, Y . Acar, and S. Fahl,
+““I wouldn’t want my unsafe code to run my pacemaker”: An interview
+study on the use, comprehension, and perceived risks of unsafe Rust,”
+inProceedings of the 32nd USENIX Security Symposium , ser. USENIX
+Security ’23. Anaheim, CA: USENIX Association, Aug. 2023, pp.
+2509–2525.
+[8] I. McCormack, T. Dougan, S. Estep, H. Hibshi, J. Aldrich, and
+J. Sunshine, “A mixed-methods study on the implications of unsafe
+Rust for interoperation, encapsulation, and tooling,” arXiv preprint
+arXiv:2404.02230 [cs.SE] , 2024.
+[9] R. Jung, H.-H. Hostert, JoDang, J. Kang, and D. Dreyer, “Stacked
+Borrows: An aliasing model for Rust,” Proceedings of the ACM on
+Programming Languages , vol. 4, no. POPL, Dec. 2019.
+[10] N. Villani, J. Hostert, D. Dreyer, and R. Jung. (2024, Nov.) Tree
+Borrows. [Online]. Available: https://perso.crans.org/vanille/treebor/au
+x/preprint.pdf
+[11] R. Jung. (2021, Nov.) Undefined behavior deserves a better reputation.
+[Online]. Available: https://blog.sigplan.org/2021/11/18/undefined-beh
+avior-deserves-a-better-reputation/
+[12] W. Crichton, “The usability of ownership,” in Proceedings of the 1st
+Workshop on Human Aspects of Types and Reasoning Assistants. , ser.
+HATRA ’20, 2020. [Online]. Available: https://arxiv.org/abs/2011.06171
+[13] S. Klabnik, C. Nichols, and the Rust Community. The Rust programming
+language. https://doc.rust-lang.org/book/.
+[14] G. Vranken and A. Crichton. (2023, Apr.) CVE-2023-30624. [Online].
+Available: https://www.cve.org/CVERecord?id=CVE-2023-30624
+[15] R. Jung. (2024, Jan.) Rust has provenance. [Online]. Available:
+https://github.com/rust-lang/rfcs/pull/3559
+[16] ISO/IEC, “Information technology – Programming languages – C,”
+International Organization for Standardization; International Elec-
+trotechnical Commission, Geneva, CH, Standard, Apr. 2024. [Online].
+Available: https://open-std.org/JTC1/SC22/WG14/www/docs/n3220.pdf
+[17] ——, “Working draft, standard for programming language C++,” Inter-
+national Organization for Standardization; International Electrotechnical
+Commission, Geneva, CH, Standard, May 2023. [Online]. Available:
+https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2023/n4950.pdf
+[18] Rust Community. (2024, Feb.) The Rust reference - behavior considered
+undefined. https://doc.rust-lang.org/reference/behavior-considered-und
+efined.html.
+[19] C. D. Feather. (2004) DR260 - indeterminate values and identical
+representations. [Online]. Available: https://www.open-std.org/jtc1/sc22
+/wg14/www/docs/dr_260.htm
+[20] K. Memarian, V . B. F. Gomes, B. Davis, S. Kell, A. Richardson, R. N. M.
+Watson, and P. Sewell, “Exploring c semantics and pointer provenance,”
+Proceedings of the ACM on Programming Languages , vol. 3, no. POPL,
+Jan. 2019.
+[21] R. Jung. (2022, May) The plan for provenance. [Online]. Available:
+https://github.com/rust-lang/miri/issues/2133
+[22] Rust Community. The bindgen user guide. https://rust-lang.github.io/ru
+st-bindgen/.
+[23] ——. CXX – safe interop between Rust and C++. https://cxx.rs/.
+[24] J. Seward and N. Nethercote, “Using Valgrind to detect undefined value
+errors with bit-precision,” in 2005 USENIX Annual Technical Confer-
+ence, ser. USENIX ATC ’05. Anaheim, CA: USENIX Association,
+Apr. 2005.
+[25] Rust Community. The Rust unstable book - sanitizer . [Online].
+Available: https://doc.rust-lang.org/beta/unstable-book/compiler-flags/s
+anitizer.html
+[26] A. Green and libffi Contributors. libffi. [Online]. Available: https:
+//sourceware.org/libffi/
+[27] LLVM Project. (2024, Mar.) lli - directly execute programs from LLVM
+bitcode. https://llvm.org/docs/CommandGuide/lli.html.
+[28] ——. Clang: a C language family frontend for LLVM. https://clang.ll
+vm.org/.
+[29] D. Kolsoi and Inkwell Contributors. Inkwell. [Online]. Available:
+https://github.com/TheDan64/inkwell
+[30] J. McIver. (2022, Jan.) Load instruction: Uninitialized memory
+semantics. [Online]. Available: https://discourse.llvm.org/t/rfc-load-ins
+truction-uninitialized-memory-semantics/67481/1[31] J. Lee, Y . Kim, Y . Song, C.-K. Hur, S. Das, D. Majnemer, J. Regehr,
+and N. P. Lopes, “Taming undefined behavior in LLVM,” SIGPLAN Not. ,
+vol. 52, no. 6, p. 633–647, Jun. 2017.
+[32] LLVM Project. LLVM documentation. [Online]. Available: https:
+//llvm.org/docs/index.html
+[33] M. Norman, V . Kellen, S. Smallen, B. DeMeulle, S. Strande, E. La-
+zowska, N. Alterman, R. Fatland, S. Stone, A. Tan, K. Yelick,
+E. Van Dusen, and J. Mitchell, “CloudBank: Managed services to
+simplify cloud access for computer science research and education,”
+inPractice and Experience in Advanced Research Computing 2021:
+Evolution Across All Dimensions , ser. PEARC ’21. New York, NY ,
+USA: Association for Computing Machinery, 2021.
+[34] M. Goregaokar. (2022, Aug.) Not a yoking matter (zero-copy #1).
+[Online]. Available: https://manishearth.github.io/blog/2022/08/03/zero
+-copy-1-not-a-yoking-matter/
+[35] R. Jung. (2020, Jun.) Stacked Borrows: How precise should UnsafeCell
+be tracked? [Online]. Available: https://github.com/rust-lang/unsafe-c
+ode-guidelines/issues/236
+[36] GNU Project. GCC, the GNU compiler collection. [Online]. Available:
+https://gcc.gnu.org/
+[37] F. S. Klock and B. Garza, “Krabcake: A Rust UB detector,” in
+Proceedings of the 3rd Rust Verification Workshop. , ser. RW2023, Apr.
+2023. [Online]. Available: https://pnkfx.org/presentations/krabcake-rus
+t-verification-2023-april.pdf
+[38] B. Qin, Y . Chen, Z. Yu, L. Song, and Y . Zhang, “Understanding memory
+and thread safety practices and issues in real-world Rust programs,” in
+Proceedings of the 41st ACM SIGPLAN Conference on Programming
+Language Design and Implementation , ser. PLDI ’20. New York, NY ,
+USA: ACM, Jun. 2020, p. 763–779.
+[39] H. Xu, Z. Chen, M. Sun, Y . Zhou, and M. R. Lyu, “Memory-safety
+challenge considered solved? an in-depth study with all Rust CVEs,”
+ACM Transactions on Software Engineering and Methodology , no. 1,
+Sep. 2021.
+[40] M. Cui, S. Sun, H. Xu, and Y . Zhou, “Is unsafe an achilles’
+heel? a comprehensive study of safety requirements in unsafe rust
+programming,” in Proceedings of the IEEE/ACM 46th International
+Conference on Software Engineering , ser. ICSE ’24. New York, NY ,
+USA: Association for Computing Machinery, 2024. [Online]. Available:
+https://doi.org/10.1145/3597503.3639136
+[41] Z. Li, J. Wang, M. Sun, and J. C. Lui, “MirChecker: Detecting bugs
+in Rust programs via static analysis,” in Proceedings of the 2021 ACM
+SIGSAC Conference on Computer and Communications Security , ser.
+CCS ’21. New York, NY , USA: ACM, 2021, p. 2183–2196.
+[42] M. Cui, C. Chen, H. Xu, and Y . Zhou, “SafeDrop: Detecting memory
+deallocation bugs of Rust programs via static data-flow analysis,” ACM
+Transactions on Software Engineering and Methodology , vol. 32, no. 4,
+May 2023.
+[43] Y . Bae, Y . Kim, A. Askar, J. Lim, and T. Kim, “RUDRA: Finding
+memory safety bugs in Rust at the ecosystem scale,” in Proceedings of
+the ACM SIGOPS 28th Symposium on Operating Systems Principles ,
+ser. SOSP ’21. New York, NY , USA: Association for Computing
+Machinery, 2021, p. 84–99.
+[44] Z. Li, J. Wang, M. Sun, and J. C. S. Lui, “Detecting cross-language
+memory management issues in Rust,” in Computer Security – ESORICS
+2022 , V . Atluri, R. Di Pietro, C. D. Jensen, and W. Meng, Eds. Cham:
+Springer Nature Switzerland, 2022, pp. 680–700.
+[45] S. Hu, B. Hua, L. Xia, and Y . Wang, “CRUST: Towards a unified cross-
+language program analysis framework for Rust,” in 2022 IEEE 22nd
+International Conference on Software Quality, Reliability and Security
+(QRS) , 2022, pp. 970–981.
+[46] L. Xia, B. Hua, and Y . Wang. (2023) ACORN: Towards a
+holistic cross-language program analysis for Rust. [Online]. Available:
+https://csslab-ustc.github.io/publications/2023/acorn.pdf
+[47] R. Jung, J.-H. Jourdan, R. Krebbers, and D. Dreyer, “RustBelt: Securing
+the foundations of the Rust programming language,” in Proceedings
+of the 44th ACM SIGPLAN Symposium on Principles of Programming
+Languages , ser. POPL ’17, vol. 2. New York, NY , USA: ACM, 2017.
+[48] S. Élie Ayoun, X. Denis, P. Maksimovi ´c, and P. Gardner, “A hy-
+brid approach to semi-automated Rust verification,” arXiv preprint
+arXiv:2403.15122 [cs.PL] , 2024.
+[49] L. Gäher, M. Sammler, R. Jung, R. Krebbers, and D. Dreyer, “Refine-
+dRust: A type system for high-assurance verification of Rust programs,”
+Proceedings of the ACM on Programming Languages , vol. 8, no. PLDI,
+Jun. 2024.
+12

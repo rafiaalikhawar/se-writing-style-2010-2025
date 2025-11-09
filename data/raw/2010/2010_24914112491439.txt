@@ -1,0 +1,1252 @@
+Effective Dynamic Detection of Alias Analysis Errors
+Jingyue Wu, Gang Hu, Y ang Tang, Junfeng Y ang
+Columbia University, United States
+{jingyue,ganghu,ty,junfeng}@cs.columbia.edu
+ABSTRACT
+Alias analysis is perhaps one of the most crucial and widely used
+analyses, and has attracted tremendous research efforts over the
+years. Yet, advanced alias analyses are extremely difﬁcult to get
+right, and the bugs in these analyses are one key reason that they
+have not been adopted to production compilers. This paper presents
+NEONGOBY, a system for effectively detecting errors in alias anal-
+ysis implementations, improving their correctness and hopefully
+widening their adoption. N EONGOBY detects the worst type of
+bugs where the alias analysis claims that two pointers never alias,
+but they actually alias at runtime. N EONGOBY works by dynam-
+ically observing pointer addresses during the execution of a test
+program and then checking these addresses against an alias anal-
+ysis for errors. It is explicitly designed to (1) be agnostic to the
+alias analysis it checks for maximum applicability and ease of use
+and (2) detect alias analysis errors that manifest on real-world pro-
+grams and workloads. It emits no false positives as long as test
+programs do not have undeﬁned behavior per ANSI C speciﬁ-
+cation or call external functions that interfere with our detection
+algorithm. It reduces performance overhead using a practical se-
+lection of techniques. Evaluation on three popular alias analyses
+and real-world programs Apache andMySQL shows that N EON-
+GOBY effectively ﬁnds 29 alias analysis bugs with zero false pos-
+itives and reasonable overhead; the most serious four bugs have
+been patched by the developers. To enable alias analysis builders
+to start using N EONGOBY today, we have released it open-source
+athttps://github.com/columbia/neongoby , along with our
+error detection results and proposed patches.
+Categories and Subject Descriptors
+D.2.4 [ Software Engineering ]: Software/Program Veriﬁcation;
+D.2.5 [ Software Engineering ]: Testing and Debugging; F.3.2
+[Logics and Meanings of Programs ]: Semantics of Programming
+Languages
+General Terms
+Algorithms, Design, Reliability, Experimentation
+Keywords
+Error Detection, Alias Analysis, Dynamic Analysis
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for proﬁt or commercial advantage and that copies
+bear this notice and the full citation on the ﬁrst page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc
+permission and/or a fee.
+Copyright 2013 ACM 978-1-4503-2237-9/13/08 ...$15.00.1. INTRODUCTION
+Alias analysis answers queries such as “whether pointers pandq
+may point to the same object.” It is perhaps one of the most crucial
+and widely used analyses, and the foundation for many advanced
+tools such as compiler optimizers [30], bounds checkers [20], and
+veriﬁers [15, 14]. Unsurprisingly, a plethora of research [33, 24,
+25] over the last several decades has been devoted to improve the
+precision and speed of alias analysis, and PLDI and POPL alone
+have accepted over 37 alias analysis papers since 1998 [32]. (Most
+citation lists in this paragraph are seriously incomplete for space.)
+Unfortunately, despite our reliance on alias analysis and the
+tremendous efforts to improve it, today’s production compilers still
+use the most rudimentary and imprecise alias analyses. For in-
+stance, the default alias analysis in LLVM for code generation,
+basicaa , simply collapses all address-taken variables into one ab-
+stract location; the default alias analysis in GCC is type-based and
+marks all variables of compatible types aliases. These imprecise
+analyses may cause compilers to generate inefﬁcient code [28, 16].
+We believe one key reason hindering the adoption of advanced
+alias analyses is that they are extremely difﬁcult to get right. Ad-
+vanced alias analyses tend to require complex implementations to
+provide features such as ﬂow sensitivity, context sensitivity, and
+ﬁeld sensitivity and to handle corner cases such as C unions, ex-
+ternal functions, function pointers, and wild void* andintcasts.
+As usual, complexity leads to bugs. Buggy alias results at the very
+least cause research prototypes to yield misleading evaluation num-
+bers. For instance, our evaluation shows that LLVM’s anders-aa ,
+implementing an interprocedural Andersens’s algorithm [9], ap-
+peared more precise than basicaa , but is actually lessprecise than
+basicaa (§8.1.1) after we ﬁxed 13 anders-aa bugs. Worse, buggy
+alias results cause optimizers to generate incorrect code, commonly
+believed to be among the worst possible bugs to diagnose. More-
+over, they compromise the safety of bounds checkers and veriﬁers,
+yet this safety is crucial because these tools often have high com-
+pilation, runtime, or manual overhead, and are applied only when
+safety is paramount.
+This paper presents N EONGOBY,1a system for effectively de-
+tecting errors in alias analysis implementations, improving their
+correctness and hopefully vastly widening their adoption. N EON-
+GOBY detects the worst type of bugs where the alias analysis claims
+that two pointers never alias, but they actually alias at runtime. We
+explicitly designed N EONGOBY to be agnostic to the alias analy-
+sis it checks: the only requirement is a standard MayAlias(p,q)
+API that returns true if pandqmay alias and false otherwise.2This
+minimum requirement ensures maximum applicability and ease of
+use. To check an alias analysis with N EONGOBY, a user addition-
+ally chooses a test program and workload at her will. For instance,
+1We name our system after the neon goby ﬁsh which helps other
+ﬁsh by cleaning external parasites off them.
+2NEONGOBY can be easily extended to check must-alias but few
+alias analyses implement a more-than-shallow must-alias analysis.Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior speciﬁc permission and/or a
+fee. Request permissions from Permissions@acm.org.
+Copyright is held by the author/owner(s). Publication rights licensed to ACM.
+ESEC/FSE’13 , August 18–26, 2013, Saint Petersburg, Russia
+ACM 978-1-4503-2237-9/13/08
+http://dx.doi.org/10.1145/2491411.2491439
+279
+she can choose a large program such as Apache andMySQL and
+a stressful workload that together exercise many diverse program
+constructs, such as the corner cases listed in the previous paragraph.
+This ﬂexibility enables N EONGOBY to catch alias analysis bugs
+that manifest on real-world programs and workloads.
+NEONGOBY works as follows. Given a test program, N EON-
+GOBY instruments the program’s pointer deﬁnitions to track
+pointer addresses. To increase checking coverage, N EONGOBY in-
+struments all pointer deﬁnitions including intermediate results, e.g.,
+pointer arithmetics. The user then runs the instrumented program
+on the workload, and N EONGOBY dynamically observes pointer
+addresses (henceforth referred to as addresses ) and checks them
+against the alias analysis. It emits bug reports if the addresses
+contradict the alias results, i.e., the pointers did alias during the
+test run but the alias analysis states that the two pointers never
+alias. We use DidAlias(p,q) to refer to N EONGOBY’s algorithm
+for determining whether pointers pandqdid alias. The invariant
+NEONGOBY checks is thus DidAlias(p,q)!MayAlias(p,q) .
+To ease discussion, we use DidAlias /MayAlias to refer to both
+the corresponding algorithm and the set of pointer pairs on which
+DidAlias /MayAlias returns true.
+Although the idea of dynamically checking alias analysis enjoys
+conceptual simplicity, implementing it faces two major challenges:
+performance overhead and false positives.
+Performance overhead. NEONGOBY must have low performance
+overhead for two reasons. First, N EONGOBY is designed to detect
+alias analysis errors that manifest on real-world programs, and large
+overhead may disturb the executions of these programs [26], such
+as triggering excessive timeouts. Second, different users may have
+different resource budgets and coverage goals when testing their
+alias analyses. Since users can best decide what overhead is rea-
+sonable, N EONGOBY should provide them the ﬂexibility to make
+their own tradeoffs between bugs and overhead.
+NEONGOBY addresses this challenge using two ideas. First,
+NEONGOBY provides two checking mode, enabling a user to se-
+lect the mode best suited for her alias analysis, test program, and
+workload. In the ofﬂine mode, N EONGOBY logs pointer deﬁnitions
+to disk when running the test program, and checks the log ofﬂine
+after the test run ﬁnishes. Since checking does not slow down the
+test run, N EONGOBY affords to check more thoroughly: it checks
+alias queries on pointers potentially in different functions, or inter-
+procedural queries . However, the logging overhead in the ofﬂine
+mode may be high, so N EONGOBY offers another mode to reduce
+overhead. In the online mode, N EONGOBY checks alias queries
+on pointers only in the same function, or intraprocedural queries ,3
+with efﬁcient inlined assertions, but it may miss some bugs the of-
+ﬂine mode catches.
+Second, N EONGOBY further reduces performance overhead
+without losing bugs using an optimization we call delta checking .
+This optimization assumes a correct baseline alias analysis, such as
+LLVM’s basicaa , often simple enough to have few bugs. N EON-
+GOBY then checks only the pointer pairs that may alias according
+to the baseline but not the checked alias analysis. By reducing the
+pointer pairs to check, N EONGOBY reduces overhead.
+False positives. Another challenge N EONGOBY faces is how to re-
+duce false positives or FPs, a major factor limiting the usefulness
+and adoption of error detection tools [11]. Recall that N EONGOBY
+checks the invariant DidAlias(p,q)!MayAlias(p,q) . There-
+fore, N EONGOBY may emit FPs if the DidAlias set it computes
+incorrectly includes pointer pairs that did not alias. DidAlias may
+3Intraprocedural queries can still be answered by interprocedural
+analyses.// no alias if ﬁeld-sensitive
+struct {char f1;char f2;}s;
+p= &s >f1;
+q= &s >f2;
+// no alias if ﬂow-sensitive
+for(i=0; i<2; ++ i)
+p=ADDR [i];
+q=ADDR [0];//p’s address is ADDR [1]
+// no alias if context-sensitive
+void *foo(int*p,int*q) {
+. . .// p and q do not alias
+}
+foo(ADDR0 ,ADDR1 );
+foo(ADDR1 ,ADDR0 );
+Figure 1: FP examples caused by sensitivities.
+be incorrect for two main reasons:
+First, a naïve DidAlias algorithm may not account for all sensi-
+tivities that a checked alias analysis offers. Figure 1 shows three ex-
+amples on which a naïve DidAlias may cause FPs. Speciﬁcally, if
+a naïve DidAlias considers pointers with one byte apart as aliases
+(because they likely point to the same object), it may cause a FP for
+a ﬁeld-sensitive alias analysis on the ﬁrst example. If it considers
+pointers ever assigned the same address as aliases, it may cause a
+FP for a ﬂow-sensitive alias analysis on the second example or for
+a context-sensitive alias analysis on the third example. If it does not
+distinguish the same variable in two different invocations of foo,
+it may cause a FP for a context-sensitive alias analysis on the third
+example. To reduce such FPs while remaining agnostic to the alias
+analysis checked, N EONGOBY must provide a DidAlias that ac-
+counts for all sensitivities that a checked alias analysis may offer.
+Second, the same observed address of a pointer is not always in-
+tended to refer to the same object due to spatial memory layout or
+temporal memory reuse. Spatially, pointers may have invalid ad-
+dresses ( e.g., go off bound or are uninitialized). For instance, an
+off-by-one pointer for marking the end of an array may acciden-
+tally have the same address as a pointer to the next object. Off-by-
+one pointers are allowed by ANSI C speciﬁcation as long as they
+are not dereferenced. Therefore, N EONGOBY must handle them to
+avoid FPs. Temporally, the same piece of memory may be reused
+for different objects. For instance, two heap memory allocations
+may return the same address if the ﬁrst allocation is freed before
+the second allocation. Thus, N EONGOBY cannot simply claim that
+two pointers did alias if their addresses are identical; instead, it
+may need to track whether a pointer is valid and, if so, what object
+it points to. This problem appears familiar to the problem bounds
+checkers solve, but it is actually very different: N EONGOBY as-
+sumes that a test program is largely correct and runs it to detect
+alias analysis errors, whereas bounds checkers are for preventing
+buffer overﬂow attacks. Thus, it is an overkill for N EONGOBY to
+borrow complex bounds-checking techniques such as tracking base
+and bounds for each pointer.
+NEONGOBY addresses this challenge using two ideas. First,
+when computing DidAlias , NEONGOBY considers two pointers
+alias only when they have the same address simultaneously at a
+point in an execution. This idea makes DidAlias ﬁeld-sensitive,
+ﬂow-sensitive, and context-sensitive. For instance, in the ﬁrst ex-
+ample in Figure 1, N EONGOBY considers pandqdo not alias, be-
+cause their addresses are different. In the second example, N EON-
+GOBY considers pandqdo not alias even if ppoints to ADDR[0]
+in the ﬁrst iteration. In the third example, although qin the ﬁrst
+invocation and pin the second invocation point to the same ad-280void bar(int*r) { * r= 1; } //raliases q
+intmain () {
+int*p= (int*)malloc (sizeof (int));
+free(p);
+int*q= (int*)malloc (sizeof (int));// memory reuse
+bar(q);
+free(q);
+return 0;
+}
+Figure 2: Example test program.
+dress, N EONGOBY does not report pandqalias because these two
+pointer deﬁnitions belong to different invocations. Second, N EON-
+GOBY bridges the gap between an address and an object using a
+practical selection of techniques. For instance, N EONGOBY ver-
+sions memory, so if a piece of memory is reused, the addresses be-
+fore and after the reuse get different versions; it also pads memory
+allocation to tolerate off-bound pointers.
+These two ideas enables N EONGOBY to avoid all FPs for test
+programs that do not (1) have undeﬁned behavior per ANSI C
+speciﬁcation, e.g., using pointers off bound by many bytes, or (2)
+call external functions unknown to N EONGOBY that return reused
+memory addresses (§3.1).
+We implemented N EONGOBY within the LLVM compiler and
+checked three popular LLVM alias analyses, including (1) the
+aforementioned basicaa , LLVM’s default alias analysis; (2) the
+aforementioned anders-aa , later used as the basis for two alias
+analyses [25, 29]; and (3) ds-aa , a context-sensitive, ﬁeld-sensitive
+algorithm with full heap cloning [24], later used by [10, 14, 12]. To
+check these analyses, we selected two real-world programs MySQL
+andApache and the workloads their developers use. N EONGOBY
+found 29 bugs in anders-aa andds-aa , including 24 previously
+unknown bugs, with zero FPs and reasonable overhead. We have re-
+ported eight bugs to ds-aa developers, and four most serious ones
+have been patched [2, 3, 4, 5].
+This paper makes four main contributions: (1) our formulation of
+an approach that dynamically checks general alias analysis with the
+invariant DidAlias(p,q)!MayAlias(p,q) ; (2) N EONGOBY,
+a long overdue system toward improving advanced alias analyses
+into production quality and widening their adoption; (3) a practi-
+cal selection of techniques to reduce overhead and FPs; and (4)
+our evaluation results, including real bugs found in two LLVM
+alias analyses and our proposed patches. Our key inspiration is
+our anecdotal struggles with some existing alias analyses in our
+research, so we hope that alias analysis builders can start apply-
+ing N EONGOBY to improve their alias analyses into production-
+quality analyses today. As such, we have released it open-source
+athttps://github.com/columbia/neongoby , along with our
+error detection results and proposed patches.
+2. AN EXAMPLE AND OVERVIEW
+Figure 2 shows an example test program. It has three pointers: p
+andqin function main , and rinbar. Among these pointers, only
+qandralias. Suppose buggyaa , a buggy alias analysis misses this
+only alias pair and reports no alias for all pointers.
+To check buggyaa with this test program using the ofﬂine mode
+of N EONGOBY, a user ﬁrst compiles the code into example.bc in
+LLVM’s intermediate representation (IR), and runs the following
+three commands:
+% neongoby --offline --instrument example.bc
+% ./example.inst
+% neongoby --check example.bc example.log buggyaaThe ﬁrst command instruments the program for checking: (1) it
+transforms the program to avoid FPs caused by memory reuse, off-
+bound pointers, and undeﬁned values and (2) it inserts a logging
+operation at each pointer deﬁnition, memory allocation, function
+entry and exit to log information for ofﬂine checking. The second
+command runs the instrumented program example.inst to gen-
+erate a log of pointer deﬁnitions, memory allocations, and func-
+tion calls and returns. The third command checks this log against
+buggyaa for errors. It ﬁrst computes DidAlias for all three pairs
+of pointers, including pointers not in the same function. It ex-
+cludes pair p,q and pair p,r from DidAlias even if the two
+malloc() calls return the same address because the versions of
+the address are different. It includes pair q,r inDidAlias be-
+cause qandrshare the same address and version. N EONGOBY
+then checks DidAlias against buggyaa , emitting an error report
+because MayAlias(q,r) returns false. To diagnose this error, the
+user can run N EONGOBY to dump log records or slice the log for
+records explaining why qandrdid alias (§6.2).
+To check buggyaa with this test program using the online mode
+of N EONGOBY, a user runs the following commands:
+% neongoby --online example.bc buggyaa
+% ./example.ck
+The ﬁrst command iterates through each function in example.bc ,
+queries buggyaa on each pair of pointers in the function, and, if
+MayAlias on the two pointers returns false, embeds an assertion
+that the two pointers never alias at runtime. In this example, N EON-
+GOBY embeds an assertion “ assert(p!=q || p==NULL) ” after
+the second malloc() . The online mode prevents the two memory
+allocations from returning the same address using a simple trick of
+deferring memory deallocation. The second command runs the in-
+strumented program example.ck to check whether this assertion
+may be triggered, which never happens.
+Each mode of N EONGOBY has pros and cons. The ofﬂine mode
+checks more thoroughly, whereas the online mode checks only
+intraprocedural queries, missing the bug in buggyaa . The ofﬂine
+mode can reuse one log to check multiple alias analyses, amortiz-
+ing the cost of running the tests, whereas the online mode can check
+only one alias analysis at a time. However, the ofﬂine mode has to
+log information to disk because the log may grow larger than the
+RAM for some real-world programs and workloads, and on-disk
+logging can be costly. In contrast, the inlined assertions the online
+mode embeds are much faster to check. By providing two modes
+of operations, N EONGOBY enables a user to select the mode that
+suits her purpose.
+3. OFFLINE MODE
+This section describes how N EONGOBY operates in the ofﬂine
+mode. Figure 3 shows the ofﬂine mode architecture. It has three
+components: the instrumenter ,logger , and ofﬂine detector . Given a
+program in LLVM’s intermediate representation (IR), a more low-
+level representation of the program than source code, the instru-
+menter transforms the program to avoid FPs and inserts logging
+operations to collect runtime information. When a user runs the in-
+strumented program, the logger records pointer deﬁnitions, mem-
+ory allocations, function entries and exits to disk. Since the logger
+runs within a test program, we explicitly designed it to be simple
+and stateless, reducing runtime overhead and avoiding perturbing
+the execution of the test program. After the run ﬁnishes, the ofﬂine
+detector checks the log against an alias analysis and emits error re-
+ports. Since the logger is much simpler than the other components,
+we focus on describing the instrumenter (§3.1) and ofﬂine detector
+(§3.2), and give a brief discussion (§3.3).281ofﬂinedetectorinstrumenterprogramaliasanalysisbugreportspointer loginstrumentedprogramloggerworkloadFigure 3: Architecture of the ofﬂine mode.
+3.1 Instrumenter
+The instrumenter does six main transformations, the ﬁrst to en-
+sure that the logger and the ofﬂine detector can consistently refer to
+the pointer variables in a program, the second to collect pointer ad-
+dresses, and the last three to reduce FPs caused by memory reuse,
+off-bound pointers, and undeﬁned values. We describe the six trans-
+formations below and highlight some of the differences between
+NEONGOBY and bounds checkers.
+Assigning IDs to pointers. The logger and ofﬂine detector run
+in different phases, so they need a consistent way to refer to the
+pointers in a program. To identify the pointers, the instrumenter
+traverses the program’s control ﬂow graph and assigns to the nth
+visited static pointer variable a numeric ID of n. To keep IDs con-
+sistent, the ofﬂine detector uses the same deterministic algorithm
+(depth-ﬁrst traversal in our implementation) to assign IDs to point-
+ers. Bounds checkers need not assign IDs to pointers because they
+cannot defer checking to ofﬂine. To check alias analyses more thor-
+oughly, N EONGOBY identiﬁes not only the pointer variables in the
+source code, but also intermediate pointers in the LLVM IR.
+Instrumenting pointer deﬁnitions. To catch errors caused by all
+different types of pointers, N EONGOBY instruments all pointer def-
+initions which assign addresses to pointers. Function pointers and
+global pointers are particularly crucial: they are widely used in real-
+world programs such as MySQL andApache , yet they are often mis-
+handled by alias analyses. Our experiments found 7 bugs caused by
+mishandled function and global pointers (§8.1.1).
+NEONGOBY logs four types of pointer deﬁnitions: pointer as-
+signment ( p = addr where addr can be a pointer arithmetic),
+pointer load ( p = *addr ), function argument passing, and global
+variable initialization. N EONGOBY instruments all pointer deﬁni-
+tions in the LLVM IR, including intermediate results. For instance,
+LLVM translates C source code p = o->f into two IR instructions
+%1 = %o + <offset of f>
+%p = load %1
+, and N EONGOBY instruments the deﬁnitions of both %1and%p.
+NEONGOBY instruments a pointer assignment or load by insert-
+ing “ log_ptr(ptr,addr) ” right after the deﬁnition where ptr
+isp’s statically assigned ID, addr is the address assigned, and
+log_ptr is a logging operation that, when executed, appends the
+ID and the assigned address to the current on-disk log. N EONGOBY
+adds calls to log_ptr similarly for function arguments at function
+entries and for global variables at the entry of the main function.
+Bounds checkers must also track these pointer deﬁnitions to prop-
+agate pointer base and bound information.
+Instrumenting memory allocations. As discussed in §1, N EON-
+GOBY cannot use only addresses to compute DidAlias becausethe same address may point to different objects if memory is reused.
+To enable the ofﬂine detector to handle memory reuse, N EON-
+GOBY instruments all memory allocations, including the alloca-
+tions of heap, stack, and global variables. (Although global mem-
+ory cannot be reused, N EONGOBY also instruments it to han-
+dle all memory allocations uniformly.) For each allocation, it in-
+serts log_alloc(addr, size) to record the allocation address
+and size. For stack variables, N EONGOBY inserts log_alloc
+at the function entry. For global variables, N EONGOBY inserts
+log_alloc at the entry of main . For heap variables, N EONGOBY
+inserts log_alloc after a call to one of the following functions:
+1. C memory allocation functions: malloc ,calloc ,valloc ,
+realloc , and memalign ;
+2. C++ new(mangled names _Znwj ,_Znwm ,_Znaj , and _Znam );
+3. Other library functions: strdup ,__strdup , and getline .
+Users can easily add more heap allocation functions. (One tricky
+point is that a memory allocation such as “ p = malloc(...) ” is
+also a pointer deﬁnition, and N EONGOBY must insert log_alloc
+before log_ptr for the ofﬂine detector to correctly handle memory
+reuse (§3.2). Another point is that LLVM shares memory between
+two constant strings for space if one is the sufﬁx of the other; to
+avoid these false aliases, N EONGOBY disables this optimization.)
+To reduce logging overhead, N EONGOBY does not instrument
+memory deallocations, such as free() calls, and relies on the of-
+ﬂine detector to lazily discover when memory is freed. Thus, a cor-
+ner case such as “ free(q); p = q; ” may cause N EONGOBY to
+emit FPs on a ﬂow-sensitive alias analysis that understands free :
+although pandqhave the same address, they technically point to
+nothing. However, use-after-free behavior is undeﬁned per ANSI C
+standard. Therefore, as long as the test program is correct, N EON-
+GOBY emits no FPs of this type. Bounds checkers in contrast must
+handle memory deallocations if they want to catch use-after-free
+errors.
+Instrumenting function entries and returns. NEONGOBY needs
+to distinguish the same variable in different invocations of a
+function to reduce FPs on a context-sensitive alias analysis. To
+track function invocations, for each function, N EONGOBY inserts
+log_entry(func) at the entry, and log_ret(func) before each
+return, where func is the ID of the function.
+Handling off-bound pointers. Pointers may be assigned off-
+bound addresses that accidentally alias other pointers, causing FPs.
+Fortunately, most programs use off-bound pointers only to mark the
+ends of arrays, and these pointers are off by only one byte. This type
+of off-bound pointer is also the only type allowed by the ANSI C
+standard. To eliminate FPs caused by off-by-one pointers, N EON-
+GOBY transforms a program to add one extra byte for each memory
+allocation, a technique borrowed from [23]. N EONGOBY currently
+does not handle other off-bound pointers because they occur very
+rarely, and we experienced no FPs caused by these pointers in our
+experiments (§8.1.2). Bounds checkers in contrast may have to han-
+dle these pointers because their FPs are fatal and abort executions.
+Handling undeﬁned values. Variables may be uninitialized and
+have undeﬁned pointer values that accidentally look like addresses
+of other pointers. These values may further propagate through as-
+signments, such as assignments of a struct with an uninitialized
+pointer ﬁeld to another struct , causing N EONGOBY to log bogus
+addresses and emit FPs. N EONGOBY handles undeﬁned pointer
+values by setting them to NULL because NULL aliases nothing. Re-
+setting undeﬁned pointer values eliminates FPs caused by unde-
+ﬁned values as long as the test program is correct, because ANSI C
+speciﬁcation disallows using an uninitialized variables, e.g., pointer
+arithmetics or wild void* andintcasts.2823.2 Ofﬂine Detector
+Given a log of pointer deﬁnitions and memory allocations,
+NEONGOBY’s ofﬂine detector ﬁnds alias analysis errors in two
+steps: it scans the log to compute the DidAlias results, and then
+checks DidAlias against an alias analysis and emits error reports.
+From a high level, N EONGOBY computes DidAlias results as
+follows. To distinguish a pointer in different function invocations,
+NEONGOBY assigns a unique context number to each invocation,
+and maintains a call stack CSof context numbers. It also main-
+tains two maps: a (conceptual) map Vfrom an address to a version
+number for handling memory reuse, and a map Pfrom a pointer’s
+unique ID and its context number to an address and version for
+tracking where pointers point to. We use deﬁnition to refer to a
+pointer-context pair, and location to refer to an address-version
+pair. Given a log, N EONGOBY scans the records sequentially from
+the beginning. Upon a memory allocation record, N EONGOBY up-
+datesVto assign a new version number for the addresses within the
+allocated range, so the same addresses get different versions before
+and after this allocation. Upon a function entry record, N EONGOBY
+generates a new context number for this invocation, and pushes it
+to the call stack. Correspondingly, upon a function return record,
+NEONGOBY pops the call stack so that the caller’s context num-
+ber will be on top. Upon a pointer deﬁnition record lwith pointer
+ptrand address addr , NEONGOBY searchesVforl:addr ’s cur-
+rent version and updates Pto makehl:ptr; top(CS)ipoint to loca-
+tionhl:addr;V [l:addr ]i. It then searches Pfor pointer deﬁnitions
+that point to the same location; for each such pointer deﬁnition d,
+it addshl:ptr;d:ptriandhd:ptr;l:ptritoDidAlias unlessd:ptr
+andl:ptr are in the same function and their contexts are different.
+(Note thathl:ptr;l:ptriis in DidAlias because a pointer aliases
+itself.)
+As discussed in §1, N EONGOBY must be very precise when
+computing DidAlias to avoid FPs. The algorithm described above
+is ﬁeld-sensitive because it considers that two pointers did alias
+only when their locations are identical, which requires their ad-
+dresses to be identical. It is context-sensitive because each invoca-
+tion gets a unique context number, and two pointers in the same
+function did alias only when they point to the same location in
+the same context. It is ﬂow-sensitive because (1) the SSA form of
+LLVM IR guarantees each pointer is statically deﬁned only once,
+which provides some ﬂow-sensitivity already, and (2) map Pmain-
+tains only the latest location of a pointer deﬁnition.
+Once N EONGOBY computes the DidAlias results, it checks an
+alias analysis as follows. It iterates through each pointer pair in
+DidAlias , and checks that the pair is also in MayAlias . It emits
+an error report otherwise. Since the DidAlias results do not de-
+pend on the alias analysis checked, N EONGOBY can reuse them to
+check multiple alias analyses, amortizing the cost of logging and
+computing DidAlias .
+Our actual algorithm to detect errors ofﬂine, shown in Algo-
+rithm 1, does three optimizations for space and speed. The ﬁrst
+optimization implements the address-to-version map Vwith an in-
+terval tree whose key is an address range and value the version
+number of the entire address range (lines 4, 13, and 35). An in-
+terval tree is much more space-efﬁcient than a version number
+per address. Upon a memory allocation record, N EONGOBY re-
+movesV’s existing address ranges that overlap with the allocated
+range (because these ranges must have been freed), increments a
+global version number, and inserts the new range and version to
+V. Second, instead of scanning the pointer map Pfor pointers
+that point to the same location, N EONGOBY maintains a reverse
+mapQfrom a location back to pointers (lines 3, 18, 31, 37, and
+39). Third, when entering a function, N EONGOBY removes fromAlgorithm 1: Ofﬂine detection algorithm
+Input : program Prog , alias analysis A, and logL
+1OfﬂineDetection( Prog ,A,L)
+2P[8denition ] hnull;0i// deﬁnition-to-location map
+3Q[8location ] ; // location-to-deﬁnitions map
+4V[8address ] 0 // address-to-version map
+5VG 0 // global version number
+6CG 0 // global context number
+7CS ; // call stack
+8 DidAlias ; // pointer pairs that did alias
+9 AP[8context ] ; // active pointers
+10 foreach recordl2Ldo
+11 iflis MemAllocRecord then
+12 VG VG+ 1
+13 V[l:startl:end] VG
+14 else iflis EntryRecord then
+15 foreach contextCofl:callee s.t.C =2CSdo
+16 foreach p2AP[C]do
+17 def hp;Ci
+18 Q[P[def]] Q[P[def]]ndef
+19 P[def] hnull;0i
+20 AP[C] ;
+21 CG CG+ 1
+22 push( CS,CG) // push CGonto CS
+23 else iflis ReturnRecord then
+24 pop(CS)
+25 else iflis PointerRecord then
+26 C 0
+27 ifCS6=;then
+28 C top(CS)
+29 def hl:ptr;Ci
+30 ifP[def]6=hnull;0ithen
+31 Q[P[def]] Q[P[def]]ndef
+32 P[def] hnull;0i
+33 ifl:addr is null then
+34 continue
+35 loc hl:addr;V[l:addr]i
+36 P[def] loc
+37 Q[loc] Q[loc][def
+38 AP[C] AP[C][def:ptr
+39 foreach deﬁnitiond2Q[loc]do
+// parent(p) returnsp’s containing function
+40 ifparent(d:ptr)6=parent( def:ptr)or
+d:context =def:context then
+41 DidAlias DidAlias[hdef:ptr;d:ptri
+42 DidAlias DidAlias[hd:ptr;def:ptri
+43 foreachhp;qi2DidAlias do
+44 ifnotA.MayAlias( p,q)then
+45 ReportError(hp;qi)
+Palloutdated pointer deﬁnitions in this function (lines 15–20).
+NEONGOBY considers a pointer deﬁnition outdated if its context
+number is no longer on the call stack. Without removing outdated
+deﬁnitions,jPjcould be very large because a pointer can be de-
+ﬁned in many function invocations. To efﬁciently implement this
+optimization, we use another mapping AP to maintain all active
+(i.e., non-outdated) pointer deﬁnitions indexed by context num-
+bers. With these optimizations, the space complexity of our algo-
+rithm isO(jPj+jMj+jDidAliasj), and the time complexity is
+O(jLj(logjMj+ logjPj+NlogjDidAliasj)), wherejMjis the
+number of memory allocations in the log, and Nis the maximum283Table 1: Different techniques in bounds checkers and N EON GOBY.
+Bounds N EONGOBY
+online only Yes No
+use alias analysis Maybe No
+pointer deﬁnition Yes Yes
+pointer metadata Yes No
+pointer dereference Yes No
+allocation Yes Yes
+deallocation Yes No
+off-bound-pointer Yes Only off-by-one
+undeﬁned value Yes Only pointer
+size ofQ[location ]. In our experiments, Nnever exceeds 400,jMj
+is typically 1% ofjLj, and the size of DidAlias is less than 106.
+3.3 Discussion
+Some of the problems N EONGOBY addresses, such as tracking
+pointer deﬁnitions and handling memory reuse, off-bound point-
+ers, and undeﬁned values, overlap with what bounds checkers must
+handle. However, N EONGOBY has very different assumptions and
+goals than bounds checkers: it assumes a test program is largely
+correct, and uses the program to detect errors in alias analyses,
+whereas bounds checkers prevent buffer overﬂow attacks to a pro-
+gram. False negatives in bounds checkers may lead to exploits, and
+FPs wrongly abort executions. In contrast, the effects of N EON-
+GOBY’s FPs and negatives are much less serious. Because of these
+differences, it is an overkill for N EONGOBY to borrow complex
+bounds-checking techniques.
+Table 1 summarizes the different techniques in typical bounds
+checkers and N EONGOBY. Bounds checkers must check buffer
+overﬂows online to stop exploits, whereas N EONGOBY can de-
+fer costly detection completely ofﬂine. Bounds checkers may as-
+sume a correct alias analysis (and other static analyses) and use
+them to remove unnecessary checks, whereas N EONGOBY is in-
+tended to detect errors in alias analyses. Bounds checkers need
+to maintain pointer base and bound information with fat pointers,
+maps, or trees [23], which break backward compatibility or have
+high overhead. In contrast, N EONGOBY maintains no pointer meta-
+data. Bounds checkers check pointer dereferences and track mem-
+ory deallocations to catch bugs, whereas N EONGOBY does neither.
+Bounds checkers may need to accurately handle pointers off by
+more than one bytes and undeﬁned integer values to avoid wrongly
+aborting executions, whereas N EONGOBY ignores these cases.
+4. ONLINE MODE
+NEONGOBY’s ofﬂine mode checks interprocedural alias queries
+to ﬁnd more bugs, but its logging may be costly. Thus, N EONGOBY
+provides an online mode to reduce performance overhead. This sec-
+tion describes how N EONGOBY operates in the online mode.
+Algorithm 2: Online mode
+Input : program Prog and alias analysis A
+1OnlineInstrumentation( Prog ,A)
+2 foreach functionF2Prog do
+3 foreach pointer deﬁnition pair hp;qi2Fdo
+4 ifpreachesqandnotA.MayAlias(p;q)then
+5 insert “ assert (p6=qorpisnull)” afterq
+6 foreach external function call Cfreeing a heap object do
+7 replaceCwith “ call deferred_free ”
+The online mode focuses on checking intraprocedural queries
+because they are often considered more crucial than interproce-
+dural queries. For instance, compiler optimizations tend to issuemostly intraprocedural queries. To check intraprocedural queries,
+NEONGOBY embeds the alias analysis checks as regular program
+assertions into a test program. N EONGOBY reports an alias analysis
+bug if one of the assertions fails when a user runs the test program.
+These assertions are much cheaper than costly on-disk logging at
+runtime, as shown in our experiments (§8.3).
+Algorithm 2 shows the algorithm to embed the checks. It iterates
+through each pair of point deﬁnitions pandqof a function (line
+3), and inserts an assertion “ assert(p!=q || p==NULL) ” (line
+5) ifMayAlias(p,q) returns false (line 4). One issue is that the in-
+serted assertion requires that both pandqare deﬁned. N EONGOBY
+solves this issue with a standard control ﬂow reachability analysis
+(line 4), and inserts the assertion only if p’s deﬁnition reaches q.
+(If pointer pis undeﬁned along some incoming edges to q’s ba-
+sic block, N EONGOBY creates a new -instruction using LLVM’s
+SSA transformation, not shown in Algorithm 2.)
+Similar to the ofﬂine mode, DidAlias computed in the online
+mode is very precise. It is ﬁeld-sensitive, because an assertion fails
+only when p=q; it is ﬂow-sensitive, because an assertion uses the
+latest addresses of the pointers; it is context-sensitive, because it
+focuses on intraprocedural queries.
+To avoid FPs caused by memory reuse, off-bound pointers, and
+undeﬁned values, the online mode borrows the techniques from the
+ofﬂine mode, with one reﬁnement: it no longer versions memory.
+The insight is that N EONGOBY checks only intraprocedural queries
+in the online mode, so it need handle only heap memory reuse,
+which can be handled in a much simpler way. Speciﬁcally, it defers
+heap memory deallocations so the allocations almost always return
+different addresses. To do so, it replaces functions that free heap
+memory, including C’s free and C++’s delete (mangled names
+_ZdlPv and_ZdaPv ), with a function that queues the free request
+without actually freeing memory. When the queue is full, N EON-
+GOBY processes half of the queued requests, ensuring that heap
+memory reuse occurs after at least n=2free operations where nis
+the queue capacity. By default, nis 20K, large enough that no FPs
+of this type occurred in our experiments.
+One additional advantage of the online mode is that the embed-
+ded assertions explicitly inform us what to check, enabling N EON-
+GOBY to leverage symbolic execution tools such as KLEE and
+WOODPECKER [13] to generate inputs that cause the assertions to
+fail. We leave this for future work.
+If a function has an extremely large number (denoted n) of
+pointers that do not alias each other, the online mode need insert
+O(n2)assertions, which may run slower than the O(n)logging
+operations inserted by the ofﬂine mode. To avoid high overhead
+caused by such pathological cases, N EONGOBY bounds the num-
+ber of assertions it inserts to 106for each function, and switches
+to the ofﬂine mode for the function otherwise. In our experiments,
+we did encounter one such case: a yacc -generated function called
+MYSQLparse inMySQL needs much more than 106assertions, so
+NEONGOBY always checks this function ofﬂine (§8.2).
+5. DELTA CHECKING
+NEONGOBY provides an optimization called delta checking to
+speed up both online and ofﬂine modes without losing any error.
+The insight is that not all pointer pairs are equally hard to handle
+by an alias analysis, so N EONGOBY can focus on checking the
+hard-to-handle pairs and skip the easy ones. To compute what pairs
+are easy, N EONGOBY takes a user-speciﬁed baseline alias analysis
+assumed to be simple enough to be correct. It then skips checking
+all pointer pairs pandqon which the baseline’s MayAlias(p,q)
+returns false. Intuitively, if an imprecise baseline alias analysis can
+infer that two pointers do not alias, then most likely they never alias284in any execution, so DidAlias would return false and N EONGOBY
+would not ﬁnd any error on the pointers.
+We envision two ways this optimization can be used. First, a
+user speciﬁes an alias analysis she trusts, such as basicaa which
+computes very conservative alias results, then enjoys speedup with-
+out losing errors when applying N EONGOBY to check an ad-
+vanced alias analysis. Second, an alias analysis builder incremen-
+tally checks each precision improvement she makes to her alias
+analysis. For instance, if her alias analysis reports 10 pointer pairs
+that each do not alias prior to the improvement and 50 pairs after,
+she can use N EONGOBY to check this difference of 40 pairs each
+indeed never alias on some test programs and workloads.
+To implement delta checking for the ofﬂine mode, we simply
+change line 44 in Algorithm 1 to
+ifB.MayAlias(p,q)andnotA.MayAlias(p,q)
+whereBis the baseline alias analysis. To implement delta checking
+for the online mode, we simply change line 4 in Algorithm 2 to
+ifpreachesqandB.MayAlias(p,q)andnotA.MayAlias(p,q)
+Our results using basicaa as baseline show delta checking reduces
+compilation time, ofﬂine detection time, and runtime overhead.
+6. IMPLEMENTATION
+We implemented N EONGOBY in LLVM. It works with version
+3.0 and above. It consists of 5,403 lines of C++ code, with 909 for
+the instrumenter, 168 for the logger, 875 for the ofﬂine detector, 642
+for the online mode, and the remaining 2,809 for common utilities.
+In the remainder of this section, we describe three additional
+techniques within N EONGOBY: the ﬁrst to further reduce overhead
+(§6.1), the second to help users diagnose error reports (§6.2), and
+the third to support multiprocess or multithreaded programs (§6.3).
+6.1 Detecting Errors Using Dereferenced
+Pointers Only
+Dereferenced pointers are presumably more crucial than the ones
+not dereferenced, so are the alias results on dereferenced pointers.
+Thus, N EONGOBY provides users an option to detect alias analysis
+errors using only dereferenced pointers, including the pointers used
+in load and store instructions and those passed to external functions
+because N EONGOBY conservatively assumes that these functions
+dereference their pointer arguments. Although N EONGOBY with
+this option may lose some alias analysis errors, it enjoys two bene-
+ﬁts. First, the error reports are of higher quality because they are on
+the more crucial pointers. Second, N EONGOBY runs faster when
+checking fewer pointer pairs in both ofﬂine and online modes. We
+evaluate this bugs v.s. overhead tradeoff in §8.3.
+6.2 Simplifying Error Diagnosis
+When N EONGOBY reports an error, it emits two pointers that did
+alias yet are not marked as aliases by the checked alias analysis. To
+diagnose such a report, it may be time consuming to manually in-
+spect all records in the log, so N EONGOBY provides a diagnosis
+tool to slice the log into a small subset of records that explains why
+two pointers did alias. The core idea is to trace data dependencies of
+the two pointers back to a common parent pointer from which both
+pointers are derived. N EONGOBY traces only direct data dependen-
+cies on pointers. For instance, given “ p = q + x ” where pandq
+are both pointers, N EONGOBY only traces p’s dependency on q,
+notx. Similarly, given “ p = *q ,” N EONGOBY only traces p’s de-
+pendency on the previous instruction that stores to the address of q,
+and ignores p’s dependency on q. NEONGOBY stops tracing back
+when it ﬁnds the common parent pointer or it cannot trace the de-pendencies further due to (for example) external functions whose
+source is not available to N EONGOBY. To use this tool on an er-
+ror report, a user needs to (re)run N EONGOBY’s logger (§3) to log
+more operations than pointer deﬁnitions and memory allocations,
+including store instructions that store pointer values and call and
+return instructions of functions that return pointers.
+6.3 Supporting Parallel Programs
+As discussed in §1, N EONGOBY is explicitly designed to detect
+alias analysis bugs that manifest on real-world programs such as
+Apache andMySQL . These programs often use multiple threads and
+processes for performance and ease of programming, so N EON-
+GOBY must handle threads and processes. It needs to do so only in
+the ofﬂine mode because the online mode checks intraprocedural
+queries. Speciﬁcally, N EONGOBY shares one log over all threads
+in a process, and protects the log using a mutex. It assigns one
+log to each process. When a process forks, N EONGOBY creates a
+new log for the child process. N EONGOBY can then check each log
+in isolation. The only modiﬁcation to Algorithm 1 is maintaining
+a call stack for each thread. N EONGOBY assumes race freedom as
+most compilers do, and data races in the worst case may cause some
+FPs. Fortunately, data races occur so rarely that no FPs of this type
+occurred in our experiments (§8.1.2).
+7. LIMITATION
+False positives. NEONGOBY assumes that test programs do not
+have undeﬁned behavior per ANSI C speciﬁcation and may emit
+FPs on buggy test programs. For instance, N EONGOBY may emit
+FPs on pointers off bound by many bytes (§3.1) which are dis-
+allowed by ANSI C speciﬁcation. Moreover, N EONGOBY works
+within a compiler, so external functions that return reused addresses
+and are not treated as memory allocation functions by N EONGOBY
+(§3.1) may cause FPs. For instance, if an external function my_-
+realloc frees and reallocates heap memory, and returns the re-
+allocated memory address, N EONGOBY would miss this memory
+reuse and emit FPs. However, in practice, external functions sel-
+dom cause issues for two reasons: external functions not treated by
+NEONGOBY as memory allocation functions seldom return reused
+addresses; without function summaries, alias analyses cannot char-
+acterize the address-reusing behavior of those functions either.
+False negatives. NEONGOBY is a dynamic tool, and detects only
+alias analysis errors that manifest on the executions it checks.
+Moreover, we explicitly designed N EONGOBY to be general to
+check many alias analyses with low false positives, but this gen-
+erality comes at a cost: N EONGOBY cannot easily ﬁnd bugs that
+violate a speciﬁc precision guarantee intended by an alias anal-
+ysis. In our future work, we plan to specialize N EONGOBY’s
+checking toward speciﬁc precision guarantees by varying the pre-
+cision of its DidAlias . In addition, although N EONGOBY checks
+thatDidAlias(p,q)!MayAlias(p,q) , it cannot dynamically
+check that if MayAlias(p,q) , then there exists an execution s.t.
+DidAlias(p,q) , for the following reasons: (1) MayAlias may
+conservatively return true even if the two pointers never alias in any
+execution; and (2) even if the pointers do alias in some execution,
+the given program and workload may not trigger this execution.
+8. EV ALUATION
+We evaluated N EONGOBY on three popular alias analyses:
+1.basicaa : LLVM’s default alias analysis, an intraprocedural,
+ﬂow-insensitive analysis that collapses all address-taken vari-
+ables. We chose the version of basicaa in LLVM 3.1.285Table 2: Descriptions of the bugs found. Starred bugs were either already reported by others or mentioned in the comments of the code. File indicates the
+ﬁle (and the line if there is a clear place to add the ﬁx) containing the bug.
+# AA File Description
+1 ds-aa TopDownClosure.cpp:207 incomplete call graph traversal in the top-down analysis stage
+2 ds-aa StdLibPass.cpp:703 matched formal argument nto actual argument n+ 1
+3 ds-aa TopDownClosure.cpp:80 symptom: missed aliases between actual parameters and the return value of an indirect call
+4 ds-aa Local.cpp:833 mishandled variable length arguments
+5 ds-aa Local.cpp:551 mishandled inttoptr andptrtoint instructions
+6 ds-aa StdLibPass.cpp did not handle errno ; pointers returned from errno may alias
+7 ds-aa StdLibPass.cpp did not handle getpwuid_r andgetpwnam_r , whose argument and return value alias
+8 ds-aa StdLibPass.cpp did not handle gmtime_r -like functions whose return value and the 2nd argument alias
+9 ds-aa StdLibPass.cpp did not handle realpath whose value and the 2nd argument alias
+10 ds-aa StdLibPass.cpp did not handle getenv whose return value aliases for the same environmental variable
+11 ds-aa StdLibPass.cpp did not handle tzname , an external global variable
+12 ds-aa StdLibPass.cpp did not handle getservbyname whose return values may alias
+13 ds-aa StdLibPass.cpp did not handle pthread_getspecific and pthread_setspecific ; the value stored via
+pthread_setspecific aliases that loaded via pthread_getspecific with the same key
+14ds-aa StdLibPass.cpp did not handle strtoll ; the dereference of the 2nd argument may alias the 1st argument
+15ds-aa StdLibPass.cpp did not handle the ctype function family; the return value of __ctype_b_loc -like function may alias
+16ds-aa StdLibPass.cpp did not handle freopen whose return value may alias stdin ,stdout , orstderr
+17 anders-aa Andersens.cpp:1882 HUValNum incorrectly marked a pointer as pointing to nothing.
+18 anders-aa Andersens.cpp:2588 mishandled indirect call arguments; points-to edge to argument nmay be attached to argument n1
+19 anders-aa Andersens.cpp:2585 points-to nodes representing indirect calls are swapped, but argument info is not updated accordingly
+20 anders-aa Andersens.cpp:764 queries on a function pointer and a function always return no alias, even though they do alias
+21anders-aa Andersens.cpp did not handle inttoptr andptrtoint instrucitons
+22anders-aa Andersens.cpp did not handle extractvalue andinsertvalue instructions
+23 anders-aa Andersens.cpp:924 incorrect summary for freopen whose return value may alias the 3rd argument
+24 anders-aa Andersens.cpp did not handle __cxa_atexit
+25 anders-aa Andersens.cpp mishandled variable length arguments
+26 anders-aa Andersens.cpp did not handle pthread_create
+27 anders-aa Andersens.cpp did not handle pthread_getspecific andpthread_setspecific
+28 anders-aa Andersens.cpp did not handle strcpy ,stpcpy andstrcat whose return value aliases the 1st arguments
+29 anders-aa Andersens.cpp did not handle getcwd andrealpath
+2.ds-aa : a context-sensitive, ﬁeld-sensitive alias analysis with
+full heap cloning [24], actively maintained by LLVM develop-
+ers.ds-aa is used by [10, 14, 12]. We chose revision 160292
+from ds-aa ’s SVN repo [8].
+3.anders-aa : an interprocedural Andersen’s alias analysis with
+three constraint optimizations: hash-based value number-
+ing [18], HU [18], and hybrid cycle detection [17]. We ported
+the version of anders-aa in LLVM 2.6 to LLVM 3.1.4
+Both anders-aa andds-aa have much better quality than typi-
+cal research-grade analyses; ds-aa in particular is used by many
+researchers, regularly tested, and actively maintained.
+Our test programs are MySQL and Apache , two widespread
+server programs. Our workloads are benchmarks used by the
+server developers themselves: SysBench [7] for MySQL , which ran-
+domly selects, updates, deletes and inserts database records; and
+ApacheBench [1] for Apache , which repeatedly downloads a web-
+page. We compiled these programs and benchmarks with Clang 3.1
+and-O3. Since MySQL andApache are server programs, we quan-
+tiﬁed N EONGOBY’s overhead on them by measuring throughput.
+Our evaluation machine is a 2.80 GHz Intel dual-CPU 12-core
+machine with 64 GB memory running 64-bit Linux 3.2.0. We
+made both SysBench andApacheBench CPU bound by ﬁtting the
+database or web contents in memory; we ran both the client and the
+4anders-aa was maintained up to LLVM 2.6, so we ported it
+to LLVM 3.1 with a patch that removes 67 lines and adds 115.
+This patch is included in our release of N EONGOBY. It does
+not change anders-aa ’s functionality; it merely ﬁxes compati-
+bility issues between LLVM 2.6 and 3.1: it replaces debug out-
+putdout with dbgs ; migrates anders-aa ’s handling of an allo-
+cation instruction because LLVM 3.1 replaces this instruction with
+other instructions; adds code to handle a new type of constant
+(ConstantDataSequential ); and changes the alias query inter-
+face to include sizes. For each bug found in our port, we veriﬁed
+that the bug also exists in the original anders-aa .server on the same machine to avoid masking N EONGOBY’s over-
+head with network delay; we used four threads for the server and
+client, and split the total eight threads on different cores to avoid
+CPU contention.
+The remainder of this section focuses on three questions:
+§8.1: can N EONGOBY detect many bugs with zero FP?
+§8.2: what is N EONGOBY’s overhead?
+§8.3: what are the bugs v.s. overhead tradeoffs with different N EON-
+GOBY techniques?
+8.1 Bug Detection Results
+This subsection shows the bugs (§8.1.1) we found using N EON-
+GOBY and how we detected them (§8.1.2).
+8.1.1 Bugs Found
+NEONGOBY found total 29 bugs, 16 in ds-aa and 13 in
+anders-aa . Of the 29 bugs, 24 are previously unknown, and four
+ds-aa bugs have been ﬁxed by the developers [2]. Table 2 shows
+all bugs. Of the 29 bugs, nine (1–5, 17–20) are logical bugs; two
+(21, 22) do not handle certain LLVM instructions; the remaining
+eighteen mishandle external functions or global variables because
+of analysis incompleteness. Although adding summaries for ex-
+ternal functions and global variables can alleviate analysis incom-
+pleteness, systematically handling unknown external functions and
+global variables remains challenging. Researchers and developers
+strive to make their analyses complete to adopt them into produc-
+tion. For instance, one novel feature of ds-aa is completeness
+tracking technique to support unknown external functions [24];
+anders-aa also strives to handle the incompleteness of external
+functions (see function AddConstraintsForCall [6]).
+We pinpointed the root causes of all bugs in Table 2 to locations
+in the source code. Since anders-aa is relatively simple, we ﬁxed
+all bugs N EONGOBY detected in this alias analysis.286Table 3: Alias analysis precision. Percentages are no-alias ratios.
+basicaa anders-aa ﬁxed anders-aa
+Apache 10.9% 24.3% 10.5%
+MySQL 3.7% 5.1% 2.7%
+Next we elaborate on two most interesting bugs: bug 1 in ds-aa
+and bug 17 in anders-aa . Both cause the points-to graphs to miss
+edges, and require tricky ﬁxes.
+Bug 1 is caused by an incomplete call graph traversal in ds-aa .
+ds-aa constructs its point-to graph in three stages: constructing
+a local point-to graph for each function, a bottom-up analysis to
+clone each callee’s point-to graph into the caller, and a top-down
+analysis to merge each caller’s point-to graph into the callees. The
+bottom-up stage computes an unsound call graph Gb, and the top-
+down stage computes a sound graph Gtbased onGbby merg-
+ing nodes and adding missing edges. Suppose the top-down stage
+merges node AandBofGbinto nodeCofGt. When the top-
+down stage traverses Gt, it needs to traverse both AandBwithin
+nodeC. However, the code incorrectly traverses only one of them.
+We reported this bug to ds-aa developers and they have ﬁxed this
+bug.
+Bug 17 is caused by an incomplete depth-ﬁrst search (DFS) of
+the constraint graph in anders-aa ’s implementation of the HU al-
+gorithm. anders-aa answers alias queries by collecting and solv-
+ing load, store, assignment, and address-of constraints. It organizes
+these constraints in a constraint graph. It runs HU to identify the
+points-to sets of pointers and unify the pointers with the same
+points-to sets. To do so, it runs a DFS over all nodes. It keeps a
+visited ﬂag per node ( Node2Visited ), and sets the ﬂag to true
+when it ﬁrst reaches the node. As an optimization, when visiting
+a node representing *p, if the points-to set of the node representing
+pis already determined to be empty, anders-aa simply sets the
+points-to set of *pto be empty. The bug lies in anders-aa ’s logic
+to determine when the points-to set of pis already determined: it
+wrongly believes the set is determined when p’s visited ﬂag is true,
+even though it has not ﬁnished exploring p’s descendants or even
+initialized p’s points-to set. We ﬁxed this bug by adding a new ﬂag
+per node to indicate when DFS has ﬁnished exploring the node.
+How bugs affect precision. As discussed in §1, alias analysis bugs
+may cause tools to mistakenly believe that pointers do not alias
+when they indeed do, invalidating research ﬁndings and compro-
+mising safety. To illustrate, we measured how bugs affect alias anal-
+ysis precision using LLVM’s AliasAnalysisEvaluator , which
+statically queries an alias analysis with all intraprocedural pointer
+pairs and computes statistics of the results. We deﬁne preci-
+sion as the percentage of queries with no-alias results over all
+queries. Table 3 shows the precision of basicaa ,anders-aa ,
+and the anders-aa after we ﬁxed all its detected bugs. Although
+anders-aa appears more precise than basicaa on both MySQL and
+Apache , the ﬁxed anders-aa is actually lessprecise than the sup-
+posedly very imprecise basicaa . This results illustrates that buggy
+alias results can indeed invalidate evaluation numbers.
+8.1.2 Bug Detection Methodology
+To detect as many bugs as possible, we ran N EONGOBY in the
+most thorough way: the ofﬂine mode without any optimization.
+(§8.3 shows how the number of bugs varies with different modes
+and optimizations.)
+Our results show N EONGOBY emits no FPs on the three
+alias analyses and the two applications we checked. We veri-
+ﬁed all N EONGOBY’s reports are true positives as follows. For
+anders-aa , NEONGOBY emitted many reports. Fortunately, oneTable 4: Bug reports and bugs. The second row shows the number of bugs
+found from the reports. The numbers of ds-aa bugs may be signiﬁcantly
+larger than those shown in the table (starred) because we did not count a
+report as a bug if we could not pinpoint its root cause in the source or re-
+produce it with a simple testcase.
+ds-aa anders-aa
+MySQL Apache MySQL Apache
+Bug reports 395 162 20,551 4,945
+Bugs 10713 9
+bug typically causes thousands of reports, so we veriﬁed the re-
+ports as follows. We diagnosed one report, produced a patch, re-
+ran N EONGOBY on the patched anders-aa to regenerate reports,
+marked the reports that disappeared as true positives, and repeated.
+After about 10 iterations, N EONGOBY emitted no more reports. For
+ds-aa , NEONGOBY emitted a relatively small number of reports,
+so we manually inspected each report. Some reports are fairly sim-
+ple to diagnose, such as incorrect external function summaries. For
+more complex ones, we created small testcases to reproduce the
+problems or applied our diagnosis tool (§6.2) to compute a slice of
+relevant log records to simplify diagnosis. We conﬁrmed all ds-aa
+reports as true positives, and pinpointed the root causes in ds-aa ’s
+code for about half of the reports. We could not pinpoint the other
+reports or reproduce them with small testcases, so we conserva-
+tively excluded them from our bug count. Thus, the actual number
+ofds-aa bugs found may be signiﬁcantly larger than what we re-
+port. We released our bug reports together with N EONGOBY.
+Table 4 shows the results on ds-aa andanders-aa with our test
+programs and workloads. (We did not include basicaa because
+NEONGOBY emitted no reports on it.) For ds-aa , NEONGOBY
+emitted 395 reports on MySQL and 162 on Apache . For anders-aa ,
+NEONGOBY emitted 20,551 on MySQL and 4,945 on Apache .
+The second row of Table 4 shows the number of bugs found.
+NEONGOBY found at least 10 ds-aa bugs with MySQL and 7 with
+Apache . Interestingly, these two sets of bugs only overlap by one
+bug, illustrating N EONGOBY’s beneﬁt of using real-world pro-
+grams with diverse programming constructs as testing programs.
+NEONGOBY found 13 anders-aa bugs with MySQL and 9 with
+Apache , and the Apache bugs are a subset of the MySQL ones.
+8.2 Overhead
+To quantify N EONGOBY’s overhead, we ran it in the most op-
+timized way: the online mode with all optimizations. (§8.3 shows
+how the overhead varies with different modes and optimizations.)
+Table 5 shows the results on basicaa ,anders-aa , the ﬁxed
+anders-aa , and ds-aa . The compilation time of Apache for ev-
+ery checked alias analysis is within 50s. The compilation time of
+MySQL is relatively longer mostly because anders-aa andds-aa
+are slower on MySQL . The throughput highly depends on the pre-
+cision of the alias analysis. For instance, the throughput for ds-aa
+is smaller than that for basicaa , because ds-aa is more precise.
+Interestingly, the bugs in anders-aa made it appear very “pre-
+cise”, so its throughput is also small. However, after we ﬁxed all
+its bugs, its throughput almost doubled. N EONGOBY checks func-
+tionMYSQLparse ofﬂine (§4), so we also measured this time. Since
+NEONGOBY logged only operations from MYSQLparse , the log
+was very small, and most of the ofﬂine detection time was spent
+on querying the checked alias analysis.
+8.3 Bugs and Overhead Tradeoffs
+NEONGOBY provides both the ofﬂine and online modes and
+several optimizations to enable users to ﬂexibly trade bugs for
+low overhead. This subsection evaluates these tradeoffs using287Table 5: N EON GOBY’s overhead. Compile shows the total compilation time including the time to query the checked alias analysis ( AA), insert alias checks
+(Insert ), and generate the executable from the transformed bitcode ( Codegen ).TPUT shows the relative throughput with N EONGOBY over without. Detect
+shows the ofﬂine detection time for function MYSQLparse ; NEONGOBY checks it ofﬂine because this yacc -generated function has too many pointers (§4).
+All times are in seconds.
+MySQL Apache
+basicaa anders-aa ﬁxed anders-aa ds-aa basicaa anders-aa ﬁxed anders-aa ds-aa
+Compile 130.65 421.59 738.43 1714.02 19.21 41.73 22.46 39.37
+AA 8.53 213.35 656.83 1493.30 0.53 3.93 7.01 1.90
+Insert 65.30 89.60 47.72 113.26 10.35 18.88 10.49 19.07
+Codegen 56.82 118.64 33.88 107.46 8.33 18.92 4.96 18.40
+TPUT 59.47% 33.32% 75.16% 34.78% 68.05% 41.58% 81.95% 45.62%
+Detect 48.02 244.08 679.47 1536.63 n/a n/a n/a n/a
+Table 6: Bugs and overhead tradeoffs. The base columns represent the
+baseline of the ofﬂine and online modes; delta with delta checking (§5);
+delta+deref with both delta checking and using dereferenced pointers only
+(§6.1). The row titles match Table 4 and Table 5. To collect all reports in
+the online mode, we changed the online mode to emit a report upon an error
+instead of aborting the current execution.
+ofﬂine online
+base delta delta+deref base delta delta+deref
+Compile 3.82 3.82 2.92 226.97 189.62 41.73
+TPUT 4.83% 4.83% 11.56% 15.52% 16.17% 41.58%
+Detect 1373.6 1204.8 579.08 n/a n/a n/a
+Reports 4945 4945 2155 3861 3861 2068
+Bugs 9 9 8 8 8 6
+anders-aa because we have understood and ﬁxed all its bugs. We
+chose Apache as the test program. Table 6 shows the results.
+Ofﬂine v.s. online. Columns base show that the online mode
+trades compilation time and a few bugs for signiﬁcantly increased
+throughput and reduced detection time. With less than 230s compli-
+cation time, the online mode improves the throughput of Apache by
+about three times, and eliminates the ofﬂine detection time of about
+1500s. It emits 22% fewer reports, but misses only one bug. A bug
+often triggers many reports, so N EONGOBY can still catch a bug as
+long as some of its reports are emitted.
+Delta checking. This optimization improves performance for both
+the ofﬂine and online modes without losing bugs (§5). We chose
+basicaa as the baseline. Columns delta show that delta checking
+reduces the detection time by 1.89% in the ofﬂine mode; it reduces
+compilation time by 16.46% and increases the throughput by 4.19%
+in the online mode. The improvements would be even larger if a
+user incrementally checks her reﬁnements to her alias analysis.
+Detecting errors using dereferenced pointers only. This opti-
+mization improves the performance of both modes, but may lose
+bugs (§6.1). Columns delta+deref show that this optimization re-
+duces the compilation time by 77.99% for the online mode; it in-
+creases the throughput for both ofﬂine and online modes by 80.28%
+and 157.14% respectively; it reduces the ofﬂine detection time by
+45.62%; and it misses 1 out of 9 bugs in the ofﬂine mode, and 2 out
+of 8 in the online mode.
+9. RELATED WORK
+Previous sections have discussed how N EONGOBY is related to
+bounds checkers (or general memory safety tools); this section dis-
+cusses other related work.
+Alias analysis. A plethora of work has been devoted to creating
+faster, more precise alias analyses [33, 24, 25]. This previous work
+is complimentary to ours because our goal is to effectively detect
+errors in alias analysis implementations. There have been several
+studies on alias analyses, though their focus is on precision and
+overhead, not correctness. Speciﬁcally, Mock et al. [28, 27] mea-
+sures the precision of static pointer analyses by comparing their re-sults with dynamic points-to sets. However, the dynamic points-to
+sets they computed are not precise enough for error detection, e.g.,
+the points-to sets are not context-sensitive and they did not han-
+dle address reusing. LLVM’s AliasAnalysisEvaluator collects
+statistics about an alias analysis, such as how many pointer pairs do
+not alias and how many may alias. Hind and Pioli [21] implemented
+six context-insensitive alias analysis algorithms and compared their
+precision, time and memory consumption on 24 programs up to 30
+K lines of code. Jablin et al. [22] compared the performance of their
+system using different alias analyses, and found that the combina-
+tion of research grade alias analyses [19, 24, 25] sometimes per-
+forms worse than the production-quality alias analysis in LLVM.
+Software error detection. A plethora of work has also been de-
+voted to software error detection or veriﬁcation ( e.g., [11, 34]).
+Most of these systems target general programs, whereas N EON-
+GOBY targets alias analyses. These analyses take programs as in-
+puts, do complex computations, and compute abstract results with
+difﬁcult-to-specify guarantees. Thus, prior systems are not directly
+applicable to detect alias analysis errors. Testing and verifying
+compilers [31] has also been an important topic for programming
+language researchers, though, to the best of our knowledge, we are
+not aware of any prior system for effectively detecting alias analy-
+sis errors.
+10. CONCLUSION
+We have presented N EONGOBY, a system for effectively ﬁnd-
+ing alias analysis bugs. N EONGOBY dynamically observes pointer
+addresses and emits errors if the addresses contradict an alias analy-
+sis. Our results show that N EONGOBY can effectively detect many
+bugs in popular alias analyses with zero FPs and reasonable over-
+head. Our key inspiration of this work is our anecdotal struggles
+with some existing alias analyses, so we hope that N EONGOBY can
+help improve advanced alias analyses into production-quality anal-
+yses and vastly widen their adoption. As such, we have released
+it open-source at https://github.com/columbia/neongoby ,
+along with our error detection results and proposed patches.
+11. REFERENCES
+[1] ab - Apache HTTP server benchmarking tool. http:
+//httpd.apache.org/docs/2.2/programs/ab.html .
+[2] Bug 12744 - Missing Call Edges, LLVM Bugzilla.
+http://llvm.org/bugs/show_bug.cgi?id=12744 .
+[3] Bug 12786 - External Function Summaries, LLVM Bugzilla.
+http://llvm.org/bugs/show_bug.cgi?id=12786 .
+[4] Bug 14147 - Handling of Variable Length Arguments,
+LLVM Bugzilla.
+http://llvm.org/bugs/show_bug.cgi?id=14147 .
+[5] Bug 14190 - Handling Function Pointers, LLVM Bugzilla.
+http://llvm.org/bugs/show_bug.cgi?id=14190 .288[6] LLVM’s Implementation of Andersen’s Interprocedural
+Alias Analysis. http:
+//llvm.org/svn/llvm-project/llvm/branches/
+release_26/lib/Analysis/IPA/Andersens.cpp .
+[7] SysBench: a system performance benchmark.
+http://sysbench.sourceforge.net .
+[8]ds-aa ’s svn repository, revision 160292. http:
+//llvm.org/svn/llvm-project/poolalloc/trunk .
+[9] L. O. Andersen. Program Analysis and Specialization for the
+C Programming Language . PhD thesis, DIKU, University of
+Copenhagen, 1994.
+[10] T. Bergan, O. Anderson, J. Devietti, L. Ceze, and
+D. Grossman. CoreDet: a compiler and runtime system for
+deterministic multithreaded execution. In Fifteenth
+International Conference on Architecture Support for
+Programming Languages and Operating Systems (ASPLOS
+’10), pages 53–64, Mar. 2010.
+[11] A. Bessey, K. Block, B. Chelf, A. Chou, B. Fulton,
+S. Hallem, C. Henri-Gros, A. Kamsky, S. McPeak, and
+D. Engler. A few billion lines of code later: using static
+analysis to ﬁnd bugs in the real world. Commun. ACM ,
+53:66–75, Feb. 2010.
+[12] J. Criswell, A. Lenharth, D. Dhurjati, and V . Adve. Secure
+virtual architecture: a safe execution environment for
+commodity operating systems. In SOSP ’07: Proceedings of
+twenty-ﬁrst ACM SIGOPS symposium on Operating systems
+principles , pages 351–366, 2007.
+[13] H. Cui, G. Hu, J. Wu, and J. Yang. Verifying systems rules
+using rule-directed symbolic execution. In Eighteenth
+International Conference on Architecture Support for
+Programming Languages and Operating Systems (ASPLOS
+’13), 2013.
+[14] D. Dhurjati, S. Kowshik, and V . Adve. SAFECode: enforcing
+alias analysis for weakly typed languages. In Proceedings of
+the ACM SIGPLAN 2006 Conference on Programming
+Language Design and Implementation (PLDI ’06) , pages
+144–157, 2006.
+[15] I. Dillig, T. Dillig, and A. Aiken. Sound, complete and
+scalable path-sensitive analysis. In Proceedings of the ACM
+SIGPLAN 2008 Conference on Programming Language
+Design and Implementation (PLDI ’08) , 2008.
+[16] A. Diwan, K. S. Mckinley, J. Eliot, and B. Moss. Using types
+to analyze and optimize object-oriented programs. ACM
+Transactions on Programming Languages and Systems ,
+23:30–72, 2001.
+[17] B. Hardekopf and C. Lin. The Ant and the Grasshopper: fast
+and accurate pointer analysis for millions of lines of code. In
+Proceedings of the ACM SIGPLAN 2007 Conference on
+Programming Language Design and Implementation (PLDI
+’07), pages 290–299, 2007.
+[18] B. Hardekopf and C. Lin. Exploiting pointer and location
+equivalence to optimize pointer analysis. In 14th
+International Static Analysis Symposium (SAS ’07) , pages
+265–280, 2007.
+[19] B. Hardekopf and C. Lin. Semi-sparse ﬂow-sensitive pointer
+analysis. In Proceedings of the 36th Annual Symposium on
+Principles of Programming Languages (POPL ’09) , pages
+226–238, 2009.
+[20] N. Hasabnis, A. Misra, and R. Sekar. Light-weight bounds
+checking. In Proceedings of 10th International Symposium
+on Code Generation and Optimization (CGO ’12) , 2012.
+[21] M. Hind and A. Pioli. Evaluating the effectiveness of pointeralias analyses. In Science of Computer Programming , pages
+31–55, 1999.
+[22] T. B. Jablin, J. A. Jablin, P. Prabhu, F. Liu, and D. I. August.
+Dynamically managed data for CPU-GPU architectures. In
+Proceedings of 10th International Symposium on Code
+Generation and Optimization (CGO ’12) , 2012.
+[23] R. W. M. Jones and P. H. J. Kelly. Backwards-compatible
+bounds checking for arrays and pointers in C programs. In
+Proceedings of The Third International Workshop on
+Automatic Debugging (AADEBUG ’97) , pages 13–26, 1997.
+[24] C. Lattner, A. Lenharth, and V . Adve. Making
+context-sensitive points-to analysis with heap cloning
+practical for the real world. In Proceedings of the ACM
+SIGPLAN 2007 Conference on Programming Language
+Design and Implementation (PLDI ’07) , 2007.
+[25] O. Lhoták and K.-C. A. Chung. Points-to analysis with
+efﬁcient strong updates. In Proceedings of the 38th Annual
+Symposium on Principles of Programming Languages
+(POPL ’11) , pages 3–16, 2011.
+[26] D. Marino, M. Musuvathi, and S. Narayanasamy. Literace:
+Effective sampling for lightweight data-race detection. In
+Proceedings of the ACM SIGPLAN 2009 Conference on
+Programming Language Design and Implementation (PLDI
+’09), June 2009.
+[27] M. Mock, D. C. Atkinson, C. Chambers, and S. J. Eggers.
+Improving program slicing with dynamic points-to data. In
+Proceedings of the 10th ACM SIGSOFT International
+Symposium on Foundations of Software Engineering
+(SIGSOFT ’02/FSE-10) , pages 71–80, 2002.
+[28] M. Mock, M. Das, C. Chambers, and S. J. Eggers. Dynamic
+points-to sets: a comparison with static analyses and potential
+applications in program understanding and optimization. In
+Proceedings of the 2001 ACM SIGPLAN-SIGSOFT
+workshop on Program analysis for software tools and
+engineering (PASTE ’01) , pages 66–72, June 2001.
+[29] R. Nasre and R. Govindarajan. Prioritizing constraint
+evaluation for efﬁcient points-to analysis. In Proceedings of
+the 9th Annual IEEE/ACM International Symposium on
+Code Generation and Optimization (CGO ’11) , pages
+267–276, 2011.
+[30] D. Prountzos, R. Manevich, K. Pingali, and K. S. McKinley.
+A shape analysis for optimizing parallel graph programs. In
+Proceedings of the 38th Annual Symposium on Principles of
+Programming Languages (POPL ’11) , pages 159–172, Jan.
+2011.
+[31] J. Regehr, Y . Chen, P. Cuoq, E. Eide, C. Ellison, and
+X. Yang. Test-case reduction for C compiler bugs. In
+Proceedings of the ACM SIGPLAN 2012 Conference on
+Programming Language Design and Implementation (PLDI
+’12), pages 335–346, 2012.
+[32] L. Shang. Pointer analysis in pldi/popl from 1998. http:
+//www.cse.unsw.edu.au/~shangl/topconf.htm .
+[33] J. Whaley and M. S. Lam. Cloning-based context-sensitive
+pointer alias analysis using binary decision diagrams. In
+Proceedings of the ACM SIGPLAN 2004 Conference on
+Programming Language Design and Implementation (PLDI
+’04), pages 131–144, June 2004.
+[34] J. Yang, C. Sar, and D. Engler. Explode: a lightweight,
+general system for ﬁnding serious storage system errors. In
+Proceedings of the Seventh Symposium on Operating
+Systems Design and Implementation (OSDI ’06) , pages
+131–146, Nov. 2006.289

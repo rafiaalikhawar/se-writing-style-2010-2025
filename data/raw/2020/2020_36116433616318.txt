@@ -1,0 +1,1352 @@
+Leveraging Hardware Probes and Optimizations for Accelerating
+FuzzTesting ofHeterogeneous Applications
+JiyuanWang
+University ofCalifornia,LosAngeles
+USA
+wangjiyuan@cs.ucla.eduQian Zhang
+University ofCalifornia,Riverside
+USA
+qzhang@cs.ucr.eduHongboRong
+IntelLab
+USA
+hongbo.rong@intel.com
+Guoqing HarryXu
+University ofCalifornia,LosAngeles
+USA
+harryxu@cs.ucla.eduMiryungKim
+University ofCalifornia,LosAngeles
+USA
+miryung@cs.ucla.edu
+ABSTRACT
+Thereisagrowinginterestinthecomputerarchitecturecommu-
+nity to incorporate heterogeneity and specialization to improve
+performance. Developers can create heterogeneous applications that
+consistofboth hostcodeand kernelcode,wherecompute-intensive
+kernelscanbeoﬄoadedfromCPUtohardwareaccelerators.Testing
+such applications on realheterogeneous architectures is extremely
+challengingaskernelsareblackboxes,providingnoinformation
+about the kernels’ internal execution to diagnose issues such as
+silent hangs or unexpected results. Additionally, inputs for hetero-
+geneous applications are often large matrices, leading to a vast
+searchspacefor identifyingbug-revealinginputs.
+Weproposeanovelfuzztestingtechnique, HFuzz,toenableef-
+ﬁcienttestingonrealheterogeneousarchitectures. HFuzzaimsto
+increase both the observability of hardware kernels and testing
+eﬃciency through a three-pronged approach. First, HFuzzautomat-
+ically generates test guidance by inserting device-side in-kernel
+hardwareprobesinadditiontohost-sidesoftwaremonitors.Second,
+itperformsrapidinputspaceexplorationbyoﬄoadingcompute-
+intensive input mutations to hardware kernels. Third, HFuzzparal-
+lelizesfuzzingandenablesfaston-chipmemoryaccess,byutilizing
+four FPGA-level optimizationsincluding loop unrolling,shannon-
+ization,datapreloading,anddynamickernelsharing.
+We evaluate HFuzzon seven open-source OneAPI subjects from
+Intel.HFuzzspeeds up fuzz testing by 4.7 ×with HW-accelerated
+inputspaceexploration.ByincorporatingHWprobesintandem
+withSWmonitors, HFuzzﬁnds33defectswithin4hoursandreveals
+25 unique, unexpected behavior symptoms that could not be found
+bySW-basedmonitoringalone. HFuzzistheﬁrsttodesignhardware
+optimizations toaccelerate fuzz testing.
+CCSCONCEPTS
+•Softwareanditsengineering →Softwaretestinganddebug-
+ging;•Computersystemsorganization →Heterogeneous .
+ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA,USA
+©2023 Copyright heldby theowner/author(s).
+ACM ISBN 979-8-4007-0327-0/23/12.
+https://doi.org/10.1145/3611643.3616318KEYWORDS
+Fuzz Testing, Heterogeneous Applications
+ACM Reference Format:
+Jiyuan Wang, Qian Zhang, Hongbo Rong, Guoqing Harry Xu, and Miryung
+Kim.2023.LeveragingHardwareProbesandOptimizationsforAccelerating
+Fuzz Testing of Heterogeneous Applications. In Proceedings of the 31st
+ACMJointEuropeanSoftwareEngineeringConferenceandSymposiumonthe
+FoundationsofSoftwareEngineering(ESEC/FSE’23),December3–9,2023,San
+Francisco, CA, USA. ACM, New York, NY, USA, 13pages.https://doi.org/10.
+1145/3611643.3616318
+1 INTRODUCTION
+Therehasbeenagrowinginterestindevelopingspecializablehard-
+ware accelerators for domain-speciﬁc workloads for various per-
+formance and energy beneﬁts [ 11,13,16]. As an example, FPGA
+canbeeasilycustomizedtoaccelerateapplicationsacrossawide
+variety of domains [ 9,14] at lower power and higher performance
+thangeneral-purposeCPUs[ 10,23,42].Majorhardwarevendors
+areoﬀeringorplantooﬀerpackagesthatincludebothCPUsand
+FPGAs[1,18].Suchhardwarepackageshavealsobeenmadeinto
+allmajorclouds toaccelerate various analytic andlearningtasks.
+In recent years, fuzz testing has emerged as an eﬀective test
+generationtechniqueforlargesoftwaresystems[ 40].Mostfuzzing
+techniques, such as AFL [ 55], start from a seed input, generate
+new inputs by mutating the previous input, and add new inputs to
+thequeueif theyimprove agivenguidancemetric suchasbranch
+coverage. In this paper, we focus on fuzz testing (i.e.fuzzing) of
+applications on a heterogeneous platform with a CPU host and an
+FPGAdevice.Sucha heterogeneousapplication consistsof hostcode
+andkernelcode, and the host code oﬄoads compute-intensive ker-
+nelsfromtheCPUtotheFPGAtorun.Despitethepotentialbeneﬁts
+of FPGAs and their commercial availability to a broad user base,
+programmingFPGAsisnotoriouslydiﬃcultinpractice.Ensuring
+the correctness of FPGA programs, even seemingly-simple kernels,
+could take a substantial amount of time in terms of months [ 46].
+As such, FPGA programming can be done by only a small handful
+of hardware experts [ 3,35,47]. Automatic fuzz testing of hetero-
+geneous applications, together with root cause analysis of failures,
+cangreatlysimplifyFPGAprogramming,therebymakingFPGAs
+accessible tothe masses.
+There has been signiﬁcant eﬀort to ease the development of
+heterogeneousapplicationswithFPGAs.Themostsuccessfuleﬀort
+Thiswork islicensedunderaCreativeCommonsAttribution4.0Interna-
+tional License.
+1101
+ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA Jiyuan Wang,Qian Zhang,Hongbo Rong,Guoqing Harry Xu,andMiryungKim
+Figure 1: Latency breakdown of running applications on het-
+erogeneous architectures. On average, data transfer into ker-
+nelstakes60% ofexecution time,highlighted ingray.
+ishigh-levelsynthesis (HLS)[15].HLSraisesthelevelofprogram-
+ming abstraction from hardware description languages (such as
+Verilog) to C/C++ dialects (such as SYCL/DPC++[ 25]), enabling
+C/C++developersonFPGAs.Evenwhenheterogeneousapplica-
+tions are written in HLS languages, debugging and testing these
+heterogeneous applications can remain a signiﬁcant challenge due
+to the following reasons:
+LackofObservability. FPGAisadeviceofmassiveparallelism.
+Little debugging support exists to help high-level programmers.
+KernelsrunonanFPGAdeviceasblackboxes,anditoftenconfuses
+programmers, e.g., when the kernels silently deadlock. General-
+purpose FPGA debugging [ 17,33] works at the gate level. Even
+when in-circuit debugging information is available, it is diﬃcult to
+correlate low-level gate signals with high-level variables in HLS
+programs.
+Consider a scenariowhere an applicationmultiplies twomatri-
+cesAandBto create a new matrix M: M=A×B and then applies a
+reciprocaltransformationoneachelementof M.Thisapplication
+hastwokernelsoﬄoadedtoFPGA:(1) matrix_multiply and(2)
+transformer .Totransfertheintermediateresult Mfromtheﬁrstto
+thesecondkernel,apipeisestablishedtofacilitatedatatransfer.For
+eachelementinthematrix M,theﬁrstkernelwritesitscomputed
+valuetothedesignatedpipe,andthesecondkernel transformer
+readsitfromthepipe,computesthereciprocal,andtransfersthe
+ﬁnal result back to the host. With FPGA emulation, the application
+works as expected because both kernels run at the same speed.
+However,whenrunonanactualFPGA,thespeedoftheﬁrstkernel
+generating a value can be diﬀerent from the speed of the second
+kernel consuming it. The developer should check the size of the
+pipe, delay writing if it is full, or delay reading if it is empty. If
+such check is not done, the pipe would be saturated or depleted,
+resulting in data loss and wrong reciprocal outcomes. Currently,
+duetoalackofobservabilityintothedynamicusageofthepipe,
+the developer mayﬁnd itdiﬃcult to diagnosethe root cause.
+CostlyTransferofDatawithHighRedundancy. Traditionalit-
+erativefuzzingtechniquesoftenmutateasmallpartofaseedinput
+to generate new inputs. While this approach works well for many
+CPUprograms, itisextremely ineﬀective forapplicationsthatare
+run onheterogeneous architectures. Inputs of heterogeneous appli-
+cationsare oftenlargematricesand tensors,leading tosigniﬁcant
+data access and transfer overheads—the host, which mutates the
+matrices, must send newly mutated matrices (e.g., with only a fewelements modiﬁed) to the device. Figure 1illustrates the latency
+breakdown of running applications on Intel’s heterogeneous archi-
+tecture.Onaverage,datatransferfromCPUtohardwarekernels
+takes60%oftheexecutiontime.Fora100k ×100kmatrix,asingle
+process of oﬄoading the new generated matrix from the fuzzer
+to the device would take 2 minutes, prohibiting fast fuzzing on
+heterogeneous architectures.
+Overlooked Opportunities forFPGA-level Optimizations.
+Fuzzing heterogeneous applications may be approached in a naïve
+mannerbytreatinghardwarekernelinvocationsasanalogousto
+softwarefunctioncallsandrepeatedlyinvokingthemfromanit-
+erative input mutation loop. However, this approach ignores the
+potentialoptimizingcapabilityofFPGA,asthemutationsoftencon-
+sistofindependenttasksthatcanbeparallelizedeﬃcientlywhen
+oﬄoadedtotheFPGAside.Inotherwords,thenatureoffuzzing(i.e.,
+iterative input generation and program invocation) unlocks new
+micro-architecturelevelperformanceoptimizations.Indeed,wecan
+treat the domain of heterogeneous applications, not only as a new
+targetdomain,butasanewenablerforacceleratingautomatedtest
+generation.Whensoftware-stylematrixinputmutationisoﬄoaded
+to FPGA and is then combined with subsequent kernel invocation,
+manymicro-architectureleveloptimizationssuchasloopunrolling,
+datapreloading,shannonization,anddynamickernelsharingare
+nowapplicable for further performance speed-up.
+HFuzz.We developed HFuzz, a novel fuzz testing tool that aims to
+quicklyrevealbugsinheterogeneousapplications.Ourkeyinsights
+are elaboratedbelow:
+First,toimproveerrorobservabilityduringtesting, HFuzzinjects
+hardwareprobesinsidethekernels intandemwithsoftwaremonitors
+inside the host. This is diﬀerent from prior approaches that con-
+sideranFPGAkernelasablackboxandinjectsoftwaremonitors
+only[58].InHFuzz,bothsoftwaremonitorsandhardwareprobes
+are designed to eﬀectively detect overﬂows caused by intermediate
+variables within the FPGA kernel, as well as pipe saturation er-
+rors that may occur during data transfer between diﬀerent devices.
+Thesehardwareprobesareinjectedthroughsource-to-sourcetrans-
+formationandthensynthesizedforFPGA.Withtimelyexecution
+feedbackfromthehardwareprobes, HFuzzprioritizesinputsthat
+provide a new behavior signal at the FPGA execution level. For
+example, HFuzzmonitorsthesaturationofacommunicationpipe
+between two FPGA kernels and retains the inputs that lead to a
+newmaximum pipe saturationlevel for further mutations.
+Second, HFuzzoﬄoads input mutations into FPGA kernels to re-
+duceunnecessarydatatransfer.Fora vector-add example,instead
+ofrepeatedlytransferringamutatedinputvectorofsize 106,HFuzz
+retains the initial input vector in the FPGA buﬀer and mutates the
+elementsof thevectorwithintheFPGA kernel.For another exam-
+ple,thehost-sidemutationofaseedmatrixwith10,000elements
+for1,000timestakes9.1seconds,inourevaluation,whilein-kernel
+inputmutation takes only 2.1 seconds.
+Third,HFuzzimplementsfourtypesofFPGA-leveloptimizations
+to speed up fuzzing. For example, one such optimization is dy-
+namickernelsharinginparallelfuzzingloops ,whichenablesamore
+eﬀective search space exploration when utilizing multiple input
+generators,each with its own seed queue. HFuzzthen invokes the
+target kernel functionusing amutatedinput selectedfrom one of
+1102LeveragingHardware ProbesandOptimizations forAccelerating Fuzz Testingof HeterogeneousApplications ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+theseedqueuesanddynamicallyincreasestheprobabilityofchoos-
+ing that input generator if the input yields new behavior signals at
+thehardwareexecutionlevel.Theotherthreemicro-architecture
+leveloptimizationsare loopunrolling whichenablesparallelitera-
+tion,shannonization which precomputes operations and reduces
+thelatencyofcriticalpaths,and datapre-loading forfastmemory
+accessbymovingdatafromglobalmemorytolocalmemory. HFuzz
+istheﬁrsttodirectlyleveragetheperformanceenhancingpower
+ofFPGAforautomatedtestingofheterogeneousapplicationson
+an FPGA device.
+We evaluate HFuzz’s eﬀectiveness on seven programs. These
+programs are from Intel’s OneAPI benchmarksfor heterogeneous
+applications with FPGA kernels [ 24]. We compare HFuzzagainst
+four alternatives: (Alternative 1: AFL-like) an AFL-like grey-box
+fuzzingtoolthatuses branchcoverageas feedback andruns onthe
+hostentirely,(Alternative2: HeteroFuzz )thestate-of-the-arttesting
+tool for heterogeneous applications using software monitors only,
+(Alternative 3: NoKernelMutation )HFuzzwith CPU-side input mu-
+tation without oﬄoadingit toFPGA, and(Alternative 4: NoHWop-
+timization )HFuzzwithout FPGA-level optimizations. It took HFuzz
+much less time (i.e., 7%, 9.7%, 21.3%, and 29.4% of the time used by
+the four alternatives) to ﬁnd the same number of defects. Given
+thesametimebudget(4hours), HFuzzfound11×,4.13×,2.36×,and
+1.03×more defects than the four alternatives. We tried longer time
+(24 hours)but nomoredefect is foundafter 4 hours.Perthe open
+science policy, we make HFuzz’s artifacts, benchmark programs,
+anddatasets available at https://github.com/UCLA-SEAL/HFuzz .
+In summary,this work makesthe following contributions:
+•Toourknowledge, HFuzzistheﬁrstfuzztestingtechniquethat
+useshardwareprobesintandemwithsoftwaremonitorstoguide
+test inputgenerationfor heterogeneous applications.
+•HFuzzis the ﬁrst to unlock new micro-architecture level perfor-
+manceoptimizations for fuzz testing by mapping both iterative
+inputmutationandkernelinvocationtoFPGA-sidecomputation.
+It implements four FPGA-level optimizations and accelerates
+fuzzingby3.4 ×.
+•HFuzzacceleratesfuzztestingby4.7 ×bydirectlysynthesizing
+inputmutationswithinkernelsonFPGA.Thisalsoreducesthe
+host-device data transfer overheadby66%.
+•Witha4-hourbudgetonsevenbenchmarks, HFuzzwasableto
+discover 33 defects, while traditional coverage-guided fuzzing
+onlyuncovered3defects.Outofthese33defects,25couldnot
+have been foundwithoutthe use ofdevice-sidefeedback.
+2 BACKGROUND
+2.1 HeterogeneousApplicationswith FPGA
+Drivenbyperformanceandenergybeneﬁts,heterogeneouscom-
+putingapplications[ 7]containcodethatisexecutedondiﬀerent
+kindsofprocessorssuch as CPU,GPU,andFPGA.
+FPGAsareﬁeldprogrammablegatearrays.ModernFPGAsin-
+clude millions of look-up tables (LUTs), thousands of embedded
+block memories (BRAMs), thousands of digital signal processing
+blocks (DSPs), and millions of ﬂip-ﬂop registers (FFs) [ 52]. Intel
+providesCPU+FPGAmulti-chippackages;withitsrecentacquisi-
+tionofAltera,suchintegrationisexpectedtobeeventighterinthe1for(ints = 1; s <= nsteps; ++s) {
+2...
+3// Kernel: calculate velocity
+4h.parallel_for(n, [=](item<1> i){
+5 acc0=0; acc1=0; acc2=0;
+6 #pragma unroll factor=2
+7 for(intj=0; j<n; j++) {
+8 if(j==i) {continue };
+9 int8dx, dy, dz;
+10 dx = p[j].pos[0]-p[i].pos[0];
+11 dy = p[j].pos[1]-p[i].pos[1];
+12 dz = p[j].pos[2]-p[i].pos[2];
+13 int8sqr=dx*dx +dy*dy+dz*dz;
+14 acc0+=(kG*p[j].mass/sqr)*dx; //calculate acceleration
+15 acc1+=(kG*p[j].mass/sqr)*dy;
+16 acc2+=(kG*p[j].mass/sqr)*dz;}
+17 p[i].vel[0] +=acc0*dt; //calculate velocity
+18 p[i].vel[1] +=acc1*dt;
+19 p[i].vel[2] +=acc2*dt;});});
+Figure 2: Nbody-simulation: a heterogeneous version with
+DPC++ high-levelsynthesis.
+future.FPGAhasmadeitswayintomoderndatacenters,including
+Microsoft’sAzure,AmazonF1, andIntel DevCloud [ 2,26,54].
+A heterogeneous application typically consists of hostcode exe-
+cutedontheCPUand kernelcodetobesynthesizedandexecutedon
+FPGA or GPU. Host code initializes the device, allocates the device
+memory, transfers data to the device, and invokes the compute-
+intensivekernelonthedeviceside.Aftertheexecution,ittransfers
+the kernel outputback to the hostanddeallocates the memory.
+To simplify kernel development, high-level-synthesis (HLS) [ 15,
+21] lifts the abstraction of hardware development by automatically
+generating register-transfer level (RTL) descriptions from code
+written in C-like dialects. One example of HLS C/C++ dialects is
+Intel’s Data Parallel C++ (DPC++), a cross-platform abstraction
+layerthatenablescodetobe targetedtodiﬀerentCPUs, GPUs,and
+FPGAs [44,45]. With DPC++, users can specify which hardware
+platform to implement a kernel on. For example, a user may use a
+compilerﬂag -Xsboard=intel_s10sx_pac toselectIntel’sFPGA
+S10.Theusercandevelopakernelfunction f,callingh.parallel_-
+for(n,f) witha job handler h.This handler executes fwithnde-
+gree parallelism on FPGA S10. Consider the example in section 2.2.
+2.2 AnIllustratingExample:Nbody-simulation
+Figure2illustrates the simulation of n particles moving over a
+sequence of nsteps. Lines 10-12 calculate the distance between
+particles, while Lines 14-16 calculate the acceleration. In lines
+17-19,theprogramsubsequentlyupdatestheparticles’velocities
+based on the acceleration. These computations are extracted as
+compute-intensive kernels and oﬄoaded to an FPGA. To enable
+parallelismandspeedupthevelocitycalculation,thedeveloperuses
+h.parallel_for and loop unrolling #pragma unroll factor=2
+(highlightedinred)at Lines4and6.
+When writing a heterogeneous application, a user must con-
+servatively estimate the limit of hardware resources and specify
+bitwidths for custom types and the size of buﬀers and pipes be-
+cause all hardware resources are ﬁnite. Due to the need to ﬁnite
+hardware resources, a heterogeneous application often contains
+defectsthatcannotbedetectedstaticallyviastaticanalysis.Thisisa
+problemthatuniversallyexistswithallHLSlanguages.Toillustrate,
+considerthe real defectsinthe Nbody-simulation.
+1103ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA Jiyuan Wang,Qian Zhang,Hongbo Rong,Guoqing Harry Xu,andMiryungKim
+Divide By Zero in Nbody-Simulation. For code in Figure 2,
+with the input p.pos=[(1,2,4),...,(1,2,4)] , the velocity calcula-
+tion on an FPGA A10 device produces absurdly large numbers
+p.vel=[(-214748364,..),..] .This isbecause,whenthekernelinputs
+contain two particles with the same position, a divide-by-zero may
+happen inside the kernel inLines14-16dueto sqr=0at Line13.
+Overﬂow in Nbody-Simulation. When the kernel calculates the
+accelerationoftwoparticlesinFigure 2,anin-kerneloverﬂowcould
+occur if two particles are close to each other (i.e., sqr≈0at Line
+13).Thisisbecausewhen sqrisclosetozero, accbecomeslarge.
+When the inputs p.pos=[(81,0,0),(81,1,0),(81,0,1),...] are sent to
+the kernel, it produces a small value sqr=1, leading to overﬂow for
+thevariables acc1;ﬁnally,thewrongresultissentbacktothehost.
+State-of-the-Art. Grey-boxfuzzing[ 58]generatesprograminputs
+based on per-iteration execution feedback. Suppose that a user
+uses grey-box fuzzing to monitor the value range of the inputs and
+outputsofkernelsonthehost-side(CPU)code.Forthedivide-by-
+zerobugthatcouldoccurinFigure 2,because sqrisanin-kernel
+variableanddoesnotappearinthehostcode,software-sidegrey-
+box fuzzing [ 58] cannot easily reveal defects that originate from
+the inside ofthe kernel.
+HFuzzaddressesthelimitationsofexistingworkbyutilizinghard-
+wareprobestomonitortheintermediatestatesofkernels. HFuzz
+identiﬁes the in-kernel local variable sqrat Line 13 and inserts
+hardware probes to track its value range. The input generation
+process is then optimized by prioritizinginputs that result innew
+minimum ormaximum values of sqr. As a result, HFuzzis ableto
+eﬀectivelydetectoverﬂowwhen sqrreachesthesmallvalue sqr=1
+anddivide-by-zerodefectswhen sqrreachesitsminimumvalue0.
+3 APPROACH
+HFuzzaims to ﬁnd inputs that can trigger both in-kernel errors
+andhost-sideerrorsforheterogeneousapplicationswritteninIn-
+tel’sDPC++HLS[ 25].HFuzzcontainsthreenovelcomponentsthat
+work in concert: (1) in tandem monitoring of software and hard-
+warefeedbackbyinjectingsoftwaremonitorsandin-kernelprobes
+(Section3.1); (2) oﬄoading input mutations to hardware kernels
+(Section3.2), and (3) FPGA-level optimizations to speed up itera-
+tiveinputgenerationandkernelinvocation(Section 3.3).HFuzz’s
+design builds on two key insights. First, hardware-level parallelism
+canbringnotableperformanceenhancementforiterativefuzzing,
+which is often characterized by independent task-level parallelism.
+Second, grey-box fuzzing’s eﬀectiveness can be signiﬁcantly im-
+proved by observing feedback signals from both hardware and
+software.
+The Fuzzing Process. The overall workﬂow of HFuzzis shown in
+Algorithm 1.HFuzztakes as input a program /u1D45Dwritten in Intel’s
+DPC++andproducesconcreteinputsthattriggerdefectsin /u1D45D.HFuzz
+ﬁrst appliesa source-to-sourcetransformation to /u1D45Dto produce an
+instrumentedversion /u1D45D′,byinsertingin-kernelprobesandsoftware
+monitorsthatcanguidefuzztesting. HFuzzselectsaninputgenera-
+tor/u1D43Afromasetofgenerator /u1D446.Itthenrandomlyoﬄoadsarandom
+seed input /u1D456/u1D45B′from/u1D43A’s seed queue into the kernels. To generate
+new inputs, HFuzzcreates a new mutation kernel job in addition
+to the original kernel, and utilizes parallelism within FPGAs toAlgorithm1: Fuzzingworkﬂow.
+Input:program/u1D45D, input generatorset /u1D446, mutation operator set /u1D442
+1FuzzingLoop( /u1D45D,/u1D446)
+2begin
+3/u1D45D′=instrument (/u1D45D);
+4/u1D439/u1D452/u1D452/u1D451/u1D44F/u1D44E/u1D450/u1D458 =∅;
+5for1..maxdo
+6 /u1D43A=/u1D446./u1D460/u1D452/u1D459/u1D452/u1D450/u1D461_/u1D456/u1D45B/u1D45D/u1D462/u1D461_/u1D454/u1D452/u1D45B/u1D452/u1D45F/u1D44E/u1D461/u1D45C/u1D45F ();
+7 /u1D456/u1D45B′=random_select (/u1D43A);
+8 /u1D439/u1D43B/u1D44A,/u1D439/u1D446/u1D44A=
+/u1D45D′.ℎ/u1D45C/u1D460/u1D461,/u1D456/u1D45B_/u1D458/u1D452/u1D45F/u1D45B/u1D452/u1D459_/u1D45A/u1D462/u1D461/u1D44E/u1D461/u1D452_/u1D452/u1D465/u1D452/u1D450/u1D462/u1D461/u1D452(in′,O);
+9 for/u1D439∈ {/u1D439/u1D43B/u1D44A/uniontext.1/u1D439/u1D446/u1D44A}do
+10 if/u1D439∉/u1D439/u1D452/u1D452/u1D451/u1D44F/u1D44E/u1D450/u1D458 then
+11 increase_prob( /u1D446,/u1D43A);
+12 /u1D454/u1D45C/u1D45C/u1D451_/u1D456/u1D45B/u1D45D/u1D462/u1D461=regenerate (/u1D439./u1D45A,/u1D456/u1D45B′);
+13 /u1D43A=/u1D43A/uniontext.1{/u1D454/u1D45C/u1D45C/u1D451_/u1D456/u1D45B/u1D45D/u1D462/u1D461};
+14 /u1D439/u1D452/u1D452/u1D451/u1D44F/u1D44E/u1D450/u1D458 =/u1D439/u1D452/u1D452/u1D451/u1D44F/u1D44E/u1D450/u1D458/uniontext.1{/u1D453};
+15 end
+16 end
+17end
+18end
+Input:kernel_input /u1D458/u1D460, mutation_ops_set /u1D442
+Output:/u1D439/u1D43B/u1D44Ais aqueue oftriples( /u1D453,/u1D45A,/u1D45C/u1D462/u1D461)where/u1D453is
+kernel-feedback, /u1D45Ais mutation,and /u1D45C/u1D462/u1D461is kerneloutput
+19In_Kernel_Mutate_Execute( /u1D458/u1D460,/u1D442)
+20begin
+21fori=1..MAX do
+22 operator/u1D45C=select_op (/u1D442);
+23 start/u1D460=random_generate ();
+24 end/u1D452=random_generate ();
+25 mutation /u1D45A= {(/u1D45C,/u1D460,/u1D452)};
+26 /u1D43C/u1D45B/u1D45E/u1D462/u1D452/u1D462/u1D452=/u1D43C/u1D45B/u1D45E/u1D462/u1D452/u1D462/u1D452/uniontext.1mutate_input (/u1D45C,/u1D460,/u1D452,/u1D458 /u1D460);
+27end
+28foreach/u1D456/u1D45B∈/u1D43C/u1D45B/u1D45E/u1D462/u1D452/u1D462/u1D452do
+29 (/u1D453,/u1D45A,/u1D45C/u1D462/u1D461)=ExecuteOnDevice (/u1D456/u1D45B);
+30 /u1D439/u1D43B/u1D44A=/u1D439/u1D43B/u1D44A/uniontext.1(/u1D453,/u1D45A,/u1D45C/u1D462/u1D461);
+31end
+32return/u1D439/u1D43B/u1D44A
+33end
+mutatetheinputlocally.Thetargetfunctiondirectlyaccessesthe
+newinputfromlocalmemory.Inthisprocessofinputmutationand
+targetexecution, HFuzzincorporatedfourFPGAleveloptimizations
+forperformanceeﬃciency.AsshowninAlgorithm 1atLines10-15,
+inputsthatadvanceeithersoftwareorhardwarefeedbackaresaved
+totheinputqueueas /u1D454/u1D45C/u1D45C/u1D451_/u1D456/u1D45B/u1D45D/u1D462/u1D461forthenextfuzzingiteration.If
+anewinputgeneratedbygenerator /u1D43Aresultsinnewfeedback, /u1D43A
+willbeconsideredafavoredgeneratoranditsactivationprobability
+willbe increasedwith /u1D43C/u1D441/u1D436/u1D445/u1D438/u1D434/u1D446/u1D438 _/u1D443/u1D445/u1D442/u1D435(/u1D446,/u1D43A)at Line11.
+3.1 Injecting HWProbesin addition to SW
+Monitors
+HFuzz,for the ﬁrst time , directly introduces application-speciﬁc
+observability to hardware kernels by inserting hardware probes.
+It leverages these kernel probes in tandem with software-level
+monitorstoformeﬀectivefeedbacksignalstostretchheterogeneous
+applicationbehavior.
+1104LeveragingHardware ProbesandOptimizations forAccelerating Fuzz Testingof HeterogeneousApplications ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+Table 1:Mutationsaccelerated by hardware.
+Average
+Category Description SW Mutations In-kernelMutations Speedup
+M1Sparsity Replace non-zeroswith zerosfrom for i in s..e do # pragma unroll 4.31×
+Mutation index/u1D460to/u1D452, or do theopposite {vector[i]=0} for i in s..e{vector[i]=0});
+M2Copy Replace eachelementfrom index /u1D460to/u1D452for i in s..e do # pragma unroll 3.98×
+Mutation with elementat /u1D460 {vector[i]=vector[s]} for i in s..e{vector[i]=vector[s]});
+M3Addition Addconstant /u1D44Eto eachelement for i in s..e do # pragma unroll 3.21×
+Mutation from index /u1D460to/u1D452 {vector[i]+=a} for i in s..e{vector[i]+=a});
+M4Bit Mutatean elementwith binary XOR for i in s..e do # pragma unroll 4.42×
+Mutation given a constant /u1D465 {vector[i]ˆ= (1«x)} for i in s..e {vector[i]ˆ= (1«x)});
+1//First kernel...
+2h.parallel_for (range(M, P), [=]( autoindex) {
+3intsum = 0;
+4#pragma unroll factor=2
+5for(inti = 0; i <num_element; i ++) {
+6 sum += a[index[0]][i] * b[i][index[1]];
+7 if(min_sum >sum) min_sum=sum;
+8 if(max_sum <sum) max_sum=sum;}
+9boolflag;
+10 KToKPipe::write(sum, flag);
+11KToKPipeSize ++;//Pipe usage Probe
+12DeviceToHostKToKPipe::write(KToKPipeSize);
+13DeviceToHostMax_sum::write(max_sum); //sum's Value Range Probe
+14DeviceToHostMin_sum::write(min_sum);});});
+15//Second kernel...
+16h.single_task ([=]() {
+17for(size_t i = 0; i <number_element; ++i) {
+18 out[i] = KToKPipe::read();
+19KToKPipeSize--; //Pipe usage Probe
+20DeviceToHostKToKPipe::write(KToKPipeSize);
+21 out[i] = reciprocalTransform(output[i]); }});});
+22for(inti=0; i<number_element; i ++) {//SW monitor for kernel output
+23outmin=min(outmin, output[i]);
+24outmax=max(outmax, output[i]);}
+Figure 3: Matrix transform: inserted Value Range Probes
+are in the green rectangle. InsertedPipe Usage Probes are in
+theredrectangles.InsertedSWMonitorsareintheorange
+rectangle.
+HardwareProbes. WhileOSvirtualizationcouldprovidetheap-
+pearanceofunboundedresourcesforthecodeexecutedontradi-
+tional CPUs, kernel functions are physically mapped to resource-
+limitedheterogeneousarchitectures.Thisdistinctionleadstounique
+failuresthatareofteninducedby resourcelimitations onthedevice-
+side,whicharenoteasilydetectablewhenrunningsoftwaresim-
+ulators. For example in Figure 2, a local variable sqrcustomizes
+regularintegersto8-bitintegersforresourceeﬃciency.Overﬂow
+conditions can occur if the variable’s value exceeds its customized
+bitwidth.Asanotherexample,pipesaturationbetweentwoconsecu-
+tivekernelfunctionscanleadtoreadandwritefailures.Infact,such
+incorrect intermediate computationstates withinhardwarekernels
+havebeenidentiﬁedastheprimaryreasonforhardware-originated
+bugs.HFuzztakes advantage of this observation, identiﬁes local
+variableswithinkernelsthatholdintermediatestates,andinjects
+hardware probes to expose potentialfailures inkernel.
+HFuzzautomatestheprocessofhardwareprobeinsertionthrough
+source tosource transformation,creating an instrumented kernel.
+From such instrumented kernel, intermediate states in the HW de-
+vice are sent directlyto thehost codeusing dedicated host-kernelcommunication channels. The channels are implemented as global
+FIFObuﬀersandcanbeaccessedfromboththehostandthekernel.
+The kernel side writes hardware feedback into the channels, while
+thehostsidereadsinformationfromthechannels.Bothreadand
+writeoperations are non-blocking, in orderto minimize any addi-
+tionaloverheadtotheoriginalkernellogic.Toexposeintermediate
+computationstates, HFuzzidentiﬁesin-kernellocalvariablesand
+pipe usage via a C/C++ AST analysis [ 4]. As shown in Figure 3,
+in-kernel variable sumis highlighted in green, and pipe usage is
+highlightedinred.Withafocusonin-kernellocalvariableandpipe
+monitoring, HFuzzaimstouncoverthetwomostcommonlyseen
+errorsincustomhardwareaccelerators:overﬂowsresultingfrom
+theresourceandbitwidthﬁnitization,aswellasread/writefailures
+causedbycommunicationpipe saturations.
+•Value Range Probe :HFuzzcreates a value range monitor that
+checks the maximum and minimum value for each in-kernel
+variable. In Figure 3,HFuzzinserts probes on the intermediate
+variablesumwhichsaves the cumulative sum of the product
+a[index[0]][i]*b[i][index[1]] .Theseprobesmonitortheminimum
+and maximum value of sum.HFuzzalso constructs channels
+DeviceToHostMax_sum andDeviceToHostMin_sum tosendthesecap-
+turedvaluesback to the hostat Line13-14.
+•PipeUsageProbe :HFuzzcreatesapipeusagemonitorforeachcom-
+municationpipe.ConsiderthesameexampleinFigure 3.HFuzz
+usesanASTanalysistool[ 4]toidentifythelocationsoftwoker-
+nelfunctions: matrix_multiply atLine1-14and transformer
+Line 16-21. We identify the variable name, KToKPipe used for
+pipe-based data transfer between the two kernels. By using
+KToKPipe::write() andKToKPipe::read() , the ﬁrst kernel
+writesitsresult sumatLine10andthesecondkernelreadsthe
+valuefrom thispipeatLine 18in Figure 3.HFuzzapplies source
+tosourcetransformationtoinjectacounter-basedusagemonitor
+for this pipe and update the counter KToKPipeSize at Line 11
+and Line 19 in Figure 3. ThenHFuzzsends this counter value
+tothehostbycreatinganotherdirectcommunicationchannel,
+calledDeviceToHostKToKPipe at Line12 andLine20.
+Software Monitors. In addition to in-kernel probes, HFuzzinserts
+asetofsoftwaremonitorsonthehostside,specializedtothecus-
+tomFPGAacceleratorsynthesizedonthedevice.Wemonitor:(1)
+the number of loop iterations, because it is related to pipelining
+andloopunrolling,commonoptimizationsforparallelizationim-
+plementation on FPGA; (2) the value range of each kernel input
+and output; (3) the kernel execution time, as hang or unexpectedly
+slow execution could be an indicator of failures. HFuzzretrieves
+the time and loop unrolling information from the HLS compilation
+1105ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA Jiyuan Wang,Qian Zhang,Hongbo Rong,Guoqing Harry Xu,andMiryungKim
+report generated by DPC++. Besides, to monitor the value range of
+eachkernel input and output, HFuzzinserts avalue range monitor
+before andafter eachkernel,as showninLines22-24ofFigure 3.
+3.2 OﬀloadingInput Mutations to Kernels
+The traditional fuzzingprocess involvesrepeatedly mutating seed
+inputsandfeedingthemintoatargetprogram.Theimplicitassump-
+tion underlying such mutations is that seed inputs can be mutated
+and sent to the targetprogram fast. Unfortunately, this assumption
+doesnotholdtrueforheterogeneousapplications.Inputstohetero-
+geneousapplicationsareoftenlargematrices,leadingtosigniﬁcant
+data transfer overheads between CPU and FPGA. We observe that
+localdatatransfer—datatransferwithinFPGAs,consumeslessthan
+89%ofthetimerequiredfordatatransferbetweenthefuzzerand
+thekernel.Additionally,intheprocessoffuzzing,avarietyof in-
+dependent mutationoperationsarefrequentlyemployedonsmall
+segments of the same seeds with the aim of exploring the input
+space. Thus, we can avoid repetitive data transfer by oﬄoading
+the seed inputs to hardware kernels and mutating them directly
+within FPGAs. Toachieve this, HFuzzcreates adedicatedkernel for
+mutations in parallel to the original kernel, as well as a segment of
+on-chipmemoryforthestorageofseedsandnewlygeneratedin-
+puts.Themutationkernelandtheoriginalkernelfunctionareboth
+synthesizedtotheFPGAhardwareconcurrently.Table 1showsfour
+supported mutation operators. Because mutation operators are all
+order-independent anddeterministic, HFuzzmodiﬁesallelements
+in the seed input at once. A resulting input can be re-generated
+given the seedandaconcrete instanceofmutation.
+ConsiderFigure 3asanexample.Theﬁrstkernelcodecomputes
+thematrixproductwith twoinputmatrices.Weshowhow HFuzz
+tracksthefeedbackandmutatestheinputstepbystepinTable 2.
+With the initial seed input oﬄoaded to the kernel, HFuzztracks
+hardwarefeedbackfromthein-kernelvariable sumatLine2bythe
+inserted in-kernel probes in the green rectangle (column Hardware
+ProbesinTable2).Afterweapplythe M3AdditionMutation with
+loop unrolling optimization, from the starting oﬀset s=1to the
+endingoﬀset e=4onarraya,agreyboxfuzzerthatonlymonitors
+the value range for the kernel interface variables aandbwould
+discard the input [-20,5,7,7,9,20] because it does not achieve a
+newvaluespectraat thesoftware level.However, HFuzzsavesthe
+corresponding mutation information, since this input registers a
+newfeedbackat the hardware level for the in-kernel variable sum.
+3.3 FPGA Optimizations forFuzzing
+Traditional fuzz testing can be naïvely applied to heterogeneous
+applications by treating hardware kernel invocations as equiva-
+lent to software function calls. However, such straightforward ap-
+plication of software-style fuzzing results in severe performance
+ineﬃciencies. In heterogeneous applications, there is a distinct
+opportunity toutilizehardwaremicro-architectureleveloptimiza-
+tions to accelerate the traditional fuzzing process. Both iterative
+matrix mutations and target executions involve independent tasks,
+enabling task-level parallelism.
+HFuzzapplies four FPGA optimizations to accelerate iterative
+matrix mutations and target execution, including loop unrolling,
+shannonization, local memory access, and dynamic kernel sharing.1for(inti = s; i <e; i++) {
+2if(A[i]==0) {A[i] = generate_number(seed);}}
+(a)Original mutation
+1intlocal_A[e-s];
+2#pragma unroll factor=4
+3for (inti = 0; i < e-s; i++) {local_A[i] = A[i+s];}
+4intt = generate_number(seed);
+5for(inti = 0; i <e-s; i++) {
+6if(local_A[i]==0) {
+7local_A[i] = t;
+8t = generate_number(seed);}}
+9#pragma unroll factor=4
+10for (inti = 0; i < e-s; i++) {A[i+s] = local_A[i];}
+(b) Optimizedmutation inkernel
+Figure4:Sparsitymutation:replacethezeroelementstonon-
+zeroelements fromindex sto index e.
+These optimizations are not speciﬁc to HFuzzor Intel’s heteroge-
+neousarchitecture,andthusalsoareapplicabletootherapplications
+on other FPGAs. For instance, loop unrolling is a technique that
+canbeusedtooptimizeiterativecomputationsthatdonothavesig-
+niﬁcantdatadependenciesbetweeniterations,anditcanbeapplied
+independently ofthe speciﬁc FPGA platform.
+1. Dynamic Kernel Sharing. In traditional fuzzing, the diﬃculty
+oftestingoftenarisesfromtheneedtoexploredeepbrancheswithin
+theprogram.However,whentestingheterogeneousapplications,
+errors tend to occur due to variations in the range of values for
+in-kernel variables and resource usage. This presentsa signiﬁcant
+challenge of rapid input space exploration especially when inputs
+are large matrices.
+Weproposeadynamic,probabilistickernel-sharingmethodto
+interleavetheexplorationofinputsearchspaceoriginatingfrom
+multiple seeds in heterogeneous applications. To implement this
+method, HFuzzemploys fourinput generatorsthatshare thesame
+target kernel and each has its own seed queue. These input genera-
+tors start with diﬀerent seed inputs and, during each iteration, one
+generatorischosenbasedonanactivationprobabilityarray.The
+selected generator then picks a seed input from its queue, mutates
+it within the kernel, and sends the generated input to the target
+kernelfunctionviaon-chipmemoryonthedevice.Ifthegenerated
+input results in new feedback, it is saved in the generator’s seed
+queuefor use infuture fuzzingiterations.
+HFuzzutilizesanadaptiveapproachtoinputgenerationbyse-
+lecting an input generator and its associated seed queue based
+onanactivationprobabilityarray.Theselectionprocessinvolves
+evaluating the performance of each generator and adjusting its
+probabilities accordingly. For instance, if a new input generated by
+generator /u1D43Aresultsinnewfeedback,itwillbeconsideredafavored
+generator and its activation probability will be increased. Other-
+wise,itwillbelabeledasaninactivegeneratoranditsactivation
+probability will be decreased. This approach allows for eﬃcient
+input space exploration and ensures that the test generation is
+1106LeveragingHardware ProbesandOptimizations forAccelerating Fuzz Testingof HeterogeneousApplications ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+Table 2:Example execution ofinput generator /u1D43A.
+Mutation Kernel HardwareProbes SoftwareMonitors New Value Over- Save Memorization
+ID Operator Inputs Variable Min Max Min Max Range ﬂow Input HWRange SWRange /u1D443/u1D43A
+Seed N/A sum -56 168 N/A No N/A [-56,168] 0.25
+a[][1]=[-20,2,4,4,6,20] a -20 20 N/A [-20,20]
+b[1][]=[1,-10,-4, -14,28, 0] b -14 28 N/A [-14,28]
+1M3 sum -202 54 Yes NoYes [-202,168] 0.3
+starts=1a[][1]=[-20,5,7,7,9,20] a -20 20 No [-20,20]
+ende=4b[1][]=[1,-10,-4, -14,28, 0] b -14 28 No [-14,28]
+2M2 sum -70 140 No No No [-202, 168] 0.25
+starts=1a[][1]=[-20,5,5,5,5,20] a -20 20 No [-20,20]
+ende=4b[1][]=[1,-10,-4, -14,28, 0] b -14 28 No [-14,28]
+3M3 sum 20 -140 No Yes Yes [-202,168] 0.3
+starts=1a[][1]=[-20,8,10, 10, 12, 20] a -20 20 No [-20,20]
+ende=4b[1][]=[1,-10,-4, -14,28, 0] b -11 28 No [-14,28]
+focusedonareas that are likely to yieldnewfeedback:
+/u1D443/u1D43A= 
+/u1D443/u1D43A+/u1D6FCif/u1D43Ais chosenand HFuzz
+gets newfeedback
+/u1D443/u1D43A−/u1D6FC
+/u1D459−1if/u1D43Ais notchosenand HFuzz
+gets newfeedback
+/u1D443/u1D43A−/u1D6FCif/u1D43Ais chosenand HFuzz
+gets no newfeedback
+/u1D443/u1D43A+/u1D6FC
+/u1D459−1if/u1D43Ais notchosenand HFuzz
+gets no newfeedback(1)
+Inourexperiment,wesetthenumberofgenerators /u1D459tobe4.The
+initialactivationprobabilityforeachgenerator /u1D443/u1D43Aissetto1/ /u1D459=0.25.
+Theupdate factor /u1D6FCis predeﬁned as 0.05. In Table 2, inthe second
+execution (ID 2), inputs generated by generator /u1D43Aincreased the
+hardwaremonitorrange.Asaresult, HFuzzincreasestheactivation
+probability of /u1D43Afrom 0.25to 0.25+ /u1D6FC=0.3.
+2. Data Preloading [ 28].Matrix mutation on large matrices re-
+quiresasigniﬁcantamountofdatareadandwriteoperations.To
+improveeﬃciency,itiscrucialtominimizememoryaccesstimefor
+inputvectorsormatrices.Manyheterogeneouscomputingsystems,
+suchasInteloneAPI,haveboth globalmemory thatcanbeaccessed
+by both kernel and host code, and on-chip local memory that is
+only accessible by kernel code. Accessing local memory within the
+kerneltypicallyhasashorterlatencythanaccessingglobalmemory.
+Wethusapplydatapreloadingtotransferdatafromglobalmemory
+to local memory.
+In Figure 4b,HFuzzreduces memory access costs(highlightedin
+red)bytransferringdatafromarray Atothelocalarray local_A.
+ThisresultsinareductionofmemoryaccesscostasseenatLines6-
+7 in the optimized code, compared to the original code in Figure 4a
+atLine2.Thisoptimizationleadstoa1.31xspeedupinthemutation
+process.
+3.Shannonization[ 27].Sparsitymutationreplaceszeroelements
+with non-zero elements. It necessitates the implementation of a
+null check for each element in the matrix. As shown in Line 2 of
+Figure4a,anifstatementisaddedtoaccomplishthis.However,this
+ifstatement induces extra hardware overhead, as it increases the
+delayinthecriticalpath.Eachtimethe ifconditionissatisﬁed(i.e.
+A[i]==0),theoperation generate_number needstobecomputed,
+whichcan slowdownthe overallperformance.
+Shannonization improves performance by precomputing opera-
+tionswithinaloopandremovingthemfromthecriticalpath.Inthisexample, HFuzzappliesshannonization(highlightedingreeninFig-
+ure4b)byprecomputingtheoperation generate_number atLine
+4,andremovingitfromthecriticalpathinsidethebranchatLine6.
+ThenHFuzzprecomputesthe next value of t = generate_number
+at Line 8 for a later iteration of the loop to use when required
+(thatis,thenexttime local_A[i]==0 ).Thisprecomputationcan
+bedonesimultaneouslywithintheloop,allowingforareductionin
+thecriticalpathdelayandleadingtoa1.24xspeedupinthesparsity
+mutation process.
+4.LoopUnrolling[ 29].Software-stylemutationsonlargevectors
+andmatricesareoftenperformedbymodifyingoneorsomepartic-
+ularelements.Line2inFigure 4ashowsanexamplemutationbased
+onaforloop.Suchdirectapplicationofloopsonhardwareneglects
+thepotentialforhardwareparallelism,resultinginineﬃcientuse
+ofhardware resources.
+Loopunrollingimprovesperformancebycreatingmultiplecopies
+of the loop body, thus the required number of iterations is reduced.
+In the example shown in Figure 4b, the#pragma unroll directive
+(highlighted in orange) causes the kernel to unroll the loop by a
+factorof4,asspeciﬁedbythe factor=4 argument.Thecompiler
+thenexpandsthepipelinebyquadruplingthenumberofoperations
+and loading three times more data. This results in a 4x speedup of
+the loopprocess.
+4 EVALUATION
+We evaluate the following research questions:
+RQ1How much improvement in defect detection capability is
+achieved by incorporating both device-side feedback and
+host-sidefeedbackin HFuzz?
+RQ2How much speed-up is achieved by in-kernel input muta-
+tions?
+RQ3Howmuchspeed-upisachievedbyFPGA-leveloptimizations
+for fuzzing?
+RQ4Howmuchoverheadisincurredbyinjectinghardwareprobes
+inHFuzz?
+Toassesstheimprovementindefectdetectionandfuzzingaccel-
+eration, we compare HFuzzagainst fourbaselines.
+(1)Alternative 1 AFL-like: This option uses branch-coverage
+guidedfuzzingsimilartoAFLandperformsinputmutations
+onCPUside.
+1107ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA Jiyuan Wang,Qian Zhang,Hongbo Rong,Guoqing Harry Xu,andMiryungKim
+0 100 2000246
+Time (min)R1
+0 100 200
+Time (min)R2
+0 100 200
+Time (min)R3
+0 100 200
+Time (min)R4
+0 100 200
+Time (min)R5
+0 100 200
+Time (min)R6
+HeteroFuzz NoKernelMutation AFL-like
+NoHWoptimization HFuzz0 100 200
+Time (min)R7
+Figure 5:# NumberofDefects
+(2)Alternative 2 HeteroFuzz : This option is a replication of the
+state-of-art work HeteroFuzz [58] for Intel DPC++. Com-
+paredto HFuzz,itdoesnothavein-kernelprobesonFPGA
+devices andconsidersonly software monitoringfeedback.
+(3)Alternative 3 NoKernelMutation : This option disables in-
+kernel mutations and performs input mutations on the CPU.
+(4)Alternative 4 NoHWoptimization : This option disables hard-
+ware optimizations andonly uses one inputqueueinstead.
+Benchmarks. We choose sevenapplicationsfrom Intel’sOneAPI
+GitHub repositories [ 24]: (R1) Matrix-transform. It has two ker-
+nels—one for matrix multiplication M=A*B and the other for re-
+ciprocal transformation on each element of M; (R2) Matrix-mul:
+multiplicationoftwomatrices;(R3)Complex-mul:multiplicationof
+two vectorsof complex numbers in parallel; (R4)APSP: the Floyd-
+Warshallalgorithmtoﬁndtheshortestpathbetweenthepairsof
+vertices in a graph; (R5) Nbody-sim: Simulation of a dynamical
+system of particles under the inﬂuence of gravity; (R6) Hidden-
+Markov-model: a statistical model using a Markov process; (R7)
+Match-num:readingdatafromthehostandsendingthenumbers
+that matchasetofpre-deﬁnedconstants back to the host.
+These benchmarks are widely used in hardware acceleration
+literature [ 46] and cover a representative set of optimizations used
+inkernels(e.g.,custombitwidth,loopunrolling,etc.)andexhibit
+diﬀerentmemoryusagepatterns(e.g.,buﬀermemoryanduniﬁed
+shared memory for kernel input and output, kernel-to-kernel pipe
+and kernel-to-host pipe, local memory for in-kernel variables, etc.).
+Testingdiﬃcultiesforheterogeneousapplicationsdonotdepend
+on the code size; rather, it depends on how hardware resources
+are synthesized (e.g., in-kernel variables, loop unrolling) and the
+communicationchanneldetailsbetweensoftwareandhardwareand
+betweenhardwarekernels.Thesebenchmarks’kernels are widely
+used and their code size is similar to commercial HLS benchmarks.
+Theyarecomplexinbothoptimizationsandmemoryarrangements
+andhardto getright.
+Experimental Environment. All experiments were conducted
+on Intel DevCloud A10 nodes [ 26]. The automated kernel probe in-
+sertionwasimplementedusingDPC++compilerandPycparser[ 4].
+The refactored programs were synthesized to RTL and targeted to
+Intel Arria 10 GX FPGA [ 30]. We also tried HFuzzon other FPGAs
+like Intel Stratix 10 SoCFPGA [ 31]andachievedsimilar results.Table 3:Example symptoms ofkerneldefectsinR1.
+ID Symptom Description HeteroFuzz Find
+S1 Kernel The value of intermediate ✓
+Runtime variables sumat line2of
+Overﬂow Figure 3exceedsits bitwidth
+capacity,leading to awrong result.
+S2 Pipe Pipewrite failurehappens ×
+Write whenFPGA attempts to write
+Failure into apipewhenthepipeisfull.
+S3 Pipe Pipereadhanghappens ×
+Read whenFPGA attempts to read
+Hang synchronouslyfrom anemptypipe.
+S4 Division suminline5of Figure 3 ×
+by Zero equals 0, leading to divide
+by zeroat line21.
+S5 Incorrect CPUand FPGA produce diﬀerent ✓
+Loop resultswhentheinput array size
+Unrolling num_element isnot multiple of 2.
+4.1 Defect Detectionby HWandSWFeedback
+We assess theeﬀectivenessof HFuzz’sfeedback guidancebycom-
+paringthenumberofdefectsdetectedthroughcombinedhardware
+probesandsoftwaremonitorstothatof HeteroFuzz ,whichrelies
+solelyonsoftwaremonitors.Foreachbenchmark,we generatetest
+inputs using HFuzzandHeteroFuzz for 4 hours. We tried longer
+time (24 hours) but no more defect is found after 4 hours. Using
+the generated inputs, we then perform diﬀerential testing between
+CPU-only executions and CPU+FPGA executions and measure the
+number ofdefects(i.e.,divergingoutcomes) found.
+Figure5shows the averageexperimentalresults fromtenruns.
+HFuzzis able to detect 3.1 ×more defects than HeteroFuzz . For
+example,forR5Nbody-simulation,withoutmonitoringin-kernel
+variablesqr,HeteroFuzz cannotﬁndthedivide-by-zeroerrorwe
+mentioned in Section 2.2at Lines 16-18 in Figure 2. When using
+HeteroFuzz , the value range of kernel inputs does not reﬂect the
+change in the square of distance between particles sqr.HFuzz,
+instead,directlymonitorsthevaluerangeofin-kernelvariable sqr,
+and ﬁnds the defects when sqrreaches its minimum value 0. In
+total,HeteroFuzz ﬁnds 8 unique defects in 16.5 hours, while HFuzz
+ﬁnds the same defects in 1.6 hours—almost 90% reduction in the
+testingtime.
+Table3listsﬁvedefectsfoundby HFuzzinR1Matrix-transform .
+First,S1showsanoverﬂowoccurredintheFPGAexecutiondue
+to the in-kernel variable sumat Line 3 in Figure 3. It happens when
+1108LeveragingHardware ProbesandOptimizations forAccelerating Fuzz Testingof HeterogeneousApplications ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+R1 R2 R3 R4 R5 R6 R7104105InputTrialsHFuzz NoKernelMutation
+Figure 6:NumberofInput Trials
+the input vector aincludes a large number such as 2090401586. By
+monitoringin-kernelvariable sum’svaluerange, HFuzzincreases
+the chance ofgeneratinganewvector withlarge numbers.
+Second, two kernels in R1 use a 128-byte pipe to facilitate direct
+data transfer. As mentioned in Section 1, when the ﬁrst kernel
+producesresultsfasterthanthesecondkernelcanconsume,thepipe
+maybecomesaturated.Consequently,apipewritefailureoccurs
+silently and the newly written value is lost, shown as S2in Table3.
+This may further lead to another defect S3: pipe read hang. The
+second kernelin Figure 3reads values fromthe pipe for number_-
+elements times. However, if the number of values successfully
+writtentothepipeislessthan number_elements ,thesecondkernel
+willhangatthispiperead.Bothdefectscannotbedetectedbyprior
+workHeteroFuzz becausehost-sidesoftwaremonitorscannotdetect
+the saturationofcommutation pipes.
+Third,S4depicts a divide-by-zero error caused by the inter-
+mediate result sumin the second kernel reciprocalTransform at
+Line21inFigure 3.Ithappenswhenbothtwoinputmatricesare
+sparse matrices. OnCPU,thisexecution mayraiseadivision-by-
+zero exception; however, it silently returns an unexpected number
+on FPGA instead. By monitoring sum’s value range, HFuzztriggers
+this defectbygeneratinginputsusing SparsityMutation .
+Fourth, since R1 makes two copies of the loop body at Line 4
+in Figure 3by using #pragma unroll factor=2 , a wrong result
+happens if the number of loop iterations num_elements is not a
+multiple ofthe unroll factor 2.
+HFuzzachieves 10.3 ×speed-up and ﬁnds 25 new defects
+comparedto HeteroFuzz ,demonstratingthecombinedben-
+eﬁt ofhardware probes andsoftware monitors.
+4.2 Speed-upfrom In-kernelInput Mutations
+To assess speed-up enabled by oﬄoading input mutations to FPGA
+devices,wecompare HFuzzwithadowngradedversion NoKernel-
+Mutation .Wemeasurethenumberofgeneratedinputsanddefects
+foundwithin the same 4-hourbudget.
+Figure6reportstheaveragenumberofinputtrialswithin4hours.
+For example, in R7, NoKernelMutation generates 23225 inputs,
+whileHFuzzgenerates100918inputs(5.3 ×speed-up)byavoiding
+redundant data transfer and parallelizing input mutations. In R2,
+NoKernelMutation andHFuzzenumerate 15824 and 112940 inputs
+respectively, leading to 7.1 ×speed-up. R2 achieves higher speedup
+thanR7becauseitsperformanceismoredominatedbydatatransfer
+as showninFigure 1.
+Figure5shows the number of defects found by NoKernelMu-
+tation.WhileNoKernelMutation reports14uniquedefectsin24hours,HFuzzdetectsthesamedefectsin5.1hours,whichtranslates
+to4.7×speed-upindefectdetection.Thesedefectsarenotfoundby
+NoKernelMutation ,becauseitwastestimeinsequentiallymutating
+inputsinCPUandsendingthe large data to the kernel.
+HFuzzreduces the need for data transfer by oﬄoading
+mutationsintokernelsandthusspeedsupfuzzingby4.7 ×.
+4.3 Speed-upfrom FPGA-level Optimizations
+To evaluate the eﬀectiveness of FPGA-level optimizations for input
+generation, we created a downgraded version of our tool NoHWop-
+timization ,whichdisablesthisfeature.Weevaluatedthetimetaken
+toﬁndthesamedefects.TheresultsareshowninFigure 5.Com-
+pared to NoHWoptimization ,HFuzzﬁnds the same 33 bugs 3.4x
+faster,taking only 8.3 hours as opposedto 28 hours.
+In R1 (e.g., Figure 3), the detected defects include (1) a divide-
+by-zeroerrorwhenthekerneltakesasinputtwosparsematrices
+and(2)anoverﬂowerrorwhenthekerneltakesasinputtwodense
+matriceswithlargeelements.Becauseinputsleadingtothesede-
+fects are distinct from each other, traditional mutational fuzzers
+with a single input queue may be ineﬃcient to ﬁnd them. In fact, it
+takes2hourstomutatetwosparsematricesintodenseones. HFuzz
+usesone hardwareoptimizationtechnique,calleddynamickernel
+sharing, to enable simultaneous exploration of input subspaces
+originatingfromdiﬀerentseeds.Forthat, HFuzzutilizesmultiple
+inputgenerators.Onegenerator /u1D434starts withdense matrices and
+anothergenerator /u1D435startswithsparsematrices. HFuzzcandetect
+these two bugs by interleaving generator /u1D434and generator /u1D435based
+onruntimefeedback.Forexample,whengenerator /u1D434reachesits
+maximum value and triggers an overﬂow, it can no longer provide
+any new feedback. HFuzzwill switch to generator /u1D435and detect the
+divided-by-zeroerror. HFuzzreduces the detection time to 5mins.
+HFuzzachieves3.4 ×speed-upinthedetectionofdetects
+by implementing hardware optimizations. Loop unrolling,
+shannaization,andfastmemoryaccessdirectlyspeedup
+the mutation process. Dynamic kernel sharing enables
+eﬃcient inputspaceexploration.
+4.4 ProbeOverhead
+Insertinghardwareprobesintotheoriginalkernelsmaycauseextra
+overheadonhardwareresources,asreportedinTable 4.Wemea-
+sure four types of hardware resource, including ALUT (a lookup
+table implementing the boolean function), FF (ﬂip ﬂops for storing
+temporarydata),RAM(randomaccessmemoryblocks),andDSP(a
+digital signal processing unit for common ﬁxed-point and ﬂoating-
+pointarithmetic).Theinsertedkernelprobesincurarelativelylarge
+overhead for a simple kernel because the inserted probes signiﬁ-
+cantlyincreasekernellogiccomplexitycomparedtotheoriginal
+kernel.InR2,comparedtotheoriginalkernelwith9592ALUTsand
+14466FFs,insertedprobesused22%moreALUTsand33%moreFFs.
+ForarelativelycomplexkernelR4,theoverheadis6%ALUTand
+10%FFs.Theextraresourceusagemainlycomesfrom(1)theprobe
+computationincludingread andwrite,and(2) thekerneldispatch
+logic establishes the communicationbetween kernel andhost.
+1109ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA Jiyuan Wang,Qian Zhang,Hongbo Rong,Guoqing Harry Xu,andMiryungKim
+Table 4: Resource overhead from injecting hardware probes.
+ID/Program #LUT #FF #RAM #DSP Freq
+/MHz
+R1/ Orig 15932 25088 137 4.5 247
+Matrix_trans Probe 17905 34320 192 4.5 246
+R2/ Orig 9592 14466 492 16 259
+Matrix_mul Probe 12032 19443 492 16 247
+R3/ Orig 11545 18494 106 6 273
+Complex_mul Probe 11203 27117 106 6 253
+R4/ Orig 60468 92249 555 195 221
+APSP Probe 64327 101229 558 195 212
+R5/ Orig 23642 44352 309 34 270
+Nbody_sim Probe 27612 50549 317 34 260
+R6/ Orig 48706 64987 395 67 257
+HMM Probe 56562 87392 491 67 247
+R7/ Orig 2239 1357 67 12 279
+Match_num Probe 3828 2033 73 12 259
+Suchoverheadcouldbefurtherreducedbymanualoptimizations.
+Forexample,Curreri[ 17]performsresourcesharingbyusing the
+same FIFO probe for multiple feedbacksignals.
+Hardwareprobeinsertionuses24%extraLUT,29%extra
+FF, and 8% extra RAM, and reduces frequency by 5% on
+average. However, it enables an overall 10.3 ×speed-up in
+defectdetection byprovidinghardware feedback.
+5 THREATS TO VALIDITY
+We discuss the threatsto validity as follows.
+DeviceDependence. Ourexperimentsrunallkernelexecutions
+on two prominent FPGA cards: S10 and A10 [ 30,31], which are
+among the most widely used FPGAs currently. This speciﬁc con-
+ﬁguration may constrain the applicability of our results to other
+devices,suchasIntel’sAltera,becausethedivergencesymptoms
+detected could diﬀer across diﬀerent platforms. While the absolute
+values of execution time and symptoms depend on conﬁgurations,
+we believe that HFuzzwill preserve its overall advantages in terms
+of acceleration and divergence-detection capability when extended
+to variousplatforms.
+Time Limit. We empirically set four hours as the time limit for
+fuzzing.Longerexecutiontimemayexposemoredivergenceerrors
+or more execution paths as suggested in [ 32]; however, this time
+limitis reasonable,aswedid notseeanyincreaseinnewtypesof
+divergenceerrorswithahigher time limit for subjectsR1-R7.
+Scalability. Theinsertionofourprobesreliesonthestaticanalysis
+ofheterogeneousprogramsandoftennecessitateshumaninterven-
+tion to address potential transformation errors. This process can
+becomechallenging,particularlyforcomplexin-kernellogicwithin
+large programs. Further experimentation is essential to validate
+the scalability of our method. However, our benchmarks may look
+smallinsizefromthesoftwareengineeringperspective,butthey
+aresizableinthehardwarecommunity.Rossetabenchmarks[ 59]
+andheterogeneousapplicationsinIntelDevcloud arecomparable
+insize(i.e.,hundredsoflinesofcode.)Testingcomplexityforhet-
+erogeneous applications do not depend on the lines of code size.
+Instead,theydependonfactorssuchashowhardwareresources
+are synthesized (e.g., in-kernel variables, loop unrolling), as wellas the nuanced details of the communication channels between
+software andhardware,as well as among hardware kernels.
+6 RELATED WORK
+Fuzz Testing. Traditional fuzzing starts from a seed input, runs
+the program on the selected input, generates new inputs by mutat-
+ing the previous input, and adds new inputs to the queue if they
+improve a given guidance metric such as branch coverage. Instead
+of using coverage as guidance, several techniques use custom guid-
+ancemechanisms.UAFL[ 50]incorporatestypestatepropertiesand
+informationﬂowanalysistodetecttheuse-after-freevulnerabili-
+ties.BigFuzz[ 57]monitorsdataﬂowoperatorcoverage intandem
+with branch coverage for dataﬂow-based analytics. For example,
+MemLock[ 51] employsbothcoverage and memoryconsumption
+metrics. AFLgo [ 5] extends AFL to direct fuzzing towards user-
+speciﬁed target sites. SiliFuzz [ 48] ﬁnds CPU defects by fuzzing
+softwareproxies,likeCPUsimulatorsordisassemblers,andthen
+executingtheaccumulatedtestinputs(knownasthecorpus)onac-
+tual CPUs on a large scale. PerfFuzz [ 36] uses the execution counts
+of exercised instructions together with branch coverage to iden-
+tify inputs revealing pathological performance. HeteroFuzz [ 58]
+generates concrete test inputs for heterogeneous applications to
+performdiﬀerentialtestingbetweenCPUvs.CPU+FPGA.Unlike
+HFuzz,HeteroFuzztreatsthekernelsasblackboxesandperforms
+software-levelmonitoringonly.Allthesetechniquesrelyonpure
+software-levelfeedbackeitheratthelevelofcodecoverageorusing
+custom monitors. None leverages hardware probes in tandem with
+software monitors to guide test inputgeneration, like HFuzz.
+Afuzzingloopconsistsofmultipleinvocationsofatargetpro-
+gram with diﬀerent inputs in an independent manner; thus, it pro-
+vides a natural opportunity for parallelism. AFL++ [ 20] injects a
+fork server, which tells the target to fork itself to run, and thus
+realizes parallel fuzzing across multiple CPU cores or across a ﬂeet
+of systems. For example, P-Fuzz [ 49] distributes unique seeds to
+runfuzzinginparallel,andPAFL[ 38]maintainsglobalandlocal
+guiding information for synchronizing parallel fuzzing jobs. These
+techniquesacceleratefuzztestingviadistributedcomputationon
+CPU,unlike HFuzz,noneacceleratesfuzzingbyusingFPGAs. HFuzz
+pushes iterative input mutation directly to an FPGA kernel, and
+beneﬁtsfromthemassivehardwareparallelismintrinsictoFPGA
+duringiterative testingof heterogeneous applications.
+Coverage-guided greybox fuzzing adds test cases into the set
+ofseedsiftheyexercisethenewpathornewbehavior.However,
+mostseedsexercisethesame“high-frequency”paths.Toexplore
+more paths with the same number of tests, researchers develop
+strategiestoselectseedswisely.AFLFast[ 6]modelscoverage-based
+greybox fuzzing as a Markov chain, and assigns diﬀerent selection
+probabilitiesfordiﬀerentseeds.EcoFuzz[ 53]improvesAFLFast’s
+Markov chain model and presents a variant of the Adversarial
+Multi-ArmedBanditmodel.EcoFuzzsetsthreestatesoftheseeds
+set and develops a unique adaptive scheduling algorithm. While
+these techniques select seedsbasedon probabilities, none of them
+leveragesFPGA-leveloptimizationstospeedupseedselectionwith
+dynamic kernel sharing.
+1110LeveragingHardware ProbesandOptimizations forAccelerating Fuzz Testingof HeterogeneousApplications ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+High Level Synthesis & In-Circuit Debugging. To ease the
+development of heterogeneous applications, HLS tools automat-
+ically generate RTL descriptions from C/C++ programs. To help
+debuggingHLS-generated circuits, Inspect[8]introducessoftware
+debugger-likecapabilities,includinggdb-likebreakpoints,step,and
+data inspection. It tracks ﬁle names and line numbers in HLS code,
+sothatHWprobesatthelevelofwiresandregisterscouldbelinked
+to speciﬁc lines in the HLS code. A user can monitor each variable
+for its data width and the number of elements in an array. Monson
+and Hutchings [ 41] design a debugger for HLS-generated FPGA-
+basedcircuitsviasourceinstrumentationbyconnecting C expres-
+sionstotop-levelportsthatserveasdebugsignals.HLScope[ 12]
+isaperformancedebuggerthattracesthecauseofstallsforHLS-
+generated circuits. Curreri et al. realize in-circuit assertions for
+timinganalysisandstall-relatebugs[ 17].Whilethesedebuggers
+andHFuzzleverageasimilarmechanismofinjectingHWprobes,
+HFuzz’sgoal is diﬀerent—itimproves theeﬀectiveness of grey-box
+fuzzing for heterogeneous applications by designing meaningful
+monitors at both software andhardware levels.
+Inthehardwaredesigncommunity, circuitveriﬁcation ,includ-
+ing formal veriﬁcation and runtime veriﬁcation, has been used
+to validate code written in hardware description languages (Ver-
+ilog,VHDL,etc.).For example,RFUZZ[ 34]isacircuit-level input
+generatorforFIRRTLIR(UCBerkeley’sRTLvariant).RFUZZin-
+vents a notion of MUX toggle coverage for circuit testing at the
+gate level and employs a rapid memory resetting on FPGA for RTL
+circuit veriﬁcation. However, their monitors are gate-level and not
+application-speciﬁc. Qin and Mishra present a scalable test genera-
+tion technique [ 43] for hardware kernels in Verilog by interleaving
+concrete and symbolic execution to bridge the gap between model
+checking and testing. Kourfali and Stroobandt [ 33] exploit parame-
+terizationofLUTsandroutinginfrastructuresinanFPGAtocreate
+avirtualdebuggingoverlaynetworkinsidecircuits.Thesecircuit
+testingandveriﬁcationtechniquesﬁndbugsinkernelsatRTLlevel,
+whileHFuzztargetsend-to-end testing of heterogeneous applications
+writteninHLS .Inotherwords,itisnotfeasibletodirectlycompare
+HFuzzagainst thesein-circuitveriﬁcation techniques.
+FPGAPerformanceOptimizations. Maetal.exploredvarious
+loop optimization techniques, such as loop tiling, loop interchange,
+and loop unrolling to reduce memory consumption and data move-
+mentwhenmappingdeepconvolutionalneuralnetworks[ 39]to
+FPGA. Zhang et al. adopt data buﬀering techniques to hide the
+memoryaccesslatencyandinterconnects,avoidingdatatransfer
+overhead from the global memory to FPGAs on-chip memory [ 56].
+Li et al. [ 37] use pipeline optimizations when mapping layer-by-
+layer computation to multiple FPGAs resources. Pipelining can
+increase hardware utilization and achieve high throughput by pre-
+ventingthecomputingenginestobecomeidleduetoimbalanced
+computation speed across layers. Other widely used kernel opti-
+mizations include I/O optimization by sharing resources among
+computationtasksat diﬀerenttimestamps.Another optimization
+isretiming, which moves edge-triggered registers across combina-
+torial gates or LUTs to improve timing while ensuring identical
+behavior,etc[ 22].InspiredbytheseFPGA-levelperformanceop-
+timizations, HFuzzdesignsfouruniqueFPGA-leveloptimizations
+to accelerate the combined computation of input generation and
+kernelinvocation:dynamickernelsharing,shannonization,loopunrolling, anddata buﬀering. HFuzzis apioneering tool—theﬁrst
+to embody FPGA-level optimizations to enhance fuzzing eﬃciency
+andeﬀectiveness for heterogeneous applications.
+SNAP[19]leveragestheexistingCPUpipelineandhardwarefea-
+tures tooptimizethebitmap updaterequiredfor coverage-guided
+testing. As opposed to SNAP that targets fuzzing traditional pro-
+gramsrunningonaCPUandsimplyusesexistinghardwarefeatures
+asablackboxaccelerationaid, HFuzzHFuzz designsnewFPGA-level
+optimizations for mapping input generation and kernel invocation
+toFPGAs and empirically demonstrates signiﬁcantfuzzing speed-
+upfrom theseoptimizations (3.4 ×).
+7 DATA AVAILABILITY
+Per the open science policy, we make HFuzz’s artifacts, bench-
+mark programs, and datasets available at https://github.com/UCLA-
+SEAL/HFuzz .
+8 CONCLUSION
+In recent years, performance improvement in CPU has slowed sig-
+niﬁcantlytoonlyafewpercent—duetochallengesinpowersupply
+scaling,heatdissipation,spaceandcost.Thistrendnecessitatesthe
+needstoembraceheterogeneouscomputerarchitecturessuchas
+GPUandFPGA.Inparticular,FPGAisapromising, reprogrammable
+alternative for improving performance and energy eﬃciency. How-
+ever, due to the lack of observability into FPGA execution and
+complex interactionbetween CPUandkernel execution onFPGA,
+developing and testing heterogeneous applications is extremely
+inaccessibleto regularsoftware engineers.
+HFuzzistheﬁrstgrey-boxtestingapproachleveragesthe capabil-
+ity of heterogeneous hardware for testing heterogeneous applications .
+Inparticular, HFuzzinjectshardwareprobesinadditiontoinjecting
+software monitors to better guide input generation and oﬄoads
+iterativeinputgenerationtohardwareaccelerators. HFuzzspeeds
+upfuzzingbyoﬄoadinginputmutationstoFPGAsby4.7 ×with-
+out sacriﬁcingany defect detectioncapability. Itspeeds up testing
+10.3×onaveragebygatheringmeaningfulsignalsfromhardware
+execution directly by injecting in-kernel probes. This work ﬁts the
+domain of software testing, as it targets HLS C/C++ dialects and it
+hasthe potentialtosigniﬁcantly improve correctnessinthe new
+era ofheterogeneous computing , where regular software developers
+writecodeinHLSC/C++toexploitcustomhardwareacceleration.
+ACKNOWLEDGMENTS
+The participants of this research are in part supported by NSF
+grants1956322,1764077,1460325,2106383,2106404,Amazongift,
+Samsung contract, and Regents Faculty Fellowship oﬀered by UCR
+AcademicSenate.
+REFERENCES
+[1]PaulAlcorn.2022. AMDtoFuseFPGAAIEnginesOntoEPYCProcessors,Arrives
+in2023.https://www.tomshardware.com/news/amd-to-fuse-fpga-ai-engines-
+onto-epyc-processors-arrives-in-2023 .
+[2]Amazon.com. 2021. Amazon EC2 F1 Instances: Run Custom FPGAs in the AWS
+Cloud.https://aws.amazon.com/ec2/instance-types/f1 .
+[3]David F. Bacon, Rodric Rabbah, and Sunil Shukla. 2013. FPGA Programming
+for the Masses. Commun. ACM 56, 4 (apr 2013), 56–63. https://doi.org/10.1145/
+2436256.2436271
+[4]E Bendersky. 2012. PyCParser C Parser and AST Generator Written in Python.
+1111ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA Jiyuan Wang,Qian Zhang,Hongbo Rong,Guoqing Harry Xu,andMiryungKim
+[5]MarcelBöhme,Van-ThuanPham,Manh-DungNguyen,andAbhikRoychoud-
+hury.2017. DirectedGreyboxFuzzing.In Proceedingsofthe2017ACMSIGSAC
+ConferenceonComputerandCommunicationsSecurity ,David Evans,Tal Maklin,
+andDongyanXu(Eds.).AssociationforComputingMachinery(ACM),United
+States of America, 2329–2344. https://doi.org/10.1145/3133956.3134020 ACM
+ConferenceonComputerandCommunicationsSecurity2017<br/>,CCS2017;
+Conferencedate: 30-10-2017 Through03-11-2017.
+[6]Marcel Böhme, Van-Thuan Pham, and Abhik Roychoudhury. 2016. Coverage-
+based greybox fuzzing as markov chain. In Proceedings of the 2016 ACM SIGSAC
+Conference onComputer and Communications Security . 1032–1043.
+[7]Andre R Brodtkorb, Christopher Dyken, Trond R Hagen, Jon M Hjelmervik, and
+OlafOStoraasli.2010. State-of-the-artinheterogeneouscomputing. Scientiﬁc
+Programming 18,1 (2010), 1–33.
+[8]NazaninCalagar, Stephen D. Brown, and Jason H. Anderson.2014. Source-level
+debuggingforFPGAhigh-levelsynthesis.In 201424thInternationalConference
+onFieldProgrammableLogicandApplications(FPL) .1–8.https://doi.org/10.1109/
+FPL.2014.6927496
+[9]Jared Casper and Kunle Olukotun. 2014. Hardware Acceleration of Database
+Operations. In Proceedings of the 2014 ACM/SIGDA International Symposium
+on Field-Programmable Gate Arrays (Monterey, California, USA) (FPGA ’14) .
+Association for Computing Machinery, New York, NY, USA, 151–160. https:
+//doi.org/10.1145/2554688.2554787
+[10]Adrian M. Caulﬁeld, Eric S. Chung, Andrew Putnam, Hari Angepat, Jeremy
+Fowers, Michael Haselman, Stephen Heil, Matt Humphrey, Puneet Kaur, Joo-
+Young Kim, Daniel Lo, Todd Massengill, Kalin Ovtcharov, Michael Papamichael,
+Lisa Woods, Sitaram Lanka, Derek Chiou, and Doug Burger. 2016. A cloud-scale
+accelerationarchitecture.In 201649thAnnualIEEE/ACMInternationalSymposium
+onMicroarchitecture(MICRO) .1–13.https://doi.org/10.1109/MICRO.2016.7783710
+[11]Andrew A Chien, Allan Snavely, and Mark Gahagan. 2011. 10x10: A general-
+purpose architectural approach to heterogeneity and energy eﬃciency. Procedia
+Computer Science 4 (2011), 1987–1996.
+[12]Young-Kyu Choi and Jason Cong. 2017. HLScope: High-Level Performance
+DebuggingforFPGADesigns.In 2017IEEE25thAnnualInternationalSymposium
+on Field-Programmable Custom Computing Machines (FCCM) . 125–128. https:
+//doi.org/10.1109/FCCM.2017.44
+[13]JasonCong,MohammadAliGhodrat,MichaelGill,BeaynaGrigorian,Karthik
+Gururaj,andGlennReinman.2014. Accelerator-richarchitectures:Opportunities
+and progresses. In 2014 51st ACM/EDAC/IEEE Design Automation Conference
+(DAC). 1–6.https://doi.org/10.1145/2593069.2596667
+[14]Jason Cong, Licheng Guo, Po-Tsang Huang, Peng Wei, and Tianhe Yu. 2018.
+SMEM++: A Pipelined and Time-Multiplexed SMEM Seeding Accelerator for
+DNA Sequencing. In 2018 IEEE 26th Annual International Symposium on Field-
+ProgrammableCustomComputingMachines(FCCM) .206–206. https://doi.org/10.
+1109/FCCM.2018.00040
+[15]JasonCong,BinLiu,StephenNeuendorﬀer,JuanjoNoguera,KeesVissers,and
+ZhiruZhang.2011. High-LevelSynthesisforFPGAs:FromPrototypingtoDe-
+ployment. IEEETransactionsonComputer-AidedDesignofIntegratedCircuitsand
+Systems30,4 (2011), 473–491. https://doi.org/10.1109/TCAD.2011.2110592
+[16]Jason Cong, Vivek Sarkar, Glenn Reinman, and Alex Bui. 2011. Customizable
+Domain-SpeciﬁcComputing. IEEEDesignTestofComputers 28,2(2011),6–15.
+https://doi.org/10.1109/MDT.2010.141
+[17]John Curreri, Greg Stitt, and Alan D. George. 2010. High-level synthesis tech-
+niques for in-circuit assertion-based veriﬁcation. In 2010 IEEE International Sym-
+posium on Parallel & Distributed Processing, Workshops and Phd Forum (IPDPSW) .
+1–8.https://doi.org/10.1109/IPDPSW.2010.5470747
+[18]Ian Cutress. 2018. Intel Shows Xeon Scalable Gold 6138P with Integrated FPGA,
+Shipping to Vendors. https://www.anandtech.com/show/12773/intel-shows-
+xeon-scalable-gold-6138p-with-integrated-fpga-shipping-to-vendors .
+[19]Ren Ding, Yonghae Kim, Fan Sang, Wen Xu, Gururaj Saileshwar, and Taesoo
+Kim. 2021. Hardware Support to Improve Fuzzing Performance and Precision. In
+Proceedingsofthe2021ACMSIGSACConferenceonComputerandCommunications
+Security. 2214–2228.
+[20]Andrea Fioraldi, Dominik Maier, Heiko Eißfeldt, and Marc Heuse. 2020. AFL++:
+Combining IncrementalStepsofFuzzingResearch . USENIXAssociation, USA.
+[21]DanielDGajski,NikilDDutt,AllenCHWu,andSteveYLLin.2012. High—Level
+Synthesis:IntroductiontoChipandSystemDesign . SpringerScience&Business
+Media.
+[22]Philippe Garrault and Brian Philofsky. 2006. HDL coding practices to accelerate
+design performance. Xilinx WhitePaper 231(2006), 1–22.
+[23]LichengGuo,JasonLau,ZhenyuanRuan,PengWei,andJasonCong.2019. Hard-
+wareAccelerationofLongReadPairwiseOverlappinginGenomeSequencing:
+A Race Between FPGA and GPU. In 2019 IEEE 27th Annual International Sym-
+posium on Field-Programmable Custom Computing Machines (FCCM) . 127–135.
+https://doi.org/10.1109/FCCM.2019.00027
+[24]Intel. 2021. Dense Linear Algebra. https://github.com/oneapi-src/oneAPI-
+samples/tree/6901f7203b549a651911fec694ﬀefad82ed0b35/DirectProgramming/
+C%2B%2BSYCL/DenseLinearAlgebra .[25]Intel. 2021. DPC++ Reference. https://oneapi-src.github.io/DPCPP_Reference/ .
+[26]Intel. 2022. Devcloud. https://www.intel.com/content/www/us/en/developer/
+tools/devcloud/overview.html .
+[27]Intel. 2022. FPGA Optimization Guide for Intel ®oneAPI Toolkits - Shann-
+onization to Improve FMAX/II. https://www.intel.com/content/www/us/en/
+develop/documentation/oneapi-fpga-optimization-guide/top/optimize-your-
+design/throughput-1/single-work-item-kernels/loops/shannonization-to-
+improve-fmax-ii.html .
+[28]Intel. 2022. FPGA Optimization Guide for Intel ®oneAPI Toolk-
+its - Transfer Loop-Carried Dependency to Local Memory. https:
+//www.intel.com/content/www/us/en/develop/documentation/oneapi-fpga-
+optimization-guide/top/optimize-your-design/throughput-1/single-work-
+item-kernels/loops/transfer-loop-carried-dependency-to-local-memory.html .
+[29]Intel. 2022. FPGA Optimization Guide for Intel ®oneAPI Toolkits - Unroll Loops.
+https://www.intel.com/content/www/us/en/develop/documentation/oneapi-
+fpga-optimization-guide/top/optimize-your-design/throughput-1/single-
+work-item-kernels/loops/unroll-loops.html .
+[30]Intel.2022.Intel ®Arria®10GXFPGAOverview. https://www.intel.com/content/
+www/us/en/products/details/fpga/arria/10/gx/products.html .
+[31]Intel. 2022. Intel ®Stratix®10 GX FPGA Overview. https://www.intel.com/
+content/www/us/en/products/details/fpga/stratix/10.html .
+[32]GeorgeKlees,AndrewRuef,BenjiCooper,ShiyiWei,andMichaelHicks.2018.
+EvaluatingFuzzTesting.In Proceedingsofthe2018ACMSIGSACConferenceon
+ComputerandCommunicationsSecurity (Toronto,Canada) (CCS’18).Association
+forComputingMachinery,NewYork,NY,USA,2123–2138. https://doi.org/10.
+1145/3243734.3243804
+[33]AlexandraKourfaliandDirkStroobandt.2020. In-CircuitDebuggingwithDy-
+namic Reconﬁguration of FPGA Interconnects. ACM Trans. Reconﬁgurable Tech-
+nol. Syst. 13,1,Article5 (jan2020),29pages. https://doi.org/10.1145/3375459
+[34]Kevin Laeufer, Jack Koenig, Donggyu Kim, Jonathan Bachrach, and Koushik Sen.
+2018. RFUZZ: Coverage-Directed Fuzz Testing of RTL on FPGAs. In Proceedings
+of the International Conference on Computer-Aided Design (San Diego, California)
+(ICCAD ’18) . Association for Computing Machinery, New York, NY, USA, Article
+28,8 pages. https://doi.org/10.1145/3240765.3240842
+[35]Yi-Hsiang Lai, Ecenur Ustun, Shaojie Xiang, Zhenman Fang, Hongbo Rong, and
+Zhiru Zhang. 2021. Programming and Synthesis for Software-Deﬁned FPGA
+Acceleration:StatusandFutureProspects. ACMTrans.ReconﬁgurableTechnol.
+Syst.14,4,Article17(sep 2021),39pages. https://doi.org/10.1145/3469660
+[36]Caroline Lemieux, Rohan Padhye, Koushik Sen, and Dawn Song. 2018. PerfFuzz:
+AutomaticallyGeneratingPathologicalInputs.In Proceedingsofthe27thACM
+SIGSOFT International Symposium on Software Testing and Analysis (Amsterdam,
+Netherlands) (ISSTA2018) .AssociationforComputingMachinery,NewYork,NY,
+USA,254–265. https://doi.org/10.1145/3213846.3213874
+[37]HuiminLi,XitianFan,LiJiao,WeiCao,XuegongZhou,andLingliWang.2016.
+AhighperformanceFPGA-basedacceleratorforlarge-scaleconvolutionalneural
+networks. In 2016 26th International Conference on Field Programmable Logic and
+Applications(FPL) . IEEE,1–9.
+[38]Jie Liang, Yu Jiang, Yuanliang Chen, Mingzhe Wang, Chijin Zhou, and Jiaguang
+Sun.2018.PAFL:ExtendFuzzingOptimizationsofSingleModetoIndustrialParal-
+lelMode.In Proceedingsofthe201826thACMJointMeetingonEuropeanSoftware
+EngineeringConferenceandSymposiumontheFoundationsofSoftwareEngineering
+(Lake Buena Vista, FL, USA) (ESEC/FSE 2018) . Association for Computing Ma-
+chinery, New York, NY, USA, 809–814. https://doi.org/10.1145/3236024.3275525
+[39]Yufei Ma, Yu Cao, Sarma Vrudhula, and Jae-sun Seo. 2017. Optimizing loop
+operationanddataﬂowinFPGAaccelerationofdeepconvolutionalneuralnet-
+works.In Proceedingsofthe2017 ACM/SIGDA InternationalSymposiumonField-
+ProgrammableGate Arrays . 45–54.
+[40]Valentin Manes, HyungSeok Han, Choongwoo Han, sang cha, Manuel Egele,
+Edward Schwartz,and MaverickWoo.2019. TheArt, Science, andEngineering
+of Fuzzing: A Survey. IEEE Transactions on Software Engineering PP (10 2019),
+1–1.https://doi.org/10.1109/TSE.2019.2946563
+[41]JoshuaS.MonsonandBradHutchings.2015. Usingsource-to-sourcecompilation
+to instrument circuits for debug with High Level Synthesis. In 2015 International
+ConferenceonFieldProgrammableTechnology(FPT) .48–55.https://doi.org/10.
+1109/FPT.2015.7393129
+[42]Andrew Putnam, Adrian M. Caulﬁeld, Eric S. Chung, Derek Chiou, Kypros Con-
+stantinides,JohnDemme,HadiEsmaeilzadeh,JeremyFowers,GopiPrashanth
+Gopal,JanGray,MichaelHaselman,ScottHauck,StephenHeil,AmirHormati,
+Joo-YoungKim,SitaramLanka,JamesLarus,EricPeterson,SimonPope,Aaron
+Smith,JasonThong,PhillipYiXiao,andDougBurger.2016. AReconﬁgurable
+FabricforAcceleratingLarge-ScaleDatacenterServices. Commun.ACM 59,11
+(Oct.2016),114–122. https://doi.org/10.1145/2996868
+[43]Xiaoke Qin and Prabhat Mishra. 2014. Scalable Test Generation by Interleaving
+ConcreteandSymbolicExecution.In Proceedingsofthe201427thInternational
+ConferenceonVLSIDesignand201413thInternationalConferenceonEmbedded
+Systems (VLSID ’14) . IEEE Computer Society, USA, 104–109. https://doi.org/10.
+1109/VLSID.2014.25
+1112LeveragingHardware ProbesandOptimizations forAccelerating Fuzz Testingof HeterogeneousApplications ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+[44]JamesReinders, BenAshbaugh,JamesBrodman,MichaelKinsner,JohnPenny-
+cook, and Xinmin Tian. 2021. DataparallelC++: masteringDPC++for program-
+mingofheterogeneous systemsusing C++ and SYCL . SpringerNature.
+[45]Ruyman ReyesandVictor Lomüller.2016. SYCL: Single-sourceC++accelerator
+programming. In ParallelComputing:OntheRoadtoExascale .IOSPress,673–682.
+[46]Hongbo Rong. 2017. Programmatic Control of a Compiler for Generating High-
+performanceSpatialHardware. CoRRabs/1711.07606(2017). arXiv: 1711.07606
+http://arxiv.org/abs/1711.07606
+[47]KyleRupnow,YunLiang,YinanLi,andDemingChen.2011. Astudyofhigh-level
+synthesis: Promises and challenges. In 2011 9th IEEE International Conference on
+ASIC. 1102–1105. https://doi.org/10.1109/ASICON.2011.6157401
+[48]Kostya Serebryany, Maxim Lifantsev, Konstantin Shtoyk, Doug Kwan, and Peter
+Hochschild.2021. Silifuzz:Fuzzingcpusbyproxy. arXivpreprintarXiv:2110.11519
+(2021).
+[49]CongxiSong,Xu Zhou,QidiYin,Xinglu He, HangweiZhang, and KaiLu. 2019.
+P-Fuzz:AParallelGrey-BoxFuzzingFramework. AppliedSciences 9,23(2019).
+https://doi.org/10.3390/app9235100
+[50]HaijunWang,Xiaofei Xie,YiLi,ChengWen,YuekangLi,YangLiu,Shengchao
+Qin,HongxuChen,andYuleiSui.2020. Typestate-GuidedFuzzerforDiscovering
+Use-after-Free Vulnerabilities. In Proceedings of the ACM/IEEE 42nd International
+Conference on Software Engineering (Seoul, South Korea) (ICSE ’20) . Association
+for ComputingMachinery, NewYork,NY,USA,999–1010. https://doi.org/10.
+1145/3377811.3380386
+[51]Cheng Wen, Haijun Wang, Yuekang Li, Shengchao Qin, Yang Liu, Zhiwu Xu,
+Hongxu Chen, Xiaofei Xie, Geguang Pu, andTing Liu. 2020. MEMLOCK:Mem-
+oryUsageGuidedFuzzing.In 2020IEEE/ACM42ndInternationalConferenceon
+SoftwareEngineering (ICSE) . 765–777. https://doi.org/10.1145/3377811.3380396[52]Xilinx. 2021. UltraScale Architecture and Product Data Sheet: Overview.
+https://www.xilinx.com/support/documentation/data_sheets/ds890-ultrascale-
+overview.pdf .
+[53]TaiYue,PengfeiWang,YongTang,EnzeWang,BoYu,KaiLu,andXuZhou.2020.
+Ecofuzz: Adaptive energy-saving greybox fuzzing as a variant of the adversarial
+multi-armed bandit. In Proceedings of the 29th USENIX Conference on Security
+Symposium . 2307–2324.
+[54]MohamedZahran.2017. Heterogeneouscomputing:Heretostay. Commun.ACM
+60,3 (2017), 42–45.
+[55] Michał Zalewski.2021. American FuzzLoop. http://lcamtuf.coredump.cx/aﬂ/ .
+[56]Chen Zhang, Peng Li, Guangyu Sun, Yijin Guan, Bingjun Xiao, and Jason Cong.
+2015. Optimizing FPGA-based accelerator design for deep convolutional neural
+networks. In Proceedings of the 2015 ACM/SIGDA international symposium on
+ﬁeld-programmablegatearrays . 161–170.
+[57]Qian Zhang, Jiyuan Wang, Muhammad Ali Gulzar, Rohan Padhye, and Miryung
+Kim. 2020. BigFuzz: Eﬃcient Fuzz Testingfor Data Analytics usingFramework
+Abstraction.In The35thIEEE/ACMInternationalConferenceonAutomatedSoft-
+wareEngineering .https://doi.org/10.1145/3324884.3416641
+[58]Qian Zhang, Jiyuan Wang, and Miryung Kim. 2021. Heterofuzz: Fuzz testing
+to detect platform dependent divergence for heterogeneous applications. In
+Proceedings of the 29th ACM Joint Meeting on European Software Engineering
+Conference and Symposium on the Foundations of Software Engineering . 242–254.
+[59]Yuan Zhou, Udit Gupta, Steve Dai, Ritchie Zhao, Nitish Srivastava, Hanchen
+Jin, Joseph Featherston, Yi-Hsiang Lai, Gai Liu, Gustavo Angarita Velasquez,
+WenpingWang,andZhiruZhang.2018. Rosetta:ARealisticHigh-LevelSynthesis
+Benchmark Suite for Software Programmable FPGAs. , 10 pages. https://doi.
+org/10.1145/3174243.3174255
+1113

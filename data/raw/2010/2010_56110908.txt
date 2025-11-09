@@ -1,0 +1,2266 @@
+EXPOSITOR : Scriptable Time-Travel Debugging
+with First-Class Traces
+Technical Report CS-TR-5021
+Khoo Yit Phang, Jeffrey S. Foster, and Michael Hicks
+Computer Science Department, University of Maryland, College Park, MD 20742, USA
+fkhooyp,jfoster,mwh g@cs.umd.edu
+Abstract —We present E XPOSITOR , a new debugging envi-
+ronment that combines scripting and time-travel debugging to
+allow programmers to automate complex debugging tasks. The
+fundamental abstraction provided by E XPOSITOR is the execu-
+tion trace , which is a time-indexed sequence of program state
+snapshots or projections thereof. Programmers can manipulate
+traces as if they were simple lists with operations such as map and
+ﬁlter. Under the hood, E XPOSITOR efﬁciently implements traces
+as lazy, sparse interval trees whose contents are materialized on
+demand. E XPOSITOR also provides a novel data structure, the
+edit hash array mapped trie , which is a lazy implementation of sets,
+maps, multisets, and multimaps that enables programmers to
+maximize the efﬁciency of their debugging scripts. In our micro-
+benchmarks, E XPOSITOR scripts are faster than the equivalent
+non-lazy scripts for common debugging scenarios. We have also
+used E XPOSITOR to debug a stack overﬂow, and to unravel a
+subtle data race in Firefox. We believe that E XPOSITOR repre-
+sents an important step forward in improving the technology for
+diagnosing complex, hard-to-understand bugs.
+I. I NTRODUCTION
+“...we talk a lot about ﬁnding bugs, but really, [Fire-
+fox’s] bottleneck is not ﬁnding bugs but ﬁxing [them]... ”
+—Robert O’Callahan [1]
+“[In debugging,] understanding how the failure came
+to be...requires by far the most time and other resources”
+—Andreas Zeller [2]
+Debugging program failures is an inescapable task for soft-
+ware programmers. Understanding a failure involves repeated
+application of the scientiﬁc method: the programmer makes
+some observations; proposes a hypothesis as to the cause of
+the failure; uses this hypothesis to make predictions about the
+program’s behavior; tests those predictions using experiments;
+and ﬁnally either declares victory or repeats the process with
+a new or reﬁned hypothesis.
+There are certain kinds of bugs that can truly test the mettle
+of programmers. Large software systems often have complex,
+subtle, hard-to-understand mandelbugs1whose untangling can
+require hours or even days of tedious, hard-to-reuse, seemingly
+sisyphean effort. Debugging mandelbugs often requires testing
+many hypotheses, with lots of backtracking and retrials when
+1“Mandelbug (from the Mandelbrot set) : A bug whose underlying causes
+are so complex and obscure as to make its behavior appear chaotic or even
+nondeterministic.” From the New Hacker’s Dictionary (3d ed.), Raymond E.S.,
+editor, 1996.those hypotheses fail. Standard debuggers make it hard to
+efﬁciently reuse the manual effort that goes into hypothesis
+testing, in particular, it can be hard to juggle the breakpoints,
+single stepping, and state inspection available in standard de-
+buggers to ﬁnd the point at which the fault actually happened.
+Scriptable debugging is a powerful technique for hypothesis
+testing in which programmers write scripts to perform complex
+debugging tasks. For example, suppose we observe a bug
+involving a cleverly implemented set data structure. We can
+try to debug the problem by writing a script that maintains
+ashadow data structure that implements the set more simply
+(e.g., as a list). We run the buggy program, and the script tracks
+the program’s calls to insert andremove , stopping execution
+when the contents of the shadow data structure fail to match
+those of the buggy one, helping pinpoint the underlying fault.
+While we could have employed the same debugging strategy
+by altering the program itself (e.g., by inserting print state-
+ments and assertions), doing so would require recompilation—
+and that can take considerable time for large programs (e.g.,
+Firefox), thus greatly slowing the rate of hypothesis testing.
+Modifying a program can also change its behavior—we have
+all experienced the frustration of inserting a debugging print
+statement only to make the problem disappear! Scripts also
+have the beneﬁt that they can invoke libraries not used by the
+program itself. And, general-purpose scripts may be reused.
+A. Background: Prior Scriptable Debuggers
+There has been considerable prior work on scriptable de-
+bugging. GDB’s Python interface makes GDB’s interactive
+commands—stepping, setting breakpoints, etc.—available in a
+general-purpose programming language. However, this inter-
+face employs a callback-oriented programming style which,
+as pointed out by Marceau et al. [3], reduces composability
+and reusability as well as complicates checking temporal
+properties. Marceau et al. propose treating the program as an
+event generator—each function call, memory reference, etc.
+can be thought of as an event—and scripts are written in the
+style of functional reactive programming (FRP) [4]. While
+FRP-style debugging solves the problems of callback-based
+programming, it has a key limitation: time always marches
+forward, so we cannot ask questions about prior states. For
+example, if while debugging a program we ﬁnd a doubly
+freed address, we cannot jump backward in time to ﬁnd the
+1corresponding malloc . Instead we would need to rerun the
+program from scratch to ﬁnd that call, which may be prob-
+lematic if there is any nondeterminism, e.g., if the addresses
+returned by malloc differ from run to run. Alternatively, we
+could prospectively gather the addresses returned by malloc
+as the program runs, but then we would need to record all
+such calls up to the erroneous free.
+Time-travel debuggers, like UndoDB [5], and systems for
+capturing entire program executions, like Amber [6], allow a
+single nondeterministic execution to be examined at multiple
+points in time. Unfortunately, scriptable time-travel debuggers
+typically use callback-style programming, with all its prob-
+lems. (Sec. VII discusses prior work in detail.)
+B.EXPOSITOR : Scriptable, Time-Travel Debugging
+In this paper, we present E XPOSITOR , a new scriptable
+debugging system inspired by FRP-style scripting but with
+the advantages of time-travel debugging. E XPOSITOR scripts
+treat a program’s execution trace as a (potentially inﬁnite)
+immutable list of time-annotated program state snapshots or
+projections thereof. Scripts can create or combine traces using
+common list operations: traces can be ﬁltered, mapped, sliced,
+folded, and merged to create lightweight projections of the
+entire program execution. As such, E XPOSITOR is particularly
+well suited for checking temporal properties of an execution,
+and for writing new scripts that analyze traces computed by
+prior scripts. Furthermore, since E XPOSITOR extends GDB’s
+Python environment and uses the UndoDB [5] time-travel
+backend for GDB, users can seamlessly switch between run-
+ning scripts and interacting directly with an execution via
+GDB. (Sec. II overviews E XPOSITOR ’s scripting interface.)
+The key idea for making E XPOSITOR efﬁcient is to employ
+laziness in its implementation of traces—invoking the time-
+travel debugger is expensive, and laziness helps minimize the
+number of calls to it. E XPOSITOR represents traces as sparse,
+time-indexed interval trees and ﬁlls in their contents on de-
+mand. For example, suppose we use E XPOSITOR ’sbreakpoints
+combinator to create a trace trcontaining just the program
+execution’s malloc calls. If we ask for the ﬁrst element of tr
+before time 42 (perhaps because there is a suspicious program
+output then), E XPOSITOR will direct the time-travel debugger
+to time 42 and run it backward until hitting the call, capturing
+the resulting state in the trace data structure. The remainder
+of the trace, after time 42 and before the malloc call, is not
+computed. (Sec. III discusses the implementation of traces.)
+In addition to traces, E XPOSITOR scripts typically employ
+various internal data structures to record information, e.g.,
+the set sof arguments to malloc calls. These data structures
+must also be lazy so as not to compromise trace laziness—
+if we eagerly computed the set sjust mentioned to answer
+a membership query at time t, we would have to run the
+time-travel debugger from the start up until t, considering all
+malloc calls, even if only the most recent call is sufﬁcient to
+satisfy the query. Thus, E XPOSITOR provides script writers
+with a novel data structure: the edit hash array mapped trie
+(EditHAMT), which provides lazy construction and queriesfor sets, maps, multisets, and multimaps. As far as we are
+aware, the EditHAMT is the ﬁrst data structure to provide
+these capabilities. (Sec. IV describes the EditHAMT.)
+We have used E XPOSITOR to write a number of simple
+scripts, as well as to debug two more signiﬁcant problems.
+Sec. II describes how we used E XPOSITOR to ﬁnd an ex-
+ploitable buffer overﬂow. Sec. VI explains how we used
+EXPOSITOR to track down a deep, subtle bug in Firefox that
+was never directly ﬁxed, though it was papered over with a
+subsequent bug ﬁx (the ﬁx resolved the symptom, but did not
+remove the underlying fault). In the process, we developed
+several reusable analyses, including a simple race detector.
+In summary, we believe that E XPOSITOR represents an
+important step forward in improving the technology for di-
+agnosing complex, hard-to-understand bugs.
+II. T HEDESIGN OF EXPOSITOR
+We designed E XPOSITOR to provide programmers with a
+high-level, declarative API to write analyses over the program
+execution, as opposed to the low-level, imperative, callback-
+based API commonly found in other scriptable debuggers.
+In particular, the design of E XPOSITOR is based on two key
+principles. First, the E XPOSITOR API is purely functional—
+all objects are immutable, and methods manipulate objects by
+returning new objects. The purely functional API facilitates
+composition, by reducing the risk of scripts interfering with
+each other via shared mutable object, as well as reuse, since
+immutable objects can easily be memoized or cached upon
+construction. It also enables E XPOSITOR to employ lazy
+programming techniques to improve efﬁciency.
+Second, the trace abstraction provided by E XPOSITOR is
+based around familiar list-processing APIs found in many
+languages, such as the built-in list-manipulating functions in
+Python, the Array methods in JavaScript, the Listmodule in
+Ocaml, and the Data.List module in Haskell. These APIs are
+also declarative—programmers manipulate lists using combi-
+nators such as ﬁlter,map, and merge that operate over entire
+lists, instead of manipulating individual list elements. These
+list combinators allow E XPOSITOR to compute individual list
+elements on-demand in any order, minimizing the number of
+calls to the time-travel debugger. Furthermore, they shield
+programmers from the low-level details of controlling the
+program execution and handling callbacks.
+A. API Overview
+Fig. 1 lists the key classes and methods of E XPOSITOR ’s
+scripting interface, which is provided as a library inside
+UndoDB/GDB’s Python environment.
+a) The execution class and the theexecution object: The
+entire execution of the program being debugged is represented
+by the execution class, of which there is a singleton instance
+named theexecution . This class provides several methods
+for querying the execution. The getat(t)2method returns a
+snapshot object representing the program state at time tin the
+2We use the convention of naming time variables as t, and trace variables
+astr.
+21class execution:
+2# get snapshots
+3getat(t): snapshot at time t
+4
+5# derive traces
+6breakpoints(fn): snapshot trace of breakpoints at func fn
+7syscalls(fn): snapshot trace of breakpoints at syscall fn
+8watchpoints(x, rw):
+9 snapshot trace of read/write watchpoints at var x
+10 allcalls(): snapshot trace of all function entries
+11 allreturns(): snapshot trace of all function exits
+12
+13 # interactive control
+14 cont(): manually continue the execution
+15 gettime(): latest time of the execution
+16
+17class trace:
+18 # count/get items
+19 len (): called by “ len(trace) ”
+20 iter (): called by “ for item in trace ”
+21 getat(t): item at exactly time t
+22 getafter(t): next item after time t
+23 getbefore(t): previous item before time t
+24
+25 # create a new trace by ﬁltering/mapping a trace
+26 ﬁlter(p): subtrace of items for which preturns true
+27 map(f): new trace with fapplied to all items
+28 slice(t0, t1): subtrace from time t0to time t1
+29
+30 # create a new trace by merging two traces
+31 merge(f, tr): see Fig. 2a
+32 trailing merge(f, tr): see Fig. 2b
+33 revtrailing merge(f, tr): see Fig. 2c
+34
+35 # create a new trace by computing over preﬁxes/sufﬁxes
+36 scan(f, acc): see Fig. 2d
+37 revscan(f, acc): see Fig. 2e
+38 tscan(f, acc): see Fig. 3a
+39 revtscan(f, acc): see Fig. 3b
+40
+41class item:
+42 time: item’s execution time
+43 value: item’s contents
+44
+45class snapshot:
+46 read var(x):
+47 gdb value of variable xin current stack frame
+48 read retaddrs():
+49 gdb values of return addresses on the stack
+50 backtrace(): print the stack backtrace
+51 . . . and other methods to access program state . . .
+52
+53class gdb value:
+54 getitem (x):
+55 called by “ gdb value[x] ” to access ﬁeld/index x
+56 deref(): dereference gdb value (if it is a pointer)
+57 addrof(): address of gdb value (if it is an l-value)
+58 . . . and other methods to query properties of gdb value . . .
+Fig. 1. E XPOSITOR ’s Python-based scripting API. The getXand len
+methods of execution andtrace are eager, and the remaining methods of those
+classes return lazy values. Lazy values include trace ,snapshot , and gdb value
+objects whose contents are computed only on demand and cached.execution (we will describe snapshot s in more detail later).
+Several methods create immutable, sparse projections of the
+execution, or trace s, consisting of program state snapshots at
+points of interest: the breakpoints(fn) andsyscalls(fn) methods
+return trace s ofsnapshot s at functions and system calls named
+fn, respectively; the watchpoints(x, rw) method returns a trace
+ofsnapshot when the memory location xis read or written; and
+theallcalls andallreturns methods return trace s ofsnapshot s
+at all function entries and exits, respectively.
+For debugging interactive programs, the execution class
+provides two useful methods: cont resumes the execution of
+the program from when it was last stopped (e.g., immediately
+after E XPOSITOR is started, or when the program is interrupted
+by pressing ˆC), and gettime gets the latest time of the
+execution. If a program requires user input to trigger a bug,
+we often ﬁnd it helpful to ﬁrst interrupt the program and call
+gettime to get a reference time, before resuming the execution
+using cont and providing the input trigger.
+b) The trace class and the item class: As mentioned
+above, the trace class represents sparse projections of the
+execution at points of interest. These trace s contain snapshot s
+or other values, indexed by the relevant time in the execution.
+Initially, trace s are created using the execution methods de-
+scribed above, and trace s may be further derived from other
+trace s.
+The ﬁrst ﬁve trace methods query items in trace s. The tr
+.len ()method is called by the Python built-in function
+len(tr) , and returns the total number of items in the tr. The
+tr.iter ()method is called by Python’s for x in tr loop, and
+returns a sequential Python iterator over all items in tr. The
+getat(t) method returns the item at time tin the trace , or
+None if there is no item at that time. Since trace s are often
+very sparse, it can be difﬁcult to ﬁnd items using getat, so
+thetrace class also provides two methods, getbefore(t) and
+getafter(t) , that return the ﬁrst item found before or after
+time t, respectively, or None if no item can be found. The
+getat,getbefore , and getafter methods return values that
+are wrapped in the item class, which associates values with a
+particular point in the execution.
+The remaining methods create new traces from existing
+traces. The tr.ﬁlter(p) method creates a new trace consisting
+only of items from trthat match predicate p. The tr.map(f)
+method creates a new trace of items computed by calling
+function fon each item from tr, and is useful for extracting
+particular values of interest from snapshots. The tr.slice(t0, t1)
+method creates a new trace that includes only items from tr
+between times t0andt1.
+Thetrace class also provides several more complex methods
+to derive new traces. Three methods create new traces by
+merging traces. First, tr0.merge(f, tr1) creates a new trace
+containing the items from both tr0and tr1, calling function
+fto combine any items from tr0andtr1that occur at the same
+time (Fig. 2a). None can be passed for fiftr0andtr1contain
+items that can never coincide, e.g., if tr0contains calls to foo
+andtr1contains calls to bar, since fwill never be called in
+this case. Next, tr0.trailing merge(f, tr1) creates a new trace by
+3calling fto merge each item from tr0with the immediately
+preceding item from tr1, orNone if there is no preceding item
+(Fig. 2b). Lastly, revtrailing merge is similar to trailing merge
+except that it merges with future items rather than past items
+(Fig. 2c).
+The remaining four methods create new traces by computing
+over preﬁxes or sufﬁxes of an input trace. The scan method
+performs a fold- or reduce -like operation for every preﬁx of
+an input trace (Fig. 2d). It is called as tr.scan(f, acc) , where
+fis a binary function that takes an accumulator and an item
+as arguments, and accis the initial accumulator. It returns a
+new trace containing the same number of items at the same
+times as in the input trace tr, where the nth output item outn
+is recursively computed as:
+outn=8
+<
+:innfoutn 1ifn >0
+innfacc ifn= 0
+where fis written inﬁx as f. The revscan method is similar,
+but deriving a trace based on future items rather than past items
+(Fig. 2e). revscan computes the output item outnas follows:
+outn=8
+<
+:innfoutn+1 if0n < length 1
+innfacc ifn=length 1
+Lastly, tscan andrevtscan are variants of scan andrevscan ,
+respectively, that take an associative binary function but no
+accumulator, and can sometimes be more efﬁcient. These two
+methods are described in Sec. III-B.
+c) The snapshot class and the gdb value class: The
+snapshot class represents a program state at a particular point
+in time and provides methods for accessing that state, e.g.,
+read var(x) returns the value of a variable named xin the
+current stack frame, read retaddrs returns the list of return
+addresses on the stack, backtrace prints the stack backtrace,
+and so on.
+Thegdb value class represents values in the program being
+debugged at a particular point in time, and provides methods
+for querying those values. For example, v.getitem (x)is
+called by the Python indexing operator v[x]to access struct
+ﬁelds or array elements, deref dereferences pointer values,
+addrof returns the address of an l-value, and so forth. These
+gdb value objects are automatically coerced to the appropriate
+Python types when they are compared against built-in Python
+values such as ints, for example; it is also sometimes useful to
+manually coerce gdb value objects to speciﬁc Python types,
+e.g., to treat a pointer value as a Python int.
+Both the snapshot andgdb value classes are thin wrappers
+around GDB’s Python API and UndoDB. When a method of a
+snapshot orgdb value object is called, it ﬁrst directs UndoDB
+to jump to the point in time in the program execution that
+is associated with the object. Then, it calls the correspond-
+ing GDB API, wrapping the return value in snapshot and
+gdb value as necessary. In general, the semantics of snapshot
+and gdb value follows GDB, e.g., the E XPOSITOR ’s notion
+of stack frames is based on GDB’s notion of stack frames.We also provide several methods, such as read retaddrs , that
+return the result of several GDB API calls in a more convenient
+form. Additionally, all of GDB’s Python API is available and
+may be used from within E XPOSITOR .
+Given a debugging hypothesis, we use the E XPOSITOR
+interface to apply the following recipe. First, we call methods
+ontheexecution to derive one or more trace s that contain
+events relevant to the hypothesis; such events could be function
+calls, breakpoints, system calls, etc. Next, we combine these
+traces as appropriate, applying trace methods such as ﬁlter,
+map,merge , and scan to derive traces of properties predicted
+by our hypothesis. Finally, we query the traces using methods
+such as getbefore andgetafter to ﬁnd evidence of properties
+that would conﬁrm or refute our hypothesis.
+B. Warm-up Example: Examining fooCalls in EXPOSITOR
+To begin with a simple example, let us consider the task
+of counting the number of calls to a function foo, to test a
+hypothesis that an algorithm is running for an incorrect number
+of iterations, for example. Counting foocalls takes just two
+lines of code in E XPOSITOR . We ﬁrst use the breakpoints
+method of theexecution to create the footrace:
+59foo = the execution.breakpoints(”foo”)
+This gives us a trace containing all calls to foo. We can then
+count the calls to foousing the Python lenfunction, and print
+it:
+60print len(foo)
+Later, we may want to count only calls to foo(x) where
+x == 0 , perhaps because we suspect that only these calls are
+buggy. We can achieve this using the ﬁlter method on the foo
+trace created above:
+61foo0 = foo.ﬁlter(lambda snap: snap.read var(”x”) == 0)
+Here, we call ﬁlter with a predicate function that takes a
+snapshot object (at calls to foo), reads the variable named x,
+and returns whether x == 0 . The resulting trace contains only
+calls to foo(0) , which we assign to foo0. We can then count
+foo0as before:
+62print len(foo 0g
+After more investigation, we may decide to examine calls
+to both foo(0) and foo(1) , e.g., to understand the interaction
+between them. We can create a new trace of foo(1) calls, and
+merge it with foo(0) :
+63foo1 = foo.ﬁlter(lambda snap: snap.read var(”x”) == 1)
+64foo01 = foo 0.merge(None, foo 1)
+We deﬁne foo1just like foo0but with a different predicate.
+Then, we use the merge method to merge foo0and foo1
+into a single trace foo01containing calls to both foo(0) and
+foo(1) , passing None for the merging function as foo(0) and
+foo(1) can never coincide. Note that we are able to reuse the
+fooandfoo0traces in a straightforward manner; under the
+hood, E XPOSITOR will also have cached the computation of
+fooandfoo0from the earlier and reuse them here.
+4tr0tr1tr0.merge(f, tr1)f(a)
+Nonetr0tr1tr0.trailing_merge(f, tr1)ffff (b)
+Nonetr0tr1tr0.rev_trailing_merge(f, tr1)ffff (c)
+trtr.scan(f, acc)accfff (d)
+trtr.rev_scan(f, acc)accfff (e)
+Fig. 2. Illustration of complex trace operations.
+Finally, we may want to take a closer look at the very
+ﬁrst call to either foo(0) orfoo(1) , which we can do using
+thegetafter method:
+65ﬁrst foo01 = foo 01.get after(0)
+We call getafter onfoo01to ﬁnd the ﬁrst item after time 0,
+i.e., the beginning of the execution, that contains the snapshot
+of a foo(0) orfoo(1) call.
+In this example, observe how we began with a simple
+debugging task that counts all calls to fooin a trace to
+answer our initial hypothesis, then gradually create more
+traces or combined existing ones and queried them as our
+hypothesis evolves. E XPOSITOR is particularly suited for such
+incremental, interactive style of debugging.
+1) Comparison to GDB’s Python API: In contrast to E X-
+POSITOR , it takes 16 lines of code to count foocalls using
+GDB’s standard Python API, as shown below:
+66count = 0; more = True
+67foo = gdb.Breakpoint(”foo”)
+68def stop handler(evt):
+69 if isinstance(evt, gdb.BreakpointEvent) n
+70 and foo in evt.breakpoints:
+71 global count; count += 1
+72def exit handler(evt):
+73 global more; more = False
+74gdb.events.stop.connect(stop handler)
+75gdb.events.exited.connect(exit handler)
+76gdb.execute(”start”)
+77while more:
+78 gdb.execute(”continue”)
+79gdb.events.exited.disconnect(exit handler)
+80gdb.events.stop.disconnect(stop handler)
+81foo.delete()
+On line 66, we ﬁrst initialize two variables, count andmore ,
+that will be used to track of the number of calls to fooand
+to track if the execution has ended respectively. Then, on
+line 67, we create a breakpoint at the call to foo. Next, we
+create a callback function named stop handler on lines 68–71
+to handle breakpoint events. In this function, we ﬁrst check on
+lines 69–70 to see if the breakpoint triggered is the one that we
+have set, and if so, we increment count on line 71. We also
+create a callback function named exit handler on lines 72–
+73 to handle stop events which are ﬁred when the program
+execution ends. This function simply resets the more ﬂag when
+called.
+After that, we register stop handler andexit handler with
+GDB on lines 74–75, and start the program execution on
+line 76. GDB will run the program until it hits a breakpointor the end of the execution is reached, calling stop handler
+in the former case, or exit handler in the latter case. Then,
+we enter a loop on lines 77–78 that causes GDB to continue
+running the program until more isFalse , i.e., the program has
+exited. Once that happens, we deregister the event handlers
+from GDB and delete the breakpoint on lines 79–81, cleaning
+up after ourselves to ensure that the callbacks and breakpoint
+will not be unintentionally triggered by other scripts.
+It also takes more work to reﬁne this GDB script to answer
+other questions about foo, compared to E XPOSITOR traces. For
+example, to count calls to foo(0) , we would have to modify the
+GDB script to add the x == 0 predicate and rerun it, instead
+of simply calling ﬁlter on the footrace. As another example,
+if we were given two different scripts, one that counts foo(0)
+and another that counts foo(1) , if would be difﬁcult to combine
+those scripts as they each contain their own driver loops and
+shared variables; it would be easier to just modify one of those
+script than to attempt to reuse both. In contrast, it took us
+one line to use the merge method to combine the foo0and
+foo1traces. Finally, note that E XPOSITOR caches and reuses
+trace computation automatically, whereas we would need some
+foresight to add caching to the GDB script in a way that can
+be reused by other scripts.
+C. Example: Reverse Engineering a Stack-Smashing Attack
+We now illustrate the use of E XPOSITOR with a more
+sophisticated example: reverse engineering a stack-smashing
+attack, in which malware overﬂows a stack buffer in the target
+program to overwrite a return address on the stack, thereby
+gaining control of the program counter [7].
+We develop a reusable script that can detect when the stack
+has been smashed in any program, which will help pinpoint
+the attack vector. Our script maintains a shadow stack of return
+addresses and uses it to check that only the top of the stack
+is modiﬁed between function calls or returns; any violation of
+this property indicates the stack has been smashed.
+We begin by using the allcalls andallreturns methods on
+theexecution to create traces of just the snapshots at function
+calls and returns, respectively:
+82calls = the execution.all calls()
+83rets = the execution.all returns()
+Next, we use merge to combine these into a single trace,
+passing None for the merging function as function calls and
+returns can never coincide. We will use this new trace to
+compare consecutive calls or returns:
+584calls rets = calls.merge(None, rets)
+Now, we map over callreturns to apply the read retaddrs
+method, returning the list of return addresses on the call stack.
+This creates a trace of shadow stacks at every call and return:
+85shadow stacks = calls rets.map(
+86 lambda s: map(int, s.read retaddrs()))
+We also use map to coerce the return addresses to Python ints.
+Then we need to check that, between function calls and
+returns, the actual call stack matches the shadow stack except
+for the topmost frame (one return address may be added or
+removed). We use the following function:
+87def ﬁnd corrupted(ss, opt shadow):
+88 if opt shadow.force() is not None:
+89 for x, y in zip(ss.read retaddrs(), opt shadow.force()):
+90 if int(x) != y:
+91 return x # l -value of return address on stack
+92 return None
+Here, ﬁnd corrupted takes as arguments a snapshot ssand
+its immediately preceding shadow stack optshadow ; the opt
+preﬁx indicates that there may not be a prior shadow stack
+(ifssis at the ﬁrst function call), and we need to call the
+force method on optshadow to retrieve its value (we will
+explain the signiﬁcance of this in Sec. III). If there is a prior
+shadow stack, we compare every return address in ssagainst
+the shadow stack and return the ﬁrst location that differs, or
+None if there are no corrupted addresses. (The zipfunction
+creates a list of pairs of the respective elements of the two
+input lists, up to the length of the shorter list.)
+Finally, we generate a trace of corrupted memory locations
+using the trailing merge method, calling ﬁnd corrupted to
+merge each function call and return from callrets with the
+immediately preceding shadow stack in shadow stacks . We
+ﬁlter None out of the result:
+93corrupted addrs = calls rets n
+94 .trailing merge(ﬁnd corrupted, shadow stacks) n
+95 .ﬁlter(lambda x: x is not None)
+The resulting trace contains exactly the locations of corrupted
+return addresses at the point they are ﬁrst evident in the trace.
+D. Mini Case Study: Running EXPOSITOR ontinyhttpd
+We used the script just developed on a version of tiny-
+httpd [8] that we had previously modiﬁed to include a buffer
+overﬂow bug. We created this version of tinyhttpd as an
+exercise for a security class in which students develop exploits
+of the vulnerability.
+As malware, we deployed an exploit that uses a return-to-
+libc attack [9] against tinyhttpd . The attack causes tinyhttpd
+to print “ Now I pwn your computer ” to the terminal and then
+resume normal operation. Finding buffer overﬂows using stan-
+dard techniques can be challenging, since there can be a delay
+from the exploit overﬂowing the buffer to the payload taking
+effect, during which the exploited call stack may be erased
+by normal program execution. The payload may also erase
+evidence of itself from the stack before producing a symptom.To use E XPOSITOR , we call the expositor launcher with
+tinyhttpd as its argument, which will start a GDB session
+with E XPOSITOR ’s library loaded, and then enter the Python
+interactive prompt from GDB:3
+96% expositor tinyhttpd
+97(expositor) python -interactive
+Then, we start running tinyhttpd :
+98> > >theexecution.cont() # start running
+99httpd running on port 47055
+When tinyhttpd launches, it prints out the port number on
+which it accepts client connections. On a different terminal,
+we run the exploit with this port number:
+100% ./exploit.py 47055
+101Trying port 47055
+102pwning...
+At this point, tinyhttpd prints the exploit message, so we
+interrupt the debugger and use E XPOSITOR to ﬁnd the stack
+corruption, starting from the time when we interrupted it:
+103Now I pwn your computer
+104ˆC
+105Program received signal SIGINT, Interrupt
+106> > >corrupted addrs = stack corruption()
+107 # function containing Sec. II-Ccode
+108> > >time = the execution.get time()
+109> > >last corrupt = corrupted addrs.get before(time)
+Items in a trace are indexed by time, so the getbefore
+method call above tells E XPOSITOR to start computing
+corrupted addrs from the interrupted time backward and ﬁnd
+the ﬁrst function call or return when the stack corruption is
+detected. We can print the results:
+110> > >print time
+11156686.8
+112> > >print last corrupt
+113Item(56449.2, address )
+This shows that the interrupt occurred at time 56686 :8, and
+the corrupted stack was ﬁrst detected at a function call or
+return at time 56449 :2. We can then ﬁnd and print the snapshot
+that corrupted the return address with:
+114> > >bad writes = the execution n
+115 .watchpoints(last corrupt.value, rw=WRITE)
+116> > >last bad write = bad writes.get before(last corrupt.time)
+117> > >print last bad write
+118Item(56436.0, snapshot )
+We ﬁnd that the ﬁrst write that corrupted the return address
+occurred at time 56436 :0. We can then inspect the snapshot
+vialast bad write.value . In this case, the backtrace of the
+very ﬁrst snapshot identiﬁes the exact line of code in tinyhttpd
+that causes the stack corruption—a socket recv with an out-
+of-bounds pointer. Notice that to ﬁnd the bug, E XPOSITOR
+only inspected from time 56686 :8to time 56436 :0. Moreover,
+had last corrupt not explained the bug, we would then call
+3GDB contains an existing python command that is not interactive; python-
+interactive is a new command that we have submitted to GDB, and is available
+as of GDB 7.6.
+6corrupted addrs.get before(last corrupt.time) to ﬁnd the prior
+corruption event, inspecting only as much of the execution as
+needed to track down the bug.
+This mini case study also demonstrates that, for some
+debugging tasks, it can be much faster to search back-
+ward in time. It takes only 1 second for corrupted addrs
+.get before(time) to return; whereas if we had instead searched
+forward from the beginning (e.g., simulating a debugger with-
+out time-travel):
+119ﬁrst corrupted = corrupted addrs.get after(0)
+it takes 4 seconds for the answer to be computed. Using
+EXPOSITOR , users can write scripts that search forward or
+backward in time, as optimal for the task.
+III. L AZY TRACES IN EXPOSITOR
+As just discussed, E XPOSITOR allows users to treat traces as
+if they were lists of snapshots. However, for many applications
+it would be impractical to eagerly record and analyze full
+program snapshots at every program point. Instead, E XPOS -
+ITOR uses the underlying time-travel debugger, UndoDB, to
+construct snapshots on demand and to discard them when they
+are no longer used (since it is expensive to keep too many
+snapshots in memory at once). Thus the major challenge is
+to minimize the demand for snapshots, which E XPOSITOR
+accomplishes by constructing and manipulating traces lazily .
+More precisely, all of the trace generators and combinators,
+including execution.all calls,trace.map ,trace.merge , etc., re-
+turn immediately without invoking UndoDB. It is only when
+ﬁnal values are demanded, with execution.get at,trace.get at,
+trace.get after, or trace.get before , that E XPOSITOR queries
+the actual program execution, and it does so only as much as
+is needed to acquire the result. For example, the construction
+ofcorrupted addrs in Sec. II-D, line 106 induces notime
+travel on the underlying program—it is not until the call to
+corrupted addrs.get before(time) in Sec. II-D, line 109 that
+EXPOSITOR uses the debugger to acquire the ﬁnal result.
+To achieve this design, E XPOSITOR uses a lazy, interval-
+tree-like data structure to implement traces. More precisely,
+a trace is a binary tree whose nodes are annotated with the
+(closed) lower-bound and (open) upper-bound of the time
+intervals they span, and leaf nodes either contain a value or
+are empty. The initial tree for a trace contains no elements
+(only its deﬁnition), and E XPOSITOR materializes tree nodes
+as needed.
+As a concrete example, the following trace constructs the
+tree shown on the right, with a single lazy root node spanning
+the interval [0;1), which we draw as a dotted box and arrow.
+120foo = the execution.breakpoints(”foo”)
+0∞
+Now suppose we call foo.get before(100) . EXPOSITOR sees
+that the query is looking for the last call to foobefore time
+100, so it will ask UndoDB to jump to time 100 and then run
+backward until hitting such a call. Let us suppose the call is at
+time50, and the next instruction after that call is at time 50:1.Then E XPOSITOR will expand the root node shown above to
+the following tree:
+0∞0∞50.1∞100∞50.1100050.1foo50.150050
+Here the trace has been subdivided into four intervals: The
+intervals [0;50)and[100;1)are lazy nodes with no further
+information, as E XPOSITOR did not look at those portions of
+the execution. The interval [50;50:1)contains the discovered
+call, and the interval [50:1;100) is fully resolved and contains
+no calls to foo. Notice that if we ask the same query again,
+EXPOSITOR can traverse the interval tree above to respond
+without needing to query UndoDB.
+Likewise, calling getat(t) orgetafter(t) either returns im-
+mediately (if the result has already been computed) or causes
+UndoDB to jump to time t(and, for getafter(t) , to then execute
+forward). These methods may return None , e.g., if a call to
+foodid not occur before/after/at time t.
+As our micro-benchmarks in Sec. V will show, if we request
+about 10–40% of the items in a trace, computing traces lazily
+takes less time than computing eagerly, depending on the
+query pattern as well as the kind of computations done. This
+makes lazy traces ideal for debugging tasks where we expect
+programmers to begin with some clues about the location of
+the bug. For example, we start looking for stack corruption
+from the end of the execution in Sec. II-D, line 109, because
+stack corruptions typically occur near the end of the execution.
+A. Lazy Trace Operations
+We implement ﬁlter andmap lazily on top of the interval tree
+data structure. For a call tr1 = tr0.map(f) , we initially construct
+an empty interval tree, and when values are demanded in
+tr1(bygetXcalls), E XPOSITOR conceptually calls tr0.get X,
+applies fto the result, and caches the result for future use.
+Calls to tr0.ﬁlter(p) are handled similarly, constructing a lazy
+tree that, when demanded, repeatedly gets values from tr0until
+pis satisﬁed. Note that for efﬁciency, E XPOSITOR ’s does not
+actually call getXon the root node of tr0; instead, it directly
+traverses the subtree of tr0corresponding to the uninitialized
+subtree of the derived trace.
+The implementation of tr0.merge(f, tr1) also calls getXon
+tr1as required. For a call tr.slice(t0, t1) EXPOSITOR creates an
+interval tree that delegates getXcalls to tr, asking for items
+from time t0to time t1, and returns None for items that fall
+outside that interval.
+For the last four operations, [rev ]trailing merge and
+[rev ]scan , EXPOSITOR employs additional laziness in the
+helper function argument f. To illustrate, consider a call to
+tr.scan(f, acc) . Here, E XPOSITOR passes the accumulator to f
+wrapped in an instance of class lazy, deﬁned as follows:
+121class lazy:
+122 force(): return the actual value
+7123 isforced(): return whether force has been called
+The force method, when ﬁrst called, will compute the actual
+value and cache it; the cached value is returned in subsequent
+calls. Thus, fcanforce the accumulator as needed, and if it is
+not forced, it will not be computed.
+To see the beneﬁt, consider the following example, which
+uses scan to derive a new trace in which each item is a count of
+the number of consecutive calls to foowith nonzero arguments,
+resetting the count when foois called with zero:
+124foo = execution.breakpoints(”foo”) # void foo(int x)
+125def count nonzero foo(lazy acc, snapshot):
+126 if snapshot.read var(”x”) != 0:
+127 return lazy acc.force() + 1
+128 else:
+129 return 0
+130nonzero foo = foo.scan(count nonzero foo, 0)
+Notice that if lazy accwere not lazy, E XPOSITOR would have
+to compute its value before calling count nonzero foo. By the
+deﬁnition of scan (Fig. 2d), this means that it must recursively
+call count nonzero footo compute all prior output items
+before computing the current item, even if it is unnecessary
+to do so, e.g., if we had called nonzero foo.get before(t) , and
+the call to foojust before time thad argument x=0. Thus, a
+lazy accumulator avoids this unnecessary work. E XPOSITOR
+uses a lazy accumulator in revscan for the same reason.
+Likewise, observe that in tr0.trailing merge(f, tr1) , for a
+particular item in tr0the function fmay not need to look in
+tr1to determine its result; thus, E XPOSITOR wraps the tr1
+argument to fin an instance of class lazy. The implementation
+ofrevtrailing merge similarly passes lazy items from tr1to
+f. Note that there is no such laziness in the regular merge
+operation. The reason is that in tr0.merge(f, tr1) , the items from
+tr0andtr1that are combined with foccur at the same time.
+Thus, making f’s arguments lazy would not reduce demands
+on the underlying time-travel debugger.
+B. Tree Scan
+Finally, E XPOSITOR provides another list combinator, tree-
+scan, which is a lazier variant of scan that is sometimes more
+efﬁcient. The tscan method computes an output for every
+preﬁx of an input trace by applying an associative binary
+function in a tree-like fashion (Fig. 3a). It is invoked with
+tr.tscan(f) , where fmust be an associative function that is lazy
+and optional in its left argument and lazy in its right argument.
+Thetscan method generates an output trace of the same length
+as the input trace, where the nth output outnis deﬁned as:
+outn=in0fin1f finn
+where fis written inﬁx as f. Notice that there is no
+accumulator, and E XPOSITOR can apply fin any order, since
+it is associative. When a value at time tis demanded from the
+output trace, E XPOSITOR ﬁrst demands the item innat that
+time in the input trace (if no such item exists, then there is no
+item at that time in the output trace). Then E XPOSITOR walks
+down the interval tree structure of the input trace, calling f
+(only if demanded) on each internal tree node’s children to
+trtr.tscan(f)ffff(a)
+tr.rev_tscan(f)trffff (b)
+Fig. 3. Illustration of tree-scan operations.
+compute outn. Since the interval tree for the input trace is
+computed lazily, fmay sometimes be called with None as
+a left argument, for the case when fforces an interval that
+turns out to contain no values; thus for correctness, we also
+require that ftreats None as a left identity. (The right argument
+corresponds to innand so will never be None .)
+Because both arguments of fare lazy, E XPOSITOR avoids
+computing either argument unnecessarily. The isforced
+method of the lazy class is particularly useful for tscan , as
+it allows us to determine if either argument has been forced,
+and if so, evaluate the forced argument ﬁrst. For example, we
+can check if a trace contains a true value as follows:
+131def has true(lazyleft, lazyright):
+132 return lazyleft.is forced() and lazyleft.force() n
+133 or lazyright.is forced() and lazyright.force() n
+134 or lazyleft.force() or lazyright.force()
+135has true trace = some trace.tscan(has true)
+136last has true = has true trace.get before(”inf”)
+The best case for this example occurs if either lazyleft or
+lazyright have been forced by a prior query, in which case
+either the ﬁrst clause (line 132) or second clause (line 133)
+will be true and the unforced argument need not be computed
+due to short-circuiting.
+EXPOSITOR ’srevtscan derives a new trace based on future
+items instead of past items (Fig. 3b), computing output item
+outnas:
+outn=innfinn+1f finlength 1
+Here, the right argument to fis optional, rather than the left.
+IV. T HEEDITHASH ARRAY MAPPED TRIE
+Many of the E XPOSITOR scripts we have written use sets
+or maps to record information about the program execution.
+For example, in Sec. I, we suggested the use of a shadow set
+to debug the implementation of a custom set data structure.
+Unfortunately, a typical eager implementation of sets or maps
+could demand all items in the traces, defeating the intention
+of E XPOSITOR ’s lazy trace data structure. To demonstrate
+this issue, consider the following code, which uses Python’s
+standard (non-lazy) setclass to collect all arguments in calls
+to a function foo:
+137foos = the execution.breakpoints(”foo”) # void foo(int arg)
+138def collect fooargs(lazy acc, snap):
+139 return lazy acc.force().union( n
+140 set([ int(snap.read var(”arg”)) ]))
+141fooargs = foos.scan(collect fooargs, set())
+8142class edithamt:
+143 # lookup methods
+144 contains(k):
+145 Return if key kexists
+146 ﬁnd(k):
+147 Return the latest value for korNone if not found
+148 ﬁnd multi(k):
+149 Return an iterator of all values bound to k
+150
+151 # static factory methods to create new EditHAMTs
+152 empty():
+153 Create an empty EditHAMT
+154 add(lazy eh, k):
+155 Add binding of kto itself to lazy eh
+156 addkeyvalue(lazy eh, k, v):
+157 Add binding of ktovtolazy eh
+158 remove(lazy eh, k):
+159 Remove all bindings of kfrom lazy eh
+160 removeone(lazy eh, k):
+161 Remove the latest binding of kto any value from lazy eh
+162 removekeyvalue(lazy eh, k, v):
+163 Remove the latest binding of ktovfrom lazy eh
+164 concat(lazy eh1, lazy eh2):
+165 Concatenate lazy eh2edit history to lazy eh1
+Fig. 4. The EditHAMT API.
+Notice that we must force lazy accto call the union method
+which will create a deep copy of the updated set (lines 139–
+140). Unfortunately, forcing lazy acc causes the immedi-
+ately preceding set to be computed by recursively calling
+collect fooargs. As a result, we must compute all preceding
+sets in the trace even if a particular query could be answered
+without doing so.
+To address these problems, we developed the edit hash
+array mapped trie (EditHAMT), a new set, map, multiset, and
+multimap data structure that supports lazy construction and
+queries. The EditHAMT complements the trace data structure;
+as we will explain, and our micro-benchmark in Sec. V-D
+will show, the EditHAMT can be used in traces without
+compromising trace laziness, unlike eager sets or maps.
+A. EditHAMT API
+From the user’s perspective, the EditHAMT is an immutable
+data structure that maintains the entire history of edit opera-
+tions for each EditHAMT. Fig. 4 shows the EditHAMT API.
+The edithamt class includes contains(k) to determine if key
+kexists, and ﬁnd(k) to look up the latest value mapped to
+key k. It also includes the ﬁnd multi(k) method to look up
+all values mapped to key k, returned as a Python iterator
+that incrementally looks up each mapped value. EditHAMT
+operations are implemented as static factory methods that cre-
+ate new EditHAMTs. Calling edithamt.empty() creates a new,
+empty EditHAMT. Calling edithamt.add(lazy eh, k) creates a
+new EditHAMT by adding to lazy eh, the prior EditHAMT,
+a binding from key kto itself (treating the EditHAMT as a
+set or multiset). Similarly, edithamt.addkeyvalue(lazy eh, k, v)
+creates a new EditHAMT by adding to lazy eha binding from
+keykvalue v(treating the EditHAMT as a map or multimap).Conversely, calling edithamt.remove(lazy eh, k) creates a new
+EditHAMT by removing all bindings of key kfrom lazy eh.
+Lastly, calling edithamt.removeone(lazy eh, k) oredithamt
+.removekeyvalue(lazy eh, k, v) creates new EditHAMTs by
+removing from lazy ehthe most recent binding of key kto
+any value or to a speciﬁc value v. The lazy ehargument to
+these static factory methods is lazy so that we need not force it
+until a call to contains ,ﬁndorﬁnd multi demands a result. For
+convenience, the lazy ehargument can also be None , which
+is treated as an empty EditHAMT.
+The last static factory method, edithamt.concat(lazy eh1,
+lazy eh2), concatenates the edit histories of its arguments.
+For example:
+166ehrem = edithamt.remove(None, ”x”)
+167ehadd = edithamt.addkeyvalue(None, ”x”, 42)
+168eh = edithamt.concat(eh add, eh rem)
+Here ehis the empty EditHAMT, since it contains the ad-
+ditions in ehadd followed by the removals in ehrem. A
+common E XPOSITOR script pattern is to map a trace to a
+sequence of EditHAMT additions and removals, and then use
+edithamt.concat with scan ortscan to concatenate those edits.
+B. Example: EditHAMT to Track Reads and Writes to a
+Variable
+As an example of using the EditHAMT, we present one
+piece of the race detector used in our Firefox case study
+(Sec. VI). The detector compares each memory access against
+prior accesses to the same location from any thread. Since
+UndoDB serializes thread schedules, each read need only be
+compared against the immediately preceding write, and each
+write against the immediately preceding write as well as reads
+between the two writes.
+We use the EditHAMT as a multimap in the following
+function to track the access history of a given variable v:
+169def access events(v):
+170 reads = the execution.watchpoints(v, rw=READ) n
+171 .map(lambda s: edithamt.addkeyvalue( n
+172 None, v, (”read”, s.get thread id())))
+173 writes = the execution.watchpoints(v, rw=WRITE) n
+174 .map(lambda s: edithamt.addkeyvalue( n
+175 edithamt.remove(None, v), n
+176 v, (”write”, s.get thread id())
+177 return reads.merge(None, writes)
+Inaccess events , we create the trace reads by ﬁnding all
+reads to vusing the watchpoints method (line 170), and then
+mapping each snapshot to a singleton EditHAMT that binds v
+to a tuple of ”read” and the running thread ID (lines 171–172).
+Similarly, we create the trace writes for writes to v(line 173),
+but instead map each write snapshot to an EditHAMT that ﬁrst
+removes all prior bindings for v(line 175), then binds vto a
+tuple of ”write” and the thread ID (lines 174–176). Finally, we
+merge reads andwrites , and return the result (line 177).
+We are not done yet, since the EditHAMTs in the trace
+returned by access events contain only edit operations corre-
+sponding to individual accesses to v. We can get an EditHAMT
+trace that records all accesses to vfrom the beginning of the
+9Readvar1t0thread 1Readvar2t1thread 2Writevar1Addvar1read,1access_events("var1").merge(access_events("var2"))Removevar1Addvar1write,1Writevar2Readvar1Addvar2read,2Removevar2Addvar2write,1Addvar1read,2t2t3t4Fig. 5. Example execution with two threads accessing var1 (gray) and var2,
+and the corresponding EditHAMT operations returned by access events .
+execution by using scan with edithamt.concat to concatenate
+the individual EditHAMTs. For example, we can record the
+access history of var1 as follows:
+178var1 history = access events(”var1”).scan(edithamt.concat)
+We can also track multiple variables by calling
+access events on each variable, merging the traces, then
+concatenating the merged trace, e.g., to track var1 andvar2:
+179access history = n
+180 access events(”var1”).merge(access events(”var2”)) n
+181 .scan(edithamt.concat)
+Since trace methods are lazy, this code completes immediately;
+the EditHAMT operations will only be applied, and the
+underlying traces forced, when we request a particular access,
+e.g., at the end of the execution (time ”inf”):
+182last = access history.get before(”inf”)
+To see laziness in action, consider applying the above
+analysis to an execution depicted in Fig. 5, which shows two
+threads at the top and the corresponding EditHAMT operations
+at the bottom. Suppose we print the latest access to var1 at
+timet4using the ﬁndmethod:
+183> > >print last.ﬁnd(”var1”)
+184(”read”, 2)
+Because ”var1” was just added at time t4, answering this
+query will only force the EditHAMT and query the time-travel
+debugger at time t4, and not before.
+As another example, suppose we want to ﬁnd all accesses
+tovar1 from the last access backward using ﬁnd multi :
+185> > >for mem access in last.ﬁnd multi(”var1”):
+186 print mem access
+187(”read”, 2)
+188(”write”, 1)
+Here since all ”var1” bindings added prior to time t2were
+removed at time t2, the results are computed without forcing
+any EditHAMTs or querying the debugger before time t2.
+C. Implementation
+The EditHAMT is inspired by the hash array mapped trie
+(HAMT) [10]. Like the HAMT, the EditHAMT is a hybrid
+data structure combining the fast lookup of a hash table and
+the memory efﬁciency of a trie. The HAMT is a hash-baseddata structure built in a manner analogous to a hash table.
+Whereas a hash table uses a bucket array to map keys to
+values, the HAMT uses an array mapped trie (AMT)—a trie
+that maps ﬁxed-width integer keys to values—for the same
+purpose. When a hash collision occurs, the HAMT resolves
+the collision by replacing the colliding entry with a nested
+HAMT, rehashing the colliding keys, and inserting those keys
+in the nested HAMT using the new hash values.
+We developed the EditHAMT by making two changes to
+the traditional HAMT. First, we replaced the AMT with
+theLazyAMT , which supports lazy, rather than eager, up-
+dates. Second, we resolve hash collisions, as well as support
+remove and multiset/multimap operations, using EditList s,
+which are lazy linked-lists of nodes tallying edit operations
+on the EditHAMT; the tails are lazily retrieved from the prior
+EditHAMT.
+1) LazyAMT: Lazy Array Mapped Tries: The ﬁrst piece of
+the EditHAMT is the LazyAMT, which is a lazy, immutable
+variant of the AMT that maps ﬁxed-width integer keys of
+sizekbits to values. We implement the LazyAMT using lazy
+sparse arrays of size 2was internal nodes, where wis the
+bit-width of the array index such that w < k , and store key-
+value bindings as leaf nodes. We will divide the key into w-bit
+words, where each w-bit word is used to index an internal node
+during a lookup; the key can be padded as necessary if kis
+not a multiple of w.
+Lazy sparse arrays combine the properties of lazy values and
+sparse arrays: each element of a lazy sparse array is computed
+and cached when ﬁrst indexed, akin to forcing a lazy value,
+and null elements are stored compactly, like sparse arrays.
+We implement lazy sparse arrays using two bitmaps to track
+which elements are initialized and non-null,4respectively, and
+an array to store initialized, non-null elements.
+To build the EditHAMT, we need to support two operations
+on the LazyAMT: adding a key-value binding to a LazyAMT,
+and merging two LazyAMTs into a single LazyAMT. We
+will explain how the LazyAMT works by example, using an
+internal node index bit-width of w= 2 bits and a key size of
+k= 6 bits.
+a) Adding a key-value binding: When we add a binding
+such as 14 :bto a LazyAMT, we ﬁrst create a new lazy sparse
+array representing the root node:
+14:bprior LazyAMT
+Initially, all elements of the root node are uninitialized, which
+we depict as four narrow dotted boxes; we will use the
+convention of numbering the boxes from left to right, i.e., in
+binary, the leftmost box is element 00, and the rightmost box
+is element 11. In addition, we also maintain a lazy reference
+4It is more efﬁcient to track non-null elements as many modern processors
+provide a POPCNT instruction, which counts the number of 1bits in a word,
+that can be used to compute the index of a non-null element in the storage
+array.
+10to the prior LazyAMT; we do not yet need to know what
+the prior LazyAMT contains, which we indicate with a dotted
+arrow. In fact, the lazy reference allows us to further defer
+the construction of (the root node of) the prior LazyAMT,
+i.e., the prior LazyAMT may not exist yet when we add the
+binding 14 :b; we indicate this with a dotted trapezoid. For
+example, in E XPOSITOR , we may query UndoDB to determine
+what binding should be added only when the lazy reference to
+the prior LazyAMT is ﬁrst forced. We also need to store the
+binding 14 :b, to be added when the LazyAMT is sufﬁciently
+initialized.
+The actual construction of the LazyAMT occurs only when
+we look up a binding. The lookup is a standard trie lookup,
+however, since internal nodes are lazy sparse arrays, the
+elements of those arrays will be initialized as necessary when
+we access those elements during the lookup. We initialize
+an element in one of three ways, depending on whether that
+element is along the lookup path of the binding we previously
+set aside to be added, and whether we have reached the end
+of the lookup path. If the element is along the lookup path
+the binding and we have not reached the end of the lookup
+path, we create the next internal node and initialize the element
+to that node. If the element is along the lookup path of the
+binding and we have reached the end of the lookup path, we
+initialize the element to a leaf node containing that binding.
+Otherwise, if the element is not along the lookup path of the
+binding, we initialize it to point to the same subtrie as the
+corresponding element (at the same partial lookup path) in
+the prior LazyAMT, or to be null if the corresponding element
+does not exist. Note that in the last case, prior LazyAMTs will
+be recursively initialized as necessary.
+For example, suppose that we look up the binding for key
+14. First, we split up the key into w-bit words, here, 00 11 10
+in binary; this is the lookup path for key 14. Then, we use the
+ﬁrst word, 00, to index the root node. We need to initialize
+the element at 00as this is the ﬁrst time we accessed it. Since
+this particular LazyAMT was created by adding 14 :band the
+00element of the root node is along the lookup path for key
+14, we initialize that element to a new uninitialized internal
+node below the root node:
+14:bprior LazyAMT
+Here, we depict the initialized element of the root node as
+a square unbroken box, and a non-lazy reference to the just
+created internal node as an unbroken arrow.
+We continue the lookup by using the next word, 11, to index
+the just created internal node. Since 11is again along the
+lookup path, we initialize the corresponding element to another
+internal node. We repeat the process again with the last word,
+10, but now that we have exhausted all bits in the lookup
+key, we initialize the element for 10to point to a leaf node
+containing the binding 14 :bthat we previously set aside. This
+results in a partially initialized LazyAMT:
+prior LazyAMT14:bWe ﬁnish the lookup for key 14and return b.
+The example so far illustrates how the lookup process drives
+the initialization process in an interleaved manner. Also, since
+we are looking up a key that was just inserted into the
+LazyAMT, we did not need to refer to the prior LazyAMT
+at all. These properties allow LazyAMTs to be constructed
+lazily, by initializing only as much as necessary to answer
+lookup queries.
+We continue the example by considering the case of looking
+up a key that was not added by the most recent LazyAMT.
+Suppose that the immediately prior LazyAMT, when com-
+puted, will add binding 5 :a:
+prior LazyAMT14:badd 5 : a
+If we then look up key 5, or00 01 01 in binary, from the
+rightmost LazyAMT, we would ﬁrst index 00of the root node.
+We have already initialized this element from looking up key
+14before, so we simply walk to the next internal node and
+index 01. The element at 01is uninitialized, but it is not along
+the lookup path of key 14, the key added to the rightmost
+LazyAMT. To continue the lookup of key 5, we retrieve the
+prior LazyAMT by forcing our lazy reference to it, causing it
+to be partially constructed:
+5:aprior LazyAMT14:b
+Then, we initialize the element at 01to point to the subtrie un-
+der the element at the partial key 00 01 in the prior LazyAMT,
+initializing the middle LazyAMT a bit more along the way:
+115:aprior LazyAMT14:bWe ﬁnish the lookup for key 5as before, initializing the
+LazyAMTs a bit more:
+14:b5:aprior LazyAMT
+Note that we have simultaneously initialized parts of the
+rightmost LazyAMT and the middle LazyAMT because they
+share a common subtrie; subsequent lookups of key 5on either
+LazyAMT will become faster as a result.
+b) Merging two LazyAMTs: The merge operation takes
+two LazyAMTs as input, which we call left and right , as
+well as a function, mergefn (lazy-opt-leftval ;rightval ), that
+is called to merge values for the same key in both LazyAMTs.
+As the name of the arguments suggests, mergefn is called in
+an unusual, asymmetric manner in that it is called for all keys
+in the right LazyAMT, but not necessarily for all keys in the
+leftLazyAMT. For each key in the right LazyAMT, mergefn
+is called with a lazy, optional value, representing the value for
+that key in the leftLazyAMT, as the lazy-opt-leftval argu-
+ment, and the value for the same key in the right LazyAMT
+as the rightval argument. This approach maximizes laziness
+in that we can compute a lazy value as soon as we determine a
+key exists in the one LazyAMT without immediately looking
+up the value for the same key in the other LazyAMT. For
+example, mergefn can be used to create a lazy linked-list by
+returning lazy-opt-leftval and rightval in a tuple.
+When we merge two LazyAMTs, we ﬁrst create a new root
+node of a new LazyAMT with two lazy references to the input
+LazyAMTs:
+right LazyAMTleft LazyAMT
+As before, the actual construction of the merged LazyAMT
+occurs when elements of internal nodes are initialized during
+lookups. We initialize an element in one of three ways,
+depending on whether the corresponding element (at the
+same partial lookup path) in the right LazyAMT points to
+an internal node, points to a leaf node, or is null. If the
+corresponding element points to an internal node, we create
+the next internal node and initialize the element to that node. Ifthe corresponding element points to a leaf node, then we call
+mergefn , giving as lazy-opt-leftval a new lazy value that,
+when forced, looks up the same key in the left LazyAMT
+(returning null if the key does not exist), and as rightval the
+value at the leaf node. Otherwise, if the corresponding element
+is null, we initialize the element to point to the same subtrie as
+the corresponding element in the leftLazyAMT, or to be null
+if the corresponding element does not exist. Note that both
+theleftandright LazyAMTs will be recursively initialized as
+necessary.
+For example, suppose the right LazyAMT contains a single
+binding 14 :b:
+left LazyAMT14:b
+If we look up key 14, or00 11 10 in binary, we would ﬁrst
+index element 00of the root node. Since this is the ﬁrst
+time we accessed this element, we initialize it by looking
+at the corresponding element in the right LazyAMT. The
+corresponding element points to an internal node, so we
+initialize the element to a new internal node:
+left LazyAMT14:b
+We repeat this process until we exhaust all bits in the lookup
+key and reach the corresponding leaf node. Because a binding
+exists for key 14in the right LazyAMT, we initialize a new
+leaf node that binds key 14to a merged value by ﬁrst creating
+a new lazy value that looks up the key 14from the left
+LazyAMT, and calling mergefn on that lazy value as well
+as the value bfrom the right LazyAMT:
+left LazyAMT14:b14:mergefn(  , b)
+Note that we do not have to force the left LazyAMT to
+be computed immediately; the decision to force the left
+12LazyAMT is deferred to mergefn . We ﬁnish the lookup by
+returning the newly merged value.
+As another example, suppose the leftLazyAMT contains a
+single binding 5 :a:
+14:b5:a14:mergefn(  , b)
+If we look up key 5, or00 01 01 in binary, we would ﬁrst index
+element 00of the root note that is already initialized above.
+However, when we index element 01of the next internal node,
+we would ﬁnd that the corresponding element in the right
+LazyAMT is null. In this case, we look up the subtrie under
+the corresponding element in the leftLazyAMT, and initialize
+element 01to it:
+14:b5:a14:mergefn(  , b)
+Note that we do not call mergefn in this case. We ﬁnish the
+lookup by walking into left LazyAMT to the leaf node for
+key5, and returning a.
+Finally, we represent the empty LazyAMT as a special
+instance that simply returns null for all key and partial key
+lookups, allowing us to avoid building a trie structure with no
+bindings.
+LazyAMT lookups are amortized O(1)time; the LazyAMT
+has a ﬁxed depth of k=w, so each lookup takes constant time
+to traverse the internal nodes to a leaf node. Similarly, adding
+a binding to a LazyAMT or merging two LazyAMTs take only
+amortized O(1)time and memory to create k=w internal nodes
+of size 2weach. The amortization of lookups, adding bindings,
+and merging LazyAMTs is due to laziness—most of the cost
+of adding a binding or merging two LazyAMTs is deferred to
+subsequent lookups. Adding the same key repeatedly would
+take an additional amortized O(1)memory each time (i.e.,
+prior bindings are never removed, only shadowed). However,
+this is actually an advantage in E XPOSITOR as we are usually
+interested in how bindings to the same key change over time.
+2) EditList: Lazy Linked-List of Edit Operations: The sec-
+ond piece of the EditHAMT is the EditList, which is a lazy
+immutable set/map/multiset/multimap implemented as a lazy
+linked-list of edit operations.When an operation such as add or remove is applied to an
+EditList, we simply append a new node to the EditList, label-
+ing it with the given operation and arguments. For example,
+if we add a binding k0:ato an EditList (treating the EditList
+as a map or multimap), we create a new EditList node labeled
+addkeyvalue (k0; a)with a lazy reference to the head of the
+prior EditList (i.e., the prior node):
+prior EditListaddkeyvalue(k0, a)
+We depict the EditList node as a box pointing to the left.
+Since all operations, including removals, are implemented by
+appending nodes, we do not need to know what the prior
+EditList contains, which we depict as a dotted arrow. And,
+as with the LazyAMT, we keep a lazy reference to the prior
+EditList which allows us to further delay any computation
+necessary to determine its contents, i.e., the prior EditList
+may not exist yet when we perform an addition or removal
+operation on it, which we depict as a dotted rounded box. Only
+when we ﬁrst force the lazy reference to the prior EditList will
+we need to determine what kind of edit operation the prior
+EditList contains or if it is null, e.g., by making queries to
+UndoDB in E XPOSITOR .
+We support several different kinds of edit operations on
+EditLists, with the corresponding node labels:
+add(k): add element k, treating the EditList as a set or
+multiset;
+addkeyvalue (k; v): add a binding from key kto value v,
+treating the EditList as a map or multimap;
+remove (k): remove all elements/bindings for key k;
+removeone (k): remove the latest element/binding for key
+k, treating the EditList as a multiset or multimap;
+removekeyvalue (k; v): remove the latest binding from
+keykto value v, treating the EditList as a multimap;
+concat (lazy el): concatenate the EditList lazy elas a
+lazy reference at this point.
+These are the building blocks for the corresponding
+EditHAMT operations listed in Fig. 4.
+We implement EditList lookup in two different ways: one
+for set membership queries and map lookups, and another for
+multiset and multimap lookups.
+a) Set Membership Queries and Map Lookups: We im-
+plement set membership queries and map lookups by travers-
+ing the EditList from head to tail (right to left), looking for
+the ﬁrst node that contains an edit operation for the given key.
+For example, if we look up the value for key k0in the above
+EditList, we would start by looking at the head node. Since
+the head node adds a binding from key k0, we can ﬁnish the
+lookup and return value awithout having to look at the prior
+EditList. As another example, suppose that the immediately
+prior node, when we force it to be computed, e.g., by making
+calls to UndoDB in E XPOSITOR , removes key k1:
+remove k1prior EditListaddkeyvalue(k0, a)
+13If we look up the value for key k1, we would ﬁrst look at
+the head node and skip it because it does not involve key k1.
+Then, we would force the lazy reference to the prior node,
+causing it to be initialized if necessary, and look at it:
+prior EditListaddkeyvalue(k0, a)remove(k1)
+Here, we indicate that the tail has been forced with an
+unbroken arrow, and that the prior node has been initialized by
+replacing the dotted rounded box with pointed box. Since the
+prior node removes key k1, we know that bindings no longer
+exist for key k1, so we can ﬁnish the lookup and return null.
+This example shows that, once we have found a node that
+involves the lookup key, we no longer need to traverse the
+rest of the EditList. Also, because the reference to the prior
+EditList is lazy, the lookup process drives the construction
+of prior EditLists in an interleaved manner, just as in the
+LazyAMT.
+If we ﬁnd a concat node during traversal, we handle that
+node by recursively looking up the concatenated EditList for
+the given key. If we do not ﬁnd any relevant nodes in the
+concatenated EditList, we would then resume the lookup in
+the original EditList.
+b) Multiset and Multimap Lookups: We implement mul-
+tiset and multimap lookups lazily by returning a Python iterator
+that allows all values for a given key to be incrementally
+retrieved, typically via a for x in values loop. To illustrate
+how we implement multimap lookups, suppose we have the
+following EditList:
+remove one k0add k0 : badd k0 : cNoneaddkeyvalue(k0, a)
+Reading backward from the tail, this EditList binds key k0to
+value c, binds value band removes it, then binds value a; i.e.,
+it represents a map that contains bindings from k0to values a
+andcbut not b. A multimap lookup on this EditList for key
+k0will return an iterator of all values bound to that key:
+k0remove one k0add k0 : badd k0 : cNoneaddkeyvalue(k0, a)
+The iterator is associated with the key k0and initially points
+to the beginning of the input EditList, which we depict as a
+large down-arrow labeled k0.
+The actual lookup does not begin until we retrieve a value
+from the iterator , which initiates a traversal of the input
+EditList to ﬁnd a binding for key k0:
+k0remove one k0addkeyvalue(k0, a)add k0 : badd k0 : cNoneIn this case, the head of the input EditList itself contains a
+binding to value a, so we return the value aand update the
+iterator to point to the tail of the input EditList (the head of
+the prior EditList), which we depict by moving the k0down-
+arrow.
+If we retrieve a value from the iterator again, the lookup
+continues from the head of the prior EditList:
+k0Noneaddkeyvalue(k0, a)removeone(k0)addkeyvalue(k0, b)addkeyvalue(k0, c)
+The prior node removes the next binding for key k0; we
+temporarily note this as a pending removal. The node after
+that adds a binding for key k0, but since we have a pending
+removal, we skip over that node. Next, we reach a node that
+binds key k0to value c, so we return cand update the iterator
+as before.
+If we retrieve a value from the iterator once more, the lookup
+will reach the end of the input EditList, which we depict as
+None , so we terminate the iterator . At this point, all nodes in
+the input EditList will have been initialized:
+Noneaddkeyvalue(k0, a)removeone(k0)addkeyvalue(k0, b)addkeyvalue(k0, c)
+We implement multiset lookups identically by treating
+add(k)as if key kwere bound to itself. Note in particular that,
+whereas a standard multiset lookup gives us the total number
+of values for a given key, a lazy multiset lookup allows us
+to ask if there are at least nvalues for a given key. As we
+illustrated above, both multiset and multimap lookups are lazy
+in that the returned iterator will only initializes as many nodes
+of the input EditList as retrieved.
+EditList set membership and map/multiset/multimap
+lookups are not particularly fast, since they take O(n), where
+nis the number of edit operations in the EditList (i.e., the
+length of the EditList), to traverse the EditList to ﬁnd a
+relevant binding. However, applying an edit operation takes
+onlyO(1)time and O(1)memory to create and append a
+single EditList node. Adding an element or binding to the
+same key repeatedly takes an additional O(1)memory each
+time, but as we explained for the LazyAMT, this is actually
+an advantage for E XPOSITOR as we are usually interested in
+how bindings change over time.
+143) EditList + Hash + LazyAMT = EditHAMT: As we
+described above, the LazyAMT provides fast amortized O(1)
+set/map lookups, but supports only ﬁxed-width integer keys as
+well as addition and merging operations; it does not support
+removal operations or multiset/multimap lookups. Conversely,
+the EditList supports arbitrary keys, removal operations as well
+as multiset/multimap lookups, but lookups are a slow O(n)
+where nis the number of edit operations in the EditList. Both
+the LazyAMT and the EditList support lazy construction, i.e.,
+we can perform operations such as addition or removal with-
+out knowing what the prior LazyAMT or EditList contains.
+Finally, each LazyAMT operation takes only an additional
+amortized O(1)time and memory over the prior LazyAMT,
+and likewise O(1)time and memory for the EditList.
+We combine these two data structures to create the
+EditHAMT, a lazy data structure that is more capable than
+the LazyAMT and faster than the EditList. The key idea is
+build multiple EditLists, each containing only edits for keys
+with the same hash h, which we denote as editlist (h), and
+use the LazyAMT to map hash htoeditlist (h). We can then
+look up a key kusing the following steps:
+1) compute the hash hof key k;
+2) look up editlist (h)from the LazyAMT of the
+EditHAMT;
+3) look up key kfrom editlist (h);
+The lookup process will cause the underlying LazyAMT or
+editlist (h)to be initialized as necessary.
+We construct EditHAMTs in one of two ways: we use the
+LazyAMT addition operation to perform addition or removal
+operations on an EditHAMT, and the LazyAMT merge oper-
+ation to concatenate two EditHAMTs.
+a) Performing Addition or Removal Operations on an
+EditHAMT: We take the following steps to perform an addition
+or removal operation for a given key kon an EditHAMT:
+1) compute the hash hof key k;
+2) lazily look up the LazyAMT of the prior EditHAMT as
+lazyamt0;
+3) lazily look up editlist0(h)from lazyamt0, and append
+the given operation to it to create editlist (h);
+4) add a new binding to lazyamt0from hash hto
+editlist (h)to create the updated EditHAMT;
+where by lazily looking up we mean to create a lazy reference
+that, when forced, looks up lazyamt0oreditlist0(h), which
+allows the construction of the prior EditHAMT to also be lazy.
+Because both the LazyAMT and the EditList are lazy, the
+EditHAMT will be mostly uninitialized at ﬁrst; (parts of) it
+will be initialized as necessary during lookup.
+For example, suppose we add a binding from key k0to value
+bto an EditHAMT, and key k0has hash 14. We would create
+a new LazyAMT that maps hash 14to a new editlist (14) that
+appends addkeyvalue (k0; b)to the prior EditHAMT:
+prior EditHAMTeditlist(14)addkeyvalue(k0, b)At ﬁrst, most of the EditHAMT—the LazyAMT as well as
+the tail of the editlist (14)—is uninitialized; we indicate the
+uninitialized editlist (14) tail as a dotted arrow pointing to the
+prior EditHAMT. When we look up key k0, we would look
+up hash 14from the LazyAMT to ﬁnd editlist (14) that we
+just added, then look up key k0from editlist (14). The head
+ofeditlist (14) adds key k0, so we can return value bwithout
+looking at the tail. At the end of the lookup, the EditHAMT
+will be initialized as follows:
+prior EditHAMTeditlist(14)addkeyvalue(k0, b)
+This example shows that we can apply an edit operation
+without knowledge of the prior EditHAMT, and since the key
+k0was just added, we can look up key k0without having
+to consult the prior EditHAMT. Both of these properties are
+inherited from the underlying LazyAMT and EditList.
+We continue the example by considering the case of looking
+up a different key that was involved in an earlier edit operation.
+Suppose that the immediately prior EditHAMT removes key
+k1, and key k1has hash 5. When we look up key k1, the
+EditHAMT will be initialized as follows:
+prior EditHAMTeditlist(14)editlist(5)addkeyvalue(k0, b)remove(k1)
+Looking up the editlist (5)from the rightmost LazyAMT
+causes parts of the middle LazyAMT to be initialized and
+shared with the rightmost LazyAMT, and since the head of
+editlist (5)removes key k1, we can return null without looking
+at its tail.
+The two examples so far do not require traversing the tail
+ofeditlist (h). We would need to do so if there was a hash
+collision or if we perform a multiset or multimap lookup. For
+example, suppose that an earlier EditHAMT added a binding
+from key k0with hash 14to value a, and we perform a
+multimap lookup of key k0to ﬁnd the second value. We have
+15to initialize the tail of editlist (14) by looking up editlist0(14)
+from the prior EditHAMT. The immediately prior EditHAMT
+did not involve key k0or hash 14; instead, we will partially
+initialize the earlier EditHAMT containing editlist0(14) and
+share it. Then, we retrieve editlist0(14) and initialize it as the
+tail of editlist (14). At the end of the lookup, the EditHAMT
+will be initialized as depicted below:
+prior EditHAMTeditlist(14)editlist'(14)editlist(5)addkeyvalue(k0, b)remove(k1)addkeyvalue(k0, a)
+b) Concatenating two EditHAMTs: To concatenate two
+EditHAMTs, we call the LazyAMT merge operation with:
+the older EditHAMT as the leftLazyAMT;
+the newer EditHAMT as the right LazyAMT;
+amergefn function that creates a new editlist (h)by ap-
+pending an EditList concat node containing editlist0(h)
+from the right EditHAMT to the lazy, optional value
+containing editlist00(h)from the leftEditHAMT;
+where the older and newer EditHAMTs are lazy eh1 and
+lazy eh2, respectively, in Fig. 4.
+For example, suppose we concatenate two EditHAMTs,
+where the right EditHAMT contains a single binding k0:b
+and key k0has hash 14. We would create a new EditHAMT
+using the LazyAMT merge operation as described above:
+left EditHAMTeditlist'(14)addkeyvalue(k0, b)None
+If we perform a map lookup on the concatenated EditHAMT to
+ﬁnd the value for key k0, we would look up the concatenated
+EditHAMT for hash 14to retrieve editlist (14) and perform a
+map lookup on it. This will cause the concatenated EditHAMT
+to be initialized as follows:
+left EditHAMTeditlist'(14)addkeyvalue(k0, b)Noneconcat(  )editlist(14)The head of editlist (14) is a concat node created by the
+mergefn described above. When we look up key k0from
+editlist (14), we would recursively look up editlist0(14) from
+theright EditHAMT for the same key. Since the head of
+editlist0(14) adds key k0, we ﬁnish the lookup by returning
+the mapped value b. We do not have to look at the tail of
+editlist (14) and can avoid forcing the left EditHAMT for
+now, which is a property inherited from the LazyAMT merge
+operation.
+To consider an example that requires us to force the left
+EditHAMT, suppose that the leftEditHAMT contains a single
+binding k1:awhere key k1also has hash 14. If we look up
+keyk1from the concatenated EditHAMT, it will be initialized
+in the following manner:
+editlist'(14)addkeyvalue(k0, b)Noneconcat(  )editlist(14)addkeyvalue(k1, a)Noneeditlist''(14)
+We would look up key k1from editlist (14), and recursively
+look up editlist0(14) for the same key. Because editlist0(14)
+does not contain key k1, we would then resume the lookup in
+editlist (14), forcing its tail to retrieve editlist00(14) from the
+leftEditHAMT, and ﬁnally return the mapped value a.
+The combination of the LazyAMT and the EditList enables
+the EditHAMT to support all operations that the EditList
+supports, reduces the EditList lookup cost to amortized O(1)
+if we assume no hash collisions, and takes only an additional
+amortized O(1)time and memory for each edit operation.
+However, multiset and multimap lookups take amortized O(n)
+time where nis the number of removeone andremovekeyvalue
+operations.
+D. Comparison with Other Data Structures
+Compared to Python sets, which are implemented as hash
+tables, it is more memory efﬁcient to make an updated copy of
+the EditHAMT, since only a constant number of nodes in the
+16underlying LazyAMT are created, than it is to make a copy
+of the bucket array in the hash table underlying Python sets,
+which can be much larger. This makes it viable to store every
+intermediate EditHAMT as it is created in a trace, as each
+EditHAMT only requires an additional amortized O(1)mem-
+ory over the prior EditHAMT. In our current implementation,
+a trace of EditHAMTs is cheaper than a trace of Python sets
+(which requires deep copying) if, on average, each EditHAMT
+orsetin the trace has more than eight elements.
+It is also common to implement sets or maps using self-
+balancing trees such as red-black trees or A VL trees. However,
+we observe that it is not possible to make these tree data
+structures as lazy as the EditHAMT. In these data structures,
+a rebalancing operation is usually performed during or after
+every addition or removal operation to ensure that every path
+in the tree does not exceed a certain bound. In particular, the
+root node may be swapped with another node in the process of
+rebalancing (in fact, every node may potentially be swapped
+due to rebalancing). This means that the root node of self-
+balancing trees is determined by the entire history of addition
+and removal operations. Thus, we would be forced to compute
+the entire history of addition and removal operations when we
+traverse the root node to look up a key, defeating laziness.
+We also observe a similar issue arising with hash tables.
+Hash tables are based on a bucket array that is used to map
+hash values to keys. Typically, the bucket array is dynamically
+resized to accommodate the number of keys in the hash table
+and to reduce hash collisions. However, the number of keys in
+the hash table is determined by the entire history of addition
+and removal operations. As a result, we would be forced to
+compute the entire history of addition and removal operations
+before we can use the bucket array to map a hash value to a
+key, defeating laziness.
+Furthermore, the EditHAMT suffers much less from hash
+collisions than hash tables. The LazyAMT in the EditHAMT
+is asparse integer map, unlike the bucket array in hash tables,
+and thus can be made much larger while using little memory,
+which reduces the likelihood of hash collisions.
+V. M ICRO -BENCHMARKS
+We ran two micro-benchmarks to evaluate the efﬁciency of
+EXPOSITOR . In the ﬁrst micro-benchmark, we evaluated the
+advantage of laziness by comparing a script written in E XPOS -
+ITOR against several other equivalent scripts written using non-
+lazy methods. In the second micro-benchmark, we compared
+the performance of scripts using the EditHAMT against other
+equivalent scripts that use non-lazy data structures.
+A. Test Program
+For both micro-benchmarks, we use the test program in
+Fig. 6 as the subject of our E XPOSITOR scripts. This program
+consists of two do-nothing functions, fooon line 193 and bar
+on line 194, and the main function on lines 195–209 that calls
+fooandbarin several nested loops.189#deﬁne LOOP I 16
+190#deﬁne LOOP J 16
+191#deﬁne LOOP K 16
+192#deﬁne LOOP L 8
+193void foo(int x, int y) fg
+194void bar(int z) fg
+195int main(void) f
+196 int i, j, k, l;
+197 for (i = 0; i <LOOP I; i++) f
+198 for (j = 0; j <LOOP J; j++) f
+199 for (k = 0; k <LOOP K; k++) f
+200 bar(i*LOOP K + k);
+201 g
+202 foo(i, i*LOOP J + j);
+203 for (l = 0; l <LOOP L; l++) f
+204 bar(i*LOOP L + l);
+205 g
+206 g
+207 g
+208 return 0;
+209g
+Fig. 6. Micro-benchmark test program.
+B. Experimental Setup
+We run both micro-benchmarks on a 32-bit Ubuntu Linux
+11.04 virtual machine (since UndoDB runs only on Linux), set
+up with 8 cores and 8 GB of RAM in VMware Fusion 4.1.4
+on Mac OS X 10.6.8 running on a Mac Pro with two 2.26
+GHz quad-core Intel Xeon processors and 16 GB of RAM.
+We use UndoDB version 3.5.1234, a developmental version
+of GDB (CVS revision as of October 4, 2012), and Python
+version 2.7.5.
+C. Evaluating the Advantage of Trace Laziness
+In our ﬁrst micro-benchmark, we evaluate the advantage
+of trace laziness using the following procedure. We ﬁrst
+start E XPOSITOR on the test program in Fig. 6, and run the
+following script:
+210footrace = the execution.breakpoints(”foo”)
+211trace1 = foo trace.ﬁlter(
+212 lambda snap: int(snap.read arg(”x”)) % 2 == 0)
+This script creates a trace named footrace of calls to foo, and
+a trace named trace1 that keeps only calls to foowhere the
+argument xis even. We then measure the time it takes to call
+getafter to ﬁnd the ﬁrst item in trace1 after time 0. We repeat
+this measurement to ﬁnd the second item, the third item, and
+so forth, until there are no more items left in trace1 . Next, we
+create another trace named trace2 :
+213trace2 = foo trace.ﬁlter(
+214 lambda snap: int(snap.read arg(”x”)) % 2 == 1)
+This trace is similar to trace1 , but keeps only calls to foo
+where xis odd. We then measure again the time it takes
+to call getafter to ﬁnd each item in trace2 . Finally, we
+restart E XPOSITOR and repeat the entire procedure, but use
+getbefore to ﬁnd all items in trace1 andtrace2 starting from
+the end of the execution, instead of using getafter.
+170 50 100 150 200 250
+action #05101520cumulative time (seconds)startup
+lazy_trace
+strict_trace
+gdb_python
+undodb_python(a)getafter
+0 50 100 150 200 250
+action #05101520cumulative time (seconds)startup
+lazy_trace
+strict_trace
+gdb_python
+undodb_python (b)getbefore
+Fig. 7. The time it takes to get all items in two traces using lazy or non-lazy scripts.
+We compare the above script against several other equiv-
+alent scripts that are not lazy, written either in a variant of
+EXPOSITOR with trace laziness disabled, or using the standard
+GDB Python API with or without UndoDB. We disable
+trace laziness in E XPOSITOR by immediately performing the
+equivalent of getafter(t) on lazy nodes as they are created,
+where tis the beginning of the time interval on those nodes,
+and replacing the lazy nodes by the computed contents.
+The results are shown in Fig. 7a for the procedure using
+getafter, and Fig. 7b for the procedure using getbefore . The
+x-axes are labeled “ action # ”, and indicate particular actions
+that are taken during the benchmarking procedure:
+action 0 corresponds to creating trace1 ;
+actions 1–128 correspond to calling getafter or
+getbefore repeatedly to get all items in trace1 ;
+action 129 (the vertical gray line) corresponds to creating
+trace2 ;
+actions 130–257 correspond to calling getafter or
+getbefore repeatedly to get all items in trace2 .
+For scripts using the standard GDB Python API, action 0 and
+action 129 correspond instead to creating the equivalent of
+trace1 ortrace2 , i.e., creating a standard Python list containing
+the times, rather than snapshots, of the relevant calls to foo.
+They-axes indicate cumulative time in seconds, i.e., the total
+time it takes to perform all actions up to a particular action,
+and is mean-averaged over 31 runs.
+Thestartup plot simply marks the time it takes for E XPOS -
+ITOR to call the GDB start command to start the execution, as
+well as to run any E XPOSITOR -speciﬁc startup initialization,
+before running any scripts. The lazy trace plot corresponds
+to the script written in E XPOSITOR above. The strict trace
+plot corresponds to the same script, but uses a variant of
+EXPOSITOR with trace laziness disabled. The gdb python plotcorresponds to a script written using the standard GDB Python
+API without the time-travel features of UndoDB, restarting the
+execution at action 129 (when the equivalent of trace2 is cre-
+ated), and without caching intermediate computation. Note that
+because gdb python does not use time travel, the gdb python
+scripts in Fig. 7a and Fig. 7b are the same, i.e., they both
+run the execution forward only, and gdb python records times
+instead of snapshots; plotting gdb python in Fig. 7b allows
+us to compare forward execution against backward execution.
+Lastly, the undodb python plot uses a nearly identical script
+asgdb python , but uses UndoDB to rewind the execution at
+action 129 instead of restarting the execution, and runs the
+execution backward in Fig. 7b.
+From Fig. 7a, we can see that lazy trace takes zero time
+to perform action 0, whereas all the other implementations
+take some non-zero amount of time. This is due to laziness—
+lazy trace defers the startup cost until the ﬁrst getafter call
+is made in action 1. We also note that strict trace is slower
+than all other implementations, which suggests that the trace
+data structure has high overhead when laziness is disabled,
+and that undodb python is slightly faster than gdb python at
+action 129, since it is faster to rewind an execution than to
+restart it.
+As we expect from laziness, each call to getafter in
+lazy trace takes a small additional amount of time, whereas
+the other non-lazy implementations do not take any additional
+time (since all relevant calls to foohave already been found at
+action 0). When we have found about 40% items from trace1 ,
+the cumulative time of lazy trace reaches that of gdb python .
+This tells us that, as long as we do not make queries to
+more than 40% of an execution, it takes us less time to
+construct and query a lazy trace, compared to other non-
+lazy implementations. This is actually the common scenario
+18in debugging, where we expect programmers to begin with
+some clues about when the bug occurs. For example, a stack
+corruption typically occurs near the end of the execution, so
+we would likely only have to examine the last few function
+calls in the execution.
+Furthermore, we observe that the slope of lazy trace is
+shallower at actions 130–257. This is because trace2 reuses
+footrace which was fully computed and cached during actions
+1–128. Thus, E XPOSITOR does not have to perform as much
+work to compute trace2 .strict trace also beneﬁts from caching
+since it uses a (non-lazy) variant of the trace data structure.
+In contrast, both gdb python andundodb python do not reuse
+any computation, so action 129 takes the same amount of time
+as action 0.
+Fig. 7b shows the results of the benchmark procedure using
+getbefore . We can see that it is much slower to use getbefore
+thatgetafter—all scripts but gdb python take longer than in
+Fig. 7a ( gdb python actually runs forward as we noted above).
+This is because these scripts has to run the execution in two
+passes: ﬁrst to get to the end of the execution, then to execute
+thegetbefore calls back to the beginning of the execution.
+Unlike other scripts, the gdb python script only has to run
+forward once and not backward, and so is much faster. Still,
+lazy trace can be faster than gdb python , if queries are made
+to fewer than about 10% of an execution.
+We note that the results of this micro-benchmark actually
+suggest a lower bound to the advantage of trace laziness. This
+micro-benchmark is based on a very simple E XPOSITOR script
+that ﬁlters calls to foousing a simple predicate. Therefore, the
+time used for each script is dominated by the time it takes to
+set a breakpoint at fooand to run the execution, forward or
+backward, until the breakpoint. To a lesser extent, the trace
+data structure in lazy trace adds overhead to the time used in
+comparison to gdb python . The ﬁlter predicate in lazy trace
+and the equivalent predicate in gdb python takes very little
+time in contrast. We expect more complex E XPOSITOR scripts
+to spend more time in programmer-provided helper functions
+such as the ﬁlter predicate or the scan operator, which will
+mask the overhead of the trace data structure.
+D. Evaluating the Advantage of the EditHAMT
+In our second micro-benchmark, we evaluate the advantages
+of the EditHAMT data structure using the following procedure.
+We ﬁrst create a trace of EditHAMTs:
+215barmaps = the execution.breakpoints(”bar”) n
+216 .map(lambda snap: edithamt.addkeyvalue(
+217 None, int(snap.read arg(”z”)), snap)) n
+218 .scan(edithamt.concat)
+For each call to bar(z) , we create a new EditHAMT that adds
+a binding from the argument zto the snapshot of that call. In
+other words, an EditHAMT in barmaps at time tcontains
+bindings from arguments zto the corresponding bar(z) calls
+preceding and including the bar(z) call at time t.
+We then create another trace that looks up values from
+barmaps :219baroffoos = the execution.breakpoints(”foo”)
+220 .trailing merge(
+221 lambda snap, bar map:
+222 barmap.force().ﬁnd(int(snap.read arg(”y”))),
+223 barmaps)
+For each call to foo(x, y) , we use the trailing merge method to
+look up the immediately prior EditHAMT in barmaps , and
+then look up that EditHAMT for the most recent bar(z) call
+where y=z.
+Next, we measure the time it takes to call getafter to
+look up the ﬁrst item from baroffoos, which includes the
+time it takes to compute the EditHAMTs in barmaps as
+necessary, as well as to compute parts of the barmaps and
+baroffoos traces. We also measure the additional memory
+used after the call to getafter by Python,5which includes the
+memory required to cache the intermediate computation of the
+EditHAMTs in barmaps as well as that of the baroffoos
+andbarmaps traces, but does not include the memory usage
+of other parts of GDB as well as UndoDB. We repeat these
+measurements to ﬁnd the second item, the third item, and so
+forth, until there are no more items in baroffoos. Finally,
+we restart E XPOSITOR and repeat the entire procedure using
+getbefore to ﬁnd all items in baroffoos starting from the
+end of the execution, instead of using getafter.
+For this micro-benchmark, we set the key size of the
+EditHAMT to k= 35 bits and its internal node index bit-
+width to w= 5 bits, which gives it a maximum depth of 7.
+These parameters are suitable for 32-bit hash values that are
+padded to 35 bits. We compare the above script against several
+other equivalent scripts using other data structures, as well as a
+script that uses the EditHAMT in a variant of E XPOSITOR with
+trace laziness disabled as described in Sec. V-C, and a script
+that uses the standard GDB Python API without the time-travel
+features of UndoDB and a list of Python dicts (hash table) as
+the equivalent of barmaps .
+The results are shown in Fig. 8: Fig. 8a and Fig. 8b
+show the time measurements using getafter andgetbefore ,
+respectively, while Fig. 8c and Fig. 8d show the memory
+measurements using getafter and getbefore , respectively.
+Thex-axes are labeled “ action # ”, and indicate particular
+actions that are taken during the benchmarking procedure:
+action 0 correspond to creating barmaps and
+baroffoos;
+actions 1–256 corresponds to calling getafter or
+getbefore repeatedly to get all items in baroffoos.
+For the script using the standard GDB Python API, action 0
+correspond instead to creating a list of Python dicts mapping
+the arguments zofbarto times, rather than snapshots, of
+calls to bar. The y-axes indicate cumulative time in seconds
+or cumulative memory usage in bytes, i.e., the total time or
+memory it takes to perform all actions up to a particular action,
+and is mean-averaged over 31 runs.
+The startup plot simply marks the time or memory it
+takes for E XPOSITOR to call the GDB start command to
+5We use Python’s sys.getsizeof and gc.get objects functions to measure
+Python’s memory usage.
+190 50 100 150 200 250
+action #0100200300400500600700cumulative time (seconds)startup
+lazy_trace_edithamt
+lazy_trace_rbtree
+lazy_trace_python_dict
+strict_trace_edithamt
+gdb_python(a)getafter (time)
+0 50 100 150 200 250
+action #0100200300400500600700cumulative time (seconds)startup
+lazy_trace_edithamt
+lazy_trace_rbtree
+lazy_trace_python_dict
+strict_trace_edithamt
+gdb_python (b)getbefore (time)
+0 50 100 150 200 250
+action #05e+610e+615e+620e+625e+630e+635e+6cumulative gc_gc_size (bytes)startup
+lazy_trace_edithamt
+lazy_trace_rbtree
+lazy_trace_python_dict
+strict_trace_edithamt
+gdb_python
+(c)getafter (memory)
+0 50 100 150 200 250
+action #05e+610e+615e+620e+625e+630e+635e+6cumulative gc_gc_size (bytes)startup
+lazy_trace_edithamt
+lazy_trace_rbtree
+lazy_trace_python_dict
+strict_trace_edithamt
+gdb_python (d)getbefore (memory)
+Fig. 8. The time and memory it takes to get all items in a trace computed by looking up items from an EditHAMT or other data structures.
+start the execution, as well as to run any E XPOSITOR -
+speciﬁc startup initialization, before running any scripts. The
+lazy trace edithamt plot corresponds to the E XPOSITOR script
+above that creates EditHAMTs, which are lazy, in barmaps .
+The lazy trace rbtree plot corresponds to a similar script,
+but creates maps based on immutable red-black trees, which
+are not lazy, instead of EditHAMTs in barmaps . Likewise,
+thelazy trace python dict plot creates Python dicts, which
+are also not lazy, in barmaps . The strict trace edithamt plot
+corresponds to a script that uses the EditHAMT in a variant
+of E XPOSITOR with trace laziness disabled as described in
+Sec. V-C. Lastly, the gdb python script corresponds to a script
+written using only the standard GDB Python API without thetime-travel features of UndoDB. Note that because gdb python
+does not use time travel, the gdb python scripts in Figs. 8a–8d
+are all the same, i.e., they all run the execution forward only,
+andgdb python records times instead of snapshots; plotting
+gdb python in Fig. 8b and Fig. 8d allows us to compare
+forward execution against backward execution.
+From Fig. 8a, we can see that the scripts that use E X-
+POSITOR ,lazy trace X, take zero time to perform action
+0, whereas strict trace edithamt and gdb python , which are
+not lazy, take some amount of time to do so, the former
+more than the latter. This is the result we expect based
+on the results in Sec. V-C. Also, for lazy trace X, each
+getafter calls takes a small additional amount of time. In
+20particular, lazy trace edithamt takes less additional time than
+lazy trace rbtree and lazy trace python dict. This is due to
+EditHAMT laziness: lazy trace edithamt only has to compute
+as many (parts) of the EditHAMTs in barmaps as needed
+to answer the look up in baroffoos. In contrast, red-black
+trees and Python dicts are not lazy, so lazy trace rbtree
+and lazy trace python dict have to compute all prior red-
+black trees or Python dicts, respectively, in barmaps , even
+before answering the lookup in baroffoos. Also, since
+there are many more calls to barthan to fooin the test
+program (Sec. V-A), and the barcall that matches a foo
+call occurs within a few calls to bar,lazy trace edithamt
+has to examine fewer bar calls than lazy trace rbtree or
+lazy trace python dict. Furthermore, as long as we make
+fewer queries than about 30% of the items in baroffoos,
+it is faster to use lazy trace edithamt than it is to use
+gdb python . We also note that it is far easier to compose
+or reuse lazy trace edithamt than gdb python . For example,
+if we later decide to compare the argument xoffooto the
+matching barcall, we can easily create a new trace that maps
+foocalls to their xargument and merge it with baroffoos
+inlazy trace edithamt , while we would need to modify and
+rerun gdb python to collect the xarguments.
+The results are quite different for lazy trace rbtree and
+lazy trace python dict in Fig. 8b—action 0 still takes zero
+time, but action 1, the very ﬁrst call to getbefore , is very
+slow, contributing most of the cumulative time by the end
+of the micro-benchmark. This is because that very ﬁrst call
+togetbefore retrieves the very last item in baroffoos near
+the end of the execution, which looks up one of the last red-
+black tree or Python dictinbarmaps to ﬁnd the matching bar
+call. As we explained above, since red-black trees and Python
+dicts are not lazy, lazy trace rbtree andlazy trace python dict
+has to compute all prior red-black trees or Python dicts,
+respectively, and examine almost all barcalls when performing
+action 1. These cases highlight the importance of using lazy
+data structures in E XPOSITOR scripts—non-lazy data struc-
+tures can completely defeat the advantage of trace laziness.
+Interestingly, lazy trace edithamt performs similarly whether
+we use getbefore orgetafter; this is because the computation
+of each item of baroffoos matches a foocall to a prior bar
+call by running the execution backwards, regardless of whether
+we use getbefore orgetafter to look up baroffoos. Note
+that we can easily change the computation of baroffoos to
+match a future barcall by using revscan /revtrailing merge
+instead of scan /trailing merge inlazy trace edithamt , whereas
+making the same change in gdb python would be signiﬁcantly
+complicated by the lack of time-travel features.
+Looking at memory usage, Fig. 8c shows that each getafter
+call in lazy trace edithamt and lazy trace rbtree takes a
+small additional amount of memory. EditHAMTs use slightly
+more memory than red-black trees, despite fewer (parts of)
+EditHAMTs being computed due to laziness. However, we
+note that the memory cost of EditHAMTs is exaggerated in
+our Python-based implementation, since it makes extensive useof closures which are rather costly memory-wise in Python.6
+We believe that an implementation of EditHAMTs in more
+efﬁcient languages such as C or OCaml would use much less
+memory. In contrast, lazy trace python setis quite expensive,
+using an increasing amount of memory after each getafter
+call. This is because Python dicts are implemented using hash
+tables, and since each dict inbarmaps has to be distinct,
+we have to make a deep copy of the dicts. This eventually
+takes O(n2)memory where nis the number of barcalls in
+the execution, which is conﬁrmed by Fig. 8c. The gdb python
+script uses almost as much memory as lazy trace python dict
+by the end of the micro-benchmark, since they both create
+many Python dicts, except that gdb python stores them in
+a Python list which has lower overhead than a trace. The
+strict trace edithamt script also uses a lot memory, more
+than lazy trace edithamt by the end of the micro-benchmark,
+since strict trace edithamt has to create every EditHAMT
+inbarmaps (the EditHAMTs themselves are lazy), un-
+like lazy trace edithamt which only creates EditHAMTs in
+barmaps when they are looked up.
+We see a similar pattern in Fig. 8d for memory usage as
+in Fig. 8b for time usage: action 1 of lazy trace rbtree and
+lazy trace python dictcontributes almost all of the cumulative
+memory usage by the end of the execution. As we explained
+above for Fig. 8b, this is due to having to compute almost all
+red-black trees or Python dicts inbarmaps .
+VI. F IREFOX CASE STUDY : DELAYED DEALLOCATION
+BUG
+To put E XPOSITOR to the test, we used it to track down
+a subtle bug in Firefox that caused it to use more memory
+than expected [11]. The bug report contains a test page that,
+when scrolled, creates a large number of temporary JavaScript
+objects that should be immediately garbage collected. How-
+ever, in a version of Firefox that exhibits the bug (revision
+c5e3c81d35ba ), the memory usage increases by 70MB (as
+reported by top), and only decreases 20 seconds after a second
+scroll. As it turns out, this bug has never been directly ﬁxed—
+the actual cause is a data race, but the ofﬁcial ﬁx instead papers
+over the problem by adding another GC trigger.
+Our initial hypothesis for this bug is that there is a prob-
+lem in the JavaScript garbage collector (GC). To test this
+hypothesis, we ﬁrst run Firefox under E XPOSITOR , load the
+test page, and scroll it twice, temporarily interrupting the
+execution to call theexecution.get time() just before each
+scroll, time tscroll1 and time tscroll2 , and after the memory
+usage decreases, tend. Then, we create several traces to help
+us understand the GC and track down the bug, as summarized
+in Fig. 9.
+We observe the GC behavior using a trace of the calls
+to (gccall) and returns from ( gcreturn ) function jsGC
+(Fig. 9a).7Also, we ﬁnd out when memory is allocated or
+6In 32-bit Python 2.7.1, a closure over a single variable takes 108 bytes,
+and each additional variable takes 28 bytes.
+7The index=-1 optional argument to execution.breakpoints indicates that the
+breakpoint should be set at the end of the function.
+21(a)R: gc_return = the_execution.breakpoints("js_GC", index=-1)(b)U: munmap = the_execution.syscalls("munmap")CR70⨉MMCRCRCRCR70⨉UUCRtimer_trace = set_tracing(A=timer-create, R=timer-fire)ARARARARchunkswaiting_trace = the_execution.watchpoints(gcChunksWaitingToExpire-variable).map(read-gcChunksWaitingToExpire)70⨉17071⨉070chunkswaiting_hb = one_lock(R=gcChunksWaitingToExpire-read, W=gcChunksWaitingToExpire-write, locks, unlocks)RWC: gc_call = the_execution.breakpoints("js_GC")M: mmap2 = the_execution.syscalls("mmap2")(c)(d)(e)tscroll1tscroll2tendFig. 9. Timeline of items in traces used to debug Firefox.
+released to the operating system using mmap2 andmunmap
+traces of the same-named system calls (Fig. 9b). Printing these
+traces reveals some oddly inconsistent behavior: the GC is
+called only once after tscroll1 , but ﬁve times after tscroll2 ; and
+memory is allocated after tscroll1 and deallocated just before
+tend. To make sense of these inconsistencies, we inspect the
+call stack of each snapshot in gccalland discover that the
+ﬁrst jsGCcall immediately after a scroll is triggered by a
+scroll event, but subsequent calls are triggered by a timer.
+We now suspect that the ﬁrst scroll somehow failed to trig-
+ger the creation of subsequent GC timers. To understand how
+these timers are created, we write a function called settracing
+that creates a trace for analyzing set-like behavior, using
+EditHAMTs to track when values are inserted or removed,
+and apply settracing to create timer trace by treating timer
+creation as set insertion, and timer triggering as set removal
+(Fig. 9c). This trace reveals that each jsGCcall creates a
+GC timer (between gccallandgcreturn snapshots), except
+thejsGCcall after the ﬁrst scroll (and the last jsGCcall
+because GC is complete).
+To ﬁnd out why the ﬁrst jsGCcall does not create a GC
+timer, we inspect call stacks again and learn that a GC timer
+is only created when the variable gcChunksWaitingToExpire is
+nonzero, and yet it is zero when the ﬁrst jsGCreturns (at
+the ﬁrst gcreturn snapshot). Following this clue, we create
+a watchpoint trace on gcChunksWaitingToExpire and discover
+that it remained zero through the ﬁrst jsGCcall and becomes
+nonzero only after the ﬁrst jsGCreturns. It stayed nonzero
+through the second scroll and second jsGCcall, causing the
+ﬁrst GC timer to be created after that (Fig. 9d).
+We posit that, for the GC to behave correctly,
+gcChunksWaitingToExpire should become nonzero at some
+point during the ﬁrst jsGCcall. Inspecting call stacks again,
+we ﬁnd that gcChunksWaitingToExpire is changed in a separate
+helper thread, and that, while the GC owns a mutex lock,
+it is not used consistently around gcChunksWaitingToExpire .
+This leads us to suspect that there is a data race. Thus, we
+develop a simple race detection script, one lock, that works
+by comparing each access to a chosen variable against prior
+accesses from different threads (Sec. IV-A explains how we
+track prior accesses), and checking if a particular lock wasacquired or released prior to those accesses. For each pair of
+accesses, if at least one access is a write, and the lock was not
+held in one or both accesses, then there is a race, which we
+indicate as an item containing the snapshot of the prior access.
+We apply this race detector to gcChunksWaitingToExpire and
+conﬁrm our suspicion that, after tscroll1 , there is a write that
+races with a prior read during the ﬁrst jsGCcall when the
+timer should have been created (Fig. 9e).
+To give a sense of E XPOSITOR ’s performance, it takes 2m6s
+to run the test page to tscroll2 while printing the gccall
+trace, with 383MB maximum resident memory (including
+GDB, since E XPOSITOR extends GDB’s Python environment).
+The equivalent task in GDB/UndoDB without E XPOSITOR
+takes 2m19s and uses 351MB of memory (some difference is
+inevitable as the test requires user input, and Firefox has many
+sources of nondeterminism). As another data point, ﬁnding the
+race after tscroll1 takes 37s and another 5.4MB of memory.
+The two analyses we developed, settracing andone lock,
+take only 10 and 40 lines of code to implement, respectively,
+and both can be reused in other debugging contexts.
+VII. R ELATED WORK
+EXPOSITOR provides scripting for time-travel debuggers,
+with the central idea that a target program’s execution can
+be manipulated (i.e., queried and computed over) as a ﬁrst-
+class object. Prior work on time-travel debugging has largely
+provided low-level access to the underlying execution without
+consideration for scripting. Of the prior work on scriptable
+debugging, E XPOSITOR is most similar to work that views the
+program as an event generator—with events seeded from func-
+tion calls, memory reads/writes, etc.—and debugging scripts
+as database-style queries over event streams or as dataﬂow-
+oriented stream transformers. None of this scripting work
+includes the notion of time travel.
+A. Time-Travel Debuggers
+Broadly speaking, there are two classes of time-travel
+debuggers. Omniscient debuggers work by logging the state
+of the program being debugged after every instruction, and
+then reconstructing the state from the log on demand. Some
+examples of omniscient debuggers include ODB [12], Am-
+ber (also known as Chronicle) [6], Tralfamadore [13], and
+22TOD [14]. In contrast, replay debuggers work by logging
+the results of system calls the program makes (as well as
+other sources of nondeterminism) and making intermediate
+checkpoints, so that the debugger can reconstruct a requested
+program state by starting at a checkpoint and replaying the
+program with the logged system calls. Several recent de-
+buggers of this style include URDB [15] and UndoDB [5]
+(which we used in our prototype) for user-level programs,
+and TTVM [16] and VMware ReTrace [17] for entire virtual
+machines. E XPOSITOR could target either style of debugger in
+principle, but replay debugging scales much better (e.g., about
+1.7recording overhead for UndoDB vs. 300 for Amber).
+Engblom [18] provides a more comprehensive survey on time-
+travel debugging techniques and implementations.
+The above work focuses on implementing time travel efﬁ-
+ciently; most systems provide very simple APIs for accessing
+the underlying execution, and do not consider how time travel
+might best be exploited by debugging scripts.
+Similarly, GDB’s Python environment simply allows a
+Python program to execute GDB (and UndoDB) commands
+in a callback-oriented, imperative style. This is quite tedious,
+e.g., just counting the number of calls to a particular function
+takes 16 lines of code (Sec. II-B1), and cannot be composed
+with other scripts (e.g., to reﬁne the count to calls that satisfy
+predicate p). E XPOSITOR ’s notion of traces is simpler and
+more composable: function call counting can be done in one
+or two lines by computing the length of a breakpoint trace;
+to reﬁne the count, we simply ﬁlter the trace with pbefore
+counting (Sec. II-B).
+Tralfamadore [19] considers generalizing standard debug-
+ging commands to entire executions, but does not provide a
+way to customize these commands with scripts.
+Whyline is a kind of omniscient debugger with which users
+can ask “ why did ” and “ why didn’t ” questions about the
+control- and data-ﬂow in the execution, e.g., “ why did this
+Button’s visible = true ” or “ why didn’t Window appear ” [20].
+Whyline records execution events (adding 1.7 to 8.5over-
+head), and when debugging begins, it uses program slicing [21]
+to generate questions and the corresponding answers (impos-
+ing up to a 20further slowdown). Whyline is good at what
+it does, but its lack of scriptability limits its reach; it is hard to
+see how we might have used it to debug the Firefox memory
+leak, for example. In concept, Whyline can be implemented
+on top of E XPOSITOR , but limitations of GDB and UndoDB
+(in particular, the high cost of software watchpoints, and
+the inability to track data-ﬂow through registers) makes it
+prohibitively expensive to track ﬁne-grained data-ﬂow in an
+execution. We plan to overcome this limitation in future work,
+e.g., using EDDI [22] to implement fast software watchpoints.
+B. High-Level (Non-callback Oriented) Debugging Scripts
+EXPOSITOR ’s design was inspired by MzTake [3], a
+Scheme-based, interactive, scriptable debugger for Java based
+onfunctional reactive programming [4]. In MzTake, the
+program being debugged is treated as a source of event
+streams consisting of events such as function calls or valuechanges. Event streams can be manipulated with combinators
+that ﬁlter, map, fold, or merge events to derive new event
+streams. As such, an event stream in MzTake is like a trace
+in E XPOSITOR . Computations in MzTake are implicitly over
+the most recent value of a stream and are evaluated eagerly as
+the target program runs. To illustrate, consider our example of
+maintaining a shadow stack from Sec. II-C. In MzTake, when
+the target program calls a function, a new snapshot event s
+becomes available on the calls stream. The calls retsstream’s
+most recent event is the most recent of calls and rets, so
+MzTake updates it to s. Since shadow stacks is derived from
+calls rets, MzTake updates its most recent event by executing
+map(int, s.read retaddrs())) .
+This eager updating of event streams, as the program
+executes, can be less efﬁcient than using E XPOSITOR . In
+particular, E XPOSITOR evaluates traces lazily so that compu-
+tation can be narrowed to a few slices of time. In Sec. II-C,
+we ﬁnd the latest smashed stack address without having to
+maintain the shadow stack for the entire program execution,
+as would be required for MzTake. Also, E XPOSITOR traces
+are time indexed, but MzTake event streams are not: there
+is no analogue to tr.get at(i) ortr.slice(t0, t1) in MzTake. We
+ﬁnd time indexing to be very useful for interactivity: we can
+run scripts to identify an interesting moment in the execution,
+then explore the execution before and after that time. Similarly,
+we can learn something useful from the end of the execution
+(e.g., the address of a memory address that is double-freed),
+and then use it in a script on an earlier part of the execution
+(e.g., looking for where that address was ﬁrst freed). MzTake
+requires a rerun of the program, which can be a problem if
+nondeterminism affects the relevant computation.
+Dalek [23] and Event Based Behavioral Abstraction
+(EBBA) [24] bear some resemblance to MzTake and suffer
+the same drawbacks, but are much lower-level, e.g., the
+programmer is responsible for manually managing the ﬁring
+and suppression of events. Coca [25] is a Prolog-based query
+language that allows users to write predicates over program
+states; program execution is driven by Prolog backtracking,
+e.g., to ﬁnd the next state to match the predicate. Coca provides
+aretrace primitive that restarts the entire execution to match
+against new predicates. This is not true time travel but re-
+execution, and thus suffers the same problems as MzTake.
+PTQL [26], PQL [27], and UFO [28] are declarative lan-
+guages for querying program executions, as a debugging aid.
+Queries are implemented by instrumenting the program to
+gather the relevant data. In principle, these languages are
+subsumed by E XPOSITOR , as it is straightforward to compile
+queries to traces. Running queries in E XPOSITOR would
+allow programmers to combine results from multiple queries,
+execute queries lazily, and avoid having to recompile (and po-
+tentially perturb the execution of) the program for each query.
+On the other hand, it remains to be seen whether E XPOSITOR
+traces would be as efﬁcient as using instrumentation.
+23VIII. C ONCLUSION
+We have introduced E XPOSITOR , a novel scriptable, time-
+travel debugging system. E XPOSITOR allows programmers to
+project a program execution onto immutable traces, which
+support a range of powerful combinators including map,ﬁlter,
+merge , and scan . The trace abstraction gives programmers
+a global view of the program, and is easy to compose and
+reuse, providing a convenient way to correlate and understand
+events across the execution timeline. For efﬁciency, E XPOS -
+ITOR traces are implemented using a lazy, interval-tree-like
+data structure. E XPOSITOR materializes the tree nodes on
+demand, ultimately calling UndoDB to retrieve appropriate
+snapshots of the program execution. E XPOSITOR also includes
+the EditHAMT, which lets script writers create lazy sets, maps,
+multisets, and multimaps that integrate with traces without
+compromising their laziness. We ran two micro-benchmarks
+that show that E XPOSITOR scripts using lazy traces can be
+faster than the equivalent non-lazy scripts in common debug-
+ging scenarios, and that the EditHAMT is crucial to ensure
+that trace laziness is not compromised. We used E XPOSITOR
+to ﬁnd a buffer overﬂow in a small program, and to diagnose a
+very complex, subtle bug in Firefox. We believe that E XPOSI -
+TOR holds promise for helping programmers better understand
+complex bugs in large software systems.
+ACKNOWLEDGMENTS
+This research was supported by in part by National Science
+Foundation grants CCF-0910530 and CCF-0915978. We also
+thank Vic Zandy and Robert O’Callahan for helpful comments
+and inspiration to pursue this work, and Greg Law for provid-
+ing prompt support and bug ﬁxes for UndoDB.
+REFERENCES
+[1] R. O’Callahan. (2010) LFX2010: a browser developer’s wish list.
+Mozilla. At 27:15. [Online]. Available: http://vimeo.com/groups/lfx/
+videos/12471856#t=27m15s
+[2] A. Zeller, Why Programs Fail: A Guide to Systematic Debugging . San
+Francisco, CA, USA: Morgan Kaufmann Publishers, 2006.
+[3] G. Marceau, G. H. Cooper, J. P. Spiro, S. Krishnamurthi, and S. P.
+Reiss, “The design and implementation of a dataﬂow language for
+scriptable debugging,” Automated Software Engineering , vol. 14, no. 1,
+pp. 59–86, Mar. 2007. doi:10.1007/s10515-006-0003-z
+[4] C. Elliott and P. Hudak, “Functional reactive animation,” in Proceedings
+of the Second ACM SIGPLAN International Conference on Functional
+Programming , ser. ICFP ’97. New York, NY , USA: ACM, 1997, pp.
+263–273. doi:10.1145/258948.258973
+[5] Undo Software. What is UndoDB? Undo Software. [Online]. Available:
+http://undo-software.com/product/undodb-overview (accessed June
+2013)
+[6] R. O’Callahan, “Efﬁcient collection and storage of indexed program
+traces,” 2006. [Online]. Available: http://www.ocallahan.org/Amber.pdf
+(accessed June 2013)
+[7] A. One, “Smashing the stack for fun and proﬁt,” Phrack magazine ,
+vol. 7, no. 49, p. 365, 1996. [Online]. Available: http://www.phrack.
+org/issues.html?issue=49&id=14#article (accessed June 2013)
+[8] J. D. Blackstone. Tiny HTTPd. [Online]. Available: http://tinyhttpd.
+sourceforge.net (accessed June 2013)
+[9] S. Designer, “‘return-to-libc’ attack,” Bugtraq , Aug. 1997. [Online].
+Available: http://seclists.org/bugtraq/1997/Aug/63 (accessed June 2013)
+[10] P. Bagwell, “Ideal hash trees,” ´Ecole Polytechnique F ´ed´erale de
+Lausanne, Lausanne, Switzerland, Tech. Rep., 2001. [Online]. Available:
+http://infoscience.epﬂ.ch/record/64398[11] A. Zakai. (2011, May) Bug 654028 - 70mb of collectible garbage
+not cleaned up. Bugzilla@Mozilla. [Online]. Available: https://bugzilla.
+mozilla.org/show bug.cgi?id=654028 (accessed June 2013)
+[12] B. Lewis, “Debugging backwards in time,” in Proceedings of the Fifth
+International Workshop on Automated Debugging , ser. AADEBUG ’03,
+2003. [Online]. Available: http://arXiv.org/abs/cs/0310016
+[13] G. Lefebvre, B. Cully, C. Head, M. Spear, N. Hutchinson, M. Feeley,
+and A. Warﬁeld, “Execution mining,” in Proceedings of the 8th ACM
+SIGPLAN/SIGOPS Conference on Virtual Execution Environments ,
+ser. VEE ’12. New York, NY , USA: ACM, 2012, pp. 145–158.
+doi:10.1145/2151024.2151044
+[14] G. Pothier, E. Tanter, and J. Piquer, “Scalable omniscient debugging,”
+inProceedings of the 22nd Annual ACM SIGPLAN Conference
+on Object-oriented Programming Systems and Applications , ser.
+OOPSLA ’07. New York, NY , USA: ACM, 2007, pp. 535–552.
+doi:10.1145/1297027.1297067
+[15] A.-M. Visan, K. Arya, G. Cooperman, and T. Denniston, “URDB:
+a universal reversible debugger based on decomposing debugging
+histories,” in Proceedings of the 6th Workshop on Programming
+Languages and Operating Systems , ser. PLOS ’11. New York, NY ,
+USA: ACM, 2011, pp. 8:1–8:5. doi:10.1145/2039239.2039251
+[16] S. T. King, G. W. Dunlap, and P. M. Chen, “Debugging operating
+systems with time-traveling virtual machines,” in Proceedings of the
+Annual Conference on USENIX Annual Technical Conference , ser.
+ATC ’05. Berkeley, CA, USA: USENIX Association, 2005, pp. 1–1.
+[Online]. Available: http://dl.acm.org/citation.cfm?id=1247360.1247361
+[17] M. Xu, V . Malyugin, J. Sheldon, G. Venkitachalam, and B. Weissman,
+“ReTrace: collecting execution trace with virtual machine deterministic
+replay,” in Proceedings of the Third Annual Workshop on Modeling,
+Benchmarking and Simulation , ser. MoBS ’07, 2007. [Online].
+Available: http://www-mount.ece.umn.edu/ jjyi/MoBS/2007/program/
+01C-Xu.pdf
+[18] J. Engblom, “A review of reverse debugging,” in System, Software, SoC
+and Silicon Debug Conference , ser. S4D ’12. Piscataway, NJ, USA:
+IEEE, 2012, pp. 1–6. [Online]. Available: http://ieeexplore.ieee.org/xpl/
+articleDetails.jsp?arnumber=6338149
+[19] C. C. D. Head, G. Lefebvre, M. Spear, N. Taylor, and A. Warﬁeld,
+“Debugging through time with the Tralfamadore debugger,” in Runtime
+Environments, Systems, Layering and Virtualized Environments , ser.
+RESoLVE ’12, 2012. [Online]. Available: http://www.dcs.gla.ac.uk/
+conferences/resolve12/papers/session4 paper1.pdf
+[20] A. J. Ko and B. A. Myers, “Debugging reinvented: asking and
+answering why and why not questions about program behavior,”
+inProceedings of the 30th International Conference on Software
+Engineering , ser. ICSE ’08. New York, NY , USA: ACM, 2008, pp.
+301–310. doi:10.1145/1368088.1368130
+[21] B. Xu, J. Qian, X. Zhang, Z. Wu, and L. Chen, “A brief survey of
+program slicing,” ACM SIGSOFT Software Engineering Notes , vol. 30,
+no. 2, pp. 1–36, Mar. 2005. doi:10.1145/1050849.1050865
+[22] Q. Zhao, R. Rabbah, S. Amarasinghe, L. Rudolph, and W.-F. Wong,
+“How to do a million watchpoints: efﬁcient debugging using dynamic
+instrumentation,” in Proceedings of the Joint European Conferences
+on Theory and Practice of Software 17th International Conference on
+Compiler Construction , ser. CC ’08/ETAPS’08. Berlin, Heidelberg:
+Springer-Verlag, 2008, pp. 147–162. doi:10.1007/978-3-540-78791-
+410
+[23] R. A. Olsson, R. H. Crawford, and W. W. Ho, “A dataﬂow approach
+to event-based debugging,” Software: Practice and Experience , vol. 21,
+no. 2, pp. 209–229, Feb. 1991. doi:10.1002/spe.4380210207
+[24] P. Bates, “Debugging heterogeneous distributed systems using event-
+based models of behavior,” in Proceedings of the 1988 ACM SIGPLAN
+and SIGOPS Workshop on Parallel and Distributed Debugging ,
+ser. PADD ’88. New York, NY , USA: ACM, 1988, pp. 11–22.
+doi:10.1145/68210.69217
+[25] M. Ducass ´e, “Coca: an automated debugger for C,” in Proceedings
+of the 21st International Conference on Software Engineering , ser.
+ICSE ’99. New York, NY , USA: ACM, 1999, pp. 504–513.
+doi:10.1145/302405.302682
+[26] S. F. Goldsmith, R. O’Callahan, and A. Aiken, “Relational queries over
+program traces,” in Proceedings of the 20th Annual ACM SIGPLAN
+Conference on Object-oriented Programming, Systems, Languages, and
+Applications , ser. OOPSLA ’05. New York, NY , USA: ACM, 2005,
+pp. 385–402. doi:10.1145/1094811.1094841
+24[27] M. Martin, B. Livshits, and M. S. Lam, “Finding application
+errors and security ﬂaws using PQL: a program query language,”
+inProceedings of the 20th Annual ACM SIGPLAN Conference on
+Object-oriented Programming, Systems, Languages, and Applications ,
+ser. OOPSLA ’05. New York, NY , USA: ACM, 2005, pp. 365–383.
+doi:10.1145/1094811.1094840[28] M. Auguston, C. Jeffery, and S. Underwood, “A framework for
+automatic debugging,” in Proceedings of the 17th IEEE International
+Conference on Automated Software Engineering , ser. ASE ’02.
+Washington, DC, USA: IEEE Computer Society, 2002, pp. 217–222.
+doi:10.1109/ASE.2002.1115015
+25

@@ -1,0 +1,1324 @@
+Guiding Dynamic Symbolic Execution
+toward Unveriﬁed Program Executions
+Maria Christakis Peter Müller Valentin Wüstholz
+Department of Computer Science, ETH Zurich, Switzerland
+{maria.christakis, peter.mueller, valentin.wuestholz}@inf.ethz.ch
+ABSTRACT
+Most techniques to detect program errors, such as testing,
+codereviews, andstaticprogramanalysis, donotfullyverify
+all possible executions of a program. They leave executions
+unveriﬁed when they do not check certain properties, fail to
+verify properties, or check properties under certain unsound
+assumptions such as the absence of arithmetic overﬂow.
+In this paper, we present a technique to complement par-
+tial veriﬁcation results by automatic test case generation. In
+contrast to existing work, our technique supports the com-
+mon case that the veriﬁcation results are based on unsound
+assumptions. We annotate programs to reﬂect which exe-
+cutions have been veriﬁed, and under which assumptions.
+These annotations are then used to guide dynamic symbolic
+execution toward unveriﬁed program executions. Our main
+technical contribution is a code instrumentation that causes
+dynamic symbolic execution to abort tests that lead to ver-
+iﬁed executions, to prune parts of the search space, and to
+prioritize tests that cover more properties that are not fully
+veriﬁed. We have implemented our technique for the .NET
+static analyzer Clousot and the dynamic symbolic execution
+tool Pex. It produces smaller test suites (by up to 19.2%),
+covers more unveriﬁed executions (by up to 7.1%), and re-
+duces testing time (by up to 52.4%) compared to combining
+Clousot and Pex without our technique.
+1. INTRODUCTION
+Modern software projects use a variety of techniques to
+detect program errors, such as testing, code reviews, and
+static program analysis [31]. In practice, none of these tech-
+niques check all possible executions of a program. They
+often leave entire paths unveriﬁed (for instance, when a test
+suite does not achieve full path coverage), fail to verify cer-
+tain properties (such as complex assertions), or verify some
+paths under assumptions (such as the absence of arithmetic
+overﬂow) that might not hold on all executions of the path.
+Making such assumptions is necessary in code reviews to re-
+ducethecomplexityofthetask; itisalsocustomaryinstatic
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+ICSE ’16, May 14 - 22, 2016, Austin, TX, USA
+© 2016 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ISBN 978-1-4503-3900-1/16/05. . . $15.00
+DOI:http://dx.doi.org/10.1145/2884781.28848431void Deposit(int amount) {
+2 if(amount <= 0 || amount > 50000) {
+3 ReviewDeposit(amount);
+4 }else {
+5 balance = balance + amount;
+6 if(balance > 10000) {
+7 SuggestInvestment();
+8 }
+9 }
+10 assert balance >= old(balance);
+11}
+Figure 1: C# example illustrating partial veriﬁca-
+tion results. Techniques that assume that the addi-
+tiononline5doesnotoverﬂowmightmissviolations
+of the assertion on line 10. We use the assertion
+to make the intended behavior explicit; the oldkey-
+word indicates that an expression is evaluated in the
+pre-state of the method. balanceis an integer ﬁeld
+declared in the enclosing class. We assume methods
+ReviewDeposit and SuggestInvestment to be correct.
+programanalysistoimprovetheprecision, performance, and
+modularity of the analysis [13], and because some program
+features elude static checking [36]. That is, most static anal-
+ysessacriﬁcesoundnessinfavorofotherimportantqualities.
+Automatic test case generation via dynamic symbolic ex-
+ecution (DSE) [27, 9], also called concolic testing [38], sys-
+tematically explores a large number of program executions
+and, thus, eﬀectively detects errors missed by other tech-
+niques. However, simply applying DSE in addition to other
+techniques leads to redundancy when executions covered by
+DSE have already been veriﬁed. In this case, the available
+testing time is wasted on executions that are known to be
+correct rather than on exploring previously-unveriﬁed exe-
+cutions. This redundancy is especially problematic when
+DSE is used to complement static analyzers because static
+techniques can check a large fraction of all possible program
+executions and, thus, many or even most of the executions
+covered by DSE are already veriﬁed.
+Method Depositin Fig. 1 illustrates this problem. A re-
+viewer or static analyzer that checks the implementation
+under the assumption that the addition on line 5 does not
+overﬂow might miss violations of the assertion on line 10.
+Applying DSE to the method tries to explore six diﬀerent
+paths through the method (there are three paths through
+the conditionals, each combined with two possible outcomes
+for the assertion), in addition to all the paths through the
+called methods ReviewDeposit and SuggestInvestment. As-
+suming that these two methods are correct, only one of all
+these paths reveals an error, namely the path that is taken
+when amountis between 0 and 50,000, and balanceis large
+2016 IEEE/ACM 38th IEEE International Conference on Software Engineering
+   144
+enough for the addition on line 5 to overﬂow. All other
+generated test cases are redundant because they lead to ex-
+ecutions that have already been veriﬁed. In particular, if
+the called methods have complex control ﬂow, DSE might
+not detect the error because it reaches a timeout before gen-
+erating the only relevant test case.
+To reduce this redundancy, existing work [10, 17, 25] in-
+tegrates static analyses and DSE; it uses the veriﬁcation
+results of a static analysis to prune veriﬁed executions from
+testing. However, existing combinations of static analysis
+and test case generation do not support analyses that make
+unsound assumptions. They either require the static analy-
+sis to be sound and are thus of limited use for most practical
+analyses, or they ignore the unsoundness of the static anal-
+ysis and may therefore prune executions during DSE that
+contain errors. In particular, they would miss the error in
+Fig. 1 if the static analysis ignores overﬂow.
+In this paper, we present a novel technique to comple-
+ment partial veriﬁcation by automatic test case generation.
+In contrast to existing work, our technique supports the im-
+portant case that the veriﬁcation results are obtained by an
+unsound (manual or automatic) static analysis. Building on
+our earlier work [12], we use program annotations to make
+explicit which assertions in a program have already been
+veriﬁed, and under which assumptions. These annotations
+can be generated automatically by a static analysis [13] or
+inserted manually, for instance, during a code review. We
+consider a code reviewer as a human static analyzer, since
+like tools, reviewers typically make simplifying assumptions.
+The main technical contribution of this paper is a code in-
+strumentation of the unit under test that (1) detects redun-
+danttestcasesearlyduringtheirexecutionandabortsthem,
+(2) reduces the search space for DSE by pruning paths that
+have been previously veriﬁed, and (3) prioritizes test cases
+that cover more assertions that are not fully veriﬁed. This
+instrumentation is based on an eﬃcient static inference that
+propagates information about unveriﬁed executions up in
+the control ﬂow, where it may prune the search space more
+eﬀectively. It does not require a speciﬁc DSE algorithm and,
+thus, can be used with a wide range of existing tools.
+This paper goes beyond our previous work [12] in three
+important ways: (1) It leverages partialveriﬁcation results,
+whereas our previous work reduced the test eﬀort mainly
+for fully-veriﬁed methods. Practical analyses typically do
+not achieve full veriﬁcation for non-trivial methods. (2) It
+demonstrates the eﬀectiveness of our approach using an in-
+dustrial analyzer and the sources of unsoundness it contains;
+our previous work used an artiﬁcially-unsound variation of
+Dafny [34]. (3) It provides a more substantial evaluation.
+Our technique works for modular and whole-program ver-
+iﬁcation, and can be used to generate unit or system tests.
+We present it for modular veriﬁcation and unit testing here.
+In particular, we have implemented our approach for Mi-
+crosoft’s .NET static checker Clousot [23], a modular static
+analysis, and the DSE tool Pex [40], a test case generator for
+unit tests. Our experiments demonstrate that, compared to
+classical DSE, our approach produces smaller test suites, ex-
+plores more unveriﬁed executions, and reduces testing time.
+Outline. We give an overview of our approach in Sect. 2.
+Sect. 3 explains how we infer the code instrumentation from
+partialveriﬁcationresults. Ourexperimentalresultsarepre-
+sented in Sect. 4. We discuss related work in Sect. 5 and
+conclude in Sect. 6.1void Deposit(int amount) {
+2 var a = true;
+3 if(amount <= 0 || 50000 < amount) {
+4 assume !a;
+5 ReviewDeposit(amount);
+6 }else {
+7 assumed noOverflowAdd(balance, amount) asa;
+8 a = a && noOverflowAdd(balance, amount);
+9 assume !a;
+10 balance = balance + amount;
+11 if(10000 < balance) {
+12 SuggestInvestment();
+13 }
+14 }
+15 assume !a || balance >= old(balance);
+16 assert balance >= old(balance) verified a;
+17}
+Figure 2: The instrumented version of the method
+from Fig. 1. The dark boxes show the annotations
+generated by the static analyzer. The assumedstate-
+ment makes explicit that the analyzer assumed that
+the addition on line 10 does not overﬂow. The
+verifiedannotation on the assertion on line 16 ex-
+presses that the assertion was veriﬁed under this
+unsound assumption. The two annotations are
+connected via the assumption identiﬁer a, which
+uniquely identiﬁes the assumedstatement. The light
+boxes show the instrumentation that we infer from
+the annotations and that prunes redundant tests.
+2. APPROACH
+Inthissection, wesummarizeanannotationlanguagethat
+we have developed in earlier work [12, 41] to express partial
+veriﬁcation results, and then illustrate how the instrumen-
+tation proposed here uses these annotations to guide DSE
+toward unveriﬁed executions. The details of the approach
+are explained in the next section.
+2.1 Veriﬁcation annotations
+Inordertoencodepartialveriﬁcationresults,weintroduce
+two kinds of annotations: An assumedstatement of the form
+assumed Pasaexpresses that an analysis assumed property
+Pto hold at this point in the code without checking it. The
+assumption identiﬁer auniquely identiﬁes this statement.
+In order to record veriﬁcation results, we use assertions of
+the form assert Pverified A, which express that property
+Phas been veriﬁed under condition A. Thepremise Ais a
+boolean condition over assumption identiﬁers, each of which
+is introduced in an assumedstatement. Speciﬁcally, it is the
+conjunction of the identiﬁers for the assumptions used to
+verify P, or false if Pwas not veriﬁed. When several veriﬁ-
+cation results are combined (for instance, from a static anal-
+ysis and a code review), Ais the disjunction of the assump-
+tions made during each individual veriﬁcation. We record
+veriﬁcation results for all assertions in the code, including
+implicit assertions such as a receiver being non-null or an
+index being within the bounds of an array.
+We assume here that a static analyzer records the as-
+sumptions it made during the analysis, which assertions it
+veriﬁed, and under which assumptions. We equipped Mi-
+crosoft’s .NET static analyzer Clousot [23] with this func-
+tionality [13]. Among other unsound assumptions, Clousot
+ignores arithmetic overﬂow and, thus, misses the potential
+145violation of the assertion on line 10 of Fig. 11. This par-
+tial veriﬁcation result is expressed by the annotations in
+the dark boxes of Fig. 2 (the light boxes are discussed be-
+low). The assumedstatement makes explicit that the addi-
+tion on line 10 was assumed not to overﬂow (the predicate
+noOverflowAdd can be encoded as equality of an integer and
+a long-integer addition); the verified annotation on the as-
+sertion on line 16 expresses that the assertion was veriﬁed
+under this (unsound) assumption.
+Themeaningofveriﬁcationannotationsisdeﬁnedinterms
+ofassignmentsandstandard assumestatements,whichmakes
+the annotations easy to support by a wide range of static
+and dynamic tools. For each assumption identiﬁer, we de-
+clare a boolean variable, which is initialized to true. For
+modular analyses, assumption identiﬁers are local variables
+initialized at the beginning of the enclosing method (line 2
+in Fig. 2); for whole-program analyses, assumption identi-
+ﬁers are global variables initialized for instance during class
+initialization. A statement assumed Pasais encoded as
+a=a&&P;
+as illustrated on line 8. That is, variable aaccumulates the
+assumed properties for each execution of the assumedstate-
+ment. Since assumptions typically depend on the current
+execution state, this encoding ensures that an assumption
+is evaluated in the state in which it is made rather than the
+state in which it is used.
+An assertion assert Pverified Ais encoded as
+assume A⇒P;
+assert P;
+as illustrated on line 15. The assumestatement expresses
+that, if condition Aholds, then the asserted property P
+holds as well, which reﬂects that Pwas veriﬁed under the
+premise A. Consequently, an assertion is unveriﬁed if Ais
+false, theassertionisfullyveriﬁedif Aistrue, andotherwise,
+the assertion is partially veriﬁed.
+2.2 Guiding dynamic symbolic execution
+To reduce redundancies with prior analyses of the unit
+under test, DSE should generate test cases that check each
+assertion assert Pverified Afor the case that the premise
+Adoes not hold, because Phas been veriﬁed to hold other-
+wise. We guide DSE toward such test cases by pruning test
+cases that cover veriﬁed executions. Moreover, we prioritize
+testcases thatviolatemore assertionpremisesand, thus, are
+more likely to reveal an assertion violation. Test prioritiza-
+tion is important when DSE is applied until certain limits
+(for instance, on the overall testing time) are reached.
+Pruning redundant tests. A test is redundant if the
+premise of each assertion in its execution holds; in this case,
+all assertions have been statically veriﬁed. To prune redun-
+dant tests, we compute statically for each program point a
+suﬃcient condition for every execution from this program
+point onward to be veriﬁed. If this condition holds during
+the execution of a test case, all subsequent assertions are
+deﬁnitely veriﬁed and, thus, the test can be aborted. More
+importantly, all other test cases that share the preﬁx of the
+execution path up to the abort and also satisfy the condition
+1Clousot is modular, that is, reasons about a method
+call using the method’s pre- and postcondition; we as-
+sume here that the postconditions of ReviewDeposit and
+SuggestInvestment state that balanceis not decreased.can be pruned from the search space for DSE. If all asser-
+tions in the shared preﬁx are fully veriﬁed, then these test
+cases are redundant. Otherwise, they are not redundant ac-
+cording to the deﬁnition above, but nevertheless guaranteed
+not to reveal an assertion violation. Assertions after the
+shared preﬁx are deﬁnitely veriﬁed; violations of assertions
+in the shared preﬁx would be detected before aborting the
+former test case since DSE tools treat assertions as branches
+and, thus, two executions of the same path satisfy or violate
+the same assertions.
+Both aborting and pruning of tests are achieved by instru-
+menting the unit under test with assumestatements. They
+aﬀect DSE in two ways. First, when the execution of a
+test case encounters an assumestatement whose condition is
+false, the execution is aborted. Second, when an execution
+encounters an assumestatement, its condition is added to
+the symbolic path condition, ensuring that subsequent test
+cases that share the preﬁx of the execution path up to the
+assumestatement will satisfy the condition.
+We instrument the unit under test by assuming at vari-
+ous program points a condition under which there maybe
+an execution from this program point onward that is un-
+veriﬁed. We call this condition a may-unveriﬁed condition ;
+it is the negation of the condition that all executions from
+the point onward are veriﬁed. Note that this may-unveriﬁed
+instrumentation is conservative. It retains any execution in
+which the premise of at least one of the assertions might not
+hold. Therefore, it does not abort or prune any tests that
+may reveal an assertion violation.
+The example in Fig. 2 has an assertion with premise a
+at the very end. Consider the program points on lines 4
+and 9. At both points, ais a suﬃcient condition for the
+rest of the execution of Depositto be veriﬁed. Since we are
+interested in test cases that lead to unveriﬁed executions, we
+instrument both program points by assuming the negation,
+!a. With this instrumentation, any test case that enters the
+outer then-branch is aborted since ais always true at this
+point, which, in particular, prunes the entire exploration of
+method ReviewDeposit. Similarly, any test case that does
+not lead to an overﬂow on line 10 is aborted on line 9, which
+prunes the entire exploration of method SuggestInvestment.
+So, out of all the test cases generated by DSE for the un-
+instrumented Depositmethod, only the one that reveals the
+error remains; all others are either aborted early or pruned.
+Note that the instrumentation aborts and prunes redun-
+dant tests more eﬀectively if may-unveriﬁed conditions are
+assumed earlier in the control ﬂow, because early assump-
+tions may abort test cases earlier and share the preﬁx with
+more executions. For instance, if instead of the assump-
+tions on lines 4 and 9 we assumed !aonly right before
+the assertion on line 16, tests would be aborted late and
+no redundant tests would be pruned. DSE would gener-
+ate the same test cases as if there were no prior veriﬁca-
+tion results. Our previous work [12] produces exactly this
+result, which demonstrates that it provides only weak sup-
+portforpartially-veriﬁedmethods. Toaddressthisproblem,
+we propagate constraints that characterize unveriﬁed execu-
+tions higher up in the control ﬂow, where they can be used
+to eﬀectively prune redundant test cases.
+Prioritizing premise violations. Intuitively, test cases
+that violate the premise of more than one assertion have a
+higher chance to detect an assertion violation. To prioritize
+such test cases, we devise a second instrumentation, called
+146Verified
+Unverified
+May‐unverified
+Must‐unverifiedFigure 3: May-unveriﬁed and must-unveriﬁed con-
+ditions. The set of all executions is depicted by the
+largeellipse; thegrayandwhiteareasdepictthever-
+iﬁed and unveriﬁed executions, respectively. Execu-
+tions that satisfy the may-unveriﬁed conditions are
+ruled horizontally, while those satisfying the must-
+unveriﬁed conditions are ruled vertically.
+must-unveriﬁed instrumentation : We compute for each pro-
+gram point a suﬃcient condition for every execution from
+this program point onward to be deﬁnitely unveriﬁed. If the
+conditionholdstheneveryexecutionfromtheprogrampoint
+onward contains at least one assertion, and the premises of
+allassertions in the execution are false.
+When the must-unveriﬁed condition is violated, it does
+not necessarily mean that the subsequent execution is ver-
+iﬁed and, thus, we cannot abort the test case. Therefore, we
+instrumenttheprogramnotbyassumingthemust-unveriﬁed
+condition, but instead with a dedicated tryfirst statement.
+This statement interrupts the execution of the test case
+and instructs DSE to generate new inputs that satisfy the
+must-unveriﬁed condition, that is, inputs that have a higher
+chance to detect an assertion violation. The interrupted
+test case is re-generated later, after the executions that sat-
+isfy the must-unveriﬁed condition have been explored. This
+exploration strategy prioritizes test cases that violate all
+premises over those that violate only some.
+Suppose that the Depositmethod in Fig. 2 contained an-
+other assertion at the very end that has not been veri-
+ﬁed, that is, whose premise is false. In this case, the may-
+unveriﬁed instrumentation yields true for all prior program
+points since every execution is unveriﬁed. In this case, this
+instrumentation neither aborts nor prunes any test cases. In
+contrast, the must-unveriﬁed instrumentation infers !aon
+line 9. The corresponding tryfirst statement (not shown in
+Fig. 2) gives priority to executions that lead to an overﬂow
+on line 10. However, it does not prune the others since they
+might detect a violation of the unveriﬁed second assertion
+at the end of the method.
+Summary. Fig. 3 illustrates the may-unveriﬁed and must-
+unveriﬁed conditions. The set of executions that satisfy the
+may-unveriﬁed conditions is a superset of the unveriﬁed exe-
+cutions, whereas the set of executions that satisfy the must-
+unveriﬁed conditions is a subset.
+The may-unveriﬁed and must-unveriﬁed instrumentations
+have complementary strengths. While the former eﬀectively
+aborts or prunes redundant tests, the latter prioritizes those
+tests among the non-redundant ones that are more likely to
+detect an assertion violation. Therefore, our experiments
+show the best results for the combination of both.
+3. CONDITION INFERENCE
+Our may-unveriﬁed and must-unveriﬁed conditions reﬂect
+whether the premises of assertions further down in the con-
+trol ﬂow hold. In that sense, they resemble weakest precon-
+ditions [20]: a may-unveriﬁed condition is the negation of
+the weakest condition that implies that all premises furtherdown hold; a must-unveriﬁed condition is the weakest con-
+dition that implies that all premises do not hold. Precisely
+computing such conditions, for instance via weakest precon-
+dition calculi [33], abstract interpretation [15], or predicate
+abstraction [30, 4], is too expensive for our purpose; the
+overhead of computing the conditions precisely would eﬀace
+the beneﬁts of pruning tests. Therefore, we use a rather
+coarseover-approximation of may- and must-unveriﬁed con-
+ditions that can be computed eﬃciently and is suﬃciently
+precise to prune and prioritize tests eﬀectively.
+Weﬁrstabstracttheunitundertesttoanon-deterministic
+booleanprogram[5]whereallvariablesareassumptioniden-
+tiﬁers. This step is an eﬃcient syntactic program transfor-
+mation. The abstraction is sound, that is, each execution of
+the concrete program is included in the set of executions of
+the abstract program. Therefore, a condition that guaran-
+tees that all premises hold (or are violated) in the abstract
+program provides the same guarantee for the concrete pro-
+gram. The may-unveriﬁed and must-unveriﬁed conditions
+can then be computed eﬃciently using abstract interpreta-
+tion of the abstract program over a simple abstract domain.
+3.1 Abstraction
+We abstract a concrete program to a boolean program,
+where all boolean variables are assumption identiﬁers. In
+the abstract program, all expressions that do not include
+assumption identiﬁers are replaced by non-deterministically
+chosen values, which, in particular, replaces conditional con-
+trol ﬂow by non-determinism. Moreover, the abstraction re-
+moves assertions that have been fully veriﬁed, that is, where
+the premise is the literal trueor includes trueas a disjunct.
+We present the abstraction for a simple concrete program-
+ming language with the following statements: assumedstate-
+ments, assertions, method calls, conditionals, loops, and as-
+signments. Besides conditional statements and loops with
+non-deterministicguards, the abstractlanguageprovidesthe
+following statements:
+−initialization of assumption identiﬁers: var a := true,
+−updates to assumption identiﬁers: a := a && *, where *
+denotes a non-deterministic (boolean) value,
+−assertions: assert *verified A, where A/negationslash≡true, and
+−method calls: call Mf, where Mfis a fully-qualiﬁed
+method name and the receiver and arguments have been
+abstracted away.
+Note that we desugar assumedstatements into initializations
+and updates of assumption identiﬁers, which allows us to
+treat modular and whole-program analyses uniformly even
+though they require a diﬀerent encoding of assumedstate-
+ments (Sect. 2.1).
+To abstract a program, we recursively apply the following
+transformations to its statements:
+−an assumption assumed Pas ais rewritten to an assump-
+tion identiﬁer initialization var a := true (at the appro-
+priate program point, as discussed above) and an update
+a := a && *,
+−an assertion assert Pverified Ais transformed into
+assert *verified A, if Ais not trivially true, and omit-
+ted otherwise,
+−a conditional statement if (b )S0elseS1is rewritten to
+if ( *)S/prime
+0else S/prime
+1, where S/prime
+0andS/prime
+1are the results of
+recursively rewriting the statements S0andS1,
+−a loop while (b )Sis rewritten to while ( *)S/prime, where S/prime
+is the result of recursively rewriting statement S,
+1471method Deposit() {
+2 {true}
+3 var a := true;
+4 {true}
+5 if(*) {
+6 {!a}
+7 call Account.ReviewDeposit;
+8 {!a}
+9 }else {
+10 {true}
+11 a := a && *;
+12 {!a}
+13 if(*) {
+14 {!a}
+15 call Account.SuggestInvestment;
+16 {!a}
+17 }
+18 {!a}
+19 }
+20 {!a}
+21 assert *verified a;
+22 {false}
+23}
+Figure 4: The abstraction of method Depositfrom
+Fig. 2. The gray boxes (light and dark) show the
+inferred may-unveriﬁed conditions. The conditions
+that are used for the may-unveriﬁed instrumenta-
+tion are shown in dark gray boxes.
+−a method call r.M(. . .)is rewritten to callMf, where
+Mfis the fully-qualiﬁed name of M, and
+−assignments are omitted.
+Fig.4showstheabstractionofmethod DepositfromFig.2.
+The gray boxes (light and dark) show the inferred may-
+unveriﬁed conditions, as we explain in the next subsection.
+Soundness. The abstraction described above is sound,
+that is, each execution of the concrete program is included
+in the set of executions of the corresponding abstract pro-
+gram. The abstraction preserves the control structure of
+each method, but makes the control ﬂow non-deterministic,
+which enlarges the set of possible executions. All other oc-
+currences of expressions (in assumedstatements, assertions,
+andcalls)arereplacedbynon-deterministicvaluesoftheap-
+propriate type, which also enlarges the set of possible execu-
+tions. Once all occurrences of variables have been replaced
+by non-deterministic values, assignments do not aﬀect pro-
+gram execution and can, thus, be omitted.
+3.2 May-unveriﬁed conditions
+A may-unveriﬁed condition expresses that some execution
+from the current program point onward may be unveriﬁed.
+We compute this condition for each program point in two
+steps. First, we compute the weakest condition at the cor-
+responding program point in the abstract program that im-
+plies that allexecutions are veriﬁed. Since the set of execu-
+tions of the abstract program subsumes the set of concrete
+executions, this condition also implies that all concrete ex-
+ecutions are veriﬁed (although for the concrete execution,
+the computed condition is not necessarily the weakest such
+condition). Second, we negate the computed condition to
+obtain a may-unveriﬁed condition.Inference. To compute the weakest condition that implies
+that all executions from a program point onward are veri-
+ﬁed, we deﬁne a predicate transformer WPon abstract pro-
+grams. If WP(S, R )holds in a state, then the premise of
+each assertion in each execution of statement Sfrom that
+state holds and, if the execution terminates, Rholds in the
+ﬁnal state. For a modular analysis such as Clousot, calls are
+encoded by asserting their precondition, reﬂecting their side
+eﬀects, and assuming their postcondition; since our abstract
+programs omit all information about program variables, the
+latter two do not occur in the abstract program. Deﬁning
+an inter-procedural WPis of course also possible. Thus, we
+deﬁne WPas follows:
+−WP(assert *verified A, R)≡A∧R,
+−WP(a:=true, R )≡R[a:=true], denoting the substitu-
+tion of abytrueinR, and
+−WP(a:=a && *, R)≡R∧R[a:=false].
+The semantics of sequential composition, conditionals, and
+loops is standard [20].
+The may-unveriﬁed condition for a statement Sis the
+negation of the weakest precondition:
+May(S)≡¬WP(S, true)
+In our implementation, we compute for each program point
+the may-unveriﬁed condition for the program fragment from
+this point onward. The computation is done using backward
+abstract interpretation over a set of cubes (that is, conjunc-
+tions of assumption identiﬁers or their negations). In the
+presence of loops, we use a ﬁxed-point computation.
+The (light and dark) gray boxes in Fig. 4 show the may-
+unveriﬁedconditionsateachprogrampoint(assumingmeth-
+ods ReviewDeposit and SuggestInvestment have no precon-
+ditions). The may-unveriﬁed inference propagates mean-
+ingful information only up until the non-deterministic up-
+date is reached, which corresponds to the assumedstatement.
+Speciﬁcally, on line 10, we infer true because the abstraction
+loses the information that would be needed to compute a
+stronger may-unveriﬁed condition. So, in return for an ef-
+ﬁcient condition inference, we miss some opportunities for
+aborting and pruning redundant tests.
+Instrumentation. Since each execution of the concrete
+program corresponds to an execution of the abstract pro-
+gram, we can instrument the concrete program by adding
+anassume Cstatement at each program point, where Cis
+the may-unveriﬁed condition at the corresponding program
+point in the abstract program. As we explained in Sect. 2.2,
+these statements abort redundant test cases and contribute
+constraints that guide DSE toward unveriﬁed executions.
+To avoid redundant constraints that would slow down
+DSE, we omit assumestatements when the may-unveriﬁed
+condition is trivially true or not diﬀerent from the condition
+at the previous program point, as well as the assume false
+statement at the end of the unit under test. Therefore, out
+of all the conditions inferred for the example in Fig. 4, we
+use only the ones on lines 6 and 12 to instrument the pro-
+gram, which leads to the assumptions on lines 4 and 9 of
+Fig. 2 and guides DSE as described in Sect. 2.2.
+3.3 Must-unveriﬁed conditions
+A must-unveriﬁed condition expresses that (1) each ex-
+ecution from the program point onward contains at least
+one assertion and (2) on each execution, the premise of each
+assertion evaluates to false.
+1481method Deposit() {
+2 {false}
+3 var a := true;
+4 {!a}
+5 if(*) {
+6 {!a}
+7 call Account.ReviewDeposit;
+8 {!a}
+9 }else {
+10 {!a}
+11 a := a && *;
+12 {!a}
+13 if(*) {
+14 {!a}
+15 call Account.SuggestInvestment;
+16 {!a}
+17 }
+18 {!a}
+19 }
+20 {!a}
+21 assert *verified a;
+22 {true}
+23 assert *verified false;
+24 {false}
+25}
+Figure 5: The abstraction of a variant of method
+Depositfrom Fig. 2 that contains an additional un-
+veriﬁed assertion at the end of the method (see
+Sect. 2.2). The gray boxes show the inferred must-
+unveriﬁed conditions. The conditions that are used
+for the must-unveriﬁed instrumentation are shown
+in dark gray boxes.
+Inference. We infer the two properties that are entailed
+by a must-unveriﬁed condition separately via two predicate
+transformers Must assertandMust all. IfMust assert(S, R )
+holds in a state, then each execution of statement Sfrom
+that state encounters at least one assertion orterminates in
+a state in which Rholds. If Must all(S, R )holds in a state,
+then the premise of each assertion in each execution of state-
+ment Sfrom that state does not hold and, if Sterminates, R
+holds. Both transformers yield the weakest condition that
+has these properties. Consequently, we obtain the weak-
+est must-unveriﬁed condition for an abstract statement Sas
+follows:
+Must(S )≡Must assert(S, false)∧Must all(S, true)
+Must assertandMust allare deﬁned analogously to WP
+(see Sect. 3.2), except for the treatment of assertions:
+Must assert(assert *verified A, R)≡true
+Must all(assert *verified A, R)≡¬A∧R
+The deﬁnition for Must assertexpresses that, at a program
+point before an assertion, property (1) holds, that is, the
+remaining execution (from that point on) contains at least
+one assertion. The deﬁnition for Must allexpresses that the
+premise Amust evaluate to false, and that Rmust hold
+to ensure that the premises of subsequent assertions do not
+hold either.
+Fig. 5 shows the abstraction of a variant of Depositfrom
+Fig. 2 that contains an additional unveriﬁed assertion at theend of the method (see Sect. 2.2). The (light and dark) gray
+boxes show the inferred must-unveriﬁed conditions. Com-
+pared to the may-unveriﬁed conditions, the must-unveriﬁed
+conditions are stronger, that is, information is usually prop-
+agated further up in the control ﬂow. Whereas the unver-
+iﬁed assertion at the end of this example causes the may-
+unveriﬁedconditionstobetriviallytrue, themust-unveriﬁed
+inference obtains conditions that can be used to prioritize
+test cases.
+Instrumentation. To prioritize tests that satisfy their
+must-unveriﬁed conditions, we instrument the concrete pro-
+gram with tryfirst Cstatements, where Cis the must-
+unveriﬁed condition at the corresponding program point in
+the abstract program. This statement causes DSE to pre-
+fer test inputs that satisfy condition C. More speciﬁcally,
+when a tryfirst Cstatement is executed for the ﬁrst time,
+it adds Cto the path condition to force DSE to generate in-
+puts that satisfy condition C. Note however, that unlike the
+constraints added by assumestatements, this constraint may
+be dropped by the DSE to also explore executions where
+the condition is violated. If during this ﬁrst execution of
+the statement condition Cis violated, then the test case is
+interrupted and will be re-generated later when condition C
+can no longer be satisﬁed. So the tryfirst statement inﬂu-
+ences the orderin which test cases are generated, but never
+aborts or prunes tests. Nevertheless, the order is important
+because DSE is typically applied until certain limits (for in-
+stance, on the overall testing time or the number of test
+cases) are reached. Therefore, exploring non-redundant test
+cases early increases eﬀectiveness.
+Pex supports primitives for expressing tryfirst Cstate-
+ments easily, as instrumentation. Alternatively, other tools
+may encode them by placing additional branches into the
+codeandcustomizingthesearchstrategytopreferthebranch
+where Cholds.
+To avoid wasting time on interrupting tests that will be
+re-generated later, our implementation enforces an upper
+bound on the number of interrupts that are allowed per
+unit under test. When this upper bound is exceeded, all
+remaining tryfirst statements have no eﬀect.
+As illustrated by lines 4, 6, 8, and 10 in Fig. 5, the must-
+unveriﬁed condition at some program points evaluates to
+false for all executions. Instrumenting these program points
+would lead to useless interruption and re-generation of test
+cases. To detect such cases, we apply constant propagation
+and do not instrument program points for which the must-
+unveriﬁed conditions are trivially true or false. Moreover,
+we omit the instrumentation for conditions that are not dif-
+ferent from the condition at the previous program point.
+Therefore, out of all the conditions inferred for the example
+in Fig. 5, we use only the ones on lines 12 and 20 to instru-
+ment the program, which prioritize test cases that lead to
+an arithmetic overﬂow on line 10, as discussed in Sect. 2.2.
+3.4 Combined instrumentation
+As we explained in Sect. 2.2, the may-unveriﬁed instru-
+mentation aborts and prunes redundant tests, while the
+must-unveriﬁed instrumentation prioritizes test cases that
+are more likely to detect an assertion violation. One can,
+therefore, combine both instrumentations such that DSE
+(1) attempts to ﬁrst explore program executions that must
+be unveriﬁed, and (2) falls back on executions that may be
+unveriﬁed when the former is no longer feasible.
+149The combined instrumentation includes both the assume
+statementsfromthemay-unveriﬁedinstrumentationandthe
+tryfirst statements from the must-unveriﬁed instrumenta-
+tion. The tryfirst statement comes ﬁrst. Whenever we
+can determine that the must-unveriﬁed and may-unveriﬁed
+conditions at a particular program point are equivalent, we
+omit the tryfirst statement, because any interrupted and
+re-generated test case would be aborted by the subsequent
+assumestatement anyway.
+4. EXPERIMENTS
+In this section, we give an overview of our implementation
+and present our experimental results. They show that, com-
+pared to dynamic symbolic execution alone, our technique
+produces smaller test suites, covers more unveriﬁed execu-
+tions, and reduces testing time. They also show that the
+combined instrumentation is more eﬀective than the may-
+unveriﬁed or the must-unveriﬁed instrumentation alone.
+4.1 Implementation
+We have implemented our technique for the .NET static
+analyzer Clousot [23] and the DSE tool Pex [40]. Our tool
+chain consists of four subsequent stages: (1) static anal-
+ysis and veriﬁcation-annotation instrumentation, (2) may-
+unveriﬁed and must-unveriﬁed instrumentation, (3) runtime
+checking, and (4) dynamic symbolic execution.
+The ﬁrst stage runs Clousot on a given .NET program,
+which contains code and optionally speciﬁcations expressed
+in Code Contracts [22], and instruments the sources of un-
+soundness and partial veriﬁcation results of the analyzer us-
+ing our veriﬁcation annotations. For this purpose, we have
+implemented a wrapper around Clousot that uses the debug
+output emitted during the static analysis to instrument the
+program (at the binary level). Note that Clousot performs
+a modular analysis, and thus, the veriﬁcation annotations
+are local to the containing methods.
+We have elicited a complete list of Clousot’s unsound as-
+sumptions by studying publications, extensively testing the
+tool, and having numerous discussions with its designers.
+We encoded most of these assumptions with our veriﬁcation
+annotations [13].
+Thesecondstageofthetoolchainaddsthemay-unveriﬁed,
+must-unveriﬁedinstrumentation,ortheircombinationtothe
+annotated program.
+In the third stage, we run the existing Code Contracts
+binary rewriter to transform any Code Contracts speciﬁca-
+tions into runtime checks. We then run a second rewriter
+that transforms all the assumedstatements and assertions of
+the annotated program into assignments and assumptions,
+as described in Sect. 2.1.
+In the ﬁnal stage, we run Pex on the instrumented code.
+4.2 Experimental evaluation
+In the rest of this section, we describe the setup for the
+evaluation of our technique and present experiments that
+evaluate its beneﬁts.
+Setup.For our experiments, we used 101 methods (written
+in C#) from nine open-source projects and from solutions
+to 13 programming tasks on the Rosetta Code repository.
+A complete list of the methods used in our evaluation can
+be found in Christakis’ Ph.D. thesis [11]. We selected only
+methods for which Pex can automatically (that is, withoutuser-provided factories) produce at least one test case that
+passes the method’s parameter validation (between 1 and 25
+methods per project or task).
+In Clousot, we enabled all checks, set the warning level to
+themaximum, anddisabledall inferenceoptions. InPex, we
+set the maximum number of branches, conditions, and exe-
+cution tree nodes to 100,000, and the maximum number of
+concrete runs to 30. Without any instrumentation, 61 meth-
+ods reach this maximum number of runs, and 35 are tested
+exhaustively, which gives an indication of the complexity of
+the selected methods.
+In our experiments, we allowed up to 4 test interrupts
+per method under test when these are caused by tryfirst
+statements (see Sect. 3.3). We experimented with diﬀerent
+such bounds (1, 2, 4, and 8) on 25 methods from the suite
+of 101 methods. For an upper bound of 4 for the number of
+allowed interrupts per method, DSE strikes a good balance
+between testing time and the number of detected bugs.
+We used a machine with a quad-core CPU (Intel Core i7-
+4770, 3.4 GHz) and 16 GB of RAM for these experiments.
+Performance of static analysis and instrumentation.
+On average, Clousot analyzes each method from our suite
+in 1.9 seconds. The may-unveriﬁed and must-unveriﬁed in-
+strumentations are very eﬃcient. On average, they need 22
+milliseconds per method when combined.
+Conﬁgurations. To evaluate our technique, we use the
+following conﬁgurations:
+−UV:unveriﬁed code.
+Stages 1 and 2 of the tool chain are not run.
+−PV:partially-veriﬁed code.
+Stage 2 of the tool chain is not run.
+−MAY: partially-veriﬁed code, instrumented with may-
+unveriﬁed conditions.
+All stages of the tool chain are run. Stage 2 adds only
+the may-unveriﬁed instrumentation.
+−MUST: partially-veriﬁed code, instrumented with must-
+unveriﬁed conditions.
+All stages of the tool chain are run. Stage 2 adds only
+the must-unveriﬁed instrumentation.
+−MAY×MUST : partially-veriﬁedcode,instrumentedwith
+may-unveriﬁed and must-unveriﬁed conditions.
+All stages of the tool chain are run. Stage 2 adds the
+combined may- and must-unveriﬁed instrumentation.
+Fig. 6 shows the number of tests that each conﬁgura-
+tion generated for the 101 methods, categorized as non-
+redundant and failing, as non-redundant and successful, or
+as redundant tests. A failing test is a test that terminates
+abnormally, whereas a successful one terminates normally.
+Teststhatterminateonexceptionsthatareexplicitlythrown
+by the method under test, for instance, for parameter vali-
+dation, are considered successful. To determine the redun-
+dant tests, we counted the tests in which the premises of
+all encountered assertions hold. Note that the ﬁgure does
+not include tests that are interrupted when a condition in
+atryfirst statement is violated (since these tests are re-
+generated—and counted—later).
+The results of DSE alone, that is, of UV, do not signif-
+icantly diﬀer from those of PVin terms of the total num-
+ber of tests and the number of non-redundant tests gener-
+ated. This conﬁrms that the instrumentation from stage 1
+alone, without the may-unveriﬁed and must-unveriﬁed in-
+strumentation, does not reduce the test eﬀort signiﬁcantly
+150142 145 146 152 150193 191 192 205 210302 301
+177300
+175
+UV PV MAY MUST MAY*MUSTNUMBER OF TESTS
+CONFIGURATIONGENERATED TESTS
+non-redundant, failing tests
+non-redundant, successful tests
+redundant testsFigure 6: The tests generated by each conﬁgura-
+tion, categorized as non-redundant and failing, as
+non-redundantandsuccessful, orasredundanttests.
+MAY×MUSTgenerates 16.1% fewer tests, but 7.1%
+more non-redundant tests than PV, including 5 ad-
+ditional failing tests.
+for partially-veriﬁed methods, as we explained in Sect. 2.2.
+Note that this result does not contradict the results of our
+previous work [12]. First, that work used a diﬀerent static
+analyzer whose (artiﬁcial) sources of unsoundness aﬀected
+fewer methods than Clousot’s, leading to a much larger por-
+tion of fully-veriﬁed methods. Second, the improvements
+observed in our earlier work were mostly caused by exempt-
+ingfully-veriﬁed methods completely from the test stage,
+whereas here, we apply stage 4 to all methods and rely on
+our may-instrumentation to prune the entire search space.
+Forthefollowingexperiments, weuseconﬁguration PVas
+the baseline to highlight the beneﬁts of the may-unveriﬁed
+and must-unveriﬁed inference over our earlier work [12].
+Smaller test suites. The may-unveriﬁed instrumentation
+causes DSE to abort tests leading to veriﬁed executions and
+to prune veriﬁed parts of the search space. As a result,
+DSE generates smaller test suites. Fig. 6 shows that, in
+total,MAYgenerates 19.2% fewer tests and MAY×MUST
+generates 16.1% fewer tests than PV. The diﬀerences in the
+total number of tests for conﬁgurations without the may-
+unveriﬁed instrumentation are minor.
+Fig. 7 compares the total number of generated tests (in-
+cluding aborted tests) by PVandMAYper method. For
+many methods, MAYproduces fewer tests, as shown by the
+negative values. However, for some methods, MAYgen-
+erates more tests than PV. This happens when pruning
+veriﬁed parts of the search space guides DSE toward execu-
+tions that are easier to cover within the exploration bounds
+of Pex (for instance, maximum number of branches).
+More unveriﬁed executions. Although conﬁgurations
+MAYandMAY×MUSTgeneratesmallertestsuitesincom-
+parison to PV, they do not generate fewer non-redundant
+tests, as shown in Fig. 6. In other words, they generate at
+least as many non-redundant tests as PV, thus covering at
+least as many unveriﬁed executions.
+The must-unveriﬁed instrumentation prioritizes test in-
+puts that lead to more premise violations. In comparison
+to the may-unveriﬁed conditions, the must-unveriﬁed condi-
+tionsarestrongerandtheirinstrumentationisusuallyadded
+further up in the control ﬂow. As a result, MUSTand
+MAY×MUSTguideDSEtocoverunveriﬁedexecutionsear-
+-100%-80%-60%-40%-20%0%20%40%60%80%100%
+1
+7
+11
+16
+21
+30
+25
+22
+41
+46
+51
+56
+61
+66
+71
+76
+81
+86
+88
+95
+97CHANGE IN PERCENTAGE
+METHOD IDFigure 7: Change in total number of tests generated
+foreachofthe101methodsbyconﬁguration MAYin
+comparison to PV(in percentage). Negative values
+indicate that MAYproduces fewer tests.
+lier and may allow it to generate more non-redundant tests
+within the exploration bounds. As shown in Fig. 6, con-
+ﬁguration MUSTgenerates 6.3% more non-redundant tests
+thanPVand 5.6% more than MAY(MAY×MUSTpro-
+duces7.1%resp.6.5%morenon-redundanttests). Bygener-
+ating more such tests, we increase the chances of producing
+more failing tests. In fact, MUSTgenerates 4.8% more fail-
+ingteststhan PVand4.1%morethan MAY(MAY×MUST
+produces 3.4% resp. 2.7% more failing tests).
+MUSTtypically generates more non-redundant tests for
+methods in which Clousot detects errors, that is, for meth-
+ods with unveriﬁed assertions. In such methods, the may-
+unveriﬁed instrumentation is added only after the unveri-
+ﬁed assertions in the control ﬂow (if the conditions are non-
+trivial), thus failing to guide DSE toward unveriﬁed execu-
+tions early on, as discussed in Sect. 2.2.
+Shorter testing time. To compare the testing time of
+the diﬀerent conﬁgurations, we considered only methods for
+which all conﬁgurations generated the same number of non-
+redundant tests. This is to ensure a fair comparison; for
+these methods, all conﬁgurations achieved the same cover-
+age of unveriﬁed executions. This experiment involved 72
+out of the 101 methods, and the time it took for each con-
+ﬁguration to test these methods is shown in Fig. 8. As ex-
+pected, pruning veriﬁed parts of the search space with the
+may-unveriﬁed instrumentation is very eﬀective. In partic-
+ular, conﬁguration MAYis 51.7% faster and conﬁguration
+MAY×MUSTis 52.4% faster than PV. The diﬀerence be-
+tween PVandMUSTis caused by a few outliers, for which
+PVruns more than twice as long. The MUSTinstrumenta-
+tion aﬀects the order in which execution paths are explored.
+Even though the same number of non-redundant tests is
+generated, the generated tests could exercise diﬀerent paths,
+leading to diﬀerent constraint solving times.
+Note that Fig. 8 does not include the time of the static
+analysis for two reasons. First, Clousot is just one way of
+obtaining veriﬁcation results. Second, the goal of our work
+is to eﬃciently complement existingveriﬁcation results with
+test case generation; we assume that the static analysis is
+run anyway to achieve a more thorough scrutiny of the code.
+Recallthattheoverheadoftheinstrumentationisnegligible.
+Even though MAYis overall much faster than PV, there
+151193.21210.47
+101.66180.19
+100.17
+UV PV MAY MUST MAY*MUSTTIME (SECONDS)
+CONFIGURATIONPERFORMANCEFigure 8: Testing time for each conﬁguration. We
+onlyconsideredmethodsforwhichallconﬁgurations
+generated the same number of non-redundant tests.
+MAY×MUSTis 52.4% faster than PV.
+21 24
+6215 15 5 561 59
+4158
+41
+171123 20 24
+UV PV MAY MUST MAY*MUSTNUMBER OF BOUNDS
+CONFIGURATIONREACHED BOUNDS
+max-branches max-stack max-runs max-solver-time
+Figure 9: The exploration bounds reached by each
+conﬁguration. MAYandMAY×MUSToverall reach
+fewer bounds than PV.
+weremethodsforwhichthetestingtimefor MAYwaslonger
+in comparison to PV. This is the case when constraint solv-
+ing becomes more diﬃcult due to the inferred conditions. In
+particular, it might take longer for the constraint solver to
+prove that an inferred condition at a certain program point
+is infeasible.
+Fewer exploration bounds reached. During its explo-
+ration, DSE may reach bounds that prevent it from cover-
+ing certain, possibly failing, execution paths. There are four
+kinds of bounds that were reached during our experiments:
+−max-branches : maximum number of branches that may
+be taken along a single execution path;
+−max-stack : maximum number of active call frames on the
+stack at any time during a single execution path;
+−max-runs : maximum number of runs that will be tried
+during an exploration (each run uses diﬀerent inputs but
+some runs are not added to the test suite if they do not
+increase coverage);
+−max-solver-time : maximumtimethattheconstraintsolver
+has to ﬁnd inputs that will cause an execution path to be
+taken.
+Fig. 9 shows the exploration bounds in Pex that were
+reached by each conﬁguration when testing all 101 meth-
+ods.MAY,MUST, and MAY×MUSTreach the max-
+solver-time bound more often than PV. This is because our
+instrumentation introduces additional conjuncts in the path
+conditions, occasionally making constraint solving harder.
+Nevertheless, conﬁgurations MAYandMAY×MUSTover-
+all reach signiﬁcantly fewer bounds than PV(for instance,
+the max-stack bound is never reached) by pruning veriﬁed
+parts of the search space. This helps in alleviating an inher-
+ent limitation of symbolic execution by building on results
+from tools that do not suﬀer from the same limitation.Winnerconﬁguration. Conﬁguration MAY×MUSTgen-
+erates the second smallest test suite containing the largest
+number of non-redundant tests and the smallest number of
+redundant tests (Fig. 6). This is achieved in the shortest
+amount of time for methods with the same coverage of un-
+veriﬁed executions across all conﬁgurations (Fig. 8) and by
+reachingthesmallestnumberofexplorationbounds(Fig.9).
+Therefore, MAY×MUSTeﬀectively combines the bene-
+ﬁts of both the may-unveriﬁed and must-unveriﬁed instru-
+mentation to prune parts of the search space that lead only
+to veriﬁed executions as well as to identify and prefer test
+inputs that lead to unveriﬁed executions as soon as possible.
+Note that, in practice, these beneﬁts should be indepen-
+dent of the exploration strategy in the underlying DSE. For
+methods whose exploration does not reach any bounds, the
+order in which the tests are generated is obviously not rel-
+evant. For the remaining methods, we do not expect an
+exploration strategy to signiﬁcantly aﬀect how often our
+instrumentation is hit because Clousot makes unsound as-
+sumptions for various expressions and statements and, thus,
+assumedstatements are spread across the method body. We
+have conﬁrmed this expectation by running the MAY×
+MUSTconﬁguration with diﬀerent exploration strategies
+on 20 methods for which exploration bounds were reached.
+The diﬀerences between all strategies (breadth-ﬁrst, random
+search, and Pex’s default search strategy) were negligible.
+Threats to validity. We identiﬁed the following threats
+to the validity of our experiments:
+−Sample size : Weused101methodsfromnineC#projects
+and from solutions to 13 programming tasks.
+−Static analyzer : For our experiments, we used a modular
+(as opposed to whole-program) static analyzer, namely,
+Clousot. Moreover, our experimental results depend on
+the deliberate sources of unsoundness and veriﬁcation re-
+sults of this particular analyzer. Note that there are a
+few sources of unsoundness in Clousot that our tool chain
+does not capture [13], for instance, about reﬂection or un-
+managed code.
+−Soundly-analyzed methods : 23 out of the 101 methods
+contain no assumedstatements. Clousot reports no warn-
+ing for 16 of them, and thus, these methods are fully ver-
+iﬁed and our may-unveriﬁed instrumentation prunes the
+entire search space. However, our results are not signiﬁ-
+cantlyaﬀectedbyincludingthesemethods: thediﬀerence
+in running times with and without fully-veriﬁed methods
+is minor (e.g., MAY×MUSTis still 50.3% faster than
+PV).
+−Failing tests : The failing tests generated by each conﬁg-
+uration do not necessarily reveal bugs in the containing
+methods. This is inherent to unit testing since methods
+are tested in isolation rather than in the context of the
+entire program. However, 50 out of the 101 methods val-
+idate their parameters (and for 10 methods no parameter
+validation was necessary), which suggests that program-
+mers did intend to prevent failures in these methods.
+5. RELATED WORK
+Many static analyzers for mainstream languages such as
+HAVOC[3],Spec#[6],andESC/Java[24]deliberatelymake
+unsound assumptions to increase automation, improve per-
+formance, and reduce the number of false positives and the
+annotation overhead for the programmer [36]. Our tech-
+152nique can eﬀectively complement these analyzers by DSE.
+Integration of static analysis and testing. Various ap-
+proaches combine static analysis and automatic test case
+generation to determine whether an error reported by the
+static analysis is spurious and to reduce the search space for
+the test case generator. For example, Check ’n’ Crash [17]
+is an automated defect detection tool that integrates the
+unsound ESC/Java static checker with the JCrasher [16]
+test case generator. Check ’n’ Crash was later integrated
+with Daikon [21] in the DSD-Crasher tool [18]. Similarly,
+DyTa [25] integrates Clousot with Pex. Like our work, all
+of these approaches use results from the static analysis to
+guide test case generation toward the errors reported by the
+static analysis and to prune parts of the search space dur-
+ing testing. However, in contrast to our work, they ignore
+the unsoundness of the static analysis: each assertion for
+which the static analysis does not report an error is consid-
+eredsoundly veriﬁed, even if the analysis makes unsound
+assumptions. Consequently, these approaches may prune
+unveriﬁed executions, whereas our technique retains all exe-
+cutions that are not fully veriﬁed and, therefore, may reveal
+errors missed by the unsound static analysis.
+SANTE [10] uses a sound value analysis (in combination
+with program slicing) to prune those execution paths that
+do not lead to unveriﬁed assertions. In contrast, our work
+supports the common case that a static analysis is unsound.
+Several analyses combine over- and under-approximations
+of the set of program executions. Counterexample-guided
+abstraction reﬁnement (CEGAR) [14] exploits the abstract
+counterexample trace of a failing proof attempt to suggest a
+concretetracethatmightrevealarealerror. If, however, the
+abstract trace refers to a spurious error, the abstraction is
+reﬁned in such a way that subsequent veriﬁcation attempts
+will not reproduce the infeasible abstract trace. YOGI [29,
+37] switches between static analysis and DSE both to prove
+properties and ﬁnd bugs, without reporting false positives.
+Speciﬁcally, YOGI uses two diﬀerent abstract domains, one
+(not-)may abstraction for proving a property and one must
+abstraction for disproving a property. The two abstractions
+are used simultaneously, communicate with each other, and
+reﬁne each other for either ﬁnding a proof or a bug. To ob-
+tainanover-approximationofthesetofprogramexecutions,
+these approaches rely on a sound analysis. In contrast, our
+work supports the common case that a static analysis is un-
+sound, that is, neither over- nor under-approximates the set
+ofprogramexecutions(theanalysismayhavebothfalsepos-
+itives and false negatives). Soundly-veriﬁed executions and
+executions for which the analysis reports an error are han-
+dled similarly to work based on over-approximations: we
+prune soundly-veriﬁed executions during test case genera-
+tion, and use an under-approximation (testing) to ﬁnd bugs
+and identify spurious errors among the executions for which
+theanalysisreportsanerror. Thenoveltyofourworkisthat
+we also handle executions that are veriﬁed unsoundly, that
+is, underunsoundassumptions. Ourannotationsmakethese
+assumptions explicit (in other words, they express which ex-
+ecutions one would have to add to the set of analyzed execu-
+tions for it to become a sound over-approximation). These
+executions are then targeted by an under-approximation.
+A recent approach [19] starts by running a conditional
+model checker [7] on a program, and then tests those parts
+ofthestatespacethatwerenotcoveredbythemodelchecker
+(for instance, due to timeouts). More speciﬁcally, the modelchecker produces an output condition, which captures the
+safe states and is used to produce a residual program that
+can be subsequently tested. Unlike an instrumented pro-
+gram in our technique, the residual program can be struc-
+turally very diﬀerent from the original program. As a result,
+its construction can take a signiﬁcant amount of time, as the
+authors point out. Furthermore, this approach can charac-
+terize assertions only as either fully veriﬁed or unveriﬁed on
+a given execution path. It is not clear how to apply this
+approach in a setting with static analysis tools that are not
+fully sound [36, 13] without reducing its eﬀectiveness.
+Dynamic symbolic execution. Testing and symbolically
+executing all feasible program paths is not possible in prac-
+tice. The number of feasible paths can be exponential in
+the program size, or even inﬁnite in the presence of input-
+dependent loops.
+Existing DSE tools alleviate path explosion using search
+strategies and heuristics that guide the search toward inter-
+esting paths while pruning the search space. These strate-
+gies typically optimize properties such as “deeper paths”
+(in depth-ﬁrst search), “less-traveled paths” [35], “number
+of new instructions covered” (in breadth-ﬁrst search), or
+“paths speciﬁed by the programmer” [39]. For instance,
+SAGE [28] uses a generational-search strategy in combina-
+tion with simple heuristics, such as ﬂip count limits and con-
+straint subsumption. Other industrial-strength tools, like
+Pex,alsousesimilartechniques. AsweexplainedinSect.4.2,
+the beneﬁts of our approach are independent of the explo-
+ration strategy in the underlying DSE. Our technique re-
+sembles a search strategy in that it optimizes unveriﬁed ex-
+ecutions, prunes veriﬁed executions, and is guided by veriﬁ-
+cation annotations, instead of properties like the above.
+Compositional symbolic execution [26, 1] has been shown
+to alleviate path explosion. Dynamic state merging [32] and
+veritesting[2]achievethisbymergingsub-programsearches,
+while RWset [8] prunes searches by dynamically comput-
+ing variable liveness. By guiding DSE toward unveriﬁed
+program executions, our technique also alleviates path ex-
+plosion. In particular, the may-unveriﬁed instrumentation
+causes DSE to abort tests that lead to veriﬁed executions
+and to prune parts of the search space. Moreover, since our
+technique does not require a particular DSE algorithm, it
+can be combined with any of the above approaches by run-
+ning them on a program that contains our instrumentation.
+6. CONCLUSION
+We have presented a technique for complementing par-
+tial veriﬁcation results by automatic test case generation.
+Our technique causes dynamic symbolic execution to abort
+tests that lead to veriﬁed executions, consequently pruning
+parts of the search space, and to prioritize tests that are
+more likely to detect an assertion violation. It is applica-
+ble to any program with veriﬁcation annotations, either in-
+serted automatically by a (possibly unsound) static analysis
+or manually, for instance, during a code review. Our work
+suggests a novel way to combine static analysis and testing
+in order to maximize software quality, and investigates to
+what extent unsound static analysis reduces the test eﬀort.
+Acknowledgments. We thank Cristian Cadar, Patrice
+Godefroid, Thomas Gross, and Nikolai Tillmann for their
+valuable help and feedback. We are also grateful to the
+anonymous reviewers for their constructive comments.
+1537. REFERENCES
+[1] S. Anand, P. Godefroid, and N. Tillmann.
+Demand-driven compositional symbolic execution. In
+TACAS, volume 4963 of LNCS, pages 367–381.
+Springer, 2008.
+[2] T. Avgerinos, A. Rebert, S. K. Cha, and D. Brumley.
+Enhancing symbolic execution with veritesting. In
+ICSE, pages 1083–1094. ACM, 2014.
+[3] T. Ball, B. Hackett, S. K. Lahiri, S. Qadeer, and
+J. Vanegue. Towards scalable modular checking of
+user-deﬁned properties. In VSTTE, volume 6217 of
+LNCS, pages 1–24. Springer, 2010.
+[4] T. Ball, R. Majumdar, T. D. Millstein, and S. K.
+Rajamani. Automatic predicate abstraction of C
+programs. In PLDI, pages 203–213. ACM, 2001.
+[5] T. Ball and S. K. Rajamani. Boolean programs: A
+model and process for software analysis. Technical
+Report MSR–TR–2000–14, Microsoft Research, 2000.
+[6] M. Barnett, M. Fähndrich, K. R. M. Leino, P. Müller,
+W. Schulte, and H. Venter. Speciﬁcation and
+veriﬁcation: The Spec# experience. CACM, 54:81–91,
+2011.
+[7] D. Beyer, T. A. Henzinger, M. E. Keremoglu, and
+P. Wendler. Conditional model checking: A technique
+to pass information between veriﬁers. In FSE, pages
+57–67. ACM, 2012.
+[8] P. Boonstoppel, C. Cadar, and D. R. Engler. RWset:
+Attacking path explosion in constraint-based test
+generation. In TACAS, volume 4963 of LNCS, pages
+351–366. Springer, 2008.
+[9] C. Cadar and D. R. Engler. Execution generated test
+cases: How to make systems code crash itself. In
+SPIN, volume 3639 of LNCS, pages 2–23. Springer,
+2005.
+[10] O. Chebaro, N. Kosmatov, A. Giorgetti, and
+J. Julliand. The SANTE tool: Value analysis, program
+slicing and test generation for C program debugging.
+InTAP, volume 6706 of LNCS, pages 78–83. Springer,
+2011.
+[11] M. Christakis. Narrowing the Gap between Veriﬁcation
+and Systematic Testing . PhD thesis, ETH Zurich,
+2015.
+[12] M. Christakis, P. Müller, and V. Wüstholz.
+Collaborative veriﬁcation and testing with explicit
+assumptions. In FM, volume 7436 of LNCS, pages
+132–146. Springer, 2012.
+[13] M. Christakis, P. Müller, and V. Wüstholz. An
+experimental evaluation of deliberate unsoundness in
+a static program analyzer. In VMCAI, volume 8931 of
+LNCS, pages 336–354. Springer, 2015.
+[14] E. M. Clarke, O. Grumberg, S. Jha, Y. Lu, and
+H. Veith. Counterexample-guided abstraction
+reﬁnement. In CAV, volume 1855 of LNCS, pages
+154–169. Springer, 2000.
+[15] P. Cousot and R. Cousot. Abstract interpretation: A
+uniﬁed lattice model for static analysis of programs by
+construction or approximation of ﬁxpoints. In POPL,
+pages 238–252. ACM, 1977.
+[16] C. Csallner and Y. Smaragdakis. JCrasher: An
+automatic robustness tester for Java. SPE,
+34:1025–1050, 2004.
+[17] C. Csallner and Y. Smaragdakis. Check ’n’ Crash:Combining static checking and testing. In ICSE, pages
+422–431. ACM, 2005.
+[18] C. Csallner, Y. Smaragdakis, and T. Xie.
+DSD-Crasher: A hybrid analysis tool for bug ﬁnding.
+TOSEM, 17:1–37, 2008.
+[19] M. Czech, M.-C. Jakobs, and H. Wehrheim. Just test
+what you cannot verify! In FASE, volume 9033 of
+LNCS, pages 100–114. Springer, 2015.
+[20] E. W. Dijkstra. Guarded commands, nondeterminacy
+and formal derivation of programs. CACM,
+18:453–457, 1975.
+[21] M. D. Ernst, J. H. Perkins, P. J. Guo, S. McCamant,
+C. Pacheco, M. S. Tschantz, and C. Xiao. The Daikon
+system for dynamic detection of likely invariants. Sci.
+Comput. Program., 69:35–45, 2007.
+[22] M. Fähndrich, M. Barnett, and F. Logozzo.
+Embedded contract languages. In SAC, pages
+2103–2110. ACM, 2010.
+[23] M. Fähndrich and F. Logozzo. Static contract
+checking with abstract interpretation. In FoVeOOS ,
+volume 6528 of LNCS, pages 10–30. Springer, 2010.
+[24] C. Flanagan, K. R. M. Leino, M. Lillibridge,
+G. Nelson, J. B. Saxe, and R. Stata. Extended static
+checking for Java. In PLDI, pages 234–245. ACM,
+2002.
+[25] X. Ge, K. Taneja, T. Xie, and N. Tillmann. DyTa:
+Dynamic symbolic execution guided with static
+veriﬁcation results. In ICSE, pages 992–994. ACM,
+2011.
+[26] P. Godefroid. Compositional dynamic test generation.
+InPOPL, pages 47–54. ACM, 2007.
+[27] P. Godefroid, N. Klarlund, and K. Sen. DART:
+Directed automated random testing. In PLDI, pages
+213–223. ACM, 2005.
+[28] P. Godefroid, M. Y. Levin, and D. A. Molnar.
+Automated whitebox fuzz testing. In NDSS, pages
+151–166. The Internet Society, 2008.
+[29] P. Godefroid, A. V. Nori, S. K. Rajamani, and
+S. Tetali. Compositional may-must program analysis:
+Unleashing the power of alternation. In POPL, pages
+43–56. ACM, 2010.
+[30] S. Graf and H. Saïdi. Construction of abstract state
+graphs with PVS. In CAV, volume 1254 of LNCS,
+pages 72–83. Springer, 1997.
+[31] G. J. Holzmann. Mars code. CACM, 57:64–73, 2014.
+[32] V. Kuznetsov, J. Kinder, S. Bucur, and G. Candea.
+Eﬃcient state merging in symbolic execution. In
+PLDI, pages 193–204. ACM, 2012.
+[33] K. R. M. Leino. Eﬃcient weakest preconditions. IPL,
+93:281–288, 2005.
+[34] K. R. M. Leino. Dafny: An automatic program veriﬁer
+for functional correctness. In LPAR, volume 6355 of
+LNCS, pages 348–370. Springer, 2010.
+[35] Y. Li, Z. Su, L. Wang, and X. Li. Steering symbolic
+execution to less traveled paths. In OOPSLA , pages
+19–32. ACM, 2013.
+[36] B. Livshits, M. Sridharan, Y. Smaragdakis, O. Lhoták,
+J. N. Amaral, B.-Y. E. Chang, S. Z. Guyer, U. P.
+Khedker, A. Møller, and D. Vardoulakis. In defense of
+soundiness: A manifesto. CACM, 58:44–46, 2015.
+[37] A. V. Nori, S. K. Rajamani, S. Tetali, and A. V.
+154Thakur. The YOGI project: Software property
+checking via static analysis and testing. In TACAS,
+volume 5505 of LNCS, pages 178–181. Springer, 2009.
+[38] K. Sen, D. Marinov, and G. Agha. CUTE: A concolic
+unit testing engine for C. In ESEC, pages 263–272.
+ACM, 2005.
+[39] K. Sen, H. Tanno, X. Zhang, and T. Hoshino.
+GuideSE: Annotations for guiding concolic testing. In
+AST, pages 23–27. IEEE Computer Society, 2015.
+[40] N. Tillmann and J. de Halleux. Pex—White box test
+generation for .NET. In TAP, volume 4966 of LNCS,
+pages 134–153. Springer, 2008.
+[41] V. Wüstholz. Partial Veriﬁcation Results . PhD thesis,
+ETH Zurich, 2015.
+155

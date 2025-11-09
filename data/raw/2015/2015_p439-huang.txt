@@ -1,0 +1,1114 @@
+Finding Schedule-Sensitive Branches
+Jeff Huang, Lawrence Rauchwerger
+Parasol Laboratory
+Texas A&M University, USA
+fje,rwergerg@cse.tamu.edu
+ABSTRACT
+This paper presents an automated, precise technique, TAME ,
+for identifying schedule-sensitive branches ( SSBs) in con-
+current programs, i.e., branches whose decision may vary
+depending on the actual scheduling of concurrent threads.
+The technique consists of 1) tracing events at ne-grained
+level; 2) deriving the constraints for each branch; and 3)
+invoking an SMT solver to nd possible SSB, by trying to
+solve the negated branch condition. To handle the infea-
+sibly huge number of computations that would be gener-
+ated by the ne-grained tracing, TAME leverages concolic
+execution and implements several sound approximations to
+delimit the number of traces to analyse, yet without sac-
+ricing precision. In addition, TAME implements a novel
+distributed trace partition approach distributing the analy-
+sis into smaller chunks. Evaluation on both popular bench-
+marks and real applications shows that TAME is eective in
+nding SSBs and has good scalability. TAME found a to-
+tal of 34 SSBs, among which 17 are related to concurrency
+errors, and 9 are ad hoc synchronizations.
+Categories and Subject Descriptors
+D.2.5 [ Software Engineering ]: Testing and Debugging|
+Debugging aids; Tracing; Diagnostics
+Keywords
+Schedule-Sensitive Branches, Symbolic Constraint Analysis
+1. INTRODUCTION
+Branch statements play a fundamental role in computer
+programs. For sequential programs, branches are either in-
+variant ( i.e., always true or false), or input-sensitive that
+their decision depends on the program input. However,
+branches in concurrent programs can have another dimen-
+sion of sensitivity: schedule-sensitivity . Depending on the
+scheduling of threads, the same branch instance in a concur-
+rent program may vary in two runs with the same input.
+T2T1if(is_good){   useProtocolA();}else{   useProtocolB();}if(speed>50){   is_good = true;}else{   is_good = false;}if(referencedColumnMap==null) {...}else {  if(referencedColumnMap.isSet(...)){...}}referencedColumnMap=null;T2T1Figure 1: An example of schedule-sensitive branch
+T2T1if(is_good){   useProtocolA();}else{   useProtocolB();}if(speed>50){   is_good = true;}else{   is_good = false;}if(referencedColumnMap==null) {...}else {  if(referencedColumnMap.isSet(...)){...}}referencedColumnMap=null;T2T1
+Figure 2: A real schedule-sensitive branch in Derby
+To understand this phenomenon, consider an example in
+Figure 1. Thread T1uses dierent protocols to transfer les
+over the network depending on the current network speed,
+while Thread T2monitors the network speed periodically
+and updates the shared variable is_good which indicates
+the current network condition. The branch \ if(is_good) "
+executed by T1is schedule-sensitive, since its choice also
+depends on the schedule.
+Although the branch schedule-sensitivity seems intuitive,
+it is often unintended by the programmer and frequently
+the result of programming errors. Figure 2 shows a real
+bug in Apache Derby [2]. Thread T1rst checks if the ref-
+erencedColumnMap isnull. If not null,T1will proceed
+to dereference it. However, T2may be concurrently run-
+ning and set referencedColumnMap tonull. The branch
+statement \ if(referencedColumnMap!=null) " is schedule-
+sensitive, but it is not expected, because if T2executes im-
+mediately after T1executes this branch and before it derefer-
+ences referencedColumnMap , it will cause NullPointerEx-
+ception upon the dereference.
+In our study of a large collection of popular multithreaded
+benchmarks and real programs (which we will show in Sec-
+tion 6), we nd that schedule-sensitive branches are a strong
+indicator of concurrency errors { 50% (17 out of 34) of the
+schedule-sensitive branches we nd in our experiments are
+resulted from concurrency bugs.
+We anticipate that eectively nding schedule-sensitive
+branches ( SSBs) is useful with at least two applications: (1)
+program understanding : if SSBs are not intended by the
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior speciﬁc permission and/or a
+fee. Request permissions from Permissions@acm.org.
+ESEC/FSE’15 , August 30 – September 4, 2015, Bergamo, Italy
+c2015 ACM. 978-1-4503-3675-8/15/08...$15.00
+http://dx.doi.org/10.1145/2786805.2786840
+439programmer, then they represent good starting points for
+better understanding the program behavior; (2) detecting
+and localizing potential concurrency errors : it is likely that
+aSSB is caused by bugs.
+In this paper, we present an automated technique, called
+TAME , to precisely identify SSBs in concurrent programs.
+TAME consists of three steps:
+1. observes a ne-grained program execution trace;
+2. constructs symbolic constraints for each branch in the
+trace; and
+3. uses an SMT solver to nd SSBs by solving the negated
+branch condition conjuncted with the symbolic constraints.
+TAME is able to identify all the SSBs that can be inferred
+from the observed execution trace. Moreover, for each iden-
+tied SSB, it generates a corresponding schedule that can
+enforce the program to execute a dierent branch choice.
+This feature also allows TAME to eectively test concurrent
+programs, as a dierent branch choice may manifest unex-
+pected behaviors, such as the runtime exceptions in Figure 2.
+A main challenge is how to scale to real programs that
+produce huge traces. TAME leverages concolic execution [11,
+25] to delimit the traces to analyse. We further propose a
+distributed trace partition approach that scopes our analysis
+to a selected range of schedules, such that the correspond-
+ing constraints can be solved within a reasonable time. Al-
+though this approach may result in missing certain SSBs,
+it does not aect the premise of precision, i.e., every iden-
+tied SSB is truly schedule-sensitive. More importantly, it
+achieves a much better balance between analysis eciency
+and eectiveness compared to a simple window-based trace
+segmentation approach [27, 14].
+Our contributions are summarized below:
+We present a technique to precisely identify schedule-
+sensitive branches in concurrent programs based on
+symbolic constraint analysis and concolic execution.
+We present a distributed trace partition approach that
+scales our technique to real world programs with long
+running executions.
+We evaluate our technique using both popular bench-
+marks and real programs and show that it is able to
+analyze real world program executions containing tens
+of millions of instructions in a minute.
+We report, for the rst time, 34 schedule-sensitive branches
+found in popular benchmarks and real programs. Among
+them, 17 are caused by concurrency bugs, and 9 are
+related to ad hoc synchronizations.
+2. OVERVIEW
+In this section, we start by illustrating our approach us-
+ing an articial example. We then identify the technical
+challenges and outline how we address them.
+Figure 3 (top) shows an overview of our approach, con-
+sisting of three components: a tracer, a constraint builder,
+and an SMT solver. The tracer monitors the execution of
+a program and produces a trace of ne-grained events. The
+constraint builder takes the trace as input and constructs
+a set of constraints for each branch event, and invokes theSMT solver to determine if a branch is schedule-sensitive.
+Consider an example in Figure 3(a). The program contains
+two threads ( T1and T2) accessing two shared variables ( x
+and y) and three branches (marked as Ê Ë Ì ). Branch Ê
+at line 1 is only input-sensitive because Thread T2is only
+started after line 4. For branches ËandÌ(at lines 6 and
+11 respectively), their schedule-sensitivity is much harder to
+see, because in addition to the branch conditions, we also
+need to reason about thread schedules.
+Suppose we run this program once with input x=0,y=0
+following a schedule denoted by the line numbers, we will
+observe 13critical events ( i.e., shared data reads/writes and
+thread synchronizations) in the execution. Note that lines 2
+and 12 are not executed in this schedule because their branch
+conditions are not satised, and line 1 generates two critical
+events (a read on xand a read on y). In our constraint
+model, we give each of these 13 events an order variable and
+each read access a symbolic value variable. We construct for
+each branch event a group of constraints over these variables.
+LetOidenote the order variable of the event at line i,x0and
+y0the input value of xandy, andxiandyithe symbolic
+value ofxandy, respectively, at line i. To avoid clutter,
+we useO2andy2to denote the order variable and symbolic
+value variable, respectively, for the read to yat line 1.
+Figure 3(b) shows the constructed constraints for the three
+branches. There are two types of constraints. The rst type
+is simple ordering constraints between critical events to en-
+sure sequential consistency1. For example, O1<O 2means
+that line 1 must happen before line 2. O4<O 9because T2
+is forked at line 4 so its rst event should happen after the
+fork event, andO5>O 14_O8<O 9because the two lock
+regions cannot overlap. The second type is the constraints
+corresponding to the branch conditions. We perform dy-
+namic symbolic execution to compute the path condition
+for each branch event and negate its corresponding branch
+condition. If the negated branch condition can be satised
+with any one valid schedule, then we know the branch is
+schedule-sensitive.
+For shared data reads that propagate to the branch con-
+ditions, we use symbolic variables to denote their values,
+because they may read a value written by the same thread
+or by a remote write from a dierent thread. Therefore,
+the negated constraints for the three branches are written
+asx1<=y2 ,x1>y2^x3+1<=y6 , and x10+2<=y11 , respectively.
+We then match each read with a valid write following the
+semantics of sequential consistency: a read returns the value
+written by the most recent write. For example, y11may ei-
+ther match with y0ory7. If it matches with y0, then either
+line 7 happens after line 11, or branch ÊorËis false. Oth-
+erwise if it matches with y7, branches ÊandËmust be true
+and line 7 should happen before line 11. Therefore, we write
+the constraint as ( y11=y0^(O11<O 7_x1>y 2_x3+1<=
+y6))_(y11=y7^(O7<O 11^x1<=y2^x3+1>y 6)). The
+constraints for the other symbolic reads can be constructed
+in a similar way.
+Putting all constraints together, we invoke an o-the-shelf
+SMT solver such as Z3 [6] or Yices [7] to solve them. For
+branches ÊandË, their corresponding constraints cannot
+be satised, hence we cannot determine if they are schedule-
+sensitive or not based on the observed trace. For branch Ì,
+1For a focused presentation, we only discuss sequential con-
+sistency in this paper. Nevertheless, our technique is gener-
+alizable to relax memory models.
+440T1T2input: x, yif(x>y)    return;a = x+1;fork(T2);lock(l);if(a>y)    y=2*a;unlock(l);1:2:3:4:5:6:7:8:lock(l);b = x+2;if(b>y)    y=2*b;x=2;unlock(l);9:10:11:12:13:14:123O1=1O2=2O3=3O4=4O9=5O10=6O11=7 x1=0y2=0x3=0x10=0 y11=0
+Tracer
+Constraint 
+Builder
+SMT 
+Solverprogramschedule-sensitive branchesτΦ3
+x1<=y2x1=x0&(O1<O13)   || x1=x13&(O13<O1)x3=x0&(O3<O13)   || x3 = x13&(O13<O3)x10=x0O1<O2<...<O8O9<O10<...<O14O4<O9O5>O14||O8<O9y2=y0y6=y0y11=y0&(O11<O7 || x3+1<=y6)    || y11=y7&(O7<O11&x3+1>y6)1x0=0  y0=0x1>y2&x3+1<=y623x10+2<=y11
+(a)(b)(c)Figure 3: Technical overview of our approach. Branches Ê Ëare not schedule-sensitive, while Branch Ìis.
+the solver returns a solution shown in Figure 3(c), which
+corresponds to a schedule that can enforce branch Ìto take
+the else branch upon re-execution of the program. We can
+then tell that branch Ìis schedule-sensitive. Note that the
+solution returned by a solver may not be unique, indicating
+that there are multiple schedules that can enforce a branch
+to take a dierent choice. However, regardless of which one is
+returned, as long as there exists any solution, the considered
+branch is schedule-sensitive.
+3. PRACTICAL CHALLENGES
+Although the overall ow of our approach is easy to follow,
+there are several tough challenges that we must tackle before
+the approach can be applied to realistic programs. We next
+discuss these challenges and describe our solutions.
+3.1 Fine Grained Tracing
+To obtain the branch conditions, we need to trace not only
+those critical events, but also thread-local computations on
+the stack. Though thread-local computations do not directly
+introduce scheduling non-determinism, they could indirectly
+transfer the eect of non-deterministic data ow to branches.
+However, the number of thread-local computations is usually
+much larger than ( e.g., several orders of magnitude of) that
+of critical events, because real programs often use standard
+libraries which encapsulate complex thread-local functions.
+In addition, it is not always possible to trace every computa-
+tion. Many programs contain native code or calls to external
+libraries of which the source code is not available or hard to
+instrument. Furthermore, the runtime overhead (including
+both memory and time) for tracing all computations can be
+prohibitive, which makes any tracing technique dicult to
+scale to long running programs.
+Consider a simple (but almost full2) Java program in Fig-
+ure 4. The program starts two threads to compare two dif-
+ferent implementations of the SHA-256 hash algorithm on an
+input string. Thread T1uses the Hashing class from Google
+2Only the main method and the thread creating statements
+are ignored to simplify the presentation.
+checkHash(String hash){   String hashed = map.get(input);   if(hashed == null){   	  map.put(input, hash);   }   else if(!hashed.equals(hash))  ERROR;}String input = "esec/fse2015";Thread T1:   String hash1 = DigestUtils.sha256Hex(input);   checkHash(hash1);   if(T2.isAlive())      System.out.println("done");Thread T2:   String hash2 = Hashing.sha256()             .hashString(input, Charsets.UTF_8)             .toString();   checkHash(hash2);HashMap map = new HashMap();1.2.3.4.
+9.10.11.12.13.14.5.6.7.8.Figure 4: Example for ne-grained tracing
+Guava3, and Thread T2uses the DigestUtils class from
+Apache Commons Codec4. Both T1and T2call the method
+checkHash to check the computed hash string. In check-
+Hash, a shared variable mapis used to store and retrieve the
+hashed value. There are two ifbranches, at lines 10 and 13,
+respectively. Each thread rst checks (at branch line 10) if
+a hash of the input string computed by the other algorithm
+exists or not. If not, the input hash will be stored into the
+map. Otherwise, the two hash strings will be compared (at
+branch line 13), and if they are dierent an error will be
+thrown at line 14. Regardless of the implementation cor-
+rectness of the two hash functions, as long as they are both
+3https://github.com/google/guava/
+4http://commons.apache.org/proper/commons-codec/
+441checkHash(String hash){   String hashed = map.get(input);   if(hashed == null){   	  map.put(input, hash);   }   else if(!hashed.equals(hash))  ERROR;}String input = "esec/fse2015";Thread T1:   String hash1 = DigestUtils.sha256Hex(input);   checkHash(hash1);   if(!T2.isAlive())      System.out.println("done");Thread T2:   String hash2 = Hashing.sha256()             .hashString(input, Charsets.UTF_8)             .toString();   checkHash(hash2);HashMap map = new HashMap();1.2.3.4.
+9.10.11.12.13.14.5.6.7.8.   		 	x = new X(y);   		 	if(x.f+y>0) doSomething;1.2.Figure 5: Example for missing computations
+deterministic, the branch at line 13 is not schedule-sensitive.
+However, the branch at line 10 is schedule-sensitive, because
+the thread which comes rst will nd that hashed isnull
+and take the true branch, and the other thread will nd
+hashed notnull and take the false branch. To illustrate the
+issue brought by native code, we also add a branch state-
+ment at line 3, which checks if T2is still alive by calling
+Thread.isAlive() , and prints out a message if not. This
+branch is schedule-sensitive because the start and termina-
+tion of T2depends on the schedule.
+Although the program contains only less than 20 lines of
+code, a complete trace of its execution contains more than
+390K computations if we trace every bytecode instruction
+(even after excluding the JDK libraries java.lang.* and
+java.util.* )5. The reason is that the library calls Diges-
+tUtils.sha256Hex() andHashing.sha256().hashString()
+involve a myriad of subclasses and other libraries. Moreover,
+the runtime overhead for tracing all these computations is
+signicant for such a tiny program. Without tracing, this
+program nishes in 20ms, whereas with tracing it takes more
+than 2 seconds (100X slower) to execute and generates a log
+of more than 100KB. We can imagine how serious this issue
+will be for large programs. Furthermore, it is dicult to
+trace the function call Thread.isAlive() because the code
+it executes is written in a dierent language (dened by Java
+native interface) and is not directly observable by the JVM.
+To address the above issues, we propose to exclude trac-
+ing certain classes, which can be dened by the user and
+matched with regular expressions. For example, the user
+can specify -exclude=java.*,com.google.*,org.apache.*
+in the command line to instruct the instrumentation tool
+to not trace classes in these packages. This is a standard
+step used also in many other analysis frameworks [14, 4,
+18]. It reduces both the trace size and runtime overhead,
+and also avoids the problem of tracing native code used in
+those excluded classes. For instance, after excluding the li-
+braries classes in java.*,com.google.*,org.apache.* , the
+simple program in Figure 4 only generates 744 events and the
+tracing takes only 100ms. However, this approach raises a
+new problem: the computation information in the excluded
+classes is missed. Because it is unknown what is computed
+in the missing code, it is hard to obtain the branch condition
+if it is related to the missing computation. For example, in
+the code in Figure 5, suppose the class Xis excluded and yis
+a thread-shared variable. At line 2, because the value of the
+eld x.fis unknown, it is impossible to compute the branch
+condition and decide its schedule-sensitiveness.
+To tackle this problem, we propose to insert additional
+value-tracking instrumentation to log the return value of
+method calls and every data read instruction (including the
+load operations on both heap and thread-local variables).
+The value information will help to recover the eect of miss-
+ing computations in a manner of under-approximation: given
+the same input value the untracked code always produces
+the same output value. For example, in Figure 5, we may
+5In fact, we could not trace classes in these libraries due to
+limitations of the tracing tool we use (ASM and Java agent).log at line 1 that the value of yis 0 and the constructor
+ofXreturns void, and at line 2 the value of x.fis 1 and
+yis 0. When computing the branch condition, we can use
+the logged value 1 to under-approximate x.f,i.e., to con-
+servatively assume that X(y) always takes y==0 and returns
+x.f==1 . In this way, despite that X(y) is excluded, the ob-
+tained branch conditions are sound (though it may limit the
+detection of SSB as additional constraints are introduced).
+3.2 Runtime Exception Handling
+When a runtime exception (either caught or uncaught)
+occurs, the program control ow will be transferred to a
+dierent point specied by the programmer. This causes two
+problems in constructing the branch conditions. First, the
+branch condition must consider the exception condition ( i.e.,
+the condition for the exception to occur). If the exception
+condition is not met, the branch may not even be executed.
+For example, in the code below, if xis 0, a divide by zero
+exception will occur and hence the branch at line 2 will not
+be executed.
+checkHash(String hash){   String hashed = map.get(input);   if(hashed == null){   	  map.put(input, hash);   }   else if(!hashed.equals(hash))  ERROR;}String input = "esec/fse2015";Thread T1:   String hash1 = DigestUtils.sha256Hex(input);   checkHash(hash1);   if(!T2.isAlive())      System.out.println("done");Thread T2:   String hash2 = Hashing.sha256()             .hashString(input, Charsets.UTF_8)             .toString();   checkHash(hash2);HashMap map = new HashMap();1.2.3.4.
+9.10.11.12.13.14.5.6.7.8.   		 	x = new X(y);   		 	if(x.f+y>0) doSomething;1.2.   		 	r=100/x;   		 	if(r>0) doSomething;1.2.
+Second, exceptions clutter the thread stack frame, which,
+if not properly handled, can fail symbolic execution. Con-
+sider an example in Figure 6. The method mwhich returns
+the quotient of 100 divided by an input integer iis called at
+line 3 with input 0. The divide by zero exception is thrown
+out of mand caught by the try-catch block at line 4. As
+we can see from the trace (shown in the gure, right), there
+is no indication that an exception has occurred in method m
+and the stack frame of mis exited. When symbolically ex-
+ecuting the instruction \ ASTORE 1 " (store a reference at the
+top of the stack into a local variable at index 1), the current
+stack is still in method m, but there is no reference data in
+the stack! And when symbolically executing the instruction
+\ILOAD 0 " (load an int value from a local variable at index
+0), the value 0 (which is the input value to m) will be loaded
+from the stack frame of m, which is wrong. The correct value
+is 1, which is stored to iat line 1 in the stack frame of the
+caller of m.
+checkHash(String hash){   String hashed = map.get(input);   if(hashed == null){   	  map.put(input, hash);   }   else if(!hashed.equals(hash))  ERROR;}String input = "esec/fse2015";Thread T1:   String hash1 = DigestUtils.sha256Hex(input);   checkHash(hash1);   if(!T2.isAlive())      System.out.println("done");Thread T2:   String hash2 = Hashing.sha256()             .hashString(input, Charsets.UTF_8)             .toString();   checkHash(hash2);HashMap map = new HashMap();1.2.3.4.
+9.10.11.12.13.14.5.6.7.8.   		 	x = new X(y);   		 	if(x.f+y>0) doSomething;1.2.   		 	r=100/x;   		 	if(r>0) doSomething;1.2.int i = 1;try{    i = m(0);}catch(Exception e){}int j = i;static int m(int i){    return 100/i;}1.2.3.4.5.6.7.8.ICONST_1ISTORE 0ICONST_0INVOKESTATIC m (I)I BIPUSH 100ILOAD 0IDIVASTORE 1ILOAD 0ISTORE 1INVOKE_EXCEPTION
+Figure 6: Example for handling exceptions
+To address these issues, we propose to add additional
+events in the trace to recognize the occurrence of runtime
+exceptions. Specically, for every method invoke statement,
+we insert a new statement INVOKE_END after it and enclose
+them within a try-catch block. If the method invocation
+returns normally, an INVOKE_END event will be logged. Oth-
+erwise if an exception is thrown from the invoked method,
+we log in the catch block an INVOKE_EXCEPTION event and
+442re-throw the exception. When performing symbolic execu-
+tion on the trace, upon an INVOKE_END event, we pop up the
+stack frame of the invoked method and push its return value
+onto the new frame; upon INVOKE_EXCEPTION , because there
+is no return value in the invoked method, we pop up its stack
+frame and push a placeholder object onto the new frame to
+denote the exception object. In this way, the \ ASTORE " in-
+struction after the exception can be correctly executed.
+In addition, we propose to capture exception conditions
+as additional branch constraints. Not all exception condi-
+tions can be captured (such as JVM internal errors). We
+currently handle two kinds of runtime exceptions: divide
+by zero, and array out of bounds, corresponding to byte-
+codes {IDIV,LDIV,IREM,LREM} (dividing an integer or long
+value) and *ALOAD (where *2{A,B,C,D,F,I,L,S} repre-
+senting eight dierent types of array accesses), respectively.
+For each instruction in {IDIV,LDIV,IREM,LREM} , we mark
+the divisor as symbolic, say d, and create a branch con-
+straintd6= 0. For *ALOAD , we mark the array index value as
+symbolic, say i, and keep track of the array size, say S, and
+create a branch constraint i<S .
+3.3 Data-Induced Control Flow
+Besides explicit branches such as if,while ,switch , etc,
+data ow that involves dereferencing a memory location can
+also implicitly aect control ow. Figure 7 illustrates the
+cases for object dereferencing and array indexing. At line 2,
+Thread T1calls o.m() , where depending on the schedule o
+may reference the object C1(created at line 1), C2(created at
+line 3), or null set by Thread T2. Hence, o.m() may execute
+a dierent method mor even throw a null pointer dereference
+exception. Similarly, the array access a[x]=1 byT1at line 6
+may write to either a[0] ora[1], which makes the branch
+choice at line 8 non-deterministic. Therefore, to construct a
+sound branch condition, the data-induced control ow must
+be considered.
+x = 0;a[x] = 1;x = 1;if(a[1]>0) doSomething;T1T2o = new C1();o.m();o = new C2();o = null;1.2.3.4.7.8.5.6.
+Figure 7: Example for data-induced control ow
+To capture data-induced control ow, we introduce ad-
+ditional branch events for object dereferencing and array
+indexing operations. Specically, for shared non-primitive
+object dereferences o.*, we introduce a symbolic variable so
+(denoting the symbolic value of o) and add a branch con-
+ditions=addr(o) whereaddr(o) is the runtime address of
+o. For array reads and writes a[i], we introduce a symbolic
+variablesi(denoting the value of the index i) and add a
+branch condition si=viwhereviis the runtime value of i.
+In this way, we not only ensure that the path conditions are
+captured, but can also nd schedule-sensitive object deref-
+erences and array accesses.
+3.4 Precise Shared Data Identiﬁcation
+In constructing the constraints for matching reads and
+writes, we can lter out those thread-local or immutable
+data accesses, because their mapping is xed. This also re-
+duces the size of constraints and speeds up the solver. How-ever, a caveat is that the address of every data access must
+be precisely identied. We must not miss any shared data
+access or match a read with a write on dierent addresses.
+Otherwise, the analysis result might be wrong. Consider
+the code in Figure 8. At line 9 the eld o2.x is written
+to 1 by Thread T2. If o2.x is mis-identied as o.x, then
+the branch if(o.x>0) at line 3 will be miss-classied as
+schedule-sensitive. Similarly, if the write access o.x=0 at
+line 8 is mis-identied as a thread-local access or on a dif-
+ferent address other than o.x, the branch at line 3 will be
+miss-classied, because then the read of o.xat line 3 will be
+able to match with the write o.x=1 at line 7.
+x = 0;a[x] = 1;x = 1;if(a[1]>0) doSomething;T1T2o = new C1();o.m();o = new C2();o = null;1.2.3.4.7.8.5.6.T1T2o.x = 0;synchronized(o){  if(o.x>0)    doSomething;}synchronized(o){  o.x = 1;  o.x = 0;  o2.x = 1;}1.2.3.4.5.6.7.8.9.10.
+Figure 8: Example for precise data identication
+To precisely identify shared data accesses, we represent
+the address of heap access as follows. For array access a[i],
+we represent its address as addr(a).i, whereaddr(a) is the
+runtime address of the array object a. For eld access o.x,
+we represent as addr(o).fid(x), whereaddr(o) is the run-
+time address of oandfid(x) is the eld ID of x(a unique
+integer to the class of o). For static eld accesses, since ois
+null, we setaddr(o) to 0.
+3.5 Scalable Constraint Solving
+There are two challenges associated with constraint solv-
+ing in this problem: (1) complex branch constraints such as
+non-linear real arithmetics; (2) long execution traces which
+generate large number of constraints. For (1), advancements
+in theorem provers and decision procedures would be needed
+to eciently solve such constraints, which is not the fo-
+cus of this paper. A practical workaround we employ is to
+under-approximate the behavior of complex computations
+with the concrete runtime value. For example, for a branch
+if(x2+y>1), because the solver does not support non-linear
+arithmeticx2, we repace x2+y>1by a conjunction of x =vx
+andv2
+x+y>1, wherevxis the recorded concrete value of x.
+For (2), it aects the scalability of our technique. Al-
+though high-performance SMT solvers such as Z3 and Yices
+are becoming increasingly powerful, in theory they can only
+solve a limited number of constraints within a limited time.
+To improve the scalability of our technique, we propose
+to partition the input trace into smaller chunks such that
+the constraints generated for each chunk has a reasonable
+size. However, a strategy proposed in previous race detec-
+tion work [27, 14] that simply segments the trace into win-
+dows of consecutive events (each containing Nevents) will
+not work well, because dierent from the trace for race de-
+tection which contains only critical events, our trace here
+contains many more ne-grained events. If Nis not large
+enough, most events in a window will be from the same
+thread, which has little space for schedule exploration. On
+the other hand, if Nis too large, the corresponding con-
+straints will be too large to solve eciently.
+Distributed Trace Partition . To achieve a good bal-
+ance between analysis eectiveness and eciency, we de-
+443e1e2e3e4e5e6e7e8e9T1T1T1T2T2T3T3T3T3e1e2e3e4e5e6e7e8e9(a)(b)(c)(a) trace(b) simple window-based partition(c) distributed partitione1e4e7e1e4e8e1e4e9e1e4e6e1e5e7e1e5e8e1e5e9e1e5e6e2e4e7e2e4e8e2e4e9e2e4e6e2e5e7e2e5e8e2e5e9e2e5e6e3e4e7e3e4e8e3e4e9e3e4e6e3e5e7e3e5e8e3e5e9e3e5e6Figure 9: Illustration for trace partition
+velop a distributed trace partition algorithm that segments
+the local trace of each individual thread into consecutive
+windows (rather than cutting a global trace), and combines
+windows from dierent threads to form a chunk. Speci-
+cally, for a trace , letidenote the events by Thread Ti,
+andi(j) thejth window in i, each containing Nevents.
+A chunk is a union of i(j) for alliwith anyj. There are
+in totalQK
+i=1Michunks, where Kis the number of threads
+andMithe number of windows in the trace of Thread Ti.
+For example, as illustrated in Figure 9(c), suppose there are
+three threads ( K=3) and each window contains one event,
+then there are 24 chunks in total. Because each chunk con-
+tains an event from each of the three threads, the space of
+possible thread schedules formed by these three events is
+much larger than that produced by a global window of three
+consecutive events as shown in Figure 9(b). The limitation
+of this approach is that some SSBs may still be missed be-
+cause schedules among events from dierent chunks are not
+explored. Nevertheless, it does not aect the precision: a
+branch that is determined to be schedule-sensitive is truly
+schedule-sensitive.
+The trace can be partitioned either oine or online. For
+long running executions, because the full trace can be even
+too large to store, online partition is preferable. We skip
+the events by the main thread until the rst child thread is
+created, because none of these events is schedule-sensitive.
+One additional issue is that the initial state for each chunk is
+unknown, which can break symbolic execution. When a full
+trace is available, we can store the nal state of the current
+chunk as the initial state of the next one. However, this
+approach does not work when only one chunk of events is
+logged online. Fortunately, recall Section 3.1 that the value
+of every data read and method return is tracked. Similar to
+the treatment of untracked computations, we are able to use
+the logged runtime value to recover the initial states.
+4. ALGORITHM
+Our algorithm is summarized in Algorithm 1. For each
+chunk of events, we rst perform a linear scan to nd all the
+critical events (including shared heap accesses and synchro-
+nizations), and to symbolically compute the branch condi-
+tions for each branch event. Then for each branch event, we
+construct a set of constraints and invoke the solver. If the
+solver returns a solution, we report that the corresponding
+branch event is schedule-sensitive.Algorithm 1 FindScheduleSensitiveBranch( )
+1:Input :- a trace of events
+2:Data structure: c-containing only critical events;
+3:m- a map from branch events to branch conditions.
+4:c extractCriticalEvents ();
+5:m computeBranchConditions ();
+6:forb2m:keyset do
+7:  b extractNegatedPathCondition (m,b);
+8:c
+b getRelevantEvents (c,b);
+9: c
+b constructConsistencyConstraints (c
+b);
+10: if satisable (b^c
+b)then
+11: reportbis schedule-sensitive .
+Constraint Construction. Recall Section 2 that the
+constraints consist of two parts:
+(i)  b: the path condition for the branch event bcon-
+juncted with its negated branch condition.
+(ii) c
+b: the consistency constraints among critical events.
+For (i), the path condition of bis a conjunction of all
+preceding branch conditions by the same thread. The only
+unknown variables in  bare the symbolic value variables
+introduced for each read access to shared heap locations.
+For (ii), the consistency constraints are similar to the thread
+causality constraints developed in previous work [13, 14, 12],
+except that the value of reads is not constrained, because the
+control ow consistency is already captured by the branch
+conditions. Specically, c
+bconsists of the conjunction of
+three types of constraints:  mhb^lock^rw, where  mhb
+denotes the must-happen-before constraints,  lockthe lock-
+mutual-exclusion constraints, and  rwthe read-write con-
+straints over read and write events. For space reasons, we
+refer the readers to GPredict [13] for detailed description of
+mhband  lock. We next describe  rw, which is dierent
+from previous work.
+Read-write constraints ( rw).Consider the Read and
+Write events on the same shared data. For a Read , it may
+read the value written by a Write by the same or a dierent
+thread, depending on the order relation between the Write s.
+Consider a Readr, and letWdenote the set of Write s on
+the same location as that of r, andVrthe value returned by
+r. rwis written as:
+_
+8wi2W(Vr=wi^Owi<O r^
+8wj6=wiOwj<O wi_Owj>O r)
+The constraint above states that, if a Read is mapped to
+aWrite , for this Write , its order is smaller than that of the
+Read , and there is no other Write that is between them.
+We group all the Read s and Write s by the accessed memory
+address, and encode  rwfor each Read .
+Constraint Complexity . LetNrandNwdenote the
+number of Read s and Write s on a certain shared address,
+the size of  rwis 4NrN2
+w, which is cubic in the number of
+Read /Write events inc
+b.
+Optimizations . In practice, the size of  rwcan be signif-
+icantly reduced by taking the must-happen-before relation
+into consideration. Consider two Write eventsw1andw2,
+andw1w2r. We can ignore w1because it is impossible
+forrto read the value written by w1. Another optimization
+is that we do not need to repeatedly check for branch events
+corresponding to the same branch location. Once a branch
+444location is determined to be schedule-sensitive, we can skip
+all th rest branch events on it.
+5. IMPLEMENTATION
+TAME is implemented based on ASM [1] and Z3 [6] and
+works for Java programs. The architecture is inspired by
+CATG [28], a Java concolic unit testing engine. We extend
+CATG to handle large real concurrent programs. TAME cur-
+rently traces at the Java bytecode level and supports all
+opcodes [3] in Java 7 excepts INVOKEDYNAMIC (Opcode 186),
+including array/eld accesses, loads/stores to local variables,
+method invocations, stack operations, etc. For dierent
+types of instructions, we log dierent runtime data such
+as the Thread ID and the value of loads and stores. For
+debugging purpose, for all instructions we also maintain a
+map from a unique instruction ID to its location (class and
+line number). We next describe the instructions related to
+critical events:
+Heap accesses: all the eld and array loads and stores.
+For eld accesses, there are four dierent instructions:
+GETSTATIC ,PUTSTATIC ,GETFIELD , and PUTFIELD . For
+each eld access instruction, we log its intruction ID,
+class ID, eld ID, read/write value, and address of the
+object if not static. For array access, there are 16
+dierent instructions: *ASTORE and *ALOAD , where *
+denotes eight dierent data types including the refer-
+erence type and seven primitive types. For each array
+access instruction, we log its intruction ID, address of
+the array object, and index value.
+Thread synchronizations: Thread start /join/wait/
+notify , and lock/unlock events (corresponding to MON-
+ITORENTER /MONITOREXIT instructions). For synchro-
+nized methods, as there is no corresponding MONI-
+TORENTER /MONITOREXIT bytecode instruction, we log
+at the beginning and every return instruction of the
+method to indicate lock/unlock events. For each syn-
+chronization instruction, we log the ID of the partici-
+pating threads and address of the lock object.
+In addition to events corresponding to the bytecode in-
+structions of the original program execution, the trace also
+contains the inserted new events for handling runtime excep-
+tions and data-induced control ow as discussed in Section 3,
+including INVOKE_END and INVOKE_EXCEPTION to recognize
+runtime exceptions and two special events: BRANCH_SPECIAL
+and MARK_SYMBOLIC . We insert BRANCH_SPECIAL after every
+branch instruction to indicate if the true branch is taken,
+which is used to build the correct branch conditions. We in-
+sert MARK_SYMBOLIC before every load access to shared heap
+locations. This is done by pre-processing the trace before
+constructing the constraints. We mark a heap load access
+as symbolic if in the logged trace (or chunk of events) there
+exists at least one heap store to the same address and by
+a dierent thread. When performing symbolic execution,
+for each MARK_SYMBOLIC event, we introduce a new symbolic
+variable to represent the value returned by the load access.
+6. EV ALUATION
+We have applied TAME on a variety of popular multi-
+threaded benchmarks and several real world large complex
+programs shown in Tables 1 and 2. All these programs were
+collected from recent concurrency studies [14, 13, 10, 23],with the total size close to 1MB. The main goal of our eval-
+uation is to answer two research questions:
+1. How eective and ecient is our technique for nding
+schedule-sensitive branches?
+2. How scalable is our technique when applied on real
+programs with long running executions?
+For the rst question, we ran TAME on a collection of
+benchmarks that produce traces with a relatively small size
+after excluding the events in the JDK libraries. We set
+the bound to 100K events and 1K critical events, to make
+sure that TAME can nish within a reasonable time. For
+the second question, we ran TAME on a collection of large
+multithreaded applications including Jigsaw-2.2.6 ,Derby-
+10.3.2.1 ,H2-1.4.178 ,FTPServer ,Cache4j ,Log4j ,Hedc,
+Weblech ,Pool, as well as several long running benchmarks.
+Because the traces of some of these programs contain tens
+of millions of events, it is challenging to even store and load
+the whole trace. We hence performed the trace partition
+strategies online (as explained in Section 3.5) to log only one
+chunk of events in each run. This turned out to work well
+in practice because there are often many redundant events
+across chunks that a single chunk can often reveal much in-
+formation about the whole trace.
+All experiments were conducted on an 8-processor 32-core
+3.6GHz Intel i7 Linux with 8GB memory and JDK 1.7. We
+set the Java heap space to 8GB and Z3 timeout to one
+minute. All data were averaged over three runs.
+Overall results .TAME is eective for nding SSBs, and
+has good scalability to real world programs and long running
+executions when our distributed trace partition approach is
+applied. For the 15 smaller benchmarks, TAME was able to
+analyze all the traces in less than two minutes and found a
+total of 20 SSBs with 8 of them related to concurrency errors.
+For most real programs and larger benchmarks, TAME could
+not nish analyzing the full trace in a reasonable time. With
+our distributed partition approach, however, it was able to
+analyze all these programs in around ten minutes and found
+a total of 14 SSBs in which 9 are related to concurrency
+errors. We present these SSBs in Section 6.3.
+6.1 Effectiveness and Efﬁciency
+Table 1 summarizes the results on the smaller bench-
+marks. Columns 3-6 report the trace characteristics (the
+numbers of threads, events, critical events, and branch events).
+The branch events include both the explicit branching events
+and those abstracted from the exception conditions and data-
+induced control ow. Column 7 reports the online tracing
+time for each benchmark. Column 8 reports the average size
+of the constructed constraints for the branch events, and
+Column 9 the total oine constraint analysis time (includ-
+ing both the constraint construction and solving). Column
+10 reports the number of schedule-sensitive branches found
+in each benchmark and the number of those related to con-
+currency errors . Note that each reported schedule-sensitive
+branch has a unique program location. Redundant schedule-
+sensitive branch events on the same location are ltered out.
+TAME is highly eective in nding SSBs in these bench-
+marks of which the traces have a manageable size. The
+number of threads in these traces ranges between 2 and 27.
+The online tracing time ranges from a few milliseconds to
+2s. The average constraint size ranges between 1.5KB to
+2.2MB, and the total oine trace analysis time ranges from
+445Table 1: Results on smaller benchmarks. The last column \()" refers to harmful #SSB.
+Program LoC #Thread #Event #Critical #Branch Tracing Avg Cons Solving #SSB
+Example 37 2 121 15 4 7ms 1.5KB 148ms 1
+Account 373 3 873 55 13 519ms 9.6KB 2ms 1(1)
+Airline 136 11 1123 77 21 85ms 125KB 885ms 0(0)
+Allocation 348 25 13440 757 503 193ms 89K 1s 0(0)
+Critical 63 3 285 27 11 243ms 3.2KB 892ms 2(1)
+MTList 5979 27 7555 584 480 408ms 152KB 17s 0(0)
+MTSet 7086 22 8569 518 394 377ms 97KB 5.5s 0(0)
+StringBuer 1339 3 674 43 22 47ms 5.9KB 287ms 4(2)
+BufWriter 255 7 7803 246 108 181ms 229KB 30.7s 1(1)
+LinkedList 425 7 1105 54 32 45ms 7KB 443ms 0(0)
+Deadlock 135 4 809 34 19 24ms 3.5KB 277ms 0(0)
+Piper 211 5 1238 130 41 46ms 28.5KB 398ms 4(1)
+Loader 129 11 3634 506 306 2s 293KB 9.3s 3(2)
+Shop 236 4 4040 306 173 93ms 2.2MB 16.7s 3(0)
+Sor 7175 3 13478 1029 690 187ms 178KB 15s 2(0)
+Philo 78 3 1428 151 58 39ms 52KB 696ms 0(0)
+Total: bench 24K 140 67K 4532 2875 4.7s - 98s 20(8)
+Table 2: Results on real programs and large benchmarks - with distributed trace partition 10K. For bench-
+marks marked with *, TAME without distributed partition either ran out of memory or timeout in an hour.
+Program LoC #Thread #Event #Critical #Branch Tracing Avg Cons Solving #SSB
+Pool107 4402 3 1634 58 15 178ms 8.1KB 326ms 2(2)
+Pool146 2091 2 5163 245 58 287ms 62.5KB 1.4s 0(0)
+Pool149 2767 3 1610 87 24 215ms 16.2KB 433ms 1(0)
+Pool162 2917 2 4219 136 18 668ms 32.8KB 592ms 1(0)
+Log4j 3792 3 7996 363 248 405ms 6.1KB 2.4s 2(2)
+Weblech 35K 3 11455 272 166 2.2s 46KB 1.7s 1(1)
+Cache4j* 1797 2 17064368 60 2 3.3s 85KB 673ms 0(0)
+Hedc* 30K 10 910593 235 595 1.6s 54KB 7.5s 0(0)
+FTPServer* 32K 11 467707 1668 1202 6.2s 325KB 36s 0(0)
+Jigsaw* 381K 13 27369096 537 263 5.5s 137KB 6.5s 2(2)
+Derby* 302K 3 15908795 106 70 7.1s 144KB 4.1s 2(2)
+H2* 136K 14 45531806 395 136 6.5s 180KB 5.8s 0(0)
+Total: real 932K 69 108M 4162 2797 34.5s - 67.4s 11(9)
+Tsp* 444 3 60775151 37 7 1.9s 4KB 282ms 0(0)
+Garage* 545 7 1686507 1399 1061 2.1s 475KB 40s 1(0)
+Elevator* 336 3 65980 1227 664 182ms 245KB 14.6s 0(0)
+Moldyn* 2887 2 2835088 640 98 3s 363KB 8.1s 2(0)
+MonteCarlo* 2887 2 36686043 185 66 6s 211KB 4.6s 0(0)
+RayTracer* 2887 2 173191 1355 1302 1.9s 397KB 651s 0(0)
+Total: bench 10K 19 102M 4843 3198 15.1s - 718.6s 3(0)
+2ms to 30.7s. For most benchmarks, TAME detected 1-4
+SSBs in each of them, with the total amount to 20.
+6.2 Scalability Results on Real Programs
+Table 2 summarizes the results on real programs and those
+benchmarks that produce large traces. For half of the real
+programs, the trace size is relatively small that TAME n-
+ished the analysis within a few seconds and found 7 SSBs in
+them. For the other half (marked with \*"), the trace size is
+much larger (ranging between 467K in FTPServer to 45.5M
+inH2), and TAME was not able to nish analyzing the whole
+trace in a reasonable time (it either ran out of memory or
+timeout in an hour). To understand the eectiveness of our
+distributed trace partition approach, we performed online
+both the distributed partition (with the chunk size of each
+thread set to 10K) and the simple window-based approach(with the total window size set to 100K) and compared be-
+tween them. It turned out that our distributed partition al-
+gorithm is ecient, and much more eective than the simple
+window-based approach. Columns 5-10 in Table 2 report the
+corresponding results for TAME with our distributed parti-
+tion approach. TAME was able to analyze all these pro-
+grams within a minute, and detected four SSBs in Jigsaw
+andDerby , whereas TAME with the window-based approach
+did not nd any SSBs (though took less time). For the oth-
+ers, although TAME did not detect SSBs based on the logged
+chunk of events, TAME was able to analyze them within a
+minute.
+For the large benchmarks, their trace size ranges from 66K
+to 60M and, similar to many real programs, TAME could not
+nish analyzing the whole trace. However, with distributed
+online trace partition, TAME was able to analyze them in a
+446Table 3: A summary of schedule-sensitive branches found. I { bug. II { ad hoc synchronization. III { unclear.
+ID Program Class Method Line Statement Type
+1 Account Account checkResult 78 if(Bank Total==Total Balance) I
+2CriticalCritical run 59 if(t.turn!=0) I
+3 Critical run 75 while(t.turn!=1) II
+4
+StringBuerStringBuer getChars 327 if(srcEnd <0jjsrcEnd >count)) I
+5 StringBuer append 446 if(newcount >value.length) I
+6 StringBuer delete 662 if(end >count) III
+7 StringBuer delete 668 if(len >0) III
+8 BufWriter BufWriter main 90 if(res!=0) I
+9
+PiperPiper llPlane 46 if(( last+1)%NUM OFSEATS== rst) I
+10 Piper llPlane 49 passengers[ last]=name II
+11 Piper emptyPlane 62 while( rst== last) II
+12 Piper emptyPlane 65 name = passengers[ last] II
+13
+LoaderLoader main 50 while(!NewThread.endd) II
+14 Loader main 58 if(array[i] >array[i+1]) I
+15 NewThread run 42 if(array[i] >array[i+1]) I
+16
+ShopShop getItem 26 storage[items] III
+17 Shop putItem 32 storage[items] III
+19 Shop isEmpty 62 if(items==-1) III
+19SorCyclicBarrier doBarrier 227 else if(index==0) II
+20 CyclicBarrier doBarrier 269 else if(r!=resets ) II
+21 Garage GarageManager WaitForManager 457 if(!status.IsManagerArrived()) III
+22MoldynTournamentBarrier DoBarrier 65 while(IsDone[myid+i*spacing]!=donevalue) II
+23 TournamentBarrier DoBarrier 78 while(IsDone[0]!=donevalue) II
+24Pool107CorsorableLinkedList next 975 return next I
+25 SimpleFactory makeObject 162 if(activeCount >maxActive) I
+26 Pool149 GenericObjectPool allocate 1117 if(isClosed() III
+27 Pool162 GenericObjectPool allocate 1427 if(isClosed() III
+28Log4jCategory callAppenders 202 if(c.iia!=null) I
+29 WriterAppender checkEntryConditions 181 if(this.layout==null) I
+30 Weblech Spider isRunning 103 return (running==0) I
+31JigsawHttpMessage getHeaderValue 186 if(d!=null&&d.oset >=0) I
+32 HeaderDescription getHolder 40 cls.newInstance()) I
+33DerbyTableDescriptor getObjectName 780 if(referencedColumn Map) I
+34 TableDescriptor getObjectName 806 if(referencedColumnMap.isSet(...)) I
+few minutes and found 3 SSBs in Garage and Moldyn . The
+one that TAME took the most time is RayTracer . The reason
+is that the trace of RayTracer contains a large number of
+(1355) critical events and a large number of (1302) branch
+events. The trace produces many (1302) large constraint
+les (400KB on average) but none of them is satisable.
+6.3 Schedule-sensitive Branches Found
+In our experiments, TAME found a total of 34 SSBs, 17
+of them are indications of concurrency bugs, 9 related to
+ad-hoc synchronizations, and the rest are either functional
+requirements or their intended behavior is unclear. We note
+that all these programs have been frequently studied be-
+fore [14, 13, 10, 23], but no previous work reported SSBs.
+Our work is the rst to report SSBs in these programs.
+Table 3 summarizes these SSBs. Columns 2-5 report for
+each SSBthe class, method, line number, and the signature,
+respectively. The last column reports the type of the SSB:\I"
+denotes concurrency bug, \II" ad hoc synchronization, and
+\III" unclear. We next describe several interesting SSBs.
+StringBuer We found four SSBs in this program, two
+of them are lated to concurrency bugs. The rst one is in
+method getChars at line 327\ if(srcEnd<0 || srcEnd>count) ".
+The value of the shared variable count can be changed by
+concurrent threads, which makes the branch choice non-
+deterministic. This SSB is a direct manifestation of the
+concurrency bug in this program (the true branch throws
+StringIndexOutOfBoundsException ). The second SSBis inmethod append at line 446 \ if(newcount>value.length) ".
+The value of the local variable newcount depends on count .
+This SSB is also an indication of the concurrency bug. The
+third and fouth SSBs are both in method delete , at lines 662
+\if(end>count) " and 668 \ if(len>0) " respectively. From
+the semantics of this method, both SSBs are intended.
+Pool107 We found two SSBs in this program, one in class
+org.apache.commons.pool.impl.CorsorableLinkedList at
+line 975 \ return _next; ", and the other in method makeOb-
+ject of class pool107$SimpleFactory at line 162\ if(active
+Count>maxActive) ". In the rst SSB,_next is a shared vari-
+able, and we found that it may return a null or non- null
+reference depending on the schedule. The second SSB is
+actually a manifestation of the concurrency bug in this pro-
+gram, which causes a runtime IllegalStateException .
+Pool149 andPool162 We found a SSB\if(isClosed() "
+in each of these two programs. Both SSBs are in method
+allocate of class org.apache.commons.pool.impl.Generic
+ObjectPool , but at dierent lines (1177 in Pool149 and 1427
+inPool162 ). The method call isClosed() can return either
+true or false depending on the schedule. It is not clear if this
+behavior is buggy or not, though.
+Jigsaw We found two SSBs in Jigsaw . One in method
+getHeaderValue in class org.w3c.www.http.HttpMessage at
+line 186\ if(d!=null&&d.offset>=0) ". The variable drefer-
+ences a shared HeaderDescription object and its eld off-
+setmay be set to 0 by another thread concurrently. This
+SSB indicates a vulnerability. The other SSB is in method
+447getHolder of class org.w3c.www.http.HeaderDescription
+at line 40 \ cls.newInstance()) ". The shared variable cls
+may be null or non- null depending on the schedule, which
+also indicates a concurrency bug.
+Derby We found two SSBs in Derby , both in method
+getObjectName of class org.apache.derby.iapi.sql.dict
+ionary.TableDescriptor at line 780\ if(referencedColumn
+Map)"and line 806\ if(referencedColumnMap.isSet(...)) ".
+In fact both SSBs reveal the same concurrency bug (which
+is previously known) that the shared variable referenced-
+ColumnMap can be set to null concurrently.
+6.4 Limitations
+We note that TAME currently has two limitations that we
+plan to address in our future work.
+Input-sensitivity Being a dynamic trace based approach,
+TAME may not nd all schedule-sensitive branches ( SSBs)
+in the program, but only those that can be inferred from the
+observed trace information, which is sensitive to the test in-
+put. Enhancing TAME with test input generation will help
+nd more SSBs that can only be revealed by dierent inputs.
+Relaxed memory models TAME currently only models
+sequential consistency, though the Java memory model is
+not sequentially consistent. We plan to develop weak mem-
+ory constraints in TAME to nd SSBs in systems exhibiting
+relaxed memory model behaviors.
+7. RELATED WORK
+To our best knowledge, our work is the rst to focus
+on nding schedule-sensitive branches in concurrent pro-
+grams. Unlike conventional consistency criteria such as data
+races [22] and atomicity violation [20] which are based on in-
+terleaving patterns, branch schedule-sensitivity is more eect-
+oriented and may serve as an alternative criterion for con-
+currency bug detection.
+Our technique belongs to the school of predictive trace
+analysis [30, 13, 15, 17, 14], which has been shown promis-
+ing for practical concurrency defect analysis. Representa-
+tive techniques include race detection [5, 14], deadlock de-
+tection [8], and nding null pointer dereferences [10]. Our
+work expands the scope to analyze branch behaviors.
+There are two lines of related work: ad hoc synchroniza-
+tion nding and concolic testing of concurrent programs.
+Ad hoc synchronizations are often witnessed together with
+schedule-sensitive branches. However, they are not the same.
+As shown in our experiments, half of the schedule-sensitive
+branches we found are indications of concurrency errors.
+In addition, ad hoc synchronizations lack a precise deni-
+tion and are hard to nd because of their behavioral se-
+mantics. There exist a few techniques to identify ad hoc
+synchronizations statically [32] or dynamically [29]. For in-
+stance, SyncFinder [32] relies on a few heuristics yet it is
+imprecise and may report false alarms. To rene our tech-
+nique for nding concurrency errors, we can integrate with
+SyncFinder or the other techniques [29] to sift out ad-hoc
+synchronizations.
+Concolic execution, rst developed in DART [11] and Cute
+[25], has been the golden approach to test sequential pro-
+grams facing complex constraints. Our technique leverages
+concolic execution to construct branch conditions facing the
+missing computations in native code or excluded libraries.
+When a computation is missed, its concrete value is used to
+construct a sound constraint. The eectiveness of our tech-nique can be further improved by exploring multiple traces
+driven by concolic execution, which is still under active re-
+search [26, 19] to improve eciency and code coverage.
+Several concolic testing techniques [9, 21, 24] have been
+proposed for generating both inputs and schedules for con-
+current programs. For generating schedules, jCute [24] takes
+a race-direct way that re-orders the events involved in data
+races. Similar to our technique, both ConCrest [9] and the
+work [21] encode scheduling constraints and use SMT solv-
+ing to generate tests. While the work [21] combines data
+ow constraints from multiple traces, ConCrest focuses on
+one trace and explores the scheduling space by iteratively
+expanding the interference scenarios formed by shared data
+reads and writes. A dierence between our technique and
+ConCrest is that we consider the events by chunks instead of
+interference scenarios. This reduces the number of invoca-
+tions to the solver when a branch is not schedule-sensitive.
+Moreover, because we do not need to generate inputs, our
+technique achieves much higher scalability than ConCrest.
+At the heart of our technique is symbolic trace analy-
+sis combined with concolic execution. Many symbolic trace
+analyses have been proposed before that extract a model
+from the execution trace in terms of rst-order logical con-
+straints and use SMT solving to nd concurrency bugs [31,
+10, 14], reproduce concurrency failures [16], and test con-
+current programs [9, 12]. The construction of symbolic con-
+straints in our work is similar to that in [14, 13], except that
+reads and writes are matched through the use of branch
+conditions rather than by the recorded concrete value.
+8. CONCLUSION
+We have presented a technique, TAME , to precisely iden-
+tify schedule-sensitive branches in concurrent programs. TAME
+combines symbolic trace analysis and concolic execution to
+precisely determine if a branch can make a dierent deci-
+sion in any feasible schedule based on the observed execution
+trace. We have specically addressed the various challenges
+for handling real world programs and proposed a novel dis-
+tributed trace partition approach to achieve good balance
+between analysis eciency and eectiveness. Our evalua-
+tion on both popular benchmarks and large complex real
+applications demonstrates that TAME is eective and scales
+well to large programs. TAME found 34 schedule-sensitive
+branches in these programs, which were rst reported in this
+paper, with half of them resulting from concurrency errors.
+9. ACKNOWLEDGEMENT
+We would like to thank the anonymous ESEC/FSE re-
+viewers for their constructive comments. This research is
+supported by faculty start-up funds from Texas A&M Uni-
+versity and a Google Faculty Research Award to Je Huang.
+10. REFERENCES
+[1] ASM bytecode analysis framework.
+http://asm.ow2.org.
+[2] Derby bug #2861.
+https://issues.apache.org/jira/browse/DERBY-2861.
+[3] Java 7 instruction opcodes.
+http://docs.oracle.com/javase/specs/jvms/se7/html/
+jvms-7.html.
+[4] T. J. Watson Libraries for Analysis (WALA).
+http://wala.sourceforge.net/ .
+448[5] Feng Chen, Traian Florin Serbanuta, and Grigore
+Rosu. jPredictor: a predictive runtime analysis tool
+for Java. In International Conference on Software
+Engineering , pages 211{230, 2008.
+[6] Leonardo De Moura and Nikolaj Bjrner. Z3: an
+ecient SMT solver. In International Conference on
+Tools and Algorithms for the Construction and
+Analysis of Systems , pages 337{340, 2008.
+[7] Bruno Dutertre and Leonardo De Moura. The Yices
+SMT solver. Technical report, 2006.
+[8] Mahdi Eslamimehr and Jens Palsberg. Sherlock:
+Scalable deadlock detection for concurrent programs.
+InJoint European Software Engineering Conference
+and ACM SIGSOFT Symposium on Foundations of
+Software Engineering , pages 353{365, 2014.
+[9] Azadeh Farzan, Andreas Holzer, Niloofar Razavi, and
+Helmut Veith. Con2colic testing. In Joint European
+Software Engineering Conference and ACM SIGSOFT
+Symposium on Foundations of Software Engineering ,
+2013.
+[10] Azadeh Farzan, P. Madhusudan, Niloofar Razavi, and
+Francesco Sorrentino. Predicting null-pointer
+dereferences in concurrent programs. In Joint
+European Software Engineering Conference and ACM
+SIGSOFT Symposium on Foundations of Software
+Engineering , pages 47:1{47:11, 2012.
+[11] Patrice Godefroid, Nils Klarlund, and Koushik Sen.
+Dart: Directed automated random testing. In ACM
+SIGPLAN Conference on Programming Language
+Design and Implementation , 2005.
+[12] Je. Huang. Stateless model checking concurrent
+programs with maximal causality reduction. In ACM
+SIGPLAN Conference on Programming Language
+Design and Implementation , pages 165{174, 2015.
+[13] Je Huang, Qingzhou Luo, and Grigore Rosu.
+GPredict: Generic Predictive Concurrency Analysis.
+InInternational Conference on Software Engineering ,
+2015.
+[14] Je Huang, Patrick O'Neil Meredith, and Grigore
+Rosu. Maximal sound predictive race detection with
+control ow abstraction. In ACM SIGPLAN
+Conference on Programming Language Design and
+Implementation , pages 337{348, 2014.
+[15] Je Huang and Charles Zhang. PECAN: Persuasive
+Prediction of Concurrency Access Anomalies. In ACM
+International Symposium on Software Testing and
+Analysis , pages 144{154, 2011.
+[16] Je Huang, Charles Zhang, and Julian Dolby. Clap:
+Recording local executions to reproduce concurrency
+failures. In ACM SIGPLAN Conference on
+Programming Language Design and Implementation ,
+pages 141{152, 2013.
+[17] Je Huang, Jinguo Zhou, and Charles Zhang. Scaling
+predictive analysis of concurrent programs by
+removing trace redundancy. ACM Transactions on
+Software Engineering and Methodology , 22(1):8:1{8:21,
+2013.
+[18] Patrick Lam, Eric Bodden, and Laurie Hendren. The
+soot framework for Java program analysis: a
+retrospective, 2011.
+[19] You Li, Zhendong Su, Linzhang Wang, and Xuandong
+Li. Steering symbolic execution to less traveled paths.InACM SIGPLAN Conference on Object Oriented
+Programming, Systems, Languages, and Applications ,
+2013.
+[20] Shan Lu, Joseph Tucek, Feng Qin, and Yuanyuan
+Zhou. Avio: detecting atomicity violations via access
+interleaving invariants. In International Conference on
+Architectural Support for Programming Languages and
+Operating Systems , 2006.
+[21] Niloofar Razavi, Franjo Ivancic, Vineet Kahlon, and
+Aarti Gupta. Concurrent test generation using
+concolic multi-trace analysis. In APLAS , 2012.
+[22] Stefan Savage, Michael Burrows, Greg Nelson, Patrick
+Sobalvarro, and Thomas Anderson. Eraser: A
+dynamic data race detector for multi-threaded
+programs. In ACM Symposium on Operating Systems
+Principles , pages 27{37, 1997.
+[23] Koushik Sen. Race directed random testing of
+concurrent programs. In ACM SIGPLAN Conference
+on Programming Language Design and
+Implementation , pages 11{21, 2008.
+[24] Koushik Sen and Gul Agha. Cute and jcute: Concolic
+unit testing and explicit path model-checking tools. In
+International Conference on Computer Aided
+Verication , 2006.
+[25] Koushik Sen, Darko Marinov, and Gul Agha. Cute: A
+concolic unit testing engine for c. In Joint European
+Software Engineering Conference and ACM SIGSOFT
+Symposium on Foundations of Software Engineering ,
+2005.
+[26] Hyunmin Seo and Sunghun Kim. How we get there: A
+context-guided search strategy in concolic testing. In
+Joint European Software Engineering Conference and
+ACM SIGSOFT Symposium on Foundations of
+Software Engineering , 2014.
+[27] Yannis Smaragdakis, Jacob Evans, Caitlin Sadowski,
+Jaeheon Yi, and Cormac Flanagan. Sound predictive
+race detection in polynomial time. In ACM
+SIGPLAN-SIGACT Symposium on Principles of
+Programming Languages , pages 387{400, 2012.
+[28] Haruto Tanno, Xiaojing Zhang, Hoshino Takashi, and
+Koushik Sen. TesMa and CATG: Automated test
+generation tools for models of enterprise applications,
+2015.
+[29] Chen Tian, Vijay Nagarajan, Rajiv Gupta, and
+Sriraman Tallam. Dynamic recognition of
+synchronization operations for improved data race
+detection. In ACM International Symposium on
+Software Testing and Analysis , 2008.
+[30] Chao Wang, Sudipta Kundu, Malay K. Ganai, and
+Aarti Gupta. Symbolic predictive analysis for
+concurrent programs. In FM, 2009.
+[31] Chao Wang, Rhishikesh Limaye, Malay K. Ganai, and
+Aarti Gupta. Trace-based symbolic analysis for
+atomicity violations. In International Conference on
+Tools and Algorithms for the Construction and
+Analysis of Systems , pages 328{342, 2010.
+[32] Weiwei Xiong, Soyeon Park, Jiaqi Zhang, Yuanyuan
+Zhou, and Zhiqiang Ma. Ad hoc synchronization
+considered harmful. In USENIX Symposium on
+Operating Systems Design and Implementation , 2010.
+449

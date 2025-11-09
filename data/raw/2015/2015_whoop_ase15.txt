@@ -1,0 +1,1237 @@
+Fast and Precise Symbolic Analysis of
+Concurrency Bugs in Device Drivers
+Pantazis Deligiannis
+Department of Computing,
+Imperial College London, UK
+p.deligiannis@imperial.ac.ukAlastair F. Donaldson
+Department of Computing,
+Imperial College London, UK
+alastair.donaldson@imperial.ac.ukZvonimir Rakamari ´c
+School of Computing,
+University of Utah, USA
+zvonimir@cs.utah.edu
+Abstract —Concurrency errors, such as data races, make
+device drivers notoriously hard to develop and debug without
+automated tool support. We present W HOOP , a new automated
+approach that statically analyzes drivers for data races. W HOOP
+is empowered by symbolic pairwise lockset analysis , a novel
+analysis that can soundly detect all potential races in a driver.
+Our analysis avoids reasoning about thread interleavings and thus
+scales well. Exploiting the race-freedom guarantees provided by
+WHOOP , we achieve a sound partial-order reduction that sig-
+niﬁcantly accelerates C ORRAL , an industrial-strength bug-ﬁnder
+for concurrent programs. Using the combination of W HOOP and
+CORRAL , we analyzed 16 drivers from the Linux 4.0 kernel,
+achieving 1.5–20 speedups over standalone C ORRAL .
+I. I NTRODUCTION
+Device drivers are complex pieces of system-level software,
+operating at the thin boundary between hardware and software
+to provide an interface between the operating system and the
+devices that are attached to a computer. Drivers are notoriously
+hard to develop and debug [1]. This has a negative impact
+on hardware product releases, as time-to-market is commonly
+dominated by driver development, veriﬁcation, and validation
+schedules [2]. Even after a driver has shipped, it typically has
+many undetected errors: Chou et al. [3] gathered data from
+7 years of Linux kernel releases and found that the relative
+error-rate in driver source code is up to 10 times higher than
+in any other part of the kernel, while Swift et al. [4] found
+that 85% of the system crashes in Windows XP are due to
+faulty drivers. Regarding concurrency bugs , a recent study [5]
+established that they account for 19% of the total bugs in
+Linux drivers, showcasing their signiﬁcance. The majority of
+these concurrency bugs were data races ordeadlocks in various
+conﬁguration functions and hot-plugging handlers.
+Concurrency bugs are exacerbated by the complex and
+hostile environment in which drivers operate [1]. The OS can
+invoke drivers from multiple threads, a hardware device can is-
+sue interrupt requests that cause running processes to block and
+switch execution context, and the user may remove a device
+(hot-plugging) while some operation is still running. These
+scenarios can cause data races if insufﬁcient synchronization
+mechanisms are in place to control concurrent access to shared
+resources. Data races are a source of undeﬁned behavior in
+C [6, p. 38], and lead to nondeterministically occurring bugs
+that can be hard to reproduce, isolate and ﬁx, especially in the
+context of complex operating systems. Several techniques have
+been successfully used to analyze device drivers [7], [8], [9],
+[10], [11], [12], [13], [14], but most focus on generic sequentialprogram properties and protocol bugs. Linux kernel analyzers,
+such as sparse [15], coccinelle [16] and lockdep [17], can ﬁnd
+deadlocks in kernel source code, but are unable to detect races.
+Techniques that can detect races in drivers [18], [19], [20],
+[21], [14] are usually either overly unsound (i.e. can miss real
+bugs) or imprecise (i.e. can report false bugs), and typically
+sacriﬁce precision for scalability. Thus, there is a clear need
+for new tools that can detect races efﬁciently and precisely.
+We present W HOOP , an automated approach for static data
+race analysis in device drivers. W HOOP is empowered by
+symbolic pairwise lockset analysis , which attempts to prove
+a driver race-free by: (i) deriving a sound sequential program
+thatover-approximates the originally concurrent program; (ii)
+instrumenting it to record locksets ; and (iii) using the locksets
+to assert that all accesses to the same shared resource are
+consistently protected by a common lock. Reducing analysis
+to reasoning over a sequential program avoids the need to
+enumerate thread interleavings, and allows reuse of existing
+successful sequential veriﬁcation techniques. We show that we
+can exploit the race-freedom guarantees provided by our sym-
+bolic analysis to achieve a sound partial-order reduction that
+signiﬁcantly accelerates C ORRAL [14], a precise bug-ﬁnder
+used by Microsoft to analyze drivers and other concurrent
+programs. Using W HOOP and C ORRAL we analyzed 16 drivers
+from the Linux 4.0 kernel. Our combination achieves analysis
+speedups in the range of 1.5–10 for most of our benchmarks,
+compared with using C ORRAL in isolation. For two drivers,
+we observed even greater speedups of 12 and 20. W HOOP
+currently supports Linux drivers, but our approach is conceptu-
+ally generic and could be applied to analyze drivers for other
+operating systems, as well as concurrent systems that use a
+similar programming model (e.g. ﬁle systems).
+To summarize, our contributions are as follows:
+ We propose symbolic pairwise lockset analysis, a
+sound and scalable technique for automatically ver-
+ifying the absence of data races in device drivers.
+ We present W HOOP , a tool that leverages our approach
+for analyzing data races in device drivers.
+ We show that we can achieve a sound partial-order
+reduction using our technique to accelerate C ORRAL ,
+an industrial-strength bug-ﬁnder.
+ We analyze 16 Linux drivers, showing that W HOOP is
+efﬁcient at race-checking and accelerating C ORRAL .static loff_t nvram_llseek( struct file *file,
+loff_t offset, int origin) {
+switch (origin) {
+...
+case 1: offset += file->f_pos; break ;// racy
+...
+}
+if(offset < 0) return -EINVAL;
+file->f_pos = offset; // racy
+return file->f_pos; // racy
+}
+Fig. 1. Racy entry point in the generic nvram Linux 4.0 driver.
+II. B ACKGROUND
+Concurrency in Device Drivers Modern operating systems
+address the demand for responsiveness and performance in de-
+vice drivers by providing multiple sources of concurrency [1]:
+an arbitrary number of entry points from the same driver can
+be invoked concurrently; a running driver process can block,
+causing the driver to switch execution to another process; and
+hardware interrupts can be handled concurrently. These forms
+of concurrent execution are prone to data races .
+Deﬁnition 1: Adata race occurs when two distinct threads
+access a shared memory location, at least one of the accesses
+is a write access, at least one of the accesses is non-atomic,
+and there is no mechanism in place to prevent these accesses
+from being simultaneous.
+Fig. 1 shows a racy entry point, nvram_llseek , in the
+generic nvram Linux 4.0 device driver. This entry point can be
+invoked concurrently from two threads, with the same file
+struct as a parameter. This can lead to multiple possible data
+races because the threads can access the f_pos ﬁeld of file
+in arbitrary order. Our tool, W HOOP (seexIII), was able to ﬁnd
+these races automatically (see xV).
+The most common method for avoiding races is by protect-
+ing sets of program statements that access a shared resource
+with locks , forming critical sections . Fig. 2 shows how to
+use locking to eliminate the races in Fig. 1. Careless use
+of locks has many well-known pitfalls [22]: coarse-grained
+locking can hurt performance as it limits the opportunity for
+concurrency, while ﬁne-grained locking can easily lead to
+deadlocks. Although the Linux kernel provides sophisticated
+lock-free synchronization mechanisms [1, p. 123], such as
+atomic read-modify-write operations, in this work we focus
+on locks as they are widely used.1
+Lockset Analysis Lockset analysis is a lightweight race
+detection method proposed in the context of Eraser [23], a
+dynamic data race detector. The idea is to track the set of locks
+(i.e. lockset ) that are consistently used to protect a memory
+location during program execution. An empty lockset suggests
+that a memory location may be accessed simultaneously by two
+or more threads. Consequently, the analysis reports a potential
+race on that memory location.
+Lockset analysis for a concurrent program starts by creating
+acurrent lockset CLS Tfor each thread Tof the program,
+and a lockset LSsfor each shared variable sused in the
+program. Every CLS Tis initially empty because the threads
+1We treat lock-free operations soundly by regarding them as not providing
+any protection between threads; this can lead to false alarms.static loff_t nvram_llseek( struct file *file,
+loff_t offset, int origin) {
+mutex_lock (&nvram_mutex); // lock
+switch (origin) {
+...
+case 1: offset += file->f_pos; break ;
+...
+}
+if(offset < 0) {
+mutex_unlock (&nvram_mutex); // unlock
+return -EINVAL;
+}
+file->f_pos = offset;
+loff_t res = file->f_pos; // store result
+mutex_unlock (&nvram_mutex); // unlock
+return res;
+}
+Fig. 2. Introducing a lock to eliminate the races in the previous example.
+do not hold any locks when they start executing. In addition,
+every LSsis initialized to the set of all locks manipulated
+by the program since initially each access to sis (vacuously)
+protected by every lock. The program is executed as usual
+(with threads scheduled according to the OS scheduler), except
+that instrumentation is added to update locksets as follows.
+After each lock andunlock operation by T,CLS Tis updated
+to reﬂect the locks currently held by T. When Taccesses s,
+LSsis updated to the intersection of LSswithCLS T, which
+removes any locks that are not common to the two locksets. If
+LSsbecomes empty as a result, a warning is issued that the
+access to smay be unprotected.
+Fig. 3 shows an example of applying lockset analysis to
+a concurrent program consisting of two threads T1andT2,
+both accessing a global variable A. Initially, LSA, which is
+the lockset for A, contains all possible locks in the program:
+MandN. During execution of T1, the thread writes Awithout
+holding N, and thus Nis removed from LSA. Next, during
+execution of T2, the thread writes Awithout holding M, and
+thusLSAbecomes empty. As a result, a warning is reported
+because the two threads do not consistently protect A.
+In contrast to more sophisticated race analyses that en-
+code a happens-before relation between threads [24] (e.g.
+using vector clocks), lockset analysis is easy to implement,
+lightweight, and thus has the potential to scale well. The
+technique, though, can report false alarms since a violation of
+the locking discipline does not always correspond to a real data
+race [23], [25], [26], [27], [28]. Furthermore, the code coverage
+in dynamic lockset analyzers, such as Eraser, is limited by the
+execution paths that are explored under a given scheduler.
+To counter the above limitations, techniques such as Lock-
+smith [20] and RELAY [21] have explored the idea of applying
+lockset analysis statically, using dataﬂow analysis. In this
+paper, we present a novel symbolic lockset analysis method
+that involves generating veriﬁcation conditions, which are then
+discharged to a theorem prover.
+III. T HEWHOOP APPROACH
+We now present symbolic pairwise lockset analysis , a novel
+method for data race analysis in device drivers. In xIII-A we
+describe how the approach works in a semi-formal manner,
+with respect to a simple concurrent programming model. In
+xIII-B we explain how we have implemented our analysis in aT1CLST2LSA
+warning: access to A may not be protectedT2{ }CLST1{ }Program{ M, N }lock (M);lock (N);write (A);unlock (N);write (A);unlock (M);{ M, N }{ M, N }{ M, N }{ M, N }{ M }{ M }{ M }{ M, N }{ M, N }{ M }{ M }{ }lock (M);write (A);unlock (M);write (A);{ M }{ M }{ }{ }{ M }{ M }{ M }{ }Initialcompute lockset intersection at access pointsFig. 3. Applying lockset analysis on a concurrent program.
+practical tool, W HOOP , that can be applied directly to driver
+source code.
+A. Symbolic Pairwise Lockset Analysis
+Our approach considers, for a given driver, every pair of
+entry points that can potentially execute concurrently. For each
+such pair, we use symbolic veriﬁcation to check whether it is
+possible for the pair to race on a shared memory location.
+We soundly model the effects of additional threads by treating
+the driver shared state abstractly: when an entry point reads
+from the shared state, a nondeterministic value is returned.
+Restricting to pairs of entry points, rather than analyzing all
+entry points simultaneously, exploits the fact that data races
+occur between pairs of threads and limits the complexity of
+the generated veriﬁcation conditions.2The trade-off is that a
+quadratic number of entry point pairs must be checked. In
+xIII-B we discuss optimizations based on device driver domain
+knowledge to reduce the number of pairs to some extent.
+Symbolic veriﬁcation of a pair of entry points works by (i)
+instrumenting each entry point with additional state to record
+locksets, and (ii) attempting to verify a sequential program that
+executes the instrumented entry points in sequence. A post-
+condition for the sequential program asserts, for every shared
+location, that the locksets for each entry point with respect
+to this location have a non-empty intersection. Veriﬁcation of
+the resulting sequential program can be undertaken using any
+sound method; in practice we employ the Boogie veriﬁcation
+engine [29], which requires procedure speciﬁcations and loop
+invariants to be generated, after which veriﬁcation conditions
+(VCs) [30] are generated and discharged to an automated
+theorem prover.
+We now detail the approach in a semi-formal manner, in
+the context of a simple concurrent programming model.
+Concurrent Programming Model We consider a concurrent
+programming model where an unbounded number of threads
+execute a set of pre-deﬁned thread templates . At any given
+point of execution a certain number of threads are active,
+each thread executing a particular template. In the context of
+2In principle, our approach could be applied at a coarser level of granularity,
+such as by considering all entry points one after the other, taking into account
+that an entry point can race with itself. However, using pairwise analysis has
+the additional advantage that it enables us to easily run the analysis for each
+pair in parallel (for performance), although we leave this for future work.Statement Notes
+x=e; private assignment, where x2VTandeis an expression
+overVT
+x=f(e); procedure call, where x2VT,eis a sequence of expres-
+sions over VT,fis the name of a procedure in procsT
+s=e; shared write, where s2Vsandeis an expression over VT
+x=s; shared read, where x2VTands2Vs
+lock(m); mutex lock, where m2M
+unlock (m);mutex unlock, where m2M
+Fig. 4. The allowed statements in our simple programming model.
+device drivers, a thread template corresponds to a driver entry
+point. Multiple instances of the same thread template may
+execute concurrently, just as multiple invocations of a single
+driver entry point may be concurrent. Further threads may
+start executing at any point during execution; in the context of
+device drivers this corresponds to the OS invoking additional
+driver entry points.3For ease of presentation only, our model
+does not feature aggregate data types, pointers, or dynamic
+memory allocation. These arehandled by our implementation,
+and inxIII-B we discuss interesting practical issues arising
+from the handling of a full-blown language.
+Aconcurrent program is described by a ﬁnite set of shared
+variables Vs, a ﬁnite set of mutexes M, and a ﬁnite set of
+thread templates . A thread template Tconsists of a ﬁnite set
+of procedures procsTand a ﬁnite set of private variables VT.
+A designated procedure main T2procsTdenotes the starting
+point for execution of Tby a thread. Each procedure of procsT
+is represented by a control ﬂow graph of basic blocks, where
+each block contains a sequence of statements. A basic block
+either has a single successor or a pair of successors. In the latter
+case, an exit condition over thread-private variables determines
+the successor to which control should ﬂow on block exit.
+The allowed statements are shown in Fig. 4, and include
+designated statements for reading from and writing to shared
+variables. In particular, shared variables may not appear in ar-
+bitrary expressions. This restriction simpliﬁes our presentation
+of lockset instrumentation below and is trivial to enforce by
+pre-processing. We do not specify the form of expressions, nor
+the types of variables, assuming a standard set of data types
+and operations.
+Semantics LetIbe an inﬁnite set from which dynamic thread
+ids will be drawn. The state of a running concurrent program
+consists of: a valuation of the shared variables Vs; a mapping
+that associates each mutex in Mwith an id fromI, recording
+which thread currently holds the mutex, or with a special value
+?=2I to indicate that the mutex is not held by any thread;
+and a list of thread states . Each thread state has an associated
+thread template T, the type of the thread (and multiple threads
+may have the same associated template), and consists of an id
+(drawn fromI), an index indicating the next statement of T
+to be executed by the thread, and a valuation of the thread
+private variables VT. If multiple threads are instances of the
+same template T, then each thread carries a separate valuation
+of the private variables for this template.
+3We do notconsider the case where one thread spawns another thread,
+which does not typically occur in the context of drivers; rather we aim to
+capture the scenario where additional threads are launched by the environment.Original Statement Instrumented Statement
+s=e; Wi=Wi[fsg;
+LSs;i=LSs;i\CLS i;
+x=s; Ri=Ri[fsg;
+LSs;i=LSs;i\CLS i;
+havoc (xi);
+lock(m); CLS i=CLS i[fmg;
+unlock (m); CLS i=CLS infmg;
+Fig. 5. Instrumenting statements for lockset analysis.
+Initially, the valuation of shared variables is arbitrary, no
+mutexes are held (i.e. each mutex maps to ?), and the list
+of thread states is empty. At any point of execution, a new
+thread state may be added to the list of thread states. This
+involves selecting a thread template Tand an id i2I that
+has not been previously used during program execution, setting
+the point of execution for the new thread state to be the ﬁrst
+statement of main T, and choosing an arbitrary valuation for
+the private variables VT. We consider a standard interleaving
+model of concurrency: at any execution point, a thread may
+execute its current statement, unless that statement has the
+form lock(m)and mutex mis held by some thread. Executing
+a statement updates the thread-private and shared state in a
+standard manner. For example, if a thread following template T
+executes s=e, where s2Vsandeis an expression over VT,
+the shared variable valuation is updated so that shas the value
+determined by evaluating ein the context of the thread’s private
+variable valuation. Because our interest is in data race analysis
+for race-free programming, we are not concerned with relaxed
+memory behavior: race-free programs exhibit only sequentially
+consistent behaviors.
+A thread terminates if it reaches the end of main T, in
+which case its state is removed from the list of thread states.
+Since our interest is in analysis of device drivers, which are
+reactive programs, we do not consider the notion of global
+program termination.
+Lockset Instrumentation For templates TandU, which can
+be equal, we want to check whether it is possible for a thread
+executing Tto race with a thread executing U, in the presence
+of arbitrarily many further concurrently executing threads.
+To this end, we ﬁrst instrument a template Tfor lockset
+analysis (seexII). Given an arbitrary symbol i, we deﬁne the
+instrumentation of Twith respect to i, denoted Ti. There are
+two aspects to this instrumentation phase: renaming andlockset
+instrumentation . Renaming is straightforward: each occurrence
+of a private variable x2VTused in Tis replaced with a
+renamed variable xiinTi, and every procedure f2procsT
+is renamed (both at its declaration site and at all call sites) to
+fiinTi. The purpose of renaming is to ensure that when we
+analyze a pair of templates, TandU, both templates execute
+distinct procedures and operate on distinct private data. This
+is vital in the case where TandUare the same.
+Lockset instrumentation introduces: sets RiP(Vs)and
+WiP(Vs)to track the shared variables that have been read
+from and written to, respectively, by the thread executing T; a
+current lockset CLS iP(M)to record the mutexes currently
+held by the thread; and, for each shared variable s2Vs, a
+lockset LSs;ito record the mutexes that are consistently held
+when the thread accesses s. The statements of each procedureCLS i=;;Ri=;;Wi=;;
+CLS j=;;Rj=;;Wj=;;
+fors2VsdoLSs;i=M;LSs;j=M;
+main Ti();
+main Uj();
+assert8s2Vs:
+s2Wi\(Rj[Wj)_s2Wj\(Ri[Wi) =)
+LSs;i\LSs;j6=;;
+Fig. 6. The sequential program to be analyzed to prove race-freedom for a
+pair of thread templates.
+inTithat access shared variables and mutexes are instrumented
+to manipulate these sets, as shown in Fig. 5. For a shared
+variable assignment s=e, we record in Withatshas been
+written to, and update LSs;ito eliminate any mutexes that
+are not currently held (those mutexes that are not in CLS i).
+A shared variable read x=sis instrumented analogously,
+with an additional havoc command which we discuss below.
+Instrumentation of mutex manipulation commands, lock(m)
+andunlock (m), involves updating CLS ito add and remove
+mutex m, respectively.
+Shared State Abstraction Recall that while our aim is to
+perform race analysis for pairs of threads, we must be sure to
+account for possible side-effects due to other threads that are
+running concurrently. The instrumentation of Fig. 5 achieves
+this via nondeterminism : when reading from a shared variable
+s, a nondeterministic value is returned. This is reﬂected by
+the use of a havoc command, which sets its argument to an
+arbitrary value. Because all shared state accesses are abstracted
+in this fashion, it is possible to completely dispense with the
+shared variables after the lockset instrumentation has been
+performed. As a result, when instrumenting a shared variable
+write, the effect of the write is not explicitly modeled.
+Sequentialization Fig. 6 shows the sequential program that
+we analyze to prove race-freedom for a pair of thread templates
+TandU. Assuming that TandUhave been instrumented
+using distinct symbols iandj, yielding TiandUj, the
+sequential program operates as follows. First, the read, write,
+and current locksets for TiandUjare initialized to be empty,
+and for each shared variable s, the locksets LSs;iandLSs;jare
+initialized to the full set of mutexes M. The main procedures
+of the instrumented thread templates, main Tiandmain Uj,
+are then executed in turn (the order does not matter due to
+renaming). Finally, an assertion checks for consistent use of
+mutexes: if sis written during execution of Tiand accessed
+during execution of Uj, or vice-versa, then the locksets LSs;i
+andLSs;jmust contain at least one common mutex.
+Soundness We sketch an argument that if the program of
+Fig. 6 is correct (i.e. the assertion, described above, holds
+invariantly at the end of the program), then it is impossible
+for a thread executing template Tto race with a thread
+executing template U, under the assumption that the threads
+are guaranteed to terminate. Let us assume that the program of
+Fig. 6 is correct, and suppose (by way of contradiction) that a
+thread executing Tcan in fact race with a thread executing U,
+on some shared variable s. By our hypothesis that the program
+is correct, and that the threads terminate, the assertion checked
+at the end of the program guarantees that at least one mutex,
+saym, belongs to both LSs;iandLSs;j. By the deﬁnition
+of a lockset (and according to the manner in which sharedBoogie IVLcode, instrumentedwith yieldsData RaceReportsNo Errors(Under Given Bounds)WHOOP
+Error TracesZ3ChauﬀeurSMACKLinux driver source code in CBoogie IVL codellvm-IRLinuxEnvironmentalModelInstrumentationSequentializationInvariant GenerationBoogieVeriﬁcation EngineCORRALA. Translation PhaseB. Symbolic Lockset Analysis PhaseC. Bug-Finding Phase
+Clang / LLVMentry point informationFig. 7. The W HOOP architecture, empowered by state-of-the-art compilation (Clang/LLVM and SMACK) and veriﬁcation (Boogie and C ORRAL ) tools.
+accesses are instrumented in Fig. 5), this means that mis held
+during every access to sby both TiandUj. As a result, m
+must be unlocked and locked between the two accesses, which
+contradicts that the pair of accesses is racing.
+In the presence of non-termination the assertion at the
+end of Fig. 6 may not be reached. The termination analysis
+problem for device drivers has been widely studied (see e.g.
+[11]), and in the remainder of the paper we do not consider
+termination issues, assuming that the drivers we analyze in our
+experimental evaluation (see xV) are terminating.
+B. Implementation in WHOOP
+The simple concurrent programming model of xIII-A is
+deliberately idealistic to make it easy to describe our symbolic
+veriﬁcation technique. In practice, Linux drivers are written in
+C, our technique does not know up-front which are the driver
+entry points, drivers do not work with a cleanly speciﬁed set
+of named locks, and rather than having a given set of named
+shared variables, we have arbitrary memory accesses via
+pointers. We now explain how we have taken the conceptual
+ideas fromxIII-A and used them to build W HOOP , a practical,
+automated tool for detecting data races in drivers.
+Architecture Fig. 7 depicts the W HOOP toolchain. The input
+to W HOOP is a Linux driver written in C, together with an
+environmental model4that is required to “close” the driver
+so that it can be analyzed for races. Initially, W HOOP uses
+three LLVM-based tools [31], [32], Chauffeur, Clang [33], and
+SMACK [34], [35], to translate the driver and its environ-
+mental model into an abstract program written in the Boogie
+intermediate veriﬁcation language (IVL) [36]. Boogie is a
+simple imperative language with well-deﬁned semantics that
+is used as the input to a number of cutting-edge veriﬁers (e.g.
+the Boogie veriﬁer and C ORRAL ). Next, W HOOP instruments
+and sequentializes the program to perform symbolic pairwise
+lockset analysis (see Fig. 7–B and xIII-A) using the Boogie
+veriﬁcation engine. After the veriﬁcation phase ends, W HOOP
+can exploit any inferred race-freedom guarantees to accelerate
+precise race-checking with C ORRAL (see Fig. 7–C and xIV).
+We engineered the Chauffeur5and W HOOP6components
+of our toolchain (denoted with grey boxes in Fig. 7). For
+4This consists of stub header ﬁles modeling relevant Linux kernel APIs.
+5https://github.com/mc-imperial/chauffeur
+6https://github.com/pdeligia/whoopconst struct file_operations nvram_fops = {
+.llseek = nvram_llseek,
+.read = read_nvram,
+.write = write_nvram,
+.unlocked_ioctl = nvram_unlocked_ioctl
+};
+Fig. 8. Entry point deﬁnitions in the generic nvram driver.
+the remaining components, we were able to reuse industrial-
+strength tools that are robust and battle-proven via their use in
+many complex software projects.
+Extracting Entry Point Information Chauffeur is a Clang-
+based tool that traverses the abstract syntax tree (AST) of the
+original driver and extracts all entry point identiﬁer names,
+together with the identiﬁer names of their corresponding kernel
+functions. Linux drivers deﬁne entry points in a standard way
+(see Fig. 8 for an example of how the generic nvram driver
+deﬁnes the entry points for file_operations ); Chauffeur
+identiﬁes these deﬁnitions in the AST and outputs the relevant
+information in an XML ﬁle, which is parsed by W HOOP to be
+used during the instrumentation.
+Translation for Veriﬁcation Next, the driver is compiled
+by Clang to LLVM-IR, a low-level assembly-like language
+in single static assignment (SSA) form. Function calls (e.g.
+for locking and unlocking) are preserved in this translation
+and, hence, we do not need to keep track of them separately.
+SMACK then translates the driver from LLVM-IR to Boogie
+IVL, which is the input language of W HOOP . An important
+feature of SMACK is that it leverages the pointer-alias analyses
+of LLVM to efﬁciently model the heap manipulation operations
+of C programs in Boogie IVL. Thus, W HOOP does not need
+to directly deal with pointers and alias analysis.
+To achieve scalability, SMACK uses a split memory model
+that exploits an alias analysis to soundly partition memory
+locations into non-overlapping equivalence classes that do not
+alias. This has been shown to lead to more tractable veriﬁcation
+compared with a monolithic model where the heap is consid-
+ered to be an array of bytes [37]. The split memory model
+is based on memory regions , which are maps of integers that
+model the heap. A beneﬁt of using this model is that distinct
+memory regions denote disjoint sections of the heap. We
+leverage this knowledge inside W HOOP to guide and optimize
+our lockset instrumentation and analysis, and to create a ﬁne-
+grained context-switch instrumentation as discussed in xIV.Identifying Locks When the instrumentation phase begins,
+WHOOP performs an inter-procedural static analysis (at Boogie
+IVL level) to identify all available locks and rewrite each one
+(both at declaration and at all access sites) to a unique Boogie
+constant. Representing all locks statically, instead of using their
+original SMACK pointer-based representation, makes it easier
+for W HOOP to perform lockset instrumentation and lockset-
+based invariant generation. Currently, W HOOP supports Linux
+kernel mutex and spinlock operations; it is easy to enhance it
+with knowledge of other locking primitives. If W HOOP cannot
+reliably infer a unique lock instance (e.g. because it is stored
+in an unbounded data structure of locks such as an array or
+a list), it will exit with a warning. However, we have never
+encountered this in practice since a small, ﬁxed number of
+locks is advocated by Linux experts as good practice when
+developing drivers [1, p. 123].
+Watchdog Race-Checking Instrumentation Data race detec-
+tion is performed by introducing sets containing the locks that
+are consistently held when accessing each shared variable and
+sets containing all shared variables that are read and written
+(seexIII-A and the instrumentation of Fig. 5). These sets can
+be modeled directly in Boogie as characteristic functions, using
+maps. However, this requires the use of quantiﬁers to express
+properties related to set contents. For instance, to express that a
+setXof elements of type Ais empty, where Xis represented
+as a map from AtoBool , we would require the quantiﬁed
+expression8a:A ::X[a]. It is well known that automated
+theorem proving in the presence of quantiﬁed constraints is
+challenging, and that theorem provers such as Z3 [38] are often
+much more effective when quantiﬁers are avoided.
+To avoid quantiﬁers and the associated theorem proving
+burden, we use instead a watchdog race-checking instrumen-
+tation, adapted from previous work [39]. Suppose we are
+analyzing entry points TandU, and that after translation
+into Boogie IVL these entry points share a common memory
+region MR. When analyzing TandUfor races, we introduce
+an unconstrained symbolic constant watched MR, representing
+some unspeciﬁed index into MR; we call this the watched
+offset forMR. We then attempt to prove that it is impossible
+forTandUto race on MR at index watched MR. If we can
+succeed in proving this, we know that TandUmust be race-
+free for the whole MR, since the watched offset was arbitrary.
+This technique of choosing an arbitrary index to analyze for
+each map manipulated by an entry point pair can be seen
+as a form of quantiﬁer elimination: rather than asking the
+underlying theorem prover to reason for all indices of MR, in a
+quantiﬁed manner, we eliminate the quantiﬁer in our encoding,
+and instead ask the theorem prover to reason about a single,
+but arbitrary, index of MR.
+Generating Loop and Procedure Summaries Early in the
+development of W HOOP , we experimented with analyzing
+recursion-free drivers using full inlining. We found that this
+did not scale to large drivers, and that some drivers do exhibit
+recursion, e.g. the r8169 ethernet driver (see xV).
+To make our analysis scale while maintaining precision,
+and to support recursion, we use the Houdini algorithm [40]
+to automatically compute summaries (pre- and post-conditions
+and loop invariants). Given a pool of candidate pre-conditions,
+post-conditions, and loop invariants, Houdini repeatedly at-
+tempts to verify each procedure. Initially, the entire candidatepool is considered. If veriﬁcation fails due to an incorrect
+candidate, this candidate is discarded. The process repeats until
+a ﬁxpoint is reached. The (possibly empty) set of remaining
+candidates has been proven to hold, and can be used to
+summarize calls and loops during further program analysis.
+Houdini does not generate the initial pool of candidates:
+WHOOP generates them using a set of heuristics, and passes
+them to Houdini as a starting point. This is done based on
+syntactic patterns extracted from an inter-procedural pass over
+the code for an entry point. We give two examples; for clarity
+we use notation from the simple concurrent programming
+model ofxIII-A. If we observe syntactically that procedure
+fof entry point Tmay write to, but does not read from,
+shared variable s, then when instrumenting Twith symbol
+i, we guess s2Wiands =2Rias post-conditions for fi.
+These guesses may be incorrect, for instance if the potential
+write to sturns out to be in dead code, or if a read from s
+has already been issued on entry to fi. Similarly, if syntactic
+analysis indicates that fmay unlock mutex m, we guess
+m =2CLS ias a post-condition for fi; this guess may be
+incorrect, for instance if the unlock operation is not reachable
+or if a subsequent lock operation acquires the mutex again.
+We stress that guessing incorrect candidate invariants does not
+compromise the soundness of veriﬁcation: W HOOP is free to
+speculate candidates that are later deemed to be incorrect, and
+thus discarded by Houdini. The balance we try to strike is to
+have W HOOP generate sufﬁcient candidates to enable precise
+lockset analysis, without generating so many candidates that
+the speed of the Houdini algorithm is prohibitively slow.
+Veriﬁcation and Error Reporting For each entry point pair,
+the instrumented sequential program, equipped with procedure
+and loop summaries, is given to the Boogie veriﬁcation engine.
+For each procedure in the program, Boogie generates a VC
+and discharges it to the Z3 theorem prover. In particular, the
+veriﬁcation for the root-level procedure, implementing the se-
+quential program sketched in Fig. 6, encodes the race-freedom
+check for the entry point pair. Successful veriﬁcation implies
+that the pair is race-free, while an error (i.e. counterexample)
+denotes a potential data race and is reported to the user. To
+improve usability, W HOOP has a built-in error reporter that
+matches counterexamples to source code. The following is a
+race that W HOOP found and reported for the example of Fig. 1:
+generic_nvram.c: error: potential read-write race:
+read by entry point nvram_llseek, generic_nvram.c:54:2
+return file->f_pos;
+write by entry point nvram_llseek, generic_nvram.c:53:2
+file->f_pos = offset;
+Optimizations We have implemented various optimizations
+to increase the precision and performance of W HOOP . We
+comment on the two most effective ones.
+First, we enriched W HOOP with information regarding
+kernel-imposed serialization to increase precision. The Linux
+kernel can serialize calls to entry points, thus forcing them to
+run in sequence instead of an interleaved manner. For example,
+a large number of networking entry points are mutually serial-
+ized with RTNL, a network-speciﬁc kernel lock. We discovered
+this when W HOOP reported many races between a number of
+networking entry points of the r8169 driver (see xV); when
+we investigated the source of these races, we found out that
+these entry points could not race in reality because of RTNL.WHOOP exploits this knowledge and does not create pairs for
+entry points that are mutually serialized by the kernel. This is
+an ongoing manual effort: the more drivers we study, the more
+such properties we discover to make W HOOP more precise.
+Second, we soundly reduce the number of memory regions
+that are analyzed for races. If memory region MR is accessed
+by only one entry point in a pair then, trivially, the pair cannot
+race on MR. We thus disable lockset analysis for MR. This
+can reduce the complexity of VCs that need to be solved by
+the theorem prover, speeding up the veriﬁcation process.
+Practical Assumptions Related to Soundness WHOOP is
+“soundy”7[41]: it aims in principle to perform a sound analysis
+that can prove absence of races, but suffers from some known
+sources of unsoundness, which we now comment on.
+We assume that the formal parameters of an entry point do
+not alias, and thus cannot race. This is a potentially unsound
+feature that can be turned off using a command line option.
+Without this assumption we have observed W HOOP reporting
+false alarms, and in our experience so far we have not missed
+any races by assuming non-overlapping parameters. We also
+rely on the soundness of our best-effort environmental model,
+and on exploiting domain-speciﬁc knowledge related to entry
+point serialization by the Linux kernel.
+In addition to inheriting soundness issues arising from cur-
+rently unknown bugs in W HOOP and in the external tools that
+WHOOP relies on, we acknowledge that: (i) the 1.5.0 release
+of SMACK we used is subject to sources of unsoundness,
+e.g. it models integers as an inﬁnite set (rather than as a
+ﬁnite set of bit-vectors), and its memory model can potentially
+be unsound in (typically rare) situations where programs
+use unaligned byte-level memory accesses;8and (ii) that the
+combination of Clang and SMACK commits our approach
+to speciﬁc choices related to undeﬁned and implementation-
+deﬁned aspects of the C language when translating to Boogie.
+However, W HOOP makes no fundamental assumptions related
+to these translation decisions, meaning that a more accurate
+C-to-Boogie translation would automatically lead to a more
+accurate analysis with W HOOP .
+Limitations As a lockset analyzer, W HOOP can be imprecise
+because a violation of the locking discipline does not always
+correspond to a real race (e.g. when lock-free synchronization
+is used). W HOOP also uses over-approximation, which can be
+another source of imprecision. Furthermore, the tool does not
+check for dynamically created locks or for locks provided by
+external libraries, although the latter could be addressed by
+providing a mechanism for users to declare custom locks. We
+also do not currently treat interrupt handlers in a special way;
+we just assume that they can execute concurrently with any en-
+try point. One way to address this is to model interrupt-speciﬁc
+kernel functions (e.g. for enabling/disabling interrupts).
+Another limitation of W HOOP is that it is unable to verify
+drivers designed to be accessed by only a single process at a
+time. This single-open device [1, p. 173] mode can be enforced
+by atomically testing (at the beginning of an entry point) a
+global ﬂag that indicates device availability: if the ﬂag is set,
+7http://soundiness.org/
+8Note that currently bit-vectors and unaligned byte-level memory accesses
+are soundly and precisely handled by SMACK (as of release 1.5.1).then the checking entry point executes, else it blocks. Because
+WHOOP over-approximates read accesses to shared variables,
+and thus this ﬂag, it can falsely report a pair as racy. However,
+experts [1, p. 173] advise against serializing drivers in this
+way, as it “inhibits user ingenuity” (e.g. a user might expect
+that a driver can be accessed concurrently for performance).
+Statically analyzing drivers requires “closing” the environ-
+ment by abstracting away the low-level implementation details.
+To this end, we developed a simple model for the Linux kernel
+that consists of (nondeterministic) stub functions. A limitation
+of our model is that it can be inaccurate, leading to semantic
+mismatches that can in turn lead to false positives and/or false
+negatives. However, we currently only focus on ﬁnding data
+races, and thus can get away with over-approximating large
+parts of the Linux kernel, without losing too much precision.
+Making our model more precise is an ongoing manual effort
+that requires Linux kernel expertise. We argue that further work
+on the model is orthogonal to the contributions of this paper.
+Also, even if our symbolic analysis results in false positives,
+WHOOP can still use the results to signiﬁcantly speedup a more
+precise bug-ﬁnder, as seen in xIV andxV.
+IV. A CCELERATING PRECISE RACE-CHECKING
+WHOOP is a sound but imprecise static race analyzer. For
+developers who deem false alarms as unacceptable, we con-
+sider a method for leveraging the full or partial race-freedom
+guarantees provided by W HOOP to accelerate C ORRAL [14],
+a precise bug-ﬁnder used by Microsoft to analyze Windows
+drivers [42]. Because C ORRAL operates on Boogie programs,
+it was easy to integrate it into our toolchain (see Fig. 7–C).
+Our technique, though, is general and capable in principle
+of accelerating any concurrency bug-ﬁnder that operates by
+interleaving threads at shared memory operations.
+CORRAL is a symbolic bounded veriﬁer for Boogie IVL
+that uses the Z3 SMT solver to statically reason about program
+behaviors. It checks for violations of provided assertions, and
+reports a precise counterexample if an assertion violation is
+found. C ORRAL performs bounded exploration of a concurrent
+program in two steps. First, given a bound on the number
+of allowed context-switches, the concurrent program is appro-
+priately sequentialized , and the generated sequential version
+preserves reachable states of the original concurrent program
+up to the context bound [43], [44], [45]. Then, C ORRAL
+attempts to prove bounded (in terms of the number of loop
+iterations and recursion depth) sequential reachability of a
+bug in a goal-directed, lazy fashion to postpone state space
+explosion when analyzing a large program. It uses two key
+techniques to achieve this: (i) variable abstraction, where it
+attempts to identify a minimal set of shared variables that have
+to be precisely tracked in order to discharge all assertions; and
+(ii) stratiﬁed inlining, where it attempts to inline procedures
+on-demand as they are required for proving program assertions.
+Race-Checking Instrumentation To detect data races with
+CORRAL , W HOOP outputs a Boogie program instrumented
+with a simple, but effective encoding of race checks [46].
+Whenever there is a write access to a shared variable s,
+WHOOP instruments the program as follows:
+s = e; // original write
+yield ; // allow for a context-switch
+assert s == e; // check written valueLikewise, whenever there is a read access to s, W HOOP
+instruments the program as follows:
+x = s; // original read
+yield ; // allow for a context-switch
+assert x == s; // check read value
+Ayield statement denotes a nondeterministic context-switch,
+and is used by C ORRAL to guide the sequentialization.
+CORRAL is inherently unsound (i.e. can miss real races),
+because it performs bounded veriﬁcation. However, C ORRAL
+is precise and, assuming a precise environmental model, it will
+only report true races. W HOOP takes advantage of this preci-
+sion to report only feasible races. Note that our instrumentation
+conveniently tolerates some benign races: it does not report a
+read-write race if the write access updates the shared memory
+location with the same value that already existed; it also does
+not report a write-write race if the two write accesses update
+the shared memory location with the same value (which can
+be different from the pre-existing value).
+In this work, we use C ORRAL to analyze individual pairs of
+entry points. We do not use any abstraction to model additional
+threads, as we want C ORRAL to report only true races. Because
+we only analyze pairs, though, C ORRAL will miss races that
+require more than two threads to manifest. We could extend
+our setup so that more than two threads are considered by
+CORRAL , but because the number of threads that an OS kernel
+might launch is unknown in general, we are inevitably limited
+by some ﬁxed maximum thread count.
+Sound Partial-Order Reduction By default, and assuming
+no race-freedom guarantees, W HOOP instruments a yield
+after each shared memory access of each entry point, and
+after every lock and unlock operation.9WHOOP then sends
+this instrumented program to C ORRAL , which leverages se-
+quentialization to explore all possible thread interleavings up
+to a pre-deﬁned bound. Our approach to accelerating C ORRAL
+is simple and yet effective: if, thanks to W HOOP ’s analysis,
+we know that a given statement that accesses shared memory
+cannot be involved in a data race, then we do not instrument
+ayield after this statement, and we also omit the assert
+that would check for a race. This is a form of partial order
+reduction [47], and reduces the number of context-switches
+that C ORRAL must consider in a sound manner: there is no
+impact on the bugs that will be detected. This is because each
+access for which a yield is suppressed is guaranteed to be
+protected by some lock (a consequence of lockset analysis).
+If the access is a write, its effects are not visible by the other
+entry point in the pair until the lock is released. If the access is
+a read, the value of the shared location cannot change until the
+lock is released. The fact that a yield is placed after each
+unlock operation sufﬁces to take account of communication
+between entry points via the shared memory location.
+We have implemented two different yield instrumenta-
+tions in W HOOP : Yield-EPP and Yield-MR. The ﬁrst instru-
+ments yield statements in a binary fashion: if W HOOP proves
+an entry point pair (EPP) as race-free, then it will instrument
+ayield only after each lock and unlock statement of the
+9We acknowledge that in the presence of data races and relaxed memory,
+even considering all interleavings of shared memory accesses may be insufﬁ-
+cient to ﬁnd all bugs.pair; else if W HOOP ﬁnds that a pair might race, then it will
+instrument a yield after all visible operations of the pair.
+Yield-MR is a ﬁner-grained instrumentation: it instruments a
+yield only after each access to a memory region (MR) that
+might race in the pair (regardless if the pair has not been fully
+proven as race-free), and after each lock and unlock statement.
+In our experiments (see xV), Yield-MR is signiﬁcantly faster
+than Yield-EPP.
+Our partial-order reduction is able in principle to accelerate
+CORRAL forarbitrary bug-ﬁnding in concurrent programs.
+Although we did preliminary explorations in this direction,
+identifying useful safety properties to check was challenging
+since drivers typically contain no assertions. Thus, in this paper
+we use C ORRAL solely to ﬁnd data races.
+V. E VALUATION
+We performed experiments to validate the usefulness of the
+WHOOP approach (xIII) and its combination with C ORRAL
+(xIV). We ﬁrst present race-checking results from running
+WHOOP and C ORRAL on 16 drivers taken from the Linux 4.0
+kernel.10We then evaluate the runtime performance and scal-
+ability of C ORRAL using different yield instrumentations and
+context-switch bounds. Our results demonstrate that W HOOP
+can efﬁciently accelerate race-checking with C ORRAL .
+Experimental Setup We performed all experiments on a
+3.40GHz Intel Core i7-2600 CPU with 16GB RAM run-
+ning Ubuntu Linux 12.04.5 LTS, LLVM 3.5, SMACK 1.5.0,
+Z3 4.3.2, Boogie rev. 4192 and C ORRAL rev. 534. We also
+used Mono 4.1.0 to run Boogie and C ORRAL . We conﬁgured
+CORRAL with a time budget of 10 hours (T.O. denotes
+timeout), a context-switch bound (csb) of 2, 5, and 9, and
+the default recursion depth bound of 1.
+Benchmarks We evaluate our methodology against 16 drivers
+from the Linux 4.0 kernel. We chose non-trivial drivers of
+several types: block, char, ethernet, near ﬁeld communication
+(nfc), universal serial bus (usb), and watchdog. For all these
+drivers, we had to understand their environment and manually
+model it; this required approximately two months of work.
+Race-Checking Table I presents statistics for our benchmarks:
+lines of code (LoC); number of possible entry point pairs
+(#Pairs); number of SMACK memory regions (#MRs); number
+of racy pairs (#Racy Pairs) and number of racy memory regions
+(#Racy MRs) reported by W HOOP ; and number of data races
+discovered by C ORRAL using a csb of 2 (#Races Found).11
+Using a higher csb than 2 did not uncover any further races;
+this might mean that all races in our benchmarks can manifest
+with a csb of 2, or that C ORRAL hit its default recursion depth
+bound of 1 before discovering a deeper bug. Although we
+experimented with higher recursion depth bounds, we were
+unable to discover any races that could not be exposed with
+the default recursion depth bound.
+We can see in Table I that W HOOP reports more races
+than C ORRAL does. This is because W HOOP employs an over-
+approximating shared state abstraction to conservatively model
+10https://www.kernel.org
+11The number of racy memory regions can be less than the number of races
+found by C ORRAL : W HOOP might ﬁnd that a memory region is racy, but the
+same memory region might race in several program statements.TABLE I. P ROGRAM STATISTICS AND RACE -CHECKING RESULTS
+FROM APPLYING WHOOP AND CORRAL ON OUR BENCHMARKS .
+WHOOP CORRAL
+#Racy #Racy #Races
+Benchmarks LoC #Pairs #MRs Pairs MRs Found
+generic nvram 283 14 39 7 2 4
+pc8736x gpio 354 27 55 13 6 5
+machzwd 457 10 49 6 3 1
+ssu100 568 7 27 7 7 7
+intel scuwd 632 10 45 5 1 2
+ds1286 635 15 49 5 3 7
+dtlk 750 21 53 10 6 7
+fs3270 883 15 54 9 1 7
+gdrom 890 94 41 21 2 7
+swim 996 28 80 15 7 8
+intel nfcsim 1272 10 24 10 2 7
+ps3vram 1499 4 32 1 1 7
+sonypi 1729 30 62 19 4 2
+sx8 1751 2 47 2 1 1
+8139too 2694 46 37 40 4 7
+r8169 7205 192 50 88 1 7
+the effects of additional threads when analyzing an entry point
+pair, and because lockset analysis is inherently imprecise; both
+factors can lead to false positives. On the other hand, C ORRAL
+is precise, but can miss races because only a limited number of
+context-switches are considered. Another issue with C ORRAL
+is loop coverage due to unsound loop unrolling. To tackle
+this, we enable the built-in loop over-approximation described
+in previous work [42]. This can potentially lead C ORRAL
+to report false bugs, but we have not seen this in practice.
+Furthermore, when we apply C ORRAL to a pair of entry points,
+we just check the speciﬁc pair and do not account for the
+effects of other threads (see xIV); this can also cause C ORRAL
+to miss some races. Note that standalone C ORRAL did not
+discover any races that W HOOP did not already report. This
+is expected, as W HOOP aims for soundness, and increases our
+conﬁdence in the implementation of W HOOP .
+Most of the races that W HOOP and C ORRAL discovered
+fall into two categories. The ﬁrst is about accessing a global
+counter (or ﬂag) from concurrent entry points, without holding
+a lock. This might be for performance, and indeed a lot of the
+races we found might be benign. Even benign races, though,
+lead to undeﬁned behavior according to the C standard. The
+second is about an entry point modifying a ﬁeld of a struct
+(either global or passed as a parameter) without holding a lock.
+This can lead to a race if another entry point simultaneously
+accesses the same ﬁeld of the same struct.
+As an example of the second category, we found the
+following race in the generic nvram driver (see Fig. 1): the
+llseek entry point accesses the ﬁle offset file->f_pos
+without holding a lock ( file is passed as a parameter to
+llseek ). This causes a race if the kernel invokes llseek
+from another thread, while passing the same file object as
+a parameter. We observed that another char driver, using the
+same APIs, does use a lock to protect the offset access in its
+respective llseek entry point, leading us to suspect that the
+race we found in generic nvram is not benign.
+Accelerating C ORRAL Table II presents runtime results from
+using W HOOP , standalone C ORRAL , and W HOOP + C ORRAL
+10 100 1000 10000 TO
+Analysis time (in seconds) using Whoop+Corral (Yield-MR)10100100010000TOAnalysis time (in seconds) using Corral (Yield-ALL)2x speedup
+10x speedup
+Fig. 9. Scatter plot showing the runtime speedups that C ORRAL achieves
+using W HOOP with the Yield-MR instrumentation. The symbols +,, and
+represent a context-switch bound of 2, 5, and 9, respectively.
+to analyze our benchmarks, while Fig. 9 plots the runtime
+speedups that C ORRAL achieves using W HOOP with the Yield-
+MR instrumentation. Standalone C ORRAL uses Yield-ALL,
+which instruments context-switches (i.e. yield statements)
+after all visible operations, while W HOOP + C ORRAL uses
+Yield-EPP and Yield-MR, which instrument context-switches
+in a more ﬁne-grained fashion (see xIV). The table also shows
+the number of context-switches per instrumentation (#Y). All
+reported times are in seconds and averaged over three runs.
+WHOOP uses over-approximation to scale and, as expected,
+executes signiﬁcantly faster than C ORRAL in all our bench-
+marks. For example, C ORRAL times out in all conﬁgurations
+(with and without W HOOP ) when trying to analyze the r8169
+ethernet driver, while W HOOP manages to analyze the same
+driver in 144.5 seconds. We believe that the reason behind this
+is that the r8169 driver has deeply-nested recursion in some
+of its entry points, which puts burden on C ORRAL ’s stratiﬁed
+inlining. This is not an issue for W HOOP , which uses procedure
+summarization. This shows that W HOOP has value as a stand-
+alone analyzer.
+Using the race-freedom guarantees from W HOOP , we
+managed to signiﬁcantly accelerate C ORRAL in most of our
+benchmarks; the best results were achieved using Yield-MR.
+Fig. 9 shows that most speedups using Yield-MR are between
+1.5and 10; in ssu100 and pc8736x gpio with a csb of 9 we
+achieved a speedup of 12 and 20, respectively. We noticed
+that a higher csb typically results in greater speedups when
+exploiting W HOOP . This is expected as complexity grows
+exponentially with csb, and hence W HOOP ’s reduction helps
+more at a higher csb. However, there are cases where W HOOP
+might slow down C ORRAL . We noticed this in the sx8 driver:
+WHOOP veriﬁed 46 out of 47 memory regions, but did not fully
+verify any of the pairs; C ORRAL , on the other hand, analyzed
+the only two pairs of the driver in just 21.4 seconds (csb of 9).TABLE II. C OMPARISON WITH DIFFERENT YIELD INSTRUMENTATION GRANULARITIES AND CONTEXT -SWITCH BOUNDS .
+WHOOP CORRAL WHOOP + C ORRAL
+TimeYield-ALL — Time (sec) Yield-EPP — Time (sec) Yield-MR — Time (sec)
+Benchmarks (sec) #Y csb = 2 csb = 5 csb = 9 #Y csb = 2 csb = 5 csb = 9 #Y csb = 2 csb = 5 csb = 9
+generic nvram 2.3 92 32.0 67.7 197.5 47 17.7 24.2 132.1 29 13.5 16.9 49.3
+pc8736x gpio 4.1 691 169.3 595.1 27337.6 500 79.4 432.4 22514.1 167 41.3 79.4 1358.9
+machzwd 2.8 104 38.1 45.6 78.4 51 26.1 31.2 55.2 22 15.7 17.3 23.9
+ssu100 2.9 82 11.1 13.8 37.3 7 3.1 3.1 3.2 7 3.1 3.1 3.1
+intel scuwd 2.4 314 22.8 130.3 1571.7 217 14.7 70.0 748.0 196 13.5 66.1 689.3
+ds1286 4.1 513 35.0 40.2 51.8 245 22.3 25.7 33.0 129 14.5 16.1 19.3
+dtlk 5.4 801 182.6 263.7 793.0 664 91.2 150.7 633.2 286 41.6 52.9 104.6
+fs3270 3.2 321 81.5 419.4 T.O. 239 62.6 405.7 33468.4 211 40.7 295.3 8883.0
+gdrom 9.5 2058 388.0 390.8 392.1 1143 104.0 105.5 107.1 812 99.2 102.4 107.6
+swim 5.8 1270 271.0 2746.6 T.O. 996 164.9 2309.8 T.O. 805 95.5 1847.9 T.O.
+intel nfcsim 3.6 732 39.8 85.0 1539.9 732 44.4 89.6 1543.4 601 21.0 32.0 278.0
+ps3vram 4.5 189 99.6 2376.8 T.O. 176 96.2 2249.0 T.O. 156 55.8 1698.6 T.O.
+sonypi 10.6 1745 1966.5 T.O. T.O. 1566 1924.4 T.O. T.O. 1024 906.0 T.O. T.O.
+sx8 2.8 227 12.9 15.2 21.4 227 16.1 18.5 24.5 217 15.9 18.5 24.3
+8139too 18.9 7151 548.2 14469.0 T.O. 6266 474.7 12677.3 T.O. 4964 359.8 5664.5 T.O.
+r8169 144.5 16035 T.O. T.O. T.O. 11723 T.O. T.O. T.O. 10535 T.O. T.O. T.O.
+We believe that in this case the overhead of running W HOOP
+outweighed the beneﬁts of using Yield-EPP or Yield-MR.
+Other Tools We tried to compare W HOOP with other similar
+approaches (seexVI). However, we found this to be hard in
+practice: we downloaded Locksmith [20], but could not get it
+to work with the 4.0 Linux drivers (the tool was last updated
+in 2007); we also could not ﬁnd source code or binaries of
+other tools [48], [49], [50].
+VI. R ELATED WORK
+Static race analysis is a promising alternative to dynamic
+techniques, which restrict analysis to the schedule chosen
+by a (possibly controlled) scheduler, providing limited cover-
+age [51]. Warlock [52] and LockLint [53] are notable static
+race analyzers. In comparison to W HOOP , these tools rely
+heavily on user annotations. Most related to our lockset
+analysis are the static lockset analyzers RELAY [21] and
+Locksmith [20]. Both tools, though, have several limitations.
+RELAY found 5022 warnings when analyzing the Linux
+kernel, with only 25 of them being true data races. To tackle
+this issue, RELAY employs unsound post-analysis ﬁlters and,
+hence, can also ﬁlter out real bugs. Locksmith was successfully
+applied in several small Pthreads applications and 7 medium-
+sized Linux device drivers, but the authors reported that the
+tool was unable to run on several large programs, hinting at its
+limited scalability. W HOOP aims to achieve scalability andpre-
+cision: the ﬁrst via novel symbolic pairwise lockset analysis,
+and the second by accelerating C ORRAL , an industrial-strength
+precise bug-ﬁnder.
+Choi et al. [54] combine static analysis and runtime access
+caching to speed up dynamic race detection. Kahlon et al. [48]
+use a divide-and-conquer algorithm that partitions all pointers
+of a program that do not alias in disjoint sets to achieve
+scalability; more recently, they used abstract interpretation to
+achieve a sound partial-order reduction on the set of thread
+interleavings and statically reduce the number of false race
+warnings [49]. Das et al. [50] employ inter-procedural alias
+analysis and veriﬁable user annotations to split programs intodisjoint sections, based on non-communicating accesses of
+shared data, and eliminate redundant checks during dynamic
+race detection. W HOOP uses symbolic lockset analysis, which
+involves generating veriﬁcation conditions and discharging
+them to a theorem prover, and then employs C ORRAL to ﬁlter
+out false races.
+Our pairwise approach to analyzing driver entry points, em-
+ploying abstraction to model additional threads, was inspired
+by the two thread reduction used by the GPUVerify tool in the
+analysis of data-parallel OpenCL and CUDA kernels [55], [39].
+The idea of pairwise analysis of components in a concurrent
+system has been broadly applied, notably in model checking
+of cache coherence protocols [56].
+VII. C ONCLUSIONS
+In this paper we presented W HOOP , a new automated
+approach for detecting all possible data races in device drivers.
+Compared to traditional data race detection techniques that are
+based on happens-before and typically attempt to explore as
+many thread interleavings as possible (and thus face code cov-
+erage and scalability issues), W HOOP uses over-approximation
+and symbolic pairwise lockset analysis, which scales well.
+Exploiting the race-freedom guarantees provided by W HOOP ,
+we showed that we can achieve a sound partial-order reduction
+that can signiﬁcantly accelerate C ORRAL , a state-of-the-art
+concurrency bug-ﬁnder.
+ACKNOWLEDGMENTS
+We thank Akash Lal for his input and for helping us
+with C ORRAL issues, and Montgomery Carter for modeling
+Linux locks. Thanks to Jeroen Ketema, Tyler Sorensen, Anton
+Burtsev, and Charlie Jacobsen for discussions and feedback in
+various stages of this work. This work is part of the project
+“Automatic Synthesis of High-Assurance Device Drivers” and
+was generously funded by a gift from Intel Corporation; it was
+also supported in part by NSF CCF 1346756. A sketch of the
+WHOOP approach was presented at the 2014 Imperial College
+Computing Student Workshop [57].REFERENCES
+[1] J. Corbet, A. Rubini, and G. Kroah-Hartman, Linux device drivers
+(Third Edition) . O’Reilly, 2005.
+[2] R. Yavatkar, “Era of SoCs,” Presentation at the Intel Workshop on
+Device Driver Reliability, Modelling and Synthesis, 2012.
+[3] A. Chou, J. Yang, B. Chelf, S. Hallem, and D. Engler, “An empirical
+study of operating systems errors,” in Proceedings of the 18th ACM
+Symposium on Operating Systems Principles , 2001, pp. 73–88.
+[4] M. M. Swift, B. N. Bershad, and H. M. Levy, “Improving the reliability
+of commodity operating systems,” in Proceedings of the 19th ACM
+Symposium on Operating Systems Principles , 2003, pp. 207–222.
+[5] L. Ryzhyk, P. Chubb, I. Kuz, and G. Heiser, “Dingo: Taming device
+drivers,” in Proceedings of the 2009 EuroSys Conference , 2009, pp.
+275–288.
+[6] ISO/IEC, “Programming languages - C,” International Standard, 2011.
+[7] T. Ball, E. Bounimova, B. Cook, V . Levin, J. Lichtenberg, C. McGarvey,
+B. Ondrusek, S. K. Rajamani, and A. Ustuner, “Thorough static analysis
+of device drivers,” in Proceedings of the 2006 EuroSys Conference ,
+2006, pp. 73–85.
+[8] E. Clarke, D. Kroening, N. Sharygina, and K. Yorav, “Predicate ab-
+straction of ANSI-C programs using SAT,” Formal Methods in System
+Design , vol. 25, no. 2-3, pp. 105–127, 2004.
+[9] D. Engler, B. Chelf, A. Chou, and S. Hallem, “Checking system
+rules using system-speciﬁc, programmer-written compiler extensions,”
+inProceedings of the 4th USENIX Symposium on Operating System
+Design and Implementation , 2000.
+[10] T. A. Henzinger, G. C. Necula, R. Jhala, G. Sutre, R. Majumdar, and
+W. Weimer, “Temporal-safety proofs for systems code,” in Proceedings
+of the 14th International Conference on Computer Aided Veriﬁcation ,
+2002, pp. 526–538.
+[11] B. Cook, A. Podelski, and A. Rybalchenko, “Termination proofs for
+systems code,” in Proceedings of the ACM SIGPLAN 2006 Conference
+on Programming Language Design and Implementation , 2006, pp. 415–
+426.
+[12] V . Kuznetsov, V . Chipounov, and G. Candea, “Testing closed-source
+binary device drivers with DDT,” in Proceedings of the 2010 USENIX
+Annual Technical Conference , 2010.
+[13] M. J. Renzelmann, A. Kadav, and M. M. Swift, “SymDrive: Testing
+drivers without devices,” in Proceedings of the 10th USENIX Sympo-
+sium on Operating Systems Design and Implementation , 2012.
+[14] A. Lal, S. Qadeer, and S. K. Lahiri, “A solver for reachability modulo
+theories,” in Proceedings of the 24th International Conference on
+Computer Aided Veriﬁcation , 2012, pp. 427–443.
+[15] J. Corbet, “Finding kernel problems automatically,” https://lwn.net/
+Articles/87538/, 2004.
+[16] Y . Padioleau, J. Lawall, R. R. Hansen, and G. Muller, “Documenting
+and automating collateral evolutions in Linux device drivers,” in Pro-
+ceedings of the 2008 EuroSys Conference , 2008, pp. 247–260.
+[17] J. Corbet, “The kernel lock validator,” https://lwn.net/Articles/185666/,
+2006.
+[18] D. R. Engler and K. Ashcraft, “RacerX: effective, static detection of race
+conditions and deadlocks,” in Proceedings of the 19th ACM Symposium
+on Operating Systems Principles , 2003, pp. 237–252.
+[19] S. Qadeer and D. Wu, “KISS: Keep it simple and sequential,” in
+Proceedings of the 2004 ACM SIGPLAN Conference on Programming
+Language Design and Implementation , 2004, pp. 14–24.
+[20] P. Pratikakis, J. S. Foster, and M. Hicks, “LOCKSMITH: Context-
+sensitive correlation analysis for race detection,” in Proceedings of the
+2006 ACM SIGPLAN Conference on Programming Language Design
+and Implementation , 2006, pp. 320–331.
+[21] J. W. V oung, R. Jhala, and S. Lerner, “RELAY: Static race detection on
+millions of lines of code,” in Proceedings of the the 6th Joint Meeting of
+the European Software Engineering Conference and the ACM SIGSOFT
+Symposium on The Foundations of Software Engineering , 2007, pp.
+205–214.
+[22] H. Sutter and J. Larus, “Software and the concurrency revolution,”
+Queue , vol. 3, no. 7, pp. 54–62, 2005.[23] S. Savage, M. Burrows, G. Nelson, P. Sobalvarro, and T. Anderson,
+“Eraser: A dynamic data race detector for multithreaded programs,”
+ACM Transactions on Computer Systems , vol. 15, no. 4, pp. 391–411,
+1997.
+[24] L. Lamport, “Time, clocks, and the ordering of events in a distributed
+system,” Communications of the ACM , vol. 21, no. 7, pp. 558–565,
+1978.
+[25] E. Pozniansky and A. Schuster, “Efﬁcient on-the-ﬂy data race detection
+in multithreaded C++ programs,” in Proceedings of the 9th ACM SIG-
+PLAN Symposium on Principles and Practice of Parallel Programming ,
+2003, pp. 179–190.
+[26] R. O’Callahan and J.-D. Choi, “Hybrid dynamic data race detection,” in
+Proceedings of the 9th ACM SIGPLAN Symposium on Principles and
+Practice of Parallel Programming , 2003, pp. 167–178.
+[27] T. Elmas, S. Qadeer, and S. Tasiran, “Goldilocks: A race and
+transaction-aware Java runtime,” in Proceedings of the 2007 ACM
+SIGPLAN Conference on Programming Language Design and Imple-
+mentation , 2007, pp. 245–255.
+[28] C. Flanagan and S. N. Freund, “FastTrack: Efﬁcient and precise
+dynamic race detection,” in Proceedings of the 2009 ACM SIGPLAN
+Conference on Programming Language Design and Implementation ,
+2009, pp. 121–133.
+[29] M. Barnett, B.-Y . E. Chang, R. DeLine, B. Jacobs, and K. R. M. Leino,
+“Boogie: A modular reusable veriﬁer for object-oriented programs,” in
+Proceedings of the 4th International Symposium on Formal methods for
+Components and Objects , 2006, pp. 364–387.
+[30] M. Barnett and K. R. M. Leino, “Weakest-precondition of unstructured
+programs,” in Proceedings of the 2005 ACM SIGPLAN-SIGSOFT
+Workshop on Program Analysis For Software Tools and Engineering ,
+2005, pp. 82–87.
+[31] C. Lattner and V . Adve, “LLVM: A compilation framework for lifelong
+program analysis & transformation,” in Proceedings of the 2nd IEEE /
+ACM International Symposium on Code Generation and Optimization ,
+2004, pp. 75–86.
+[32] “The LLVM compiler infrastructure,” http://llvm.org.
+[33] “Clang: A C language family frontend for LLVM,” http://clang.llvm.org.
+[34] Z. Rakamari ´c and M. Emmi, “SMACK: Decoupling source language
+details from veriﬁer implementations,” in Proceedings of the 26th
+International Conference on Computer Aided Veriﬁcation , 2014, pp.
+106–113.
+[35] “SMACK: A bounded software veriﬁer for C programs,” https://github.
+com/smackers/smack.
+[36] R. DeLine and K. R. M. Leino, “BoogiePL: A typed procedural
+language for checking object-oriented programs,” Microsoft Research,
+Tech. Rep., 2005.
+[37] Z. Rakamari ´c and A. J. Hu, “A scalable memory model for low-
+level code,” in Proceedings of the 10th International Conference on
+Veriﬁcation, Model Checking, and Abstract Interpretation , 2009, pp.
+290–304.
+[38] L. De Moura and N. Bjørner, “Z3: An efﬁcient SMT solver,” in Pro-
+ceedings of the 14th International Conference on Tools and Algorithms
+for the Construction and Analysis of Systems , 2008, pp. 337–340.
+[39] E. Bardsley, A. Betts, N. Chong, P. Collingbourne, P. Deligiannis,
+A. F. Donaldson, J. Ketema, D. Liew, and S. Qadeer, “Engineering
+a static veriﬁcation tool for GPU kernels,” in Proceedings of the 26th
+International Conference on Computer Aided Veriﬁcation , 2014, pp.
+226–242.
+[40] C. Flanagan and K. R. M. Leino, “Houdini, an annotation assistant for
+ESC/Java,” in Proceedings of the International Symposium of Formal
+Methods for Increasing Software Productivity , 2001, pp. 500–517.
+[41] B. Livshits, M. Sridharan, Y . Smaragdakis, O. Lhot ´ak, J. N. Amaral,
+B. E. Chang, S. Z. Guyer, U. P. Khedker, A. Møller, and D. Vardoulakis,
+“In defense of soundiness: a manifesto,” Communications of the ACM ,
+vol. 58, no. 2, pp. 44–46, 2015.
+[42] A. Lal and S. Qadeer, “Powering the Static Driver Veriﬁer using Corral,”
+inProceedings of the 22nd ACM SIGSOFT International Symposium
+on Foundations of Software Engineering , 2014, pp. 202–212.
+[43] M. Emmi, S. Qadeer, and Z. Rakamari ´c, “Delay-bounded scheduling,”
+inProceedings of the 38th ACM SIGPLAN-SIGACT Symposium on
+Principles of Programming Languages , 2011, pp. 411–422.[44] S. K. Lahiri, S. Qadeer, and Z. Rakamari ´c, “Static and precise de-
+tection of concurrency errors in systems code using SMT solvers,” in
+Proceedings of the 21st International Conference on Computer Aided
+Veriﬁcation , 2009, pp. 509–524.
+[45] A. Lal and T. W. Reps, “Reducing concurrent analysis under a context
+bound to sequential analysis,” in Proceedings of the 20th International
+Conference on Computer Aided Veriﬁcation , 2008, pp. 37–51.
+[46] J. Erickson, M. Musuvathi, S. Burckhardt, and K. Olynyk, “Effective
+data-race detection for the kernel,” in Proceedings of the 9th USENIX
+Conference on Operating Systems Design and Implementation , 2010,
+pp. 1–16.
+[47] P. Godefroid, Partial-Order Methods for the Veriﬁcation of Concurrent
+Systems - An Approach to the State-Explosion Problem , ser. Lecture
+Notes in Computer Science. Springer, 1996, vol. 1032.
+[48] V . Kahlon, Y . Yang, S. Sankaranarayanan, and A. Gupta, “Fast and accu-
+rate static data-race detection for concurrent programs,” in Proceedings
+of the 19th International Conference on Computer Aided Veriﬁcation ,
+2007, pp. 226–239.
+[49] V . Kahlon, S. Sankaranarayanan, and A. Gupta, “Semantic reduction of
+thread interleavings in concurrent programs,” in Proceedings of the 15th
+International Conference on Tools and Algorithms for the Construction
+and Analysis of Systems , 2009, pp. 124–138.
+[50] M. Das, G. Southern, and J. Renau, “Section based program analysis to
+reduce overhead of detecting unsynchronized thread communication,”
+inProceedings of the 20th ACM SIGPLAN Symposium on Principles
+and Practice of Parallel Programming , 2015, pp. 283–284.[51] M. Musuvathi, S. Qadeer, T. Ball, G. Basler, P. A. Nainar, and
+I. Neamtiu, “Finding and reproducing heisenbugs in concurrent pro-
+grams,” in Proceedings of the 8th USENIX Symposium on Operating
+Systems Design and Implementation , 2008, pp. 267–280.
+[52] N. Sterling, “WARLOCK — A static data race analysis tool,” in
+Proceedings of the Usenix Winter 1993 Technical Conference , 1993,
+pp. 97–106.
+[53] Oracle Corporation, “Analyzing program performance with Sun Work-
+Shop, Chapter 5: Lock analysis tool,” http://docs.oracle.com/cd/
+E19059-01/wrkshp50/805-4947/6j4m8jrnd/index.html, 2010.
+[54] J.-D. Choi, K. Lee, A. Loginov, R. O’Callahan, V . Sarkar, and M. Srid-
+haran, “Efﬁcient and precise datarace detection for multithreaded object-
+oriented programs,” in Proceedings of the 2002 ACM SIGPLAN Con-
+ference on Programming Language Design and Implementation , 2002,
+pp. 258–269.
+[55] A. Betts, N. Chong, A. F. Donaldson, J. Ketema, S. Qadeer,
+P. Thomson, and J. Wickerson, “The design and implementation of
+a veriﬁcation technique for GPU kernels,” ACM Trans. Program.
+Lang. Syst. , vol. 37, no. 3, p. 10, 2015. [Online]. Available:
+http://doi.acm.org/10.1145/2743017
+[56] K. L. McMillan, “Veriﬁcation of inﬁnite state systems by compositional
+model checking,” in Proceedings of the 10th IFIP WG 10.5 Advanced
+Research Working Conference on Correct Hardware Design and Veri-
+ﬁcation Methods , 1999, pp. 219–237.
+[57] P. Deligiannis and A. F. Donaldson, “Automatic veriﬁcation of data
+race freedom in device drivers,” in Imperial College Computing Student
+Workshop , 2014, pp. 36–39.

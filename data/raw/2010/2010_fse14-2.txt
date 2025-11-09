@@ -1,0 +1,1718 @@
+Grail: Context-Aware Fixing of Concurrency Bugs
+Peng Liu1
+lpxz@ust.hkOmer Tripp2
+otripp@us.ibm.comCharles Zhang3
+charlesz@cse.ust.hk
+1State Key Laboratory of Software Engineering2IBM Research3HKUST
+Wuhan University
+China United States China
+ABSTRACT
+Writing ecient synchronization for multithreaded programs
+is notoriously hard. The resulting code often contains subtle
+concurrency bugs. Even worse, many bug xes introduce
+new bugs. A classic example, seen widely in practice, is dead-
+locks resulting from xing of an atomicity violation. These
+complexities have motivated the development of automated
+xing techniques. Current techniques generate xes that
+are typically conservative, giving up on available parallelism.
+Moreover, some of the techniques cannot guarantee the cor-
+rectness of a x, and may introduce deadlocks similarly to
+manual x, whereas techniques that ensure correctness do so
+at the expense of even greater performance loss.
+We present Grail, a novel xing algorithm that departs
+from previous techniques by simultaneously providing both
+correctness and optimality guarantees. Grail synthesizes bug-
+free yet optimal lock-based synchronization. To achieve this,
+Grail builds an analysis model of the buggy code that is
+both contextual , distinguishing dierent aliasing contexts
+to ensure eciency, and global , accounting for the entire
+synchronization behavior of the involved threads to ensure
+correctness. Evaluation of Grail on 12 bugs from popular
+codebases conrms its practical advantages, especially com-
+pared with existing techniques: Grail patches are, in general,
+40% more ecient than the patches produced by other
+techniques, and incur only 2% overhead.
+Categories and Subject Descriptors
+D.1.3 [ Programming Techniques ]: Concurrent Program-
+ming
+General Terms
+Algorithms, Reliability, Performance
+Keywords
+Context-aware xing, concurrency bugs
+This research is supported by RGC GRF grant RGC621912.
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for proﬁt or commercial advantage and that copies
+bear this notice and the full citation on the ﬁrst page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc
+permission and/or a fee.
+FSE’14 , November 16–22, 2014, Hong Kong, China
+Copyright 2014 ACM 978-1-4503-3056-5/14/11 ...$15.00.1. INTRODUCTION
+Concurrency bugs are elusive. Not only are they hard
+to reproduce and understand, but also xing a bug often
+introduces new bugs. A typical example is that xing an
+atomicity violation requires insertion of additional synchro-
+nization, which leads to new deadlocks. A recent study
+of bug xes in large software systems such as Linux and
+FreeBSD [ 43] reports that 39% of the manual xes commit-
+ted by programmers are incorrect, and 16.4% of the incorrect
+xes introduce deadlocks. These statistics clearly conrm
+the hardness of manually xing concurrency bugs, marking
+the need for automation.
+Several dierent approaches have been proposed recently
+to automatically x concurrency bugs [ 11,12,19,38]. These
+address concurrency problems resulting from inadequate syn-
+chronization, including atomicity violations [ 11,20], dead-
+locks [ 38], and data races [ 33]. Roughly speaking, in all
+of these cases the x amounts to inserting additional syn-
+chronization to inhibit bad interleaving scenarios. The goal,
+naturally, is to insert \tight" synchronization, which prevents
+all bad executions (correctness) while permitting most of the
+good executions (performance).
+Existing Approaches. To illustrate the behavior and
+limitations of existing techniques, we refer to a real-world
+concurrency bug reported on the NioTcpServer class in the
+Apache Mina framework.1The buggy code is shown in
+Figure 1a. Concurrent execution of methods bind and un-
+bindAll can result in a ConcurrentModificationException
+ifbind adds an element to the addresses collection while un-
+bindAll iterates over the contents of addresses . The bug is
+likely due to the wrong assumption that a SynchronizedSet
+instance guarantees atomic iteration over its elements. (The
+bug report is available as bug 869 in JIRA issue tracker.)
+Existing xing techniques are context oblivious . They
+focus solely on the statements involved in the bug, without
+accounting for the context , i.e. the aliasing conguration of
+shared variables and locks that leads to the manifestation of
+the bug. We illustrate the consequences of context-oblivious
+xing by reference to the two most recent and advanced
+xing techniques.
+The rst, AFix [ 11], disallows concurrent execution of the
+statements involved in the bug in all contexts, including
+contexts that do not expose the bug. The AFix patch, shown
+in Figure 1b, essentially encloses accesses to addresses inside
+an atomic region guarded by the fixL lock, which serializes
+evaluation of the statements even if the threads read dierent
+addresses collections and there is no threat of atomicity
+1http://mina.apache.org In method bind(localAddr):
+       synchronized (
+this
+) {
+A:      ...
+B:     
+addresses
+.add(localAddr);
+       }
+  
+       In method unbindAll():  
+C:    for (addr: 
+addresses
+){ 
+        synchronized (
+this
+) {
+D:        strategy.unbind(addr);
+         }
+        }
+  
+addresses 
+= Collections.synchronizedSet(new HashSet());(a) Original Mina code with latent atomicity violation
+       bind(localAddr):
+       synchronized (
+this
+) {
+A:      ...
+         
+synchronized(fixL)
+B:      {
+addresses
+.add(localAddr);}
+       }
+  
+     unbindAll():
+ 
+       
+synchronized(fixL){
+C:    for (addr: 
+addresses
+){ 
+        synchronized (
+this
+) {
+D:        strategy.unbind(addr);
+         }
+        }
+      }
+  
+static Object 
+fixL 
+= new Object(); (b)Mina code following the AFix x
+ bind(localAddr):
+ 
+ 
+synchronized(deadlockL){ 
+       synchronized (
+this
+) {
+A:      ...
+         
+synchronized(fixL)
+B:      {
+addresses
+.add(localAddr);}
+       }
+  }
+ unbindAll():
+ 
+synchronized(deadlockL){
+     
+synchronized(fixL){
+C:    for (addr: 
+addresses
+){ 
+        synchronized (
+this
+) {
+D:        strategy.unbind(addr);
+         }
+        }
+      }
+  }
+static Object 
+fixL 
+= new Object();
+static Object 
+deadlockL 
+= new Object();
+(c)Mina code following the Axisx
+bind(localAddr):
+synchronized(contextL(addresses, 
+this)){ 
+synchronized ( this) {
+A:      ...
+synchronized(addresses)
+B:      { addresses .add(localAddr);}
+}
+}unbindAll():
+synchronized(contextL(addresses, 
+this)){
+synchronized(addresses){
+C:    for (addr: addresses ){ 
+synchronized ( this) {
+D:        strategy.unbind(addr);
+}
+}
+}
+}contextL(addresses,this)
+{  return (hash(addresses) +"&&"+hash(this)).intern();} (d)Mina code following the Grail x
+Figure 1: Motivating example: buggy code from the Apache Mina TcpNioServer class (a) and xed versions
+of the code (b)-(d)
+violation. Moreover, AFix cannot guarantee a deadlock-free
+x, and indeed in this case a deadlock is introduced between
+the x and the existing synchronization over this. The
+second approach, Axis [ 19], is even more conservative. It
+ensures deadlock freedom2by turning the bug xing into
+an iterative process: In each round of this process, deadlocks
+introduced during the previous round are eliminated. The
+resulting code is given in Figure 1c. The temporary deadlock
+due to the insertion of fixL is eliminated thanks to a second
+lock, deadlockL , which essentially serializes the executions
+ofbind and unbindAll , completely sacricing any available
+parallelism.
+Our Approach. The insight underlying our approach
+is that quality xes for concurrency bugs must account not
+only for the buggy statements themselves, but also for the
+execution context, so that mutual exclusion is enforced only
+when absolutely necessary. It is nontrivial to realize such
+context-aware bug xing. For example, if we merely introduce
+the lock on addresses to x the atomicity violation, then a
+deadlock may occur between the x and the existing this
+lock. These challenges call for a principled algorithmic frame-
+work to realize context-aware bug xing. We have designed
+such a framework, based on the theory of Petri net, which
+creates an analysis model that is simultaneously contextual ,
+distinguishing between dierent runtime congurations to
+pinpoint the exact conditions under which the bug manifests
+for optimal performance , and global , accounting for the com-
+plete synchronization behavior of threads for correctness , to
+guarantee that no new deadlocks are introduced.
+Compared to both AFix and Axis, Grail is strictly better.
+Any bug that AFix or Axis are able to remedy is also handled
+byGrail. In addition, Grail guarantees deadlock freedom,
+which AFix cannot guarantee as we have shown above. The
+dierence from Axis, which also guarantees deadlock freedom,
+is that Grail guarantees at least the same concurrency level
+if not higher. Indeed, Grail guarantees an optimal x under
+the assumptions that (i) the bug involves two threads and
+2Throughout this paper, deadlock freedom does not mean
+the whole-program deadlock freedom, instead, it means that
+the xes do not introduce new deadlocks.(ii) the x is in the form of mutual exclusion. Both AFix
+and Axis are governed by these assumptions, and none of
+these techniques ensures optimality neither in theory nor in
+practice.
+As an illustration, we refer the reader to Figure 1d, which
+presents the x produced by our approach. We defer technical
+detail to Section 2, and instead focus on the intuition for
+now. A thread th1executing method bind would acquire a
+lock on addresses , after it has already acquired a lock on
+this. The opposite is true of a thread th2transitioning into
+the program point with label DinunbindAll . A deadlock
+would thus arise if, and only if,
+this th1= this th2&& addresses th1= addresses th2
+(Note that the symbol \=" denotes equality in terms of mem-
+ory addresses, and not values.) Therefore, the minimal
+synchronization | i.e. the most permissive synchronization
+| that can be synthesized to simultaneously (i) x the orig-
+inal bug and (ii) ensure deadlock freedom is to (i) govern
+transition into the code blocks accessing addresses with an
+instance lock on addresses , which coordinates threads only
+when they access the same addresses instance, and (ii) apply
+mutual exclusion to avoid the deadlock i two concurrent
+threads have both this and addresses aliased.
+Grail enforces this solution by creating synchronization
+objects of type string that capture the needed conditions, as
+the implementation of contextL in Figure 1d demonstrates.
+This factory method computes a hash value for both ad-
+dresses and this, and concatentates these values. While
+hash values are not guaranteed to be unique, we rely on Sys-
+tem.identityHashCode (abbreviated as hash), which suces
+in practice. Note, importantly, the use of the intern method
+on the resulting string object ensures that if two synchro-
+nization objects have the same value, then they also point to
+the same memory. Otherwise strings representing the same
+context do not necessarily enforce mutual exclusion.
+This solution cannot be gleaned by inspection of the buggy
+statements alone. It requires contextual reasoning, which
+accounts for the conditions under which the above bug man-
+ifests, as well as global reasoning, which accounts for the
+locks acquired by threads and the constraints they cast onconcurrency in every possible concurrent execution of bind
+and unbindAll . Our approach is born out of this insight,
+and implements this type of analysis model to simultane-
+ously achieve both correctness and eciency. A comparative
+study of our approach with two state-of-the-art approaches,
+AFix [11] and Axis [19], on 12 bugs from 8 popular Java ap-
+plications (including e.g. Tomcat andDerby ) indicates that
+this mode of reasoning is essential, leading | in most cases
+| to a performance improvement of over 40% compared to
+the competing approaches.
+This paper makes the following principal contributions:
+1.Context-aware bug xing: We introduce a novel ap-
+proach for xing concurrency bugs, which factors into
+the x precise modeling of contextual information, yield-
+ing a x that is both optimal and provably correct.
+2.Formalization and proofs: We provide full formaliza-
+tion of our approach, including proofs, highlighting
+interesting aspects of our modeling.
+3.Implementation and evaluation: We have implemented
+a prototype system, Grail, that realizes our approach,
+and conducted experiments on 12 conrmed bugs in
+popular real-world applications to evaluate the qual-
+ity of the xes. The patches generated by Grail are
+almost all signicantly more ecient than competing
+approaches while also being provably correct.
+2. TECHNICAL OVERVIEW
+In this section, we dene the scope of our approach, walk
+the reader through a high-level description of the Grail work-
+ow, and conclude by highlighting points of interest and
+limitations of our approach. When describing the workow,
+we start with a simplied version, and later explain how we
+deal with challenges that we initially glossed over.
+2.1 Scope
+Similarly to past studies [ 6,12,19], our work addresses
+concurrency bugs involving two threads. According to a
+recent study [ 21], the vast majority (96%) of real-world
+concurrency bugs fall into this class. We concentrate on (any
+combination of) the following three bug categories: (i) data
+races [ 16,33,18,34], (ii) atomicity violations [ 29,36,20] and
+(iii) deadlocks [ 13,1]. These are described in more detail,
+as well as illustrated, in an accompanying technical report
+(TR).3(See Figure 2 there.)
+We assume that patches are in the form of additional
+mutual-exclusion-based synchronization. We preclude other
+transformations, such as code reordering, from consideration.
+In this setting, correctness translates into avoiding from
+introducing new deadlocks between pairs of threads, and
+optimality translates into introducing the least amount of
+synchronization needed to eliminate the reported bug.
+2.2 Simpliﬁed Flow
+We assume as input a multithreaded program along with
+bug reports given in terms of the involved code statements.
+(See Section 3.) For the given bugs, the rst step of our
+technique is to model the lexical scopes enclosing the buggy
+statements as a \concurrent control-ow graph". We soon ex-
+plain how the graph is built, but rst we start from the scopes
+it represents. These are essentially the methods containing
+the buggy statements along with their transitive caller and
+3https://sites.google.com/site/grailfixing/callee methods. This selected fragment of the entire program
+suces for correct xing of the bug, since all relevant lock
+acquisitions and releases are contained within this subpro-
+gram. By reasoning about them, we avoid from introducing
+new deadlocks between pairs of threads (Theorem 5.2). Ac-
+cording to our experience, the resulting program fragment is
+relatively small and constrained.
+The \ow graph" we mentioned earlier is, more accurately,
+a Petri net [ 38]. Stated simply, a Petri net is a graph con-
+taining two types of nodes: places , which denote statements;
+and transitions , which denote control ow between state-
+ments. A Petri net is thus similar to a control ow graph,
+except that control-ow edges are represented as transition
+nodes. In addition, the Petri net has a mathematical repre-
+sentation that permits formal modeling and reasoning about
+x synthesis. To simulate thread execution, the Petri net
+maintains a (control-ow) token for each of the threads. The
+token is associated with a place and denotes the current
+statement a thread is executing. The state of a Petri net is
+tantamount to the token conguration, capturing a snapshot
+during concurrent execution of the respective threads.
+Reasoning about multithreaded execution under the Petri
+net model amounts to combining the control-ow graphs of
+nitely many threads into a unied graph, which is essentially
+the product of the control-ow graphs. For our needs, it
+suces to combine the graphs of two threads, such that
+every concurrent execution, as modeled by the Petri net
+state, corresponds to the product of two statements that are
+being executed by the threads. In the resulting graph, we
+distinguish between three kinds of concurrent executions:
+Infeasible execution refers to the concurrent execution
+(of a pair of statements) that cannot arise at runtime
+due to existing synchronization code. As an example,
+the control locations with labels Aand Din Figure
+1a cannot be visited simultaneously by two parallel
+threads when their this references are aliased.
+Buggy execution is the concurrent execution that arises
+during a buggy run, thereby exposing the bug. In our
+example in Figure 1a, the buggy pairs include ( B,C),
+(B,D) and ( A,C). (B,C) and ( B,D) directly correspond to
+the reported bug involving addresses and expose the
+bug if the addresses variables accessed by threads are
+aliased. As for ( A,C), the reason why this pair is classi-
+ed as buggy is more subtle, involving its successors:
+These are ( B,C), which is buggy if the addresses refer-
+ences are aliased, and ( A,D), which is infeasible if the
+this references are aliased, and so ( A,C) is buggy, if
+both addresses and this are aliased, by the fact that
+it can only lead to a buggy execution.
+Safe executions are all the remaining executions. That
+is, the set of all possible executions excluding the buggy
+and infeasible executions.
+In the above, we reason about the buggy executions and
+the associated contexts (aliasing congurations) in which the
+bugs manifest. Reasoning about the buggy executions that
+lead to an input bug, such as ( B,C), is relatively easy as they
+can be determined by analyzing the bug reports. However,
+reasoning about buggy executions that result from xing of
+the input bug, such as ( A,C), is less trivial. Based on the
+Petri net representation, we propose the automatic reasoning
+that is both contextual , systematically exploring and distin-
+guishing aliasing congurations, and global , accounting for all
+synchronization concerns arising due to a concurrency bug.This conveys all the needed information to precisely decide
+(i) how to avoid buggy executions in dierent contexts and
+(ii) how to ensure that the threads are not deadlocked in any
+context.
+At the technical level, we achieve an optimal x by encod-
+ing the safe and buggy executions as vectors and leveraging
+the theoretical framework of Nazeem et al. [ 27] for vector
+separation. As we assert in Theorem 5.1 and prove in the
+TR, the resulting vectors are linearly separable, and so a
+solution is guaranteed. Besides, our x encodes the contexts
+so that it prohibits the buggy executions only in the rele-
+vant contexts. A comprehensive explanation is provided in
+Section 3, where we establish that our technique eliminates
+the original bug while guaranteeing deadlock freedom via
+ne-grained synchronization that is provably optimal.
+2.3 Challenges
+Our description above hides certain sources of complexity,
+and in particular, the question of how to synthesize an opti-
+mal bug x given approximate and incomplete knowledge on
+aliasing between lock references. For example, we mention
+above that AandDare both governed by the same this lock,
+and thus the concurrent execution ( A,D) is infeasible. This
+statement is clearly untrue if the this references in bind and
+unbindAll are not aliased.
+In general, the problem of computing a precise aliasing
+solution is undecidable [ 31], which appears to stand in our
+way to a precise x. Our strategy for addressing this inherent
+diculty stems from the observation that in practice, due to
+the sensitive role of synchronization, a lock variable typically
+refers to the same lock object throughout the entire execution
+of the guarded lock region (i.e., it remains unchanged from
+the entry to the exit). Therefore, aliasing between the lock
+references accessed by two threads is, in general, immutable
+during their execution inside lock regions.
+Guided by this assumption, we have implemented a divide-
+and-conquer approach, whereby (i) the baseline model is
+divided into multiple models, each corresponding to a specic
+aliasing conguration over the locks, (ii) the ow described
+above is carried out for each of these models fully precisely,
+and (iii) the resulting xes are merged. Roughly speaking,
+the merging step fuses together two xes if they both refer to
+the same set of buggy executions (i.e., statement pairs). The
+merge operation is equivalence preserving, yielding a bug
+avoidance condition that is the disjunction of the merged
+conditions.
+2.4 Points of Interest and Limitations
+Our technique features several pleasing properties. First,
+as we prove formally in Lemma 4.1, our technique exploits
+a small-model property, whereby a x that is shown cor-
+rect with respect to concurrent executions involving only a
+bounded number of threads remains correct in the presence
+of any number of threads. The intuition underlying this
+property is that every buggy execution has a corresponding
+\minimal" buggy execution, where minimality refers to the
+number of threads. This number can be upper bounded.
+A second property that is worthy of mention is that unlike
+previous approaches that ensure correct xing [ 19], our tech-
+nique is non-iterative. A synchronization solution that both
+eliminates the original bug and guarantees deadlock freedom
+is computed at once, without the need to iteratively revisit
+and correct the solution by inserting more locks. For thecode in Figure 1a, our analysis simultaneously captures both
+the missing synchronization in accesses to addresses and
+the deadlock that would arise once synchronization around
+addresses is introduced, and addresses these concerns in a
+single algorithmic step.
+We mention above the simplifying assumption of our ap-
+proach, i.e., the aliasing between the lock references is im-
+mutable during the thread executions inside the lock regions.
+Our ability to guarantee correct xing leans on this assump-
+tion, and so this is a clear limitation of our approach, which
+restricts its applicability. However, as we conrmed for all
+the benchmarks in our experimental suite (see Section 6),
+this assumption appears to be of little practical consequence.
+Besides, we also default to context-oblivious xing if the
+context refers to the variables that are not accessible within
+the current method/block scope.
+Another limitation is that our approach does not apply
+to ad-hoc synchronization [ 41] and does not apply to x
+communication deadlocks [14].
+3. BASIC WORKFLOW
+The Grail algorithm accepts as input a program along with
+one or more concurrency bugs. A bug is specied as a tuple,
+which captures the involved statements and memory states.
+As an example, the tuple (s1:f;s2:f;s3:f)would describe
+an atomicity violation, such that two statements, s1and s2,
+that access eld fare interleaved by statement s3that also
+accesses f.
+First, we model the program as a Petri net , which
+is a well-studied modeling technique [ 6,38,19]. The Petri
+net model [ 38] is essentially a bipartite directed graph, as
+shown in Figure 2a, where a place (denoted as circle) models
+a statement, a transition between places (denoted as bar)
+models control ow between statements, and an arc con-
+nects a place and a transition. Specically, the Petri net in
+Figure 2a models the running example in Figure 1a. The
+Petri net representation resembles an interprocedural control
+ow graph (ICFG), except that it models control ow edges
+explicitly as transition nodes.
+As noted above, the Petri-net model we build represents
+only the relevant fragment of the program. We assume that
+synchronization is expressed as synchronized( : : :) {: : :}
+blocks. This means that all lock acquisitions and releases that
+arise during a buggy execution occur within transitive callers
+and callees of the methods enclosing the buggy statements.
+Therefore, modeling only the methods transitively calling,
+and called from, the buggy methods suces for the purpose of
+our analysis. Restricting the scope in this way is a signicant
+performance and scalability optimization, which enables Grail
+to handle bugs in large-scale real-world programs.
+Then, we encode the buggy executions in the Petri
+net. The Petri net model simulates thread execution using
+tokens . The token transition from a place to a successor place,
+e.g., from place Ato place Bin Figure 2a, represents an
+execution step by the corresponding thread. The snapshot of
+all tokens in the Petri net represents the concurrent execution
+state of all threads. Formally, we refer to the snapshot as a
+Petri net state , and denote it in (i) vector form, e.g., [1;0;1;0],
+where each entry records the number of tokens in a place
+(following the xed order ABCD ), or if the vector is binary,
+(ii) short form, e.g., [AC], which records only the places that
+contain a single token. Specically, the empty state contains
+zero tokens in each place, denoting the initial execution orthe nal execution. We use the terms thread ,statement and
+concurrent execution , and their Petri net counterparts, token ,
+place andstate, interchangeably.
+We discover all the buggy executions through context-
+aware analysis, which is specic to a unique execution con-
+text. Section 4 explains how we systematically model the
+contexts. For now, let us assume we already have a con-
+text, which fully resolves (i) the memory state conditions,
+i.e., the aliasing among shared elds (variables), and (ii) the
+synchronization state conditions, i.e., the aliasing among
+locks. More concretely, we assume the current context is
+addresses th1=addresses th2^this th1=this th2for our
+running example. Here, we assume that only two threads th1
+andth2 are running. Section 4 discusses thread modeling in
+more detail. Our context-aware analysis rst nds the buggy
+and infeasible executions, then the executions that would
+become buggy due to the xing.
+Buggy Executions. Given an atomicity violation, we auto-
+matically extract the buggy concurrent executions [ 35], and
+the memory state conditions associated with them such that
+the bug manifests. We refer to this condition as the manifest-
+ing condition . In our running example (Figure 1a), the buggy
+executions include [ BC] and [ BD], denoting that the atomic
+loop, which includes CandD, is interleaved by B. Besides,
+the manifesting condition is addresses th1=addresses th2,
+which holds in the current context under analysis. We also
+explain the automatic extraction of other types of bugs in
+the TR.
+Infeasible Executions. Some executions are infeasible as
+they violate the constraints imposed by the original locks.
+Given an execution context where lock aliasing is fully re-
+solved, Grail applies the lockset algorithm [ 26] to nd the
+infeasible execution. The pair of statements in it are guarded
+by aliased locks. For example, the concurrent execution [AD]
+in Figure 1a is infeasible in the current context because the
+this locks guarding AandDare aliased.
+Potential Buggy Executions. After the buggy executions
+are eliminated due to the bug xing, some safe executions may
+become buggy. We refer to such executions as potential buggy
+executions . In our running example (Figure 1a), after the
+buggy [BC]execution is eliminated, the concurrent execution
+[AC] may result in a deadlock. Given the buggy/infeasible
+executions, we automatically discover the potential buggy
+executions through xpoint computation over the state tran-
+sition graph (STG) [ 25]. Specically, the STG | as shown
+in Figure 2b | captures the transitions (edges) among all
+states (vertices). Each step in the computation nds new
+potential buggy states by applying Lemma 3.1.
+Lemma 3.1. A state is a potential buggy state i it does
+not have any safe child state in the state transition graph.
+Proof Sketch. For a state swith no safe child states,
+the child states are eventually eliminated by the x and
+become infeasible, leaving sunreachable to any state. This
+means the state scorresponds to a deadlock in the Petri
+net [25].
+Fixpoint Computation. The STG in Lemma 3.1 is con-
+structed by recursively exploring the child states. Assume
+the input set S1of buggy states in the STG. The rst iter-
+ation would yield a new set S2of buggy states. The next
+iteration would then treat S1[S2as the input set, etc.
+Starting from the initial state (empty state), a state transi-
+tions to another state (denoted by !) in two cases: (1) Anew token/thread enters the Petri net, e.g. [ A]![AC]; or
+(2) an existing token/thread moves to the next place, e.g.
+[AC]![BC]. The input buggy/infeasible states are used
+to avert state explosion: We stop exploring the children of a
+buggy/infeasible state. As an example, the buggy/infeasible
+state in Figure 2b does not have children. This optimization
+does not aect the correctness or performance of our xes as
+the states reachable only through the buggy/infeasible state
+will be rendered unreachable by xes that we eventually add.
+The xpoint computation always terminates with a solution
+(See our TR).
+The xpoint computation is complicated by branch and
+loop semantics. Given a branch structure, depending on the
+branch condition, a state smay follow the left branch to
+transition to child state sleftor the right branch to tran-
+sition to another child state sright. We refer to them as
+conditional transitions . Determining which branch is taken
+is undecidable statically, and so we conservatively assume
+the worst: A conditional transition leading to a buggy state
+always occurs. Formally, a state is discovered as buggy if (1)
+at least one conditional transition leads to a buggy/infeasible
+state, and (2) all transitions that are not conditional lead
+to buggy/infeasible states. In our example, the state [AC]
+in Figure 2b is buggy because one of its conditional transi-
+tions (dotted line) leads to an infeasible state [ AD], and the
+transition that is not conditional leads to the buggy state
+[BC].
+Last, we carry out the actual x synthesis. Having
+found the safe states Aand the buggy states F, and the
+conditions associated with them, we automatically synthesize
+the xes in two steps: (1) We nd the linear constraints
+separating the buggy state vectors from the safe state vectors,
+i.e. the constraints satised by the safe states but violated
+by the buggy states. (2) We enforce the linear constraints
+by producing xes.
+We reuse existing frameworks: For (1), separating two
+sets of points (vectors) with hyperplanes (linear constraints)
+in high-dimensional space is a well-studied problem in ge-
+ometry [ 27]. GivenFandA, we apply Mixed Integer Pro-
+gramming (see [ 27], equations 36-42 at page 11) to separate
+FfromA. This results in the minimum set of separating
+constraints. Constraints are in the form of linear inequality,
+lsb, where lis a column vector of non-negative integer
+weights and bis a non-negative integer. For example, the con-
+straint s(A)+s(c)1essentially states that the total number
+of tokens/threads in the places/statements AandCshould
+be at most 1. For (2), given the input linear constraints,
+we apply the Supervision Based on Place Invariants (SBPI )
+framework [ 38,19] to compute the Petri net additives that
+realize the constraints in the net. The additives are new
+control places connecting with some existing Petri net tran-
+sitions and blocking some token movement, which behave
+equivalently to new locks. We implement them as locks
+in the code, of which the locking operations are placed at
+the control ow edges modeled by the transitions to block
+certain thread executions. We insert the locking operations
+via instrumentation, similarly to existing approaches [ 38,19].
+More details appear in the TR.
+The locks computed above are, however, oblivious to the
+manifesting conditions. They always prohibit the concurrent
+execution [AC]in Figure 2b. We rene them so that they
+prohibit the concurrent execution [ AC] only when its mani-
+festing conditions are satised at runtime. In the example1 
+2
+34
+5
+6(lock this)
+(lock this)
+(unlock this) (unlock this)7(a) Petri net
+Empty State
+[A] [C]
+[B] AC [D]
+[BC] [AD]
+(addresses th1=
+addresses th2)(this th1=this th2) (b) State Transition Graph
+(STG)
+Empty State
+[A] [C]
+[B] [AC] [D]
+[BC] [AD]
+(addresses th1=
+addresses th2)(this th1≠
+this th2)
+[BD](c) Another STG
+ (d) Merging the States
+Figure 2: Our technique
+of Figure 1d, Grail achieves this ne-grained synchronization
+by creating a unique string object out of the arguments of
+lock(...) . We then use the built-in monitor of the string ob-
+ject for locking ( Unsafe.monitorEnter(string) ).4A more
+natural transformation is to enclose the buggy code in a syn-
+chronized block. Grail oers this option when the transfor-
+mation does not change the locking order, which is typically
+the case. We discuss other forms of optimizations in the TR.
+A point of interest is that we do not encode the inequality
+checking in the x, which is in fact safe. Informally, the
+inequality condition exposes the buggy executions that are
+infeasible in the equality condition. For example, the execu-
+tion [ BD] in Figure 2c is buggy in the inequality condition
+this th16=this th2, but is infeasible in the equality condition.
+Without checking the inequality, the x may exert the syn-
+chronization even in the equality condition, i.e., when the
+execution is infeasible. This does not aect the correctness.
+4. FULL ALGORITHM
+In this section, we address remaining challenges, including
+specically (i) modeling of unbounded concurrency and (ii)
+missing may-alias information.
+Bounded Thread Modeling. In general, only one token
+| representing a single thread | is created to execute a
+Petri net. To model concurrent execution of the same code
+by parallel threads, we create two tokens that move inside
+the same Petri net. Lemma 4.1 asserts that this form of
+bounded modeling suces to address all the \minimal" buggy
+concurrent executions, and thus also all concurrent executions
+in general.
+Lemma 4.1. For the bugs considered in Section 2.1, all
+buggy concurrent executions are eliminated if all the minimal
+buggy concurrent executions are eliminated.
+Proof Sketch. Given our declared scope, any buggy
+concurrent execution using three or more threads has a cor-
+responding minimal buggy execution involving two threads.
+The former execution is automatically eliminated by the
+constraints constructed to eliminate the minimal buggy exe-
+cution, e.g., s(B) +s(C)1, following the monotonicity of
+the lefthand functions (with non-negative coecient) of the
+constraints.
+4http://mishadoff.github.io/blog/
+java-magic-part-4-sun-dot-misc-dot-unsafe/Lock Aliasing. Computing the aliasing relation precisely
+is undecidable in general [ 31]. We rely on lock aliasing infor-
+mation to identify infeasible executions, and subsequently
+analyze potential buggy executions. As explained in Sec-
+tion 2.3, we place the assumption that the aliasing relation-
+ship between a pair of lock references does not change during
+the thread executions inside the guarded lock regions. We
+then iterate over all possible congurations of may-alias lock
+pairs while skipping invalid aliasing congurations, such as
+l1=l2&&l2=l3&&l16=l3.
+Splitting and Merging STGs. As dierent execution con-
+texts lead to dierent classication of buggy/safe states, we
+create a unique STG per execution context. We refer to this
+as the splitting process . Splitting happens in two phases: (1)
+Before STG construction, we fully resolve the may-alias lock
+pairs, each conguration corresponding to a unique set of
+infeasible executions. We create one STG per conguration
+and annotate it uniquely. (2) During STG construction,
+when dierent memory state conditions lead to dierent clas-
+sications of a state, we split the STG into two clones, one
+for the condition and one for its negation. The workow
+in Section 2 is carried out within each STG, producing the
+buggy and safe states associated with the execution context.
+Figure 2d (upper part) summarizes the results for dierent
+STGs, one per line (buggy/safe states in left/right box), with
+the execution context shown above.
+Prior to x synthesis, to reduce the number of xes as
+well as the number of conditions in each x, merging is ap-
+plied. Specically, if a state is buggy in \twin contexts" |
+i.e. contexts that are exactly identical except at one con-
+dition | then we x the state in the disjunction of the
+contexts. For example, the state [BC]is buggy in both in
+context addresses th1=addresses th2^this th1=this th2
+and in its twin context addresses th1=addresses th2^
+this th16=this th2. With merging, we merely need to x
+context addresses th1=addresses th2and x once. we copy
+the safe states from both of the twin contexts to their dis-
+junction to ensure that xes do not sacrice any safe states.
+The merging process is iterative.
+Preprocessing. We apply a known transformation [ 11,
+19] to preprocess the input bugs to ensure the correct lock
+placement, i.e., the paired lock/unlock in each method.
+5. FORMAL GUARANTEES
+In this section, we formally state performance and correct-
+ness guarantees. We also discuss limitations of our approach.Theorem 5.1 (Optimality). Assuming the x can only
+introduce mutual-exclusion-based synchronization, Grail gen-
+erates optimal xes, in that mutual exclusion is applied only
+in the exact scenarios when the bug may manifest.
+Proof Sketch. Our xes prohibit only the buggy con-
+current executions, as guaranteed by Grail's underlying theo-
+retical framework for precise vector-based xpoint analysis,
+vector separation and constraint realization (Section 3). Fur-
+ther, buggy executions are only prohibited when their mani-
+festing conditions are satised, as ensured by runtime context
+checking. The manifesting conditions are calculated precisely,
+and the merging step in Section 4 neither strengthens nor
+weakens the conditions associated with a buggy state. Note
+that vector separation always has a solution as the vectors
+are linearly separable [ 27]. We prove this in the technical
+report.
+Practical Issues. In practice, there are several sources of
+conservativeness: (1) In the implementation of the context-
+aware synchronization, the hash API in the helper function
+lock(), which is essentially System:identityHashcode (arg),
+may return the same value for two dierent argument objects,
+which leads to unnecessary blocking of some safe executions.
+However, this API is normally able to enforce a uniform
+distribution. (2) Preprocessing of the input bugs essentially
+enlarges the scope of the atomic region, which could change
+certain safe states into buggy states. (3) In the technical
+report, we describe the \locking-map" optimization that re-
+duces the number of locks. This could lead to unnecessary
+blocking. In terms of overall performance, neither (1) nor (2)
+lead to any observable overhead, as anticipated, while (3) has
+been introduced deliberately as an optimization. Indeed, our
+experimental data suggests that Grail xes incur a slowdown
+of merely 2%, which is negligible.
+Theorem 5.2 (Correctness). With the Grail x ap-
+plied, the input bug does not manifest at runtime, and equally
+importantly, the x does not cause new deadlocks to arise
+between any pair of threads.
+Proof Sketch. Deadlock freedom (over pairs of threads)
+is guaranteed by the fact that the Petri net models all relevant
+lock operations. Reasoning applied to the model detects, in
+addition to the buggy states pertaining to the input bugs,
+also the potential buggy (deadlock) states.
+6. EV ALUATION
+In this section, we describe the experimental results we
+obtained by comparing Grail, a tool realizing our approach,
+with the Axis and AFix algorithms on real-world bugs.
+6.1 Prototype Implementation and Benchmarks
+We implemented Grail atop the Soot compiler framework.5
+For Petri net model extraction, it is fully automatic. Similarly
+to Wang et al. [ 38], we implement it using the depth-rst
+traversal of the control ow graph. For MIP calculation (see
+Section 3), Grail uses the popular lpsolve mixed integer linear
+programming solver,6which it references as a shared library
+invoked via the JNI interface. Our current Grail prototype is
+applicable to Java programs.
+5http://www.sable.mcgill.ca/soot
+6http://lpsolve.sourceforge.net/5.5/For our evaluation, we focused on bugs in popular appli-
+cations. Most of the bugs, e.g., Derby-3260 , were originally
+reported into the Apache JIRA bug tracker7, whereas other
+bugs were detected by automated tools [ 9]. Our benchmark
+suite includes the large applications such as the Lucene text
+search engine, the Derby database engine, the Tomcat web
+container and the Jigsaw web server. The details of the bugs
+are characterized in our TR.
+6.2 Experimental Setting and Methodology
+To compare between the dierent xing approaches, both
+in general and in reference to the original (buggy) code, we
+built a test harness for each of the benchmarks. The harnesses
+are all based directly on the test cases exposing the bugs,
+which are either provided as part of the application package or
+kept at the JIRA bug tracker. We applied only minor changes
+to the test cases for the purpose of our experiments, such as
+(i) changing the number of active threads or (ii) changing
+loop bounds for worker threads. We also make publicly avail-
+able ( https://sites.google.com/site/grailfixing/ ) the
+performance test drivers that contain our x and xes pro-
+duced by other approaches, so that the readers can reproduce
+the reported data.
+All measurements were conducted using an x86 64 Thinkpad
+W530 workstation with eight 2.30GHz Intel Core i7-3610QM
+processors, 16GB of RAM and 6M caches. The workstation
+runs version 12.04 of the Ubuntu Linux distribution, and has
+the Sun 64-Bit 1.7 Java virtual machine (JVM) installed.
+The performance numbers we report below represent the
+average across 20 independent runs of the test driver. We
+also validated, as part of our methodology, the correctness
+of our Grail implementation by conrming, for each of the
+xes generated by Grail, that (i) the original bug is no longer
+present, and (ii) no deadlocks were introduced as a conse-
+quence of our patch. For (i), we applied the bug detection
+tools [ 20,9] to the patched version. We also attempted re-
+play of the bug on the patched version [ 10]. As expected, we
+could not reproduce any of the bugs. For (ii), we applied the
+deadlock detection tool [ 13] to the patched version. Again,
+we could not detect any deadlocks due to the patch.
+6.3 Performance Results: Fixing and Parallel
+Execution
+Our experience with the bugs in our suite indicates that
+theGrail xing algorithm is ecient. For all the benchmarks
+in our suite, Grail requires less than 1.5 seconds to complete,
+and exhibits negligible memory and resource consumption.
+This is correlated with the small Petri net models that Grail
+builds internally, each of which contains less than 1000 places
+and leads to fewer than 4000 states.
+We are further encouraged by the performance results
+shown in Figure 4. The graphs depict running time in mil-
+liseconds (the Y axis) as a function of the concurrency level
+(i.e., number of threads; X axis) for the original program as
+well as its versions patched by AFix, Axis and Grail. We
+point to two main trends that emerge from the graphs:
+Across the entire set of benchmarks and bugs that we
+studied, the Grail version of the code and the original
+code cluster together, while the Axis and AFix ver-
+sions form a separate cluster. In certain cases (most
+noticeably, Lucene-651, but also Derby-5561), the x
+7JIRA: https://issues.apache.org/jira/ .1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+}(a)Log4j-24159
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (b)Cache4j
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (c)Derby-3260
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (d)Derby-5561
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+}
+(e)Ftpserver
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (f)Lucene-481
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (g)Lucene-651
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (h)Tomcat-37458
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+}
+(i)Tomcat-50885
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (j)Tomcat-53498
+1 if(_sleep){
+2   interrupt();
+3  }4 _sleep = true;
+5t r y  {6    sleep(_Interval);7 } catch (e){... } 8  finally{9    _sleep=false;}ps.rePrepare();
+ps.rePrepare();
+n=ps.getActClass();activation=n.newInst();     
+1    physical=null;try{
+checkNull();
+return physical
+.createStmt();
+}catch(e) {...}props.set(u+"home", …);
+props.set(u+"passwd", …);props.removeAbout(u); 
+1 if (to.exists())
+2 to.delete();
+3 from.renameTo(to);4  open(to.getPath());1  ret = lookup(reader, f);
+2  if (ret == null) {3   int[] arr = new int[...];4   process(arr ); 5    store (reader, f, arr );6}
+if (entry.manifest == null) {...}
+else {
+definePackage(
+entry.manifest,...);
+}
+if(q.size()==0)
+{ continue; }
+it=q.dequeue();
+if(q.size()==0)
+{ continue; }it=q.dequeue();entry.manifest=null;sync(this)
+1  {_servlet= …}
+_servlet.destroy();
+2  sync(this){3  _servlet.service(q,p);     
+}   
+if(attrs.contain(n)) {
+v=attrs.remove(n);    
+//use v;
+}                     if(attrs.contain(n))
+{ attrs.remove(n);}                     4 sync setState()5 { ...6    sync(c)
+{  …}
+}1 sync(c)
+2 { ...3    getState();
+// sync method  
+} (k)Weblech
+Figure 3: Real-world Concurrency Bugs
+due to Grail leads to better parallelism and scalability!
+As we discuss below in detail, this is because certain
+atomicity violations manifest as performance bugs.
+In 11 out of the 15 cases, (all except Derby-3260,
+Tomcat-50885, Jigsaw and Weblech), there is a vis-
+ible performance gap and scalability gap between Grail
+and its competing xing approaches, AFix and Axis.
+For some of the benchmarks, the synchronization syn-
+thesized by Axis and AFix causes linear performance
+degradation, e.g., in the application Cache4j.
+In summary, the Grail xes mostly outperform both Axisand
+AFix. The performance gap in these cases is greater than
+40% on 8 threads. The overhead added by the Grail x com-
+pared to the original version is typically negligible, ranging
+around 2%, and in some cases Grail is able to outperform
+the original problem by eliminating performance problems
+due to insucient synchronization. These results are highly
+encouraging, suggesting that the xes generated by Grail
+are not only optimal in theory but also ecient in practice,
+and in particular, they are signicantly better than previous
+xing approaches. This validates the main hypothesis of this
+paper, which is that a contextual and global analysis model
+is required for quality bug xing.
+6.4 Detailed Discussion
+Beyond the high-level trends outlined above, we now pro-
+vide in-depth analysis of each of the bugs and its correspond-
+ing xes. We discuss each of the benchmarks in turn.
+Log4j-24159. Log4j-24159 is a deadlock. As Figure 3a
+shows, it occurs when one thread rst acquires lock cand
+then tries to acquire sto invoke the synchronized method
+getState , and another thread acquires swhen entering set-
+State and then tries to acquire c. Axis xes the deadlock
+internally by applying the Gadadra approach [ 38]. AFix can-
+not x deadlocks. We collected data only from runs where
+the deadlock did not manifest. For these runs, our x incurs
+2% overhead, and outperforms the Axis version by more
+than 60% when there are more than 4 threads. Under the
+hood, our x coordinates the threads only when they involve
+the same candslocks, while the Axisx always coordinates
+the threads, being oblivious to the locks used and making
+the execution almost sequential.
+Apache Mina-869. The bug Apache Mina-869 is the onethat we show in Section 1. The performance results in
+Figure 4b show that our x incurs less than 5% overhead,
+outperforms the other xes ( AFix/Axis) by 40% when there
+are 8 threads or more. The improvement clearly demonstrates
+that our bug xing, underpinned by the contextual and global
+reasoning framework as explained in Sections 3-5, produces
+the very lightweight x.
+Cache4j Bug. As shown in Figure 4c, our x introduces
+negligible overhead, which outperforms the AFix/Axis xes
+by at least 50% and by up to 93% when the number of
+threads increases to 16. Under the hood, the interleavings
+shown in Figure 3b cause the InterruptedException at line
+6 (reported by Sen et al. [ 33]), which can be avoided by
+preventing the access of _sleep at line 1 from interleaving
+the accesses at line 4 and line 9. Our x, which is aware of
+the runtime program states, coordinates two threads only
+when their accessed _sleep elds belong to the same object,
+only in which case the bug could manifest. Comparatively,
+theAFix orAxisxes coordinate them whenever they reach
+the code region, even if they access dierent _sleep elds.
+As a consequence, the threads have to unnecessarily wait for
+the thread that sleeps while holding the x lock.
+Derby-3260. Similarly, to x the atomicity violation in
+Figure 3c, which leads to NullPointerException (NPE) as re-
+ported in bug Derby-3260 , our x cooridnates the threads only
+when they invoke the APIs on the same PreparedStatement
+instance ps, as the invocations upon dierent PreparedState-
+ment instances are commutative and never cause the incorrect
+composition of rePrepare() andgetActClass . Here, the in-
+correct composition [ 20] stands for the composition intended
+as atomic but implemented incorrectly as non-atomic. It is
+a special kind of atomicity violation and manifests in the
+condition that the invocations are not commutative. The
+commutativity property [ 17] among invocations is explained
+in TR. Comparatively, the AFix/Axisxes are oblivious to the
+condition and always coordinate the threads that execute the
+relevant code. The performance results in Figure 4d shows
+that our x incurs only 1% overhead and it outperforms the
+AFix/Axisxes by around 14%.
+Derby-5561. Our approach adds the synchronizations to
+x the atomic violation bug Derby-5561 , of which the non-
+atomic interleavings are shown in Figure 3d. The added
+x coordinates the threads only when they access the same
+eld physical , which represents the shared physical network(a)Log4j-24159
+ (b)Apache Mina-869
+ (c)Cache4j
+ (d)Derby-3260
+ (e)Derby-5561
+(f)Ftpserver
+ (g)Lucene-481
+ (h) Lucene-651 (One Cache
+Shared by All Threads)
+(i)Lucene-651 (One Cache Per
+Thread)
+(j)Tomcat-37458
+(k)Tomcat-50885
+ (l)Tomcat-53498 (One Map
+Per Thread)
+(m) Tomcat-53498 (One Map
+Shared by All Thread)
+(n)Weblech
+ (o)Jigsaw
+Figure 4: Performance Comparison
+connection. Note that one access of the eld is originally
+inside the invocation of the method checkNull , it is replaced
+as the invocation following the preprocessing (Section 4), and
+the eld accessed is replaced as its equivalent this.physical
+at the invocation site accordingly. As shown in Figure 4e,
+our x usually incurs 2% overhead, while the AFix/Axisxes
+incur around 11% (when there are more than 8 threads). In
+addition, there are 15 other methods that may be interleaved
+non-atomically by the statement at line 1. Our approach pro-
+duces the xes that systematically encode sets of conditions
+to avoid all the atomicity violations.
+Ftpserver Bug. Our x of the Ftpserver bug in Figure 3e
+coordinates two threads only when they invoke upon the same
+instance props . In other words, our x allows the multiple
+server threads to independently manger the information of
+the hundreds of incoming users, while the xes produced by
+existing approaches disallow the concurrency unnecessarily.
+The performance results in Figure 4f show that, when the
+number of threads is 8 or exceeds 8, our x incurs around
+5% overhead, while the AFix/Axisxes incur more than 73%
+overhead and they even double the execution time in the
+presence of 12 threads. Our x outperforms the AFix/Axis
+xes by around 40%.
+Lucene-481. The Lucene-481 bug, shown in Figure 3f, leads
+to the FileNotFoundException when one thread rst deletes
+the le to(line 2) and then creates it using the method re-
+nameTo , while the other thread interleaves to open the le to.
+To the best of our knowledge, existing automatic tools cannot
+nd the bug as it involves the shared le in the disk, but we
+anticipate the emergence of tools that can nd it, given its
+severity. The bug is an incorrect composition. We manuallyspecify the commutativity property among the invocations,
+i.e., the invocation of the method open is commutative with
+the invocation of the delete orrenameTo only when their
+involved parameters (include the implicit this parameter)
+are completely dierent. Leveraging the condition, our x
+coordinates the threads once the invocations share common
+parameter instances and does not coordinate them otherwise.
+The xes produced by existing approaches always coordinate
+the threads. The performance results in Figure 4g show that
+our x incurs only 2% overhead. Our version is faster by
+40% than the version patched by existing approaches, which
+incurs around 70% overhead.
+Lucene-651. Lucene-651 (Figure 3g) is reported in the JIRA
+tracker as the performance bug, rather than the functionality
+bug. Specically, the code at line 1 and line 5 needs to be
+composed atomically, as proposed by the bug reporter, so
+that only the rst thread, that fails to nd in the cache
+the records specic to a Field instance f, needs to conduct
+the expensive computations at line 4. Otherwise, if the
+atomicity violation occurs, multiple concurrent threads may
+have to conduct the expensive computations. According
+to the commutativity specication [ 8,17] of the cache, the
+atomicity violation manifests only when dierent threads
+involve the same Field instance fat the caching operations
+(line 1 and line 5). Accordingly, our x coordinates the
+threads only in the condition. First, we evaluate the scenario
+in which dierent threads share the same cache: As shown in
+Figure 4h, our patched version, which xes the performance
+bug, is faster than the original version by 40%. Meanwhile,
+the version patched by existing approaches also outperforms
+the original version, by around 30% when there are 4 or 8threads. Our version outperforms their version by up to
+36% (16 threads), due to that our x does not impede the
+concurrency among the threads that retrieve the records
+related to dierent Field instances. Second, we evaluate the
+scenario in which dierent threads do not share the cache:
+As shown in Figure 4i, the version patched by AFix/Axis is
+slower than our version by around 60% when there are more
+than 8 threads. The slowdown is unnecessarily caused by
+the unconditional coordination among threads.
+Tomcat-37458. To x the atomicity violation bug Tomcat-
+37458 that causes the NPE as shown in Figure 3h, our x
+coordinates the threads only when they access the same eld
+manifest . In other words, our x allows multiple threads to
+load classes from dierent jars that contain dierent manifest
+les. Comparatively, existing approaches produce the xes
+that serialize the executions by dierent class loader threads.
+As shown in Figure 4j, our x incurs 5% overhead on average
+and up to 9% when there are 16 threads. The version patched
+by existing approaches is slower than our version by 13%-
+153%. The slowdown grows dramatically when the number
+of threads increases.
+Tomcat-50885. Figure 3i shows the atomicity violation
+bug Tomcat-50885 inTomcat : When the two accesses of
+theJspServlet instance _servlet by a thread are interleaved
+non-atomically by a thread that destroys the instance, the
+exception occurs. Our x coordinates the threads if they in-
+volve the same _servlet instance, while existing approaches
+coordinate them unconditionally. As shown in Figure 4k, our
+x incurs typically 4% overhead. As compared to our x,
+the xes produced by existing approaches are slower by 40%
+when there are 12 threads and slower by 14% when there
+are 16 threads. Given that the code (lines 1-3) lies in the
+core component of Tomcat and is frequently executed, the
+developers hesitate8to x those bugs in the component and
+obviously cannot aord the around 40% overhead caused by
+the conservative AFix/Axisxes.
+Tomcat-53498. The Tomcat-53498 bug, as shown in Fig-
+ure 3j, is due to the incorrect composition of the invocations
+of the methods contains() and remove() , both from the
+thread-safe class ConcurrentHashmap . The bug may cause
+the variable vto be null and cause the NPE in the later
+use. According to the commutativity specication [ 8] of the
+Map, the atomicity violation manifests only when the threads
+involve the same map and the same key at the Mapoperations.
+Comparatively, the xes produced by existing approaches
+coordinate the threads once they reach the code. Corre-
+spondingly, when dierent threads do not share the map, as
+shown in Figure 4l, our x incurs up to 5% overhead and
+outperforms other xes by 60% (when there are more than 8
+threads); when dierent threads share the map, as shown in
+Figure 4m, our x incurs 10%-17% overhead when there are
+more than 8 threads, and outperforms other xes by 50%.
+The AFix/Axisversion takes almost 2X running time as ours.
+The overhead of our x is caused by the coordination when
+dierent threads access the same key, and the improvement
+over other xes is due to the concurrency allowed among the
+map operations upon dierent keys.
+Weblech Bug. Figure 3k shows the incorrect composition
+inWeblech , reported by Lucia et al. [ 22]. The invocations
+ofq.size() and q.dequeue() are not composed atomically.
+As a result, the interleaving update may cause the invocation
+8issues.apache.org/bugzilla/show_bug.cgi?id=50885ofq.dequeue() to throw the exception. Our x encodes
+the commutativity condition needed by the bug to manifest.
+Figure 4n shows the evaluation results, where the original
+version and dierent patched version run similarly, which
+indicates the quality of the xes does not matter.
+Bugs detected in Jigsaw. We also apply our tool to all
+the atomicity violations automatically detected [ 9] inJig-
+saw. Our tool successfully computes the xes, given the
+large number (754) of input bugs, which actually correspond
+to the combinations of statements from very few methods.
+Figure 4o shows the performance comparison with the Axis
+version (The AFix version frequently deadlocks [ 19]). Our x
+incurs negligible overhead and outperforms the Axisversion
+by 15% when there are more than 10 threads. To better
+understand the improvement over Axis, we break down the
+overhead of the xes by grouping the bugs that share the
+same container method and xing each group of bugs sep-
+arately. It is interesting that xing certain group of bugs
+using both approaches do not make any dierences. We
+also identify the main source of improvement over the Axis
+version: Our approach diers from Axis in xing the viola-
+tion of the atomicity between store.lookupResource() and
+store.loadResource in the method NewStoreEntry.lock() .
+One should be able to observe obvious slowdown (close to
+10%) by introducing a stationary object to unconditionally
+protect the two invocations in an atomic region, which ex-
+plains why the Axisversion incurs high overhead.
+7. RELATED WORK
+Many solutions have been proposed to x concurrency
+bugs. There are dynamic methods [ 32,15,30,4,2] that
+integrate dynamic bug detection and xing. On the other
+hand, static methods patch the program oine and avoid the
+runtime bug detection overhead. Our method belongs to this
+category. In addition, Weeratunge et al. [ 39] insert additional
+synchronizations to enforce the inferred atomicity. Besides,
+researchers also propose methods to address concurrency
+bugs that are not discussed within this paper, e.g., order
+violations [12] and type-state violations [23, 44].
+Another related area of research is code synthesis, including
+lock synthesis [ 24,3], specication-based control synthesis [ 5,
+42,7] and x synthesis for semantic bugs [ 40,28]. Within this
+area, there are works that share our motivation of ensuring a
+maximally permissive solution. One example is Vechev et al.'s
+study on conditional critical regions (CCRs) [ 37], where the
+challenge is to nd appropriate guard expressions for atomic
+sections. Vechev et al. present a greedy algorithm that |
+given program Psatisfying specication Sand language LG
+of guards | infers under certain conditions a program P0
+that is maximally permissive w.r.t. LGand also satises S.
+8. CONCLUSION
+We have presented Grail, a context-aware xing algorithm
+for concurrency bugs. Unlike previous techniques, Grail is
+able to guarantee both correctness and optimal performance.
+The insight is that Grail accounts for both the synchroniza-
+tion and execution contexts in which the bug arises. We
+have conrmed the advantages of Grail compared to existing
+approaches in a study over 12 real-world bugs.References
+[1]Y. Cai and W. K. Chan. Magicfuzzer: Scalable deadlock
+detection for large-scale applications. In ICSE , 2012.
+[2]Y. Cai, W. Chan, and Y. Yu. Taming deadlocks in
+multithreaded programs. In QSIC , 2013.
+[3]S. Cherem, T. M. Chilimbi, and S. Gulwani. Inferring
+locks for atomic sections. In PLDI , 2008.
+[4]L. Chew and D. Lie. Kivati: Fast detection and preven-
+tion of atomicity violations. In EuroSys , 2010.
+[5]N. D'Ippolito, V. Braberman, N. Piterman, and S. Uchi-
+tel. Synthesising non-anomalous event-based controllers
+for liveness goals. TOSEM , 22(1), 2013.
+[6]A. Farzan and P. Madhusudan. Causal atomicity. In
+CAV , 2006.
+[7]D. Gopinath, M. Z. Malik, and S. Khurshid.
+Specication-based program repair using sat. In TACAS ,
+2011.
+[8]M. Herlihy and E. Koskinen. Transactional boosting: a
+methodology for highly-concurrent transactional objects.
+InPPoPP , 2008.
+[9]J. Huang and C. Zhang. Persuasive prediction of con-
+currency access anomalies. In ISSTA , 2011.
+[10]J. Huang, P. Liu, and C. Zhang. Leap: Lightweight
+deterministic multi-processor replay of concurrent java
+programs. In FSE, 2010.
+[11]G. Jin, L. Song, W. Zhang, S. Lu, and B. Liblit. Auto-
+mated atomicity-violation xing. In PLDI , 2011.
+[12]G. Jin, W. Zhang, D. Deng, B. Liblit, and S. Lu. Auto-
+mated concurrency-bug xing. In OSDI , 2012.
+[13]P. Joshi, C. seo Park, K. Sen, and M. Naik. A random-
+ized dynamic program analysis technique for detecting
+real deadlocks. In PLDI , pages 110{120, 2009.
+[14]P. Joshi, M. Naik, K. Sen, and D. Gay. An eective
+dynamic analysis for detecting generalized deadlocks. In
+FSE, 2010.
+[15]H. Jula, D. M. Tralamazza, C. Zamr, and G. Candea.
+Deadlock immunity: Enabling systems to defend against
+deadlocks. In OSDI , 2008.
+[16]V. Kahlon and C. Wang. Universal causality graphs:
+A precise happens-before model for detecting bugs in
+concurrent programs. In CAV , 2010.
+[17]M. Kulkarni, D. Nguyen, D. Prountzos, X. Sui, and
+K. Pingali. Exploiting the commutativity lattice. In
+PLDI , 2011.
+[18]D. Li, W. Srisa-an, and M. B. Dwyer. Sos: Saving time
+in dynamic race detection with stationary analysis. In
+OOPSLA , 2011.
+[19]P. Liu and C. Zhang. Axis: Automatically xing
+atomicity violations through solving control constraints.
+InICSE , 2012.[20]P. Liu, J. Dolby, and C. Zhang. Finding incorrect com-
+positions of atomicity. In ESEC/FSE , 2013.
+[21]S. Lu, S. Park, E. Seo, and Y. Zhou. Learning from mis-
+takes: a comprehensive study on real world concurrency
+bug characteristics. In ASPLOS , 2008.
+[22]B. Lucia, B. P. Wood, and L. Ceze. Isolating and
+understanding concurrency errors using reconstructed
+execution fragments. In PLDI , 2011.
+[23]Q. Luo and G. Ro su. Enforcemop: A runtime property
+enforcement system for multithreaded programs. In
+ISSTA , 2013.
+[24]B. McCloskey, F. Zhou, D. Gay, and E. Brewer. Au-
+tolocker: Synchronization inference for atomic sections.
+InPOPL , 2006.
+[25]T. Murata. Petri nets: Properties, analysis and appli-
+cations. Proceedings of the IEEE , 77(4):541{580, Apr.
+1989.
+[26]M. Naik, A. Aiken, and J. Whaley. Eective static race
+detection for Java. In PLDI , 2006.
+[27]A. Nazeem et al. Designing compact and maximally
+permissive deadlock avoidance policies for complex re-
+source allocation systems through classication theory.
+IEEE Trans. Automatic Control , 56(8), 2011.
+[28]H. D. T. Nguyen, D. Qi, A. Roychoudhury, and S. Chan-
+dra. Semx: Program repair via semantic analysis. In
+ICSE , 2013.
+[29]C.-S. Park and K. Sen. Randomized active atomicity
+violation detection in concurrent programs. In FSE,
+2008.
+[30]S. Rajamani, G. Ramalingam, V. P. Ranganath, and
+K. Vaswani. Isolator: dynamically ensuring isolation in
+concurrent programs. In ASPLOS , 2009.
+[31]G. Ramalingam. The undecidability of aliasing. ACM
+Trans. Program. Lang. Syst. , 16(5):1467{1471, 1994.
+[32]P. Ratanaworabhan, M. Burtscher, D. Kirovski, B. G.
+Zorn, R. Nagpal, and K. Pattabiraman. Detecting and
+tolerating asymmetric races. In PPOPP , 2009.
+[33]K. Sen. Race directed random testing of concurrent
+programs. In PLDI , 2008.
+[34]Y. Smaragdakis, J. Evans, C. Sadowski, J. Yi, and
+C. Flanagan. Sound predictive race detection in polyno-
+mial time. In POPL , 2012.
+[35]F. Sorrentino, A. Farzan, and P. Madhusudan. PENE-
+LOPE: Weaving threads to expose atomicity violations.
+InFSE, 2010.
+[36]M. Vaziri, F. Tip, and J. Dolby. Associating synchroniza-
+tion constraints with data in an object-oriented language.
+InPOPL , 2006.
+[37]M. T. Vechev, E. Yahav, and G. Yorsh. Inferring synchro-
+nization under limited observability. In S. Kowalewski
+and A. Philippou, editors, TACAS , Lecture Notes in
+Computer Science, pages 139{154. Springer, 2009.[38]Y. Wang, S. Lafortune, T. Kelly, M. Kudlur, and
+S. Mahlke. The theory of deadlock avoidance via discrete
+control. In POPL , 2009.
+[39]D. Weeratunge, X. Zhang, and S. Jaganathan. Accentu-
+ating the positive: Atomicity inference and enforcement
+using correct executions. In OOPSLA , 2011.
+[40]W. Weimer, S. Forrest, C. Le Goues, and T. Nguyen. Au-
+tomatic program repair with evolutionary computation.
+CACM , 53(5), 2010.
+[41] W. Xiong, S. Park, J. Zhang, Y. Zhou, and Z. Ma. Ad
+hoc synchronization considered harmful. In OSDI , 2010.[42]T. Yavuz-Kahveci and T. Bultan. Specication, verica-
+tion, and synthesis of concurrency control components.
+InISSTA , 2002.
+[43]Z. Yin, D. Yuan, Y. Zhou, S. Pasupathy, and L. Bairava-
+sundaram. How do xes become bugs? In ESEC/FSE ,
+2011.
+[44]L. Zhang and C. Wang. Runtime prevention of con-
+currency related type-state violations in multithreaded
+applications. In ISSTA , 2014.

@@ -1,0 +1,1269 @@
+Spatio-Temporal Context Reduction: A Pointer-Analysis-Based
+Static Approach for Detecting Use-After-Free Vulnerabilities†
+Hua Yan∗
+School of Computer Science and Engineering
+University of New South Wales, AustraliaYulei Sui∗
+Centre for Artificial Intelligence and School of Software
+University of Technology Sydney, Australia
+Shiping Chen
+Data61
+CSIRO, AustraliaJingling Xue
+School of Computer Science and Engineering
+University of New South Wales, Australia
+ABSTRACT
+Zero-dayUse-After-Free(UAF)vulnerabilitiesareincreasinglypop-
+ular and highly dangerous, but few mitigations exist. We introduceanewpointer-analysis-basedstaticanalysis,CRed,forfindingUAFbugsinmulti-MLOCCsourcecodeefficientlyandeffectively.CRed
+achieves this by making three advances:(i) a spatio-temporal con-
+textreductiontechniqueforscalingdownsoundlyandpreciselytheexponentialnumberofcontextsthatwouldotherwisebeconsideredatapairoffreeandusesites,(ii)amulti-stageanalysisforfilteringoutfalsealarmsefficiently,and(iii)apath-sensitivedemand-driven
+approach for finding the points-to information required.
+WehaveimplementedCRedinLLVM-3.8.0andcompareditwith
+four different state-of-the-art static tools: CBMC (model checking),
+Clang (abstract interpretation), Coccinelle (pattern matching),
+and Supa (pointer analysis) using all the C test cases in Juliet Test
+Suite(JTS)and10open-sourceCapplications.Fortheground-truth
+validated with JTS, CRed detects all the 138 known UAF bugs as
+CBMC and Supa do while Clang and Coccinelle miss some bugs,
+with nofalse alarms fromany tool. Forpracticality validated with
+the10applications(totaling3+MLOC),CRedreports132warnings
+including 85 bugs in 7.6 hours while the existing tools are either
+unscalablebyterminatingwithin3daysonlyforoneapplication
+(CBMC) or impractical by finding virtually no bugs (Clang and
+Coccinelle) or issuing an excessive number of false alarms (Supa).
+CCS CONCEPTS
+•Securityandprivacy →Softwareandapplicationsecurity ;•
+Theoryofcomputation →Programanalysis ;•Softwareand
+its engineering →Software defect analysis;
+KEYWORDS
+use-after-free, program analysis, bug detection
+∗These two authors contributed equally to this work.
+†This work is supported by ARC Grants (DP180104069 and DE170101081).
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+on the first page. Copyrights for components of this work owned by others than ACMmustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,orrepublish,topostonserversortoredistributetolists,requirespriorspecificpermissionand/ora
+fee. Request permissions from permissions@acm.org.
+ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+© 2018 Association for Computing Machinery.
+ACM ISBN 978-1-4503-5638-1/18/05...$15.00
+https://doi.org/10.1145/3180155.3180178ACM Reference Format:
+Hua Yan, Yulei Sui, Shiping Chen, and Jingling Xue. 2018. Spatio-Temporal
+ContextReduction:APointer-Analysis-BasedStaticApproachforDetecting
+Use-After-FreeVulnerabilities.In ProceedingsofICSE’18:40thInternational
+Conference on Software Engineering , Gothenburg, Sweden, May 27-June 3,
+2018 (ICSE ’18), 11 pages.
+https://doi.org/10.1145/3180155.3180178
+1 INTRODUCTION
+Use-After-Free(UAF) vulnerabilities,i.e., danglingpointer derefer-
+ences(referencinganobjectthathasbeenfreed),areincreasingly
+beingexploited,asshowninFigure1.UAFvulnerabilitiesarehighly
+dangerous, with 80.14% in the NVD database being rated critical or
+high in severity, causing crashes, silent data corruption and arbi-
+trarycodeexecution.Thisvulnerabilityclasspersistsinallkinds
+of C/C++ applications. While other types of memory corruption
+errors such as buffer overflows are nowadays harder to exploit due
+to mitigations, there are few mitigations deployed in production
+environments to prevent UAF vulnerabilities [53].
+050100150200250300
+High Severity           (7 - 10)
+All Severity Levels  (0 - 10)
+Figure 1: Use-after-free vulnerabilities in NVD [49].
+Therehavebeenconsiderableeffortsonbuildingautomatictools
+for mitigating UAF bugs. However, existing solutions almost ex-clusively rely on dynamic analysis [
+10,12,25,30,35,47,51,53],
+which inserts metadata-manipulating instrumentation code into
+theprogram,anddetectsorprotectsagainstUAFbugsatruntime
+by performing checks at all pointer dereferences [ 10,30,35,51]o r
+invalidatingalldanglingpointersidentified[ 25,53].Whilemain-
+taining zero or low false alarms (due to unsound modeling for, e.g.,
+casting [30] and safety window sizes [ 10]), dynamic techniques
+haveanumberoflimitations,includinglowcodecoverage(when
+used as debugging aids), binary incompatibility (due to memory
+layouttransformationssuch asfat pointers[ 51]),and highruntime
+and memory overheads (due to runtime instrumentation).
+Static analysis for detecting UAF bugs will not suffer from
+suchinstrumentation-basedlimitations.However,statictechniques
+for UAF detection are scarce, with [ 18] focusing on binary code,
+although there are several source code analysis tools for de-tecting other types of memory corruption bugs, such as buffer
+3272018 ACM/IEEE 40th International Conference on Software Engineering
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Hua Yan, Yulei Sui, Shiping Chen, and Jingling Xue
+overflows [ 24,27], memory leaks [ 11,44,45] and null derefer-
+ences [14, 29].
+Inthispaper,weintroduceanewpointer-analysis-basedstatic
+sourcecodeanalysisforfindingUAFbugsinmulti-MLOCCpro-
+grams efficiently and effectively. We first formulate the problem of
+detecting UAF bugs statically. We then describe several challenges
+faced, existing static techniques (for analyzing C/C++ source code),
+and our solution (by highlighting its novelty).
+Problem Statement. Consider a pair of statements,/parenleftbigfree(p@lf),use(q@lu)/parenrightbig, where pandqare pointers and
+lfandluare line numbers. Let P(l)be the set of all feasible
+(concrete) programpaths reachingline lfrom main(). Thepair is
+a UAF bug if and only if ST/parenleftbigfree(p@lf),use(q@lu)/parenrightbigholds:
+[Spatio-Temporal Correlation]
+ST/parenleftbigfree(p@lf),use(q@lu)/parenrightbig/colonequal
+∃(ρf,ρu)∈P (lf)×P(lu):(ρf,lf)/leadsto(ρu,lu)∧(ρf,p)/simequal(ρu,q)(1)
+where /leadstodenotestemporal reachability (in the program’s ICFG
+(InterproceduralControlFlowGraph))and /simequaldenotesa spatialalias
+relation (meaning that pandqpoint to a common object). By con-
+vention,(ρ,l)identifiestheprogrampoint lunderapathabstrac-
+tionρ. Both temporal and spatial properties must correlate on the
+same concrete program path. However, STis not computationally
+verifiable due to exponentially many paths in large codebases.
+Challenges. One mainchallenge faced indesigning a pointer-
+analysis-basedstatic UAFanalysis, A,lies inhow toreasonabout
+theexponentialnumberofprogrampathsin P(lf)×P(lu)inorder
+to find real bugs at a low false positive rate. This entails approx-
+imating STwith STAby abstracting these program paths with
+somecontextsaccordingtoatradeofftobemadeamongsoundness,
+precision and scalability. Aissound(by catching all UAF bugs)
+ifST/parenleftbigfree(p@lf),use(q@lu)/parenrightbig⇒STA/parenleftbigfree(p@lf),use(q@lu)/parenrightbig
+for every UAF pair/parenleftbigfree(p@lf),use(q@lu)/parenrightbig.Aisprecise(by
+reporting no false alarms if STA/parenleftbigfree(p@lf),use(q@lu)/parenrightbig⇒
+ST/parenleftbigfree(p@lf),use(q@lu)/parenrightbigfor every/parenleftbigfree(p@lf),use(q@lu)/parenrightbig.
+Ais regarded as being scalableifSTAcan analyze large code-
+basesunderagivenbudget.Forconvenience, STAisalsosaidto
+be sound/precise/scalable if Ais sound/precise/scalable.
+Anotherchallengeishowtoverify /leadstoefficientlyandprecisely,
+especially in the presence of aliasing, as discussed below.
+Afinalchallengeliesinhowtoobtain /simequalefficientlyandprecisely.
+Thisrequiresapointeranalysisthatis field-sensitive (bydistinguish-
+ingdifferentfieldsinastruct), flow-sensitive (bydistinguishingflow
+of control), context-sensitive (by distinguishing calling contexts for
+a function), and path-sensitive (by distinguishing different program
+paths). However, computing such precise points-to information
+byreasoningabout P(lf)×P(lu)isunscalable,despiterecentad-
+vances on whole-program [ 5,17,19,26,28,40,41,46,52,54] and
+demand-driven [20, 42, 56] pointer analyses for C/C++ programs.
+Stateof theArt. Duetotheabovechallenges,therehasbeen
+littleworkondevelopingspecializedstaticapproachesfordetect-
+ingUAFbugsatthesource-codelevel.General-purposestaticap-
+proaches for detecting memory corruption bugs include modelchecking[ 6,8,22],abstractinterpretation[ 3,16,21],patternmatch-
+ing[33],andpointeranalysis[ 38,42].Theircorrespondingrepre-
+sentative tools are CBMC [ 22], Clang [ 3], Coccinelle [ 33], and
+Supa (which can be leveraged for finding UAF bugs) [42].
+Model Checking. CBMC [22] is a bounded model checker that
+reasonsaboutalltheprogrampathsin P(lf)×P(lu)givenin(1)for
+C/C++programsasconstraintsthatcanbesolvedbyanSMTsolver.
+When used in finding UAF bugs, CBMC is sound (in a bounded
+manner) and highly precise but scales only to small programs [ 48]
+whose “sizes are restricted” (according to its user manual).
+Abstract Interpretation. Clang[3]is anabstractinterpreterfor
+analyzingC/C++programs.Itadoptsahighlyunsoundmodelby
+analyzingonlyasmallsubsetoftheprogrampathsin P(lf)×P(lu)
+givenin(1)inordertoachievescalabilityandprecision.Toscale
+for large codebases with few false alarms, Clang limits its UAF-
+bug-findingabilitybyperforminganintraproceduralanalysis(with
+inlining). In general, such tools refrain from reporting too many
+false alarms, but at the expense of missing many UAF bugs.
+Pattern Matching. Coccinelle [ 33] is a pattern-based tool for
+analyzing and certifying C programs. Coccinelle can find UAF
+bugsbasedonsomepatternsgiven.Duetothelackofthepoints-to
+information,Coccinellecanbebothfairlyunsoundandimprecise
+but is highly scalable (due to its pattern-matching nature).
+Pointer Analysis. Supa [42] is a state-of-the-art demand-driven
+pointer analysis that is field-, flow- and context-sensitive but path-
+insensitive for C programs. When used in finding UAF bugs, Supa
+canberegardedasreasoningaboutalltheprogrampathsin P(lf)×
+P(lu)withanextremelycoarseabstraction, {[ ]}×{[ ]} ,inor der
+to achieve soundness and scalability. By convention, []represents
+allpossiblecallingcontextsandthusallpossible(concrete)paths
+reaching l. Thus, STin (1) is weakened significantly to STSupa:
+[Spatio-Temporal Correlation with a High Level of Spuriosity]
+STSupa/parenleftbigfree(p@lf),use(q@lu)/parenrightbig/colonequal
+([ ],lf)/leadsto([ ],lu)∧( [] ,p)/simequal([ ],q)(2)
+where/leadstoisthestandardcontext-sensitivereachabilityand /simequalisthe
+standard context-sensitive alias relation obtained under [].
+When used in finding UAF bugs, STSupawill be highly im-
+precise, since spurious spatio-temporal correlations are intro-
+duced at an extremely large number of UAF pairs, where
+STSupa/parenleftbigfree(p@lf),use(q@lu)/parenrightbig/notdblarrowrightST/parenleftbigfree(p@lf),use(q@lu)/parenrightbig
+holds,asexplainedinSection2andvalidatedinSection5.These
+spurious correlations are false alarms.
+Our Solution and Contributions. We introduce an (interpro-
+cedural)pointer-analysis-basedstaticanalysis,CRed,forfinding
+UAF bugs in multi-MLOC C code, by making several contributions.
+First, we present a spatio-temporal context reduction technique
+that enables developing our new static UAF analysis systematically
+by simplifying STin (1) into STCRedgiven below:
+[Spatio-Temporal Context Reduction]
+STCRed/parenleftbigfree(p@lf),use(q@lu)/parenrightbig/colonequal
+∃(/tildewiderρf,/tildewiderρu)∈/tildewideP(lf)×/tildewideP(lu):(/tildewiderρf,lf)/leadsto(/tildewiderρu,lu)∧(/tildewiderρf,p)/simequal(/tildewiderρu,q)(3)
+We ensure that STCRedis sound by requiring /tildewideP(l)to be a
+coarser abstraction of P(l)and scalable by requiring |/tildewideP(lf)×
+328
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. Spatio-Temporal Context Reduction ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+/tildewideP(lu)| /lessmuch |P( lf)×P (lu)|. Unlike STSupa, however, STCRed
+will be highly precise, as STCRed/parenleftbigfree(p@lf),use(q@lu)/parenrightbig/notdblarrowright
+ST/parenleftbigfree(p@lf),use(q@lu)/parenrightbighappens only for a small number of
+UAF pairs. With spatio-temporal context reduction, CRedis designed
+purposelytopreservethespatio-temporalcorrelationof STbykeeping
+spurious correlations, i.e., false alarms, as low as possible. Without it,
+CRed will be either highly unsound or highly imprecise.
+Second,we adopta multi-stageapproach thatstarts withsome
+UAF pairs obtained by a pre-analysis and then uses increasingly
+morepreciseyetmorecostlyUAFanalysesonincreasinglyfewer
+UAF pairs to filter out false alarms. In our current implementation,
+we perform context reduction by first using calling contexts and
+thenconsideringpathsensitivity.Stagingsuchanalysesthisway
+improves the efficiency of the overall solution.
+Third,weintroduceademand-drivenpointeranalysiswith field-,
+flow-, context- and path-sensitivity as the foundation for the main
+analysis stages of CRed. This work is the first to consider path-
+sensitivity on-demand in order to reduce false UAF alarms.
+Finally, we have implemented CRed in LLVM-3.8.0 and com-
+pareditwithfourstate-of-the-artsource-codeanalysistools:CBMC
+(model checking) [ 22], Clang (abstract interpretation) [ 3], Coc-
+cinelle(patternmatching)[ 33],andSupa(pointeranalysis)[ 42]
+using all the C test cases in Juliet Test Suite (JTS) [ 1] and 10 open-
+source C applications. For the ground truth evaluated with JTS,
+CRed is as effective as CBMC and Supa by detecting all the 138
+knownUAFbugswhileClangreportsonly36bugsandCoccinelle
+finds126bugs,withnofalsealarmsissuedinallthecases.Forprac-
+ticality evaluated with the 10 applications (totaling over 3 MLOC),
+CRed produces 132 warnings including 85 bugs in about 7.6 hours.
+Incontrast,CBMCproducesnowarnings,terminatingin19.0hours
+forthesmallestapplicationbutexceedingthe3-daytimebudgetfor
+every remaining application; Clang reports 3 warnings including
+1 bug in 1.2 hours; Coccinelle reports 103 false alarms in 179.0
+seconds without finding any bugs; and Supa detects the same 85
+bugsfoundbyCRed,togetherwith23,095falsealarms,in5.1hours.
+2 OVERVIEW
+5HILQHG
+SDLUV
+ Bug 
+Report5HILQHG
+SDLUV
+5HILQHG
+SDLUV
+Demand-Driven Pointer AnalysisProgram
+,QSXW
+Pre-
+AnalysisContext 
+ReductionPath-
+Sensitivity
+Figure 2: Workflow of CRed.
+As depicted in Figure 2, we start with a fast but imprecise “Pre-
+Analysis”(i.e.,anAndersen-stylepointeranalysis[ 4])toobtaina
+setofcandidateUAFpairstobeanalyzed(accordingto(1)).Wethen
+apply two spatio-temporal context reductions, “Calling Context
+Reduction”(Section2.1)and“PathReduction”(Section2.2),founded
+onthesamedemand-drivenpointeranalysisinfrastructure.Note
+that each stage refines the results from the preceding one.
+We focus on describing how calling-context reduction works
+and why it is significant. Without the two reduction techniques,
+aUAFanalysisthatreliesonexistingpointeranalysistechniques
+will be either unscalable or highly imprecise (Section 5).2.1 Calling-Context Reduction
+Theobjectiveistosimplify STin(1)into STCRedin(3)byabstract-
+ing program paths with calling contexts so that CRed is sound,
+scalableandprecise.OurexampleisgiveninFigure3.Weusewhole-programpointeranalysis[
+19,26,52,54]toexplainwhy CRedwould
+be unscalable if full calling contexts were used(although it would
+be highly precise) and imprecise if k-limited calling contexts were
+used (although it would be possibly scalable). These arguments
+applyalsotodemand-drivenpointeranalysis[ 20,36,42,56](asval-
+idated later). We achieve both efficiency and precision by reducing
+full calling contexts substantially in both length and quantity.
+2.1.1 Context-Sensitivity. We introduce the terminologies and
+notations used in context-sensitive program analysis.
+•Call String (or Call Stack). In ak-limitedork-callsite context-
+sensitiveanalysis,everyvariableaccessedorobjectallocatedinafunction
+funisidentifiedbyacallstring c=[c1,...,ck],known
+asacallingcontext,whichrepresentsasequenceofthe k-most-
+recent call sites (on the call stack) calling fun. In a call string,
+every recursion cycle is typically approximated once. The analy-
+sis is said to be fully context-sensitive ifc1starts from main().
+•Context-Sensitive Control-Flow Reachability. Given two
+programpoints landl/primeidentifiedundercontexts candc/prime,respec-
+tively,(c,l)/leadsto(c/prime,l/prime)signifiesthat (c,l)reachescontext-sensitively
+(c/prime,l/prime).Thisissolvedasa balanced-parenthesesproblem bymatch-
+ingcallsandreturnstofilteroutunrealizablepathsinthepro-gram’s ICFG [
+34]. We start from (c,l)with an abstract stack
+initializedas c.Whenenteringacalleefunctionfromacallsite ci,
+wepushciintothe contextstackcontaining c,denoted c⊕[ci].
+When returning from a callee to a callsite cj,w epo pcjfrom the
+currentstackcontaining c,denoted c/circleminus[cj],ifccontainscjasits
+topvalueor c=[]sincearealizablepathmaystartandendin
+different functions. Finally, (c,l)/leadsto(c/prime,l/prime)is established if l/primeis
+reached when the context stack contains c/prime.
+•k-Call-Site Context-Sensitive Pointer Analysis. Letpt(c,v)
+bethepoints-tosetofavariable vunderacallingcontext csuch
+that|c|=k.Giventwovariables pandq,(c,p)/simequal(c/prime,q)holdsifp
+andqmay point to a common object, i.e., pt(c,p)∩pt(c/prime,q)/nequal∅.
+Here,c(c/prime)representsthecallingsequenceforthefunctionwhere
+p(q)is defined and h(h/prime) represents the calling sequence for the
+function where object ois allocated. We speak of full context-
+sensitivity if c,c/prime,handh/primeall start from main().
+2.1.2 Limitations of k-Call-Site Context-Sensitivity. Figure3(a)
+illustratesatypicalheapusagescenario.Inlines1–11,thereare
+2ncalling contexts to com()from main(). In lines 12 – 35, two
+heapobjects areallocated (lines 14– 15),then used(lines16 and
+18), and finally, deallocated (lines 17 and 19), through a series of
+wrappers. There is one UAF pair/parenleftbigfree(p@ln34),use(q@ln31)/parenrightbigto
+be analyzed, where use(q@ln31)stands for print(*q) at line 31.
+ThisexampleisUAF-free.Withfullcontext-sensitivity,nowarn-
+ings would be reported but the resulting analysis is unscalable.
+Withk-limiting, the analysis scales, but at the expense of precision.
+•FullContext-Sensitivity:PrecisebutUnscalable. Asshown
+in Figure 3(b), Ris the set of 2nfull calling contexts for com().
+Thus, there are 2n+1×2n+1calling context pairs reaching/parenleftbigfree(p),print(*q)/parenrightbig.A s∀c∈R:(c⊕[c5,c9],ln34)/leadsto
+329
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Hua Yan, Yulei Sui, Shiping Chen, and Jingling Xue
+1:int main() {
+2: f1();//ca1
+3: f1();//cb1
+4:}
+5:void f 1() {
+6: f2();//ca2
+7: f2();//cb2
+8:}
+... ...
+9:void f n() {
+10: com();// c1
+11:}12:int *x, *y;
+13:void com() {
+14: x = xmalloc();// c2
+15: y = xmalloc();// c3
+16: xuse(x); //c4
+17: xfree(x);// c5
+18: xuse(y); //c6
+19: xfree(y);// c7
+20:}
+21:int* xmalloc() {
+22: return malloc (1);//o
+23:}24:void xuse(int* u) {
+25: xxuse(u); //c8
+26:}
+27:void xfree(int* v) {
+28: xxfree(v); //c9
+29:}
+30:void xxuse(int* q) {
+31: print(*q); //use(q)
+32:}
+33:void xxfree(int* p) {
+34: free(p);
+35:}
+(a) Programpt([ca1,...,can,c1,c5,c9],p)={([ca1,...,can,c1,c2],o)}
+pt([ca1,...,can,c1,c7,c9],p)={([ca1,...,can,c1,c3],o)}
+pt([ca1,...,can,c1,c4,c8],q)={([ca1,...,can,c1,c2],o)}
+pt([ca1,...,can,c1,c6,c8],q)={([ca1,...,can,c1,c3],o)}
+...
+pt([cb1,...,cbn,c1,c5,c9],p)={([cb1,...,cbn,c1,c2],o)}
+pt([cb1,...,cbn,c1,c7,c9],p)={([cb1,...,cbn,c1,c3],o)}
+pt([cb1,...,cbn,c1,c4,c8],q)={([cb1,...,cbn,c1,c2],o)}
+pt([cb1,...,cbn,c1,c6,c8],q)={([cb1,...,cbn,c1,c3],o)}૛࢔ൈ૝
+(c) Fully context-sensitive points-to sets
+pt([c9],p)={([c2],o),([c3],o)}
+pt([c8],q)={([c2],o),([c3],o)}pt([c5,c9],p)={([c2],o)}
+pt([c7,c9],p)={([c3],o)}
+pt([c4,c8],q)={([c2],o)}
+pt([c6,c8],q)={([c3],o)}
+(d) k-limited context-sensitive (e) Points-to sets with
+points-to sets (k = 1) calling-context reduction
+: call
+: return ... ...main
+free(p)xxfreeࢉ૛:x=xmalloc()
+ࢉ૜:y=xmalloc()
+ࢉ૝:xuse (x)
+ࢉ૞:xfree(x)
+ࢉ૟:xuse (y)
+ࢉૠ:xfree(y) ࢉૢ:xxfree(v)xfreemalloc()xmalloccom
+(Common Caller)
+ࢉૡ:xxuse(u)xuseprint(*q)
+//use(q)xxuse
+ࢉ૚:com()fn[ࢇࢉ૚,ࢇࢉ૛,…,ࢉ,࢔࢈ࢉ૚]
+…[ࢇࢉ૚,ࢇࢉ૛,…,ࢉ,࢔ࢇࢉ૚]
+[࢈ࢉ૚,࢈ࢉ૛,…,ࢉ,࢔࢈ࢉ૚][࢈ࢉ૚,࢈ࢉ૛,…,ࢉ,࢔ࢇࢉ૚][ࢇࢉ૙,ࢇࢉ૛,…,ࢉ,࢔ࢇࢉ૚] …,
+[ࢇࢉ૙,ࢇࢉ૛,…,ࢉ,࢔࢈ࢉ૚] …,૛࢔=܀ 
+෦ࢌࢉ∈ࢉ૞,ࢉૢ,ࢉૠ,ࢉૢ ࢛ࢌࢉ∈ࡾ ෦࢛ࢉ∈ࢉ૝,ࢉૡ,ࢉ૟,ࢉૡcom
+………main f 1f2 fn fn-1… call strings from main to com
+෪ࢎ∈[ࢉ૛],[ࢉ૜]
+(b) Interprocedural control flow graph (ICFG)
+Figure3:Calling-contextreductionforovercomingthelimitationsoffulland k-limitedcontext-sensitivityinUAFdetection.
+...mainmalloc() //࢕
+:ࢌ࢒free(࢖)
+:࢛࢒use(ࢗ)Common Caller
+:࢕࢒Transitively call malloc
+:࢖࢒Transitively call   free
+:ࢗ࢒Transitively call   use෦࢛ࢉ෦ࢌࢉ෪ࢎ
+࢛ࢌࢉ(࢛ࢌࢉ⊕෪)࢕,ࢎ∈࢚࢖ ஶ࢛ࢌࢉ⊕෦࢖,ࢌࢉ∩࢚࢖ஶ(࢛ࢌࢉ⊕෦)ࢗ,࢛ࢉ
+Figure 4: Context reduction, illustrated conceptually with
+an oracle fully-context-sensitive pointer analysis.
+(c⊕[c6,c8],ln31),free(p) reaches print(*q) . However, as
+∄c∈R,([c⊕[c5,c9],p)/simequal([c⊕[c6,c8],q),pandqneverpointto
+a common object. Therefore, no UAF warning will be issued. To
+reason about /simequal, however, we may have to compute 2n+2points-
+tosetsinFigure3(c),makingexistingpointeranalysistechniques
+[19, 38, 42, 52] unscalable when nis large (as validated later).
+•k-Limiting:ScalablebutImprecise. Withk=1,the2n+1call-
+ing contexts reaching free(p) (print(*q) )are abstracted by
+[c9]([c8]). Then([c9],ln34)/leadsto([c8],ln31). In addition, ([c9],p)/simequal
+([c8],q)holds spuriously, based on the two points-to sets in Fig-
+ure3(d),computedimpreciselybutpossiblyefficiently.Thus,a
+false alarm (from line 17 to line 18) is reported.
+With 2-limiting, the false alarm will be suppressed. However,
+increasing kwillnotworkforlargecodebasesfortworeasons.
+First,thenumberofcontextpairstobeanalyzedataUAFpairwillgrowexponentially.Second,theoptimalvaluesfor
+kvaryacross
+the UAF pairs. Finding such values is beyond the state-of-the art.
+2.1.3 Spatio-Temporal Calling-Context Reduction. Thekeyin-
+sightisto removeprefixesinfullcalling contextsthatdonotcon-
+tribute to context-sensitivity, thereby achieving the precision of
+full context-sensitivity and the scalability of k-limiting.Letpt∞(c,v)be the points-to set of vunder context ccomputed
+byanoraclepointeranalysisfullycontext-sensitively.Asillustrated
+in Figure 4,/parenleftbigfree(p@lf),use(q@lu)/parenrightbigis a bug when C1 – C4 hold:
+(C1):main()calls,underacontext cfu,acommoncallerfunction,
+which calls an object allocation function, e.g., malloc() ,free(p)
+anduse(q)at lineslo,lpandlqin that order,
+(C2):ois allocated under context cfu⊕/tildewideh,
+(C3):(cfu⊕/tildewideh,o)∈pt∞(cfu⊕/tildewidecf,p), and
+(C4):(cfu⊕/tildewideh,o)∈pt∞(cfu⊕/tildewidecu,q).
+By definition, (cf,lf)/leadsto(cu,lu)∧(cf,p)/simequal(cu,q)⇐ ⇒
+(/tildewidecf,lf)/leadsto(/tildewidecu,lu)∧(/tildewidecf,p)/simequal(/tildewidecu,q), making cfuredundant.
+Forourexample,Figure3(b)illustratesthecallingcontextreduc-
+tion performed. As cfu∈Ris a common prefix for the common
+caller, com(),thatsatisfiesC1–C4,atotalof2n+1×2n+1fullcalling
+contextpairsreaching/parenleftbigfree(p),print(*q)/parenrightbighavebeenreducedto
+just four, with (/tildewidecf,/tildewidecu)∈{ [c5,c9],[c7,c9]}×{[c4,c8],[c6,c8]}and
+/tildewideh∈{c2,c3}.A scom()is a common caller, (c⊕/tildewidecf,p)/simequal(c/prime⊕/tildewidecu,q)
+doesnothold,i.e., pandqaremust-not-aliasesif candc/primearediffer-
+entprefixesin R.Thus,itisonlynecessarytoverify (c⊕/tildewidecf,ln34)/leadsto
+(c/prime⊕/tildewidecu,ln31)whenc=c/prime.Wecandothisefficientlybycheckingif
+car(/tildewidecf)appearslexicallybefore car(/tildewidecu)incom(),i.e.,iflpappears
+beforelqin Figure 4. Note that caris the standard function for
+returning the first element in a sequence. For the four reducedcontext pairs, only
+([c5,c9],ln34)/leadsto([c6,c8],ln31)holds since c5
+precedes c6incom(). According to the points-to sets, shown in
+Figure3(e),computedefficientlyforthereducedcallingcontexts,
+([c5,c9],p) /negationslash/simequal([c6,c8],q). Hence, no UAF warnings are reported.
+2.2 Path Reduction
+We improve precision by augmenting calling contexts with
+330
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. Spatio-Temporal Context Reduction ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+1: void foo() {
+2: p = malloc(...);// o1
+3: if (cnd) {4: free(p); //free(p@ ln4)
+5: p = malloc(...);// o
+2
+6: }
+7: print(*p); //use(p@ ln7)
+8: }
+Figure 5: Path reduction.path-sensitivity. Consider a bug-
+free example in Figure 5. Withoutpath-sensitivity,
+pat line 4 points
+too1andqat line 7 points to o1
+ando2, causing a path-insensitive
+detector to report a false alarm/parenleftbigfree(p@ln4),use(p@ln7)/parenrightbig. With
+path-sensitivity, ho wever,this false
+alarm will be suppressed successfully.
+To the best of our knowledge, CRed is the first UAF detector
+for large codebases that reasons about path-sensitivity on-demand
+based on a new path-sensitive demand-driven pointer analysis.
+3 THECREDANALYSISFORUAFDETECTION
+AsshowninFigure2,CRedcomprisesthreekeycomponents: 1/circlecopyrt
+spatio-temporalcontextreduction, 2/circlecopyrtdemand-drivenpointeranal-
+ysis, and 3/circlecopyrtmulti-stage UAF analysis. While 1/circlecopyrtrepresents the
+mostimportantcontributionofthispaper,weintroduce 2/circlecopyrtand3/circlecopyrt
+first in that order in order to build the basis for 1/circlecopyrt.
+3.1 Demand-Driven Pointer Analysis
+Wedescribeademand-drivenpointeranalysisthatisnotonlyfield-,
+flow- and context-sensitive as in [ 38,42] but also path-sensitive.
+Addingpath-sensitivityissignificantintermsofbothadvancing
+demand-driven pointer analysis in general and reducing a large
+number of false alarms that would otherwise be reported by CRed.
+3.1.1Program Representation. A C program is represented
+byputtingitintoLLVM’spartialSSAform,following[ 19,26,28,52].
+The set of program variables Vis separated into two subsets: A
+containing all possible targets, i.e., address-taken variables of a
+pointer,and Tcontainingall top-levelvariables,where V=T∪A.
+After the SSA conversion, a program has seven types of state-
+ments:p=&a(AddrOf), p=q(Copy),p=∗q(Load),∗p=q(Store),
+p=ϕ(...,q,...)(Phi),p=callfun(q)(Call),and returnp(Return),
+wherep,q∈Tanda∈A.Top-levelvariablesareputdirectlyin
+SSA form while address-taken variables are accessed indirectly
+via Load or Store. For an AddrOf statement p=&a, known as
+anallocation site, ais a stack or global variable with its address
+taken or a dynamically created abstract heap object. Passing pa-
+rametersandreturnvalues(explicitlyfortop-levelandimplicitly
+for address-taken variables) is modeled by Copy.
+All pointer analyses used are field-sensitive. Each field instance
+of a struct is treated as a separate object. However, arrays are
+considered monolithic. Precise solutions for arrays do not exist.
+Given a program, its ICFG is built in the normal manner [ 23].
+A call site for a function funis split into a call node and a return
+node,withacalledgefromthecallnodetotheentrynodeof fun
+and a return edge from the exit node of funto the return node.
+3.1.2Algorithm. As shown in Figure 6, we extend [ 38,42]b y
+making it also path-sensitive with the required path guards gener-
+ated on-demand. Our analysis is flow-sensitive, since it answers a
+points-to query for a variable vby traversingall the def-use chains
+affecting vbackwards on a value-flow graph (VFG) [ 19,43,44].
+In the VFG, a node represents a statement (identified by its linenumber) and an edge from statement
+lto statement l/prime, denoted
+lv→l/prime,representsadef-userelationforavariable v∈V,withits[ADDR]c,τ,l:p=&o
+(c,τ,l,p)←/arrowhookright(c,τ,ol)
+[COPY]c,τ,l:p=qlqq→lδq=Guard(lq,l)
+(c,τ,l,p)←/arrowhookright(c,τ∧δq,lq,q)
+[PHI]c,τ,l:p=ϕ(..,q,..)lqq→lδq=Guard(lq,l)
+(c,τ,l,p)←/arrowhookright(c,τ∧δq,lq,q)
+[LOAD]c,τ,l:p=∗q (c,τ∧δq,lq,q)←/arrowhookright(co,τo,o)
+lqq→lloo→lδq=Guard(lq,l)δo=Guard(lo,l)
+(c,τ,l,p)←/arrowhookright(co,τo∧δo,lo,o)
+[STORE]c,τ,l:∗p=q (c,τ∧δp,lp,p)←/arrowhookright(co,τo,o)
+lpp→ll qq→ll oo→l
+δp=Guard(lp,l)δq=Guard(lq,l)δo=Guard(lo,l)
+(co,τo,l,o)←/arrowhookright(c,τ∧δq,lq,q)
+(co,τo,l,o)←/arrowhookright(co,τo∧δo,lo,o)
+[CALL]c,τ,l:definefun(v){...}lcall:callfun(a)
+laa→lcall δa=Guard(la,lcall)
+(c,τ,l,v)←/arrowhookright(c/circleminus[l],τ∧δa,la,a)
+[RETURN]c,τ,l:y=callfun(...)definefun(...){...,lret:returnx}
+lxx→lret δx=Guard(lx,lret)
+(c,τ,l,y)←/arrowhookright(c⊕[l],τ∧δx,lx,x)
+[TRANS](c,τ,l,v)←/arrowhookright(c/prime,τ/prime,l/prime,v/prime)(c/prime,τ/prime,l/prime,v/prime)←/arrowhookright(c/prime/prime,τ/prime/prime,l/prime/prime,v/prime/prime)
+(c,τ,l,v)←/arrowhookright(c/prime/prime,τ/prime/prime,l/prime/prime,v/prime/prime)
+Figure 6: Demand-driven pointer analysis with field-, flow-andcontext-sensitivityasin[42]and path-sensitivity added.
+def at statement land its use at statement l/prime. These def-use chains
+are pre-computed with a fast but imprecise Andersen-style pointer
+analysis flow- and context-insensitively [ 4]. Our analysis is also
+context-sensitive. The points-to query pt([c1,...,ck],v), whereci
+identifiesacallsite,returnsthepoints-tosetof vforallthefunction
+calling sequences ending with [c1,...,ck]. Thus,pt([],v@l)gives
+the points-to set of vat linelat all calling contexts.
+We explain our extension on handling path-sensitivity high-
+lighted in red. Calling contexts are path abstractions but can be
+too coarse. To perform path-sensitive analysis, we represent an
+abstract path by both a calling context cand a path guard τso that
+cspecifies its calling sequence and τcollects its branch conditions.
+Thus,pt((c,τ),v@l)givesthepoints-tosetof vatlinelunder(c,τ).
+Inafunction fun,everybranchconditionistreatedasaBoolean
+formula. As in [11, 44, 46], a loop (after unrolling, if needed) is ap-
+proximated only once with its back edge ignored. For each control-
+flow edge e,EdgeGuard( e)is the branch condition under which
+eis executed. For a control-flow path cp, which consists of a set
+ofcontrol-flowedges e,thepathconditionisthelogicalconjunc-
+tion of branch conditions of e, i.e.,/logicalandtext.1
+e∈cpEdgeGuard( e).Apath guard
+Guard(l,l/prime)fromastatement ltoastatement l/primeinfunisthelogical
+disjunctionofpathconditionofallcontrol-flowpathsfrom ltol/prime:
+Guard(l,l/prime)=/logicalordisplay.1
+cp∈Path(l,l/prime)/logicalanddisplay.1
+e∈cpEdgeGuard( e)(4)
+wherePath(l,l/prime)denotes the set of control-flow paths from ltol/prime.
+Apath guard τfrom the entry of main()to a statement is de-
+finedsimplyintermsof(4).Forthetwospecialcases, true(false)
+represents an abstract feasible (infeasible) path.
+331
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Hua Yan, Yulei Sui, Shiping Chen, and Jingling Xue
+Given(c,τ,l,v),wherevariable vappearsatline l,thepoints-to
+setofviscomputedbyfindingallreachableobjects (co,τo,o)via
+backward traversal on the pre-computed def-use chains:
+pt((c,τ),v@l)={(co,τo,o)|(c,τ,l,v)←/arrowhookright(co,τo,o)}(5)
+The first seven rules handle the seven types of statements in
+theprogrambytraversingbackwardsalongallthepre-computed
+def-use chains affecting v@l. The last says that ←/arrowhookrightis transitive. In
+[ADDR], objects created at different allocation sites are identified by
+their line numbers. In [CALL],a∈Vdenotes a variable passed into
+the callee directly or indirectly via parameter passing. Similarly, x
+in[RETURN]represents a value returned directly or indirectly from
+the callee to its caller. Context-sensitivity is enforced by matching
+calls and returns. In c⊕[l], the callsite label lis appended to c.I n
+c/circleminus[l],lisremovedfrom cifccontainslasitstopvalueorisempty
+sincearealizablepathmaystartandendindifferentfunctions[ 39].
+Strong updates are performed on singleton objects as in Supa [ 42].
+Foraprogram,itscallgraphisbuiltonthefly.Ouranalysishan-
+dlesitsSCCs(StronglyConnectedComponents)context-sensitively
+but the function calls in an SCC context-insensitively as in [ 39].
+Thus,ouranalysisisfullyfield-andflow-sensitiveaswellasfully
+context- and path-sensitive (modulo loops and recursion cycles).
+main() { ln1 - ln5
+ln6
+ln8ln7
+returncnd
+true
+true൓cnd൓cnd
+cndGuard(ln1,ln2)=true
+1 : p=& o 1; Guard(ln1,ln4)=true
+2 : x=& o 2; Guard(ln1,ln6)=cnd
+3 : y=& o 3
+4: *p = x; Guard(ln1,ln8)=Guard(ln4,ln8)
+5: if(cnd) =(cnd∧¬cnd)∨(¬ cnd∧¬cnd)
+6: *p = y; =¬cnd
+7: if(!cnd)
+8: z = *p; Guard(ln6,ln8)=¬cnd
+}
+(a) Code (b) CFG (c) Path Guards
+Figure 7: Path guard construction on a CFG.
+3.1.3Example. We use an example in Figure 7 to explain our
+rules on on-demand path-guard generation, with some relevant
+pathguardsshown.Supposeapoints-toquery pt(([],true),z@ln8)
+is issued. With path-sensitivity, we can determine precisely that z
+points only to o2but noto3. In line 8, [LOAD]is applied:
+[],true,ln8:z=* p ([],¬cnd,ln1,p)←/arrowhookright([],¬cnd,o1)ln1p→ln8
+δp=Guard(ln1,ln8)=¬cnd δo1=Guard(ln4,ln8)=¬cnd ln4o1→ln8
+([],true,ln8,z)←/arrowhookright([],¬cnd,ln4,o1)
+Similarly,applying [STORE]and[ADDR]tolines4and2,respectively,
+yields([],true,ln8,z)←/arrowhookright([],¬cnd,ln4,o1)←/arrowhookright([],¬cnd,ln2,x)←/arrowhookright
+([],¬cnd,o2). Thus,zpoints to o2. We can also attempt to
+tracezbackwards to o3via* p=y, by first applying [LOAD]
+in line 8, which produces ([],true,ln8,z)←/arrowhookright([],¬cnd,ln6,o1).
+However, no more rules can be applied further, because
+([],¬cnd,ln6,o1) /negationslash←/arrowhookright([],¬cnd∧cnd,ln6,y),as¬cnd∧cnd=false,
+representing an infeasible path. Thus, zcannot point to o3.
+3.2 Multi-Stage UAF Analysis
+CRed, as shown in Figure 2, consists oftwo stages, Stages 1 and 2.
+Eachstagedecideswhethertoissueawarningornotforagiven
+UAFpairbyverifyingitsownversionof STCRedgivenin(3),which
+isdiscussedbelow.Thepre-analysis,whichservestoprovidethe
+set of UAF pairs for CRed to analyze, can be regarded as Stage 0.mainmalloc() //࢕
+:ࢌ࢒free(࢖)
+:࢛࢒use(ࢗ)…common 
+caller
+࢕࢒(࢖࢒)
+ࢗ࢒ࢉି෪࢖ࢎ
+෦ࢉ࢛ࢉା
+෦ࢌࢉࢉା⨁ࢉି=
+෪ࢗࢎࢉା⨁෪=࢖ࢎmainmalloc() //࢕
+:ࢌ࢒free(࢖)
+:࢛࢒use(ࢗ)…common 
+caller
+࢖࢒
+ࢗ࢒࢕࢒
+෦࢛ࢉ෦ࢌࢉ෪࢖ࢎ(෪ࢗࢎ)
+(a) (b)
+Figure8:Contextreductionwithademand-drivenflow-and
+context-sensitivepointeranalysisthatcomputesthepoints-tosetofavariableunderthecallingcontext [].Boxesandar-
+rows represent functions and (transitive) calls, respectively.
+Eachstageisfoundedonapointeranalysis, Pi.InStage0(ourpre-
+analysis), P0isflow-,context-andpath-insensitive.InStage1(with
+calling-context reduction), P1is flow- and context-sensitive on-
+demand. In Stage 2 (with path reduction), P2is also path-sensitive.
+Asiincreases, Stage ibecomes progressively more precise but
+also more costly, working on filtering out false alarms from an
+increasingly smaller set of UAF warnings provided by Stage i−1.
+AtStagei,where1 /lessorequalslanti/lessorequalslant2,weobtain /leadstoand/simequalasfollows.To
+obtain/simequal,weinvoke Pitocomputethepoints-toset pti(ρi,v),with
+ptin(5)subscriptedby i,foreveryvariable vneededon-demand
+under a budget ηi. Here,ρiis an appropriate path abstraction used
+byPifor querying v.I fηiis exhausted before pti(ρi,v)is found,
+we fall back to Pi−1by setting pti(ρi,v)=pti−1(ρi−1,v)conserva-
+tively,wherethesetofconcretepathsabstractedby ρiisasubset
+of the set of concrete paths abstracted by ρi−1. To obtain /leadsto,w e
+compute it on the ICFG obtained in Stage 0 and refined with the
+function pointers being resolved more precisely by Pi.
+3.3 Spatio-Temporal Context Reduction
+We describe two reductions performed for Stages 1 and 2, with the
+latterbeingdevelopedontopoftheformer,makingStage2more
+precisebutalsomorecostlythanStage1.Foreachstage,wegive
+the inference rules for implementing for its reduction.
+3.3.1 Stage 1. Calling-Context Reduction. We abstractprogram
+paths with calling contexts so that the resulting UAF analysis is
+sound,scalableandhighlyprecise(withasfewspuriouscorrelations
+as possible), as already motivated in Section 2. To this end, we
+wouldliketoreplace P(lf)×P(lu)in(1)withacoarserabstraction
+/tildewideC(lf)×/tildewideC(lu)expressed in terms of calling contexts, reduced as
+shown in Figure 4, so that STin (1) can simplify to STC:
+[Spatio-Temporal Calling Context Reduction]
+STC/parenleftbigfree(p@lf),use(q@lu)/parenrightbig/colonequal
+∃(/tildewidercf,/tildewidercu)∈/tildewideC(lf)×/tildewideC(lu):(/tildewidercf,lf)/leadsto(/tildewidercu,lu)∧(/tildewidercf,p)/simequal(/tildewidercu,q)(6)
+How do we construct /tildewideC(lf)×/tildewideC(lu)? The basic idea was illus-
+trated earlier conceptually in Figure 4 with an oracle fully-context-
+sensitive pointer analysis, pt∞. To reduce the number of context
+pairs in /tildewideC(lf)×/tildewideC(lu), we should remove their redundant prefixes
+if they do not help separate calling contexts as desired.
+However, pt∞is non-existent as it is not scalable for reasonably
+large programs. Below we obtain /tildewideC(lf)×/tildewideC(lu)equivalently by
+usingpt1,whichisaflow-andcontext-sensitivepointeranalysis
+in Stage 1 (Section 3.2), with the intuition illustrated in Figure 8:
+332
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. Spatio-Temporal Context Reduction ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+[CTX-R](/tildewiderhp,o)∈pt1([],p)(/tildewiderhq,o)∈pt1([],q)/tildewiderhpis a suffix of /tildewiderhq
+lo=car(/tildewiderhq⊕[o])lp=car(/tildewidercf⊕[lf])lq=car(/tildewidercu⊕[lu])
+lpandlqreside in the function containing loor its callee, s.t. lp/nequallq
+/tildewidercfis a calling context for lf /tildewidercuis a calling context for lu
+(/tildewidercf,/tildewidercu)∈/tildewideC(lf)×/tildewideC(lu)(7)
+Figure 8 illustrates a total of two cases in which/parenleftbigfree(p@lf),use(q@lu)/parenrightbigmay be potentially a UAF bug. The
+scenario illustrated earlier in our motivating example given in
+Figure 4 is a special instance of one of these two cases.
+AsshowninFigure6, pt([],v)iscomputed on-demand bytravers-
+ing interprocedurally the statements producing values that may
+flow into v, under all possible calling contexts for the function
+containing v, as indicated by [].I fvis found to point to ounder
+contextcwhen [ADDR]is applied, then (c,o)∈pt([],v). Note that c
+is a suffix of a calling sequence from main()too’s allocation site.
+Let us examine [CTX-R].A s(/tildewiderhp,o)∈pt1([],p)and(/tildewiderhq,o)∈
+pt1([],q),(cf,p)/simequal(cu,q)holdsif /tildewiderhpisasuffixof /tildewiderhq,i.e.,thesetof
+full callingcontexts (from main()) abstracted by /tildewiderhpis asuperset
+of the set of full calling contexts abstracted by /tildewiderhq, in which case,
+(/tildewiderhp,o)and(/tildewiderhq,o)may represent a common (concrete) object.
+The common caller, Com, for malloc() ,free(p)and
+use(q), is the function containing line lo. Lineslpandlqre-
+side in either Com(Figure 8(a)) or a (direct or indirect) callee of
+Com(Figure 8(b)) (In the special case, lp=lfandlq=luhold).
+Thus, /tildewidecfis simply the calling context from lptolfsuch that
+lp=car(/tildewidecf⊕[lf]). Similarly, /tildewidecuis derived.
+LetST∞be obtained from STCsuch that /tildewideC(lf)×/tildewideC(lu)
+are now expressed in terms of all full calling contexts
+possible. By [CTX-R],STC/parenleftbigfree(p@lf),use(q@lu)/parenrightbig⇐⇒
+ST∞/parenleftbigfree(p@lf),use(q@lu)/parenrightbig.Thus, STCissoundandasprecise
+as possible by using calling contexts. In addition, STCis efficiently
+verifiable, as motivated in Section 3 and validated later.
+Byconstruction, (cfu⊕/tildewidecf,p) /negationslash/simequal(c/prime
+fu⊕/tildewidecu,q),i.e.,pandqaremust-
+not-aliasesif cfuandc/prime
+fuaredifferentcontextprefixes.Now, (cfu⊕
+/tildewidecf,lf)/leadsto(c/prime
+fu⊕/tildewidecu,lu)holds, where cfu=c/prime
+fu, i.e.,(/tildewidecf,lf)/leadsto
+(/tildewidecu,lu)holds,onlyif lpappearslexicallybefore lqinthefunction
+containing loor its callee in [CTX-R]. To check (/tildewidecf,p)/simequal(/tildewidecu,q)for
+these reachable pairs, we rely on pt1(/tildewidecf,p)andpt1(/tildewidecu,q).
+Let us apply [CTX-R]to formally analyze the UAF pair/parenleftbigfree(p@ln34),use(q@ln31)/parenrightbigin Figure 3. By computing on-
+demand the points-to sets of pandqflow- and context-sensitively,
+we obtain pt1([],p)=pt1([],q)={(c2,o),(c3,o)}. Let us consider
+(c2,o)only. For this example, considering also (c3,o)adds no in-
+formation. As /tildewiderhp=/tildewiderhq=[c2], we have lo=car([c2,o])=c2.
+Thus, com()is the common caller that transitively calls malloc() ,
+free(p)anduse(q).A slp∈{c5,c7}andlq∈{c4,c6},weobtain
+/tildewideC(lf)×/tildewideC(lu)={[c5,c9],[c7,c9] }×{ [c4,c8],[c6,c8]}. Finally, the
+UAF pair is filtered out as a false alarm, as discussed in Section 2.1.
+3.3.2 Stage 2. Path Reduction. Weimprovecalling-contextre-
+ductionbyaugmentingthecallingcontexts /tildewidec∈/tildewideC(l)fromStage1
+with path guards /tildewideτ∈/tildewideG(l), thus achieving path reduction. As aCommon Caller
+FF
+TTxfree
+FT෦ ܿ௙=[ܿଵ]
+෦ ܿ௨=[ܿଶ]xuseEntryܿଵ
+݀݊ܿ1
+ܿଵ: xfree()
+ܿଶ: xuse()݀݊ܿ2
+ReturnEntry݈௙݀݊ܿ3
+݈௙: free(p) Return
+Entry݈௨݀݊ܿ4
+݈௨: use(q) ReturnFT
+=෦߬௙∧Guard(݈௙,ܿଶ)∧Guard(Entry ݈௨,݈௨)=݀݊ܿ1∧݀݊ܿ3∧݀݊ܿ2∧݀݊ܿ4 ෦=࢛࣎Guard (Entryܿଵ,ܿଵ)∧Guard(Entry ݈௙,݈௙)=݀݊ܿ1∧݀݊ܿ3 ෦ࢌ࣎
+Figure 9: Adding path guards to calling contexts in [PAT-R].
+result, STCis refined to STPby considering path-sensitivity:
+[Spatio-Temporal Path Reduction]
+STP/parenleftbigfree(p@lf),use(q@lu)/parenrightbig/colonequal
+∃/parenleftbig(/tildewidercf,/tildewiderτf),(/tildewidercu,/tildewiderτu)/parenrightbig∈/parenleftbig(/tildewideC(lf)×/tildewideG(lf)/parenrightbig×/parenleftbig/tildewideC(lu)×/tildewideG(lu)/parenrightbig:
+((/tildewidercf,/tildewiderτf),lf)/leadsto((/tildewidercu,/tildewiderτu),lu)∧( ( /tildewidercf,/tildewiderτf),p)/simequal((/tildewidercu,/tildewiderτu),q)(8)
+where/parenleftbig/tildewideC(lf)×/tildewideG(lf)/parenrightbig×/parenleftbig/tildewideC(lu)×/tildewideG(lu)/parenrightbigis constructed below:
+[PAT-R]/tildewidercf∈/tildewideC(lf)/tildewidercu∈/tildewideC(lu)/tildewiderτf=/logicalandtext.1
+ci∈/tildewidercf⊕[lf]Guard(ENTRY ci,ci)
+/tildewiderτu=/tildewiderτf∧Guard(lf,car(/tildewidercu⊕[lu])) ∧/parenleftBig/logicalandtext.1
+ci∈cdr(/tildewidestcu⊕[lu])Guard(ENTRY ci,ci)/parenrightBig
+IsFeasible(/tildewiderτu)
+/parenleftbig(/tildewidercf,/tildewiderτf),(/tildewidercu,/tildewiderτu)/parenrightbig∈/parenleftbig/tildewideC(lf)×/tildewideG(lf)/parenrightbig×/parenleftbig/tildewideC(lu)×/tildewideG(lu)/parenrightbig
+Figure9 illustrates theintraprocedural pathscaptured bythese
+guards (marked by different colors). The interprocedural path from
+xfree()tothecommoncallerandtheinterproceduralpathfrom
+the common caller to xuse()are distinguished by calling contexts.
+ENTRYcidenotestheentrystatementofthefunctioncontaining
+the point ci. Thus, /tildewideτfrepresents the path from the entry of the
+functioncontainingthefirstcallsitein /tildewidecftofree(p@lf),and/tildewideτufor
+use(q@lu)consistsofthreeparts:(i) /tildewideτf,(ii)Guard(lf,car(/tildewidecu⊕[lu])),
+whichrepresentsthepathfrom lftothefirstcallsitein /tildewidecu,and(iii)/logicalandtext.1
+ci∈cdr(cu⊕[lu])Guard(ENTRY ci,ci),whichissimilarlydefinedas
+/tildewideτf.Givenasequence, carreturnsitsfirstelementand cdrreturns
+the rest in the sequence. We also check the feasibility of /tildewideτu(and/tildewideτf
+implicitly) by using an SMT solver to enforce branch correlation.
+STPis efficiently verifiable. For /leadsto,(/tildewidecf,lf)/leadsto(/tildewidecu,lu)=⇒
+((/tildewidecf,/tildewideτf),lf)/leadsto((/tildewidecu,/tildewideτu),lu). For/simequal, we check ((/tildewidecf,/tildewideτf),p)/simequal
+((/tildewidecu,/tildewideτu),q)by querying pt2((/tildewidecf,/tildewideτf),p)andpt2((/tildewidecu,/tildewideτu),q).
+Let us see how/parenleftbigfree(p@ln4),use(p@ln7)/parenrightbigin Figure 5 is re-
+ported as a UAF warning in Stage 1 (with calling-context re-
+duction) but removed as a false alarm in Stage 2 (with path re-
+duction). In Stage 1, /tildewideC(ln4)×/tildewideC(ln7)={([],[])}by applying
+[CTX-R].As([],ln4)/leadsto([],ln7)and([],p@ln4)/simequal([],p@ln7)(since
+pt1([],p@ln4)={o1}andpt1([],p@ln7)={o1,o2}),aUAFwarn-
+ing is issued. Let us now apply [PAT-R]. We find that /tildewideτf=cnd
+encodesthepathfromtheentryofthefunction foo()toline4.Sim-
+ilarly,/tildewideτu=cnd∧true∧true=cndencodesthepathfromtheentry
+toline7vialine4.Thus, (([],cnd),ln4)/leadsto(([],cnd),ln7).Weobtain/parenleftbig/tildewideC(ln4)×/tildewideG(ln4)/parenrightbig×/parenleftbig/tildewideC(ln7)×/tildewideG(ln7)/parenrightbig=/braceleftbig/parenleftbig([],cnd),([],cnd)/parenrightbig/bracerightbig
+.A s
+pt2(([],cnd),p@ln4)={([],cnd,o1)}andpt2(([],cnd),p@ln7)=
+{([],cnd,o2)}, we have (([],cnd),p@ln4) /negationslash/simequal(([],cnd),p@ln7). Thus,/parenleftbigfree(p@ln4),use(p@ln7)/parenrightbighas been filtered out as a false alarm.
+333
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Hua Yan, Yulei Sui, Shiping Chen, and Jingling Xue
+4 IMPLEMENTATION
+We have implemented CRed in LLVM (3.8.0). The source files of a
+programarecompiledunder“-O0”intobit-codeby clangfront-end
+and then merged using the LLVM Gold Plugin at link time to pro-
+duceawholeprogrambcfile.Fordebuggingpurposes,LLVMunder
+“-O1”orhigherflagsbehavesnon-deterministicallyonundefined
+(i.e.,undef) values [55], making bug detection nondeterministic.
+Wehaveimplementedourdemand-drivenpointeranalysis,by
+operating on the def-use chains computed by the open-source tool,
+SVF[43],field-sensitivelybutflow-andcontext-insensitivelyusing
+Andersen’s algorithm [ 4]. A program’s call graph is built on the fly
+and points-to sets are represented using sparse bit vectors.
+Instaticanalysis,alinkedlistismodeledfinitely.Thus,anode
+inapoints-tocycleisnotconsideredforUAFdetection(toavoid
+false alarms), as it may represent many different concrete nodes.
+Arrays must be approximated in static analysis. When comput-
+ing/leadstowith a pointer analysis, arrays are considered monolithic.
+When computing /simequal, we distinguish different array elements in-
+traprocedurally.LLVM’s ScalarEvolution passisappliedtoreason
+about must-aliases between two array accesses intraprocedurally.
+PathguardsareencodedbyBDDs(BinaryDecisionDiagrams)
+usingCUDD-2.5.0[ 37].Forpathfeasibility, IsFeasible( /tildewideτu)in[PAT-R]
+is checked by an SMT solver, known as Z3 [13].
+5 EVALUATION
+We show that CRed is efficient and effective in detecting UAF bugs
+in real-world programs without generating excessively many false
+alarms, by answering three research questions (RQs):
+RQ1:Is CRed effective in detecting existing UAF bugs?
+RQ2:CanCRedfind(true)UAFbugsefficientlywithalowfalse
+positive rate in programs with millions of lines of code?
+RQ3:What are the patterns of UAF bugs detected?
+5.1 Methodology
+CRed is fully automatic without requiring user annotations. To
+answer RQ1 and RQ2, we compare CRed with four state-of-the-art
+source-code analysis tools: (1) CBMC (a bounded model checker
+for C/C++) [ 22], (2) Clang (an abstract interpreter for C/C++ in
+LLVM)[3],(3)Coccinelle(apattern-basedbugdetectorforC)[ 33],
+and (4) Supa (a flow- and context-sensitive demand-driven pointer
+analysis for C used for detecting UAF bugs according to STSupain
+(2)[42].ToanswerRQ3,weperformmanualinspectioninrealcode
+to check whether a reported UAF warning is a bug or not.
+5.2 Benchmarks
+To answer RQ1 (for ground truth), we use all the C test cases in
+JulietTestSuite(JTS)[ 1],including138knownUAFvulnerabilities.
+Each test case consists of 100 - 500 lines of code extracted from
+real-worldapplications.ToanswerRQ2andRQ3(inordertotest
+the practicality of CRed), we use 10 widely-used open-source C
+applications, totaling over 3 MLOC, given in Table 1.
+5.3 Experimental Setup
+CBMCisconfiguredtorunasaUAFdetectorbyenabling“–pointer-check”anddisablingtheotherchecks.ToensurethatCBMChandlesloops identically asCRed (as described inSection 3.1.2), every loop
+isunrolledbyspecifying“-unwind2”.Toensuretermination,theTable 1: Benchmarks.
+Program Version KLOC #Pointers #Frees #Uses
+bison 3.0.4 113 102679 299 20163
+curl 7.52.2 188 16432 249 2179
+ed 1.1 3 1062351 17 1604
+grep 2.21 118 1692834 193 5910
+ghostscript 9.14 1693 24067 489 255891
+gzip 1.6 644 106458 66 3904
+phptrace 0.3 6 354077 39 1344
+redis 3.2.6 133 37793 782 59056
+sed 4.2 38 548267 221 6969
+zfs 0.7.0 327 52629 680 6162
+per-program analysis budget for CBMC is set as 3 days. To use
+Clang,eachprogramiscompiledwith“scan-build./configure”and
+“scan-buildmake”,followingitsofficialusermanual[ 3].Coccinelle
+isinvokedwith spatch --sp-file ,withtheUAFpatternsspecified
+with its official UAF script, osdi_kfree.cocci . Supa is used for
+finding UAF bugs according to the analysis given in (2).
+Both Supa and CRed share the same pre-analysis, which is per-
+formedwithAndersen’salgorithm[ 4]field-sensitivelybutflow-,
+context-andpath-insensitively.Inbothcases,thebudgetforone
+points-to query is set as 300 ,000 (the maximum number of def-use
+chains traversable). For any larger budget, both Supa and CRed
+take longer to run but exhibit small improvements in precision.
+For CRed, we apply one optimization in Stage 2 to reduce
+the human effort required in inspecting warnings. Considertwo warnings,
+B1=/parenleftbigfree(p@lf),use(q1@l1u)/parenrightbigandB2=/parenleftbigfree(p@lf),use(q2@l2u)/parenrightbig, with the same free site. It suffices to
+reportB1only,ifB1isabugwhenever B2isandB2isafalsealarm
+whenever B1is. This happens if (1) pt2((/tildewidec1u,/tildewideτ1u),q1)includes all the
+objects in pt2((/tildewidec2u,/tildewideτ2u),q2)and (2)/tildewideτ2u=⇒/tildewideτ1u(solved by Z3).
+Ourexperiments weredone ona3.0 GHZIntel Core2Duopro-
+cessorwith128GBmemory,runningRedHatEnterpriseLinux5
+(2.6.18). The analysis time of a program is the average of 3 runs.
+5.4 Results and Analysis
+5.4.1RQ1: Recall (i.e., Hit Rate). We assess whether CRed
+iscapableoflocatingthe138knownUAFbugsinJTS[ 1].Asdis-
+played in Figure 10, CRed finds all the 138 bugs, just as CBMC and
+Supa do, but Clang and Coccinelle detect only 36 and 126 bugs,
+respectively, with no false alarms produced by any tool.
+0 20 40 60 80 100 120CRedSupaCoccinelleClangCBMC
+126
+13836
+Figure 10: Hit rates for the 138 bugs in JTS: CBMC (100%),
+Clang (26%),Coccinelle (91%),Supa (100%)and CRed (100%).
+CRedachievesatotalrecall,i.e.,a100%hitratein3.7seconds.
+CBMC,asaverificationtool,alsoachievesatotalrecallbutin125.5
+seconds, the longest among all the five tools. Supa, as a sound
+pointer analysis, achieves a total recall in 3.0 seconds.
+Both Clang and Coccinelle miss some bugs. Clang finds only
+36 bugs in 2.5 seconds with a hit rate of 26%. Clang fails to detect
+102 out of 138 UAF bugs for several reasons: (i) it lacks a pointer
+analysis,(ii)itperformsonlysomelimitedinterproceduralanalysis
+throughinlining,and(iii)itreasonsaboutloopsveryconservatively.
+334
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. Spatio-Temporal Context Reduction ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+Table 2: Experimental results (#T:#True Positives (Bugs) and #F: #False Positives (i.e., False Alarms)).
+ProgramCBMC Clang Coccinelle Supa CRed
+ReportTimeReportTimeReportTimeReportTime#Warnings Context Reduction ReportTime
+#T #F (secs) #T #F (secs)#T #F (secs)#T #F (secs) Pre CS PS Before After #T #F (secs)
+bison 00 >259200 00 11301 8 70 1044 17931640 352 1 7.3×10152.0×105011904
+curl 00 >259200 00 35508 530 694 27699 82 0 3.3×1078.2×10300 668
+ed 00 68553 00 1800 103 4 134 32 2 6.3×1043.6×10302 4
+grep 00 >259200 00 11001 8 91 537 362630 493 2 1.1×1073.0×105112023
+ghostscript 00 >259200 00200702 3 680 1944 25562630 1038 3 6.4×10151.6×105032805
+gzip 00 >259200 10 6801 2 31 381 3382 117 1 7.1×1083.6×10310 4
+phptrace 00 >259200 00 2900 11 192 1268 5 1 7.0×1053.2×10310 2
+redis 00 >259200 02 83605 716 4187 1333311019 395 20 1.1×10154.0×10316 413551
+sed 00 >259200 00 11601 4 326 1887 1602258 441 29 1.0×1091.8×10526 3 5102
+zfs 00 >259200 00 79005 3040 12195 18022283 2730 73 2.3×10141.0×10640 33 1271
+Total 00 >2401353 1244420 103 17985 23095 1841641843 5685 132 1.5×10161.9×10685 4727334
+Coccinelle detects 126 bugs in 19.7 seconds. It has missed 12
+bugs due to some unsound search-space reduction heuristics used.
+Oneisconcernedwithmatchingafreesitewithitsusesites.Given
+afreesite,Coccinelleexaminesonlytheusesitesreachablealong
+the forward edges in the program’s call graph. Thus, any UAF
+bugwillbemissedifitsfreesiteresidesinawrapper.Anotheris
+related to the limited alias analysis in Coccinelle. Given a free
+sitefree(p),Coccinelleconsidersthealiasesfor ∗pbytracking
+only the value-flow of pforwards along the control flow via only a
+sequenceofcopyassignmentsontop-levelvariables.Thus,analiasbetween
+∗pand∗q(fora use(q))thatisformedbefore free(p)or
+indirectlyviaaddress-takenvariablesintermsofloadsandstores
+will be missed. All the 12 bugs in JTS are missed this way.
+5.4.2RQ2: Bug-Finding Ability. We assess how efficiently
+andeffectivelyCRedfindsnewUAFbugsinthe10real-worldappli-cations(Table1).Table2givestheresults.CRedissues132warningsincluding85bugsin27,334seconds(7.6hours),startingfrom41,843
+warningsissuedbyitspre-analysis.However,thefourexistingtools
+are either unscalable by terminating within 3 days only for one
+application(CBMC)orimpracticalbyreportingvirtuallynobugs
+(Clang and Coccinelle) or excessively many false alarms (Supa).
+CBMC does not scale yet to large codebases. It spends 68,553
+seconds, i.e., 19.0 hours in analyzing ed(the smallest with 3 KLOC)
+but cannot terminate for each remaining application in 3 days. As
+a result, CBMC detects no UAF bugs (as edis absent of UAF bugs).
+Clangreports3warningsincludingonly1(intraprocedurally-
+detectable)bug,whichisalsofoundbyCRed,in1.2hours.Interest-
+ingly, Clang has even a higher false positive rate than CRed.
+Coccinelle reports 103 warnings, which are all false alarms by
+manualinspection,in179.0seconds.Coccinellefailstodetectanytruebugduetomainlyitstwounsoundheuristicsthataredescribed
+above in Section 5.4.1. Specifically, among the 85 bugs detected by
+CRed, 84 bugs require tracking the backward (i.e., return) edges of
+wrappersforfreesites,withoneexceptionin gzip,which,however,
+requiresanalyzingthealiasingrelationsforaddress-takenvariables.
+Inaddition,allthe26bugsin sedand32bugsin zfsalsorequire
+the value flows of address-taken variables to be tracked.
+Supa also starts with the same 41,843 UAF warnings pre-
+computedbyCRed’spre-analysis.Beingsound,Supareportsthe
+same 85 bugs foundby CRed but also 23,180warnings (with both
+asexpected).Thesefalsealarmsarethespuriousspatio-temporal
+correlations introduced in STSupain (2), as motivated in Section 2.0%20%40%60%80%100%Pre-Analysis Context-Sensitive Analysis Path-Sensitive Analysis
+Figure11:Percentagedistributionof CRed’sanalysistimes.
+CRed is effective in finding new UAF bugs in real-world applica-
+tions.Byexaminingmanuallythe132warningsreported,wefound
+85 to be bugs and 47 to be false positives. These false alarms are
+issued due to mainly imprecise handling of complex path condi-
+tions (among others as explained in Section 5.5). Clang finds only
+1bugin gzip,whichisalsofoundbyCRed,amongthe3warnings
+reported. The other 2 warnings (in sed) are false alarms, due to its
+lackofpointeranalysis.These2falsealarmsarenotreportedby
+CRed.CRedisalsohighlyeffectiveinfilteringoutfalsealarmsin
+its two stages. Let wibe the warnings produced by Stage i. The
+false alarm elimination (FAE) rate at Stage i, where 1 /lessorequalslanti/lessorequalslant2, is
+givenby (wi−1−wi)/wi−1.Thetwostages(CSandPSinTable2)
+are effective, with their average FAE rates being 68.7% and 95.8%.
+CRedisalsoefficientinitstwostages,asshowninFigure11,by
+using increasingly more precise yet more expensive analyses on
+handlingincreasinglyfewerUAFwarnings(asvalidatedinTable2).
+In Stage 1 (context-sensitive analysis), context reduction is signifi-
+cant, as revealed in Columns 17 – 18 in Table 2. Otherwise, Stage 1
+would run for 2 ×109days for the 10 applications (estimated based
+on the per-query time consumed in), implying that Supa would be
+unscalable (as its core pointer analysis pt1is used in [CTX-R]).
+Given its effectiveness, CRed is the most scalable interprocedu-
+ral UAF detector reported (to the best of our knowledge). CRed
+spendsjust7.6hoursinanalyzingthe10applications(totaling3+
+MLOC).Theanalysistimeforaprogramincludesthetimeselapsed
+initstwostagesanditspre-analysis.ForClangandCoccinelle,
+ghostscript takes the longest to analyze since it is the largest
+with1693KLOC.ForCRedandSupa, redistakesthelongestsince
+ithasthesecondlargestnumberofUAFcandidatepairs,i.e.,11,019
+pairs to be analyzed and complex constraints to be solved by Z3.
+5.4.3RQ3: Understanding UAF Bugs. There are 85 UAF
+bugsdetectedbyCRed.Wefirstexaminetworepresentativepat-
+terns in Figures 12(a) and (b) and then discuss these bugs briefly.
+Figure 12(a) illustrates three UAF bugs found in sed(counted as
+one in Column 19 in Table 2, as discussed in Section 5.3). Under
+335
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Hua Yan, Yulei Sui, Shiping Chen, and Jingling Xue
+//lib/regexec.c
+reg_errcode_t re_search_internal (...) {
+for (;; match_first += incr) {
+match_last = check_matching ( &mctx, ...);
+if(match_last == REG_ERROR) //REG_ERROR=-2
+return err; 
+}
+}Idx check_matching (r e_match_context_t * mctx, ...) { 
+if (BE (new_entry == NULL, 0)) {
+free (mctx->bkref_ents) ;
+returnREG_ESPACE; //REG_ESPACE=-12
+}mctx->bkref_ents [mctx->nbkref_ents - 1] .more = 1;
+mctx->bkref_ents [mctx->nbkref_ents].node = node;
+mctx->bkref_ents [mctx->nbkref_ents].str_idx = str_idx;
+}643757
+862
+866869
+1116
+4280
+4282
+4283
+4292
+4294
+4295
+(a) Three UAF bugs in sedķĸĹĺ
+Ļ
+ļ
+Ľ
+ľ
+}
+m
+m
+m
+m
+}
+m
+m
+m//deps/lua/src/strbuf.c
+void strbuf_free(strbuf_t * s){
+free(s);
+}
+//redis/deps/lua/src/lua_cjson.c
+voidjson_check_encode_depth( ..., strbuf_t * json)
+{ strbuf_free( json); }
+voidjson_append_data(..., strbuf_t * json){
+json_check_enco de_depth(..., json);
+json_append_array(..., json, ...);
+}
+voidjson_append_array(..., strbuf_t * json, ...)
+{ strbuf_append_char( json, '['); }
+//deps/lua/src/strbuf.h
+voidstrbuf_append_char(strbuf_t * s, const char c) {
+s->buf[ s->length ++] = c;
+}104
+113
+536
+553
+660
+680683
+566
+571
+116
+119
+(b) Two UAF bugs in redisķ
+ĸ
+Ĺ
+ĺ
+Ļ
+ļ
+Ľ
+ľ
+s
+-
+>bu
+ s
+-
+>len
+Figure 12: A case study for some false alarms eliminated and some bugs reported by CRed in real-world applications.
+a certain path condition, the program frees mctx->bkref_ents
+(line 4282) and returns an error flag REG_ESPACE (line 4283).
+Unfortunately, the error is not captured later in line 866,
+since REG_ESPACE /nequalREG_ERROR , causing the freed pointer
+mctx->bkref_ents to be dereferenced in lines 4292 – 4295.
+Figure12(b)givestwoUAFbugs(countedasoneinColumn19in
+Table2)in redis.Infunction json_append_data (line660), jsonis
+indirectly freed in line 680 by calling json_check_encode_depth ,
+which in turn calls strbuf_free (line 553) to free the object
+(line113).Afterthat, json_append_data calls json_append_array
+(line 683) with jsonpassed as a parameter, where the freed object
+is accessed twice (line 119), resulting in two UAF bugs.
+The85bugsdetectedbyCRedresidein grep,gzip,phptrace ,
+redis,sedandzfs.Precisepointeranalysisisessential.Asmen-
+tionedearlier,58bugs(including26in sedand32in zfs)require
+analyzing aliases for address-taken variables. The other 27 bugs,
+which are found in grep,gzip,phptrace ,redisandzfs, require
+analyzingtop-levelpointersonly.The4bugsin zfswouldbemissed
+if some function pointers in the call sequence from their common
+callerstotheirusesiteswerenotresolvedaccurately.Inaddition,
+interprocedural analysis is also essential. Consider Figure 8. The
+averagecallsequencefromacommoncallertoafree(use)siteis
+2.33 (3.71), with the longest being 4 (7). For only one out of the 85
+bugs, its free and use sites reside directly in its common caller.
+5.5 Limitations
+As a static analysis, CRed can suffer from both false negatives and
+falsepositives.CRedcanmissbugsduetoitsunsoundmodelingof loops (by analyzing two iterations), its unsound handling of a
+linked list (by ignoring its nodes participating in points-to cycles),
+and its unsound modeling of array access aliases (by using LLVM’s
+ScalarEvolution pass for detecting must-aliases). In addition, in
+non-compliantCprograms,whereoneusesapointerpointingto
+oneobjecttoaccessanotherobjectwithpointerarithmetic,pointer
+analysis will be unsound, resulting in potentially false negatives.
+CRed yields false alarms due to mainly (i) imprecise path re-
+duction in [PAT-R], and (ii) imprecise points-to information for
+out-of-budget points-to queries (in traversing points-to cycles).
+6 RELATED WORK
+Detection. Almostall solutionsare dynamic(instrumentation-
+based). Debugging tools such as Valgrind [ 31] and Dr.Memory [ 9]
+candetectarangeofmemorycorruptionerrorsincludingUAFbugsattheexpenseofhighruntimeandmemoryoverheads.Address-
+Sanitizer[ 35]isanotherwidelyuseddynamictool.However,itcan
+miss dangling pointers that, when dereferenced, point to an object
+that has reused the memory range. Undangle [ 10] detects dangling
+pointers by performing a dynamic taint analysis. Its early detec-
+tionapproachcanincurhighruntimeoverheads.CETS[ 30]uses
+an identifier-based scheme, which assigns a unique key for each
+allocation region to identify dangling pointers. It has an overhead
+of 116% in order to provide complete memory safety.
+Static tools dedicated to UAF detection are scarce, with [18]
+focusingonbinarycode,forthereasonsgiveninSection1.General-
+purposememory-safetycheckingtoolsthatcanbeusedtodetect
+UAF bugs include CBMC [ 22], Clang [ 3], Coccinelle [ 33], and
+Supa[42],whichhavebeencomparedwithCRed.Specializedtools
+fordetectingothertypesofbugsexist.Saturn[ 14,50]detectsmem-
+ory leaks and null pointers by solving a Boolean satisfiability prob-
+lem.FastCheck[ 11]andSaber[ 44,45]findmemoryleaksonthe
+value-flow graph of a program. Buffer overflows can be detected
+path-sensitively [24] or symbolically [27].
+Protection. InsteadofdetectingUAFbugs,protectionagainst
+their exploitation can be made. For example, control flow in-tegrity [
+15] prevents control-flow hijacking attacks due to UAF
+buffer overflow exploits via runtime instrumentation. However, all
+fine-grained solutions are toocostly to be deployed in production
+environments and all coarse-grained solutions are bypassable [ 15].
+Cling [2] represents a safe memory allocator that restricts mem-
+oryreusetoobjectsofthesametype.Diehard[ 7]andDieharder[ 32]
+applyarandomizedmemoryallocatorbyprovidingprobabilistic
+safeguarantees.Inthesecases,UAFexploitsaremadeharderbut
+noteliminated.Alternatively,FreeSentry[ 53]andDangNull[ 25]
+invalidatethedanglingpointersdetectedatruntime,attheexpense
+of high runtime and memory overheads.
+7 CONCLUSION
+We present CRed, a novel static detector for finding UAF bugs,
+anddemonstrateitseffectivenessandefficiencyinfindingallthe
+known UAF bugs in Juliet Test Suite and new ones in multi-MLOC
+C applications. CRed achieves this level of scalability, precisionand accuracy by making three advances: (i) a context reductiontechnique for scaling CRed to large codebases, (ii) a multi-stageapproach for filtering false alarms earlier, and (iii) a field-, flow-,context- and path-sensitive demand-driven pointer analysis for
+providing the precise points-to information required.
+336
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. Spatio-Temporal Context Reduction ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+REFERENCES
+[1] Juliet Test Suite 1.2. https://samate.nist.gov/SRD/testsuite.php.
+[2]PeriklisAkritidis.2010. Cling:Amemoryallocatortomitigatedanglingpointers.
+InUSENIX Security’10. 177–192.
+[3] Clang Static Analyzer. http://clang-analyzer.llvm.org/.
+[4]Lars Ole Andersen. 1994. Program analysis and specialization for the C program-
+ming language. Ph.D. Dissertation. DIKU, University of Copenhagen.
+[5]GeorgeBalatsourasandYannisSmaragdakis.2016. Structure-SensitivePoints-To
+Analysis for C and C++. In SAS’16. 84–104.
+[6]ThomasBallandSriramKRajamani.2002. TheSLAMproject:Debuggingsystem
+software via static analysis. In POPL’02. 1–3.
+[7]EmeryD.BergerandBenjaminG.Zorn.2006. DieHard:Probabilisticmemory
+safety for unsafe languages. In PLDI’06. 158–168.
+[8]Dirk Beyer, Thomas A Henzinger, Ranjit Jhala, and Rupak Majumdar. 2007. The
+softwaremodelcheckerBlast. InternationalJournalonSoftwareToolsforTech-
+nology Transfer 9, 5-6 (2007), 505–525.
+[9]DerekBrueningandQinZhao.2011.PracticalmemorycheckingwithDr.Memory.
+InCGO’11. 213–223.
+[10]Juan Caballero, Gustavo Grieco, Mark Marron, and Antonio Nappa. 2012. Un-
+dangle: Early detection of dangling pointers in use-after-free and double-free
+vulnerabilities. In ISSTA’12. 133–143.
+[11]SigmundCherem,LonniePrincehouse,andRaduRugina.2007. Practicalmemory
+leak detection using guarded value-flow analysis. In PLDI’07. 480–491.
+[12]Thurston HY Dang,Petros Maniatis,and David Wagner. 2017. Oscar: Apractical
+page-permissions-based scheme for thwarting dangling pointers. In USENIX
+Security’17. 815–832.
+[13]LeonardoDeMouraandNikolajBjørner.2008. Z3:AnefficientSMTsolver.In
+TACAS’08. 337–340.
+[14]IsilDillig,ThomasDillig,andAlexAiken.2008. Sound,completeandscalable
+path-sensitive analysis. In PLDI’08. 270–280.
+[15]Isaac Evans, Fan Long, Ulziibayar Otgonbaatar, Howard Shrobe, Martin Rinard,
+Hamed Okhravi, and Stelios Sidiroglou-Douskos. 2015. Control Jujutsu: On the
+weaknesses of fine-grained control flow integrity. In CCS’15. 901–913.
+[16]ManuelFähndrichandFrancescoLogozzo.2010. Staticcontractcheckingwith
+abstract interpretation. In FoVeOOS’10. 10–30.
+[17]Xiaokang Fan, Yulei Sui, Xiangke Liao, and Jingling Xue. 2017. Boosting the
+PrecisionofVirtualCallIntegrityProtectionwithPartialPointerAnalysisfor
+C++. InISSTA’17. 329–340.
+[18]JosselinFeist,LaurentMounier,andMarie-LaurePotet.2014. Staticallydetect-
+ing use after free on binary code. Journal of Computer Virology and Hacking
+Techniques 10, 3 (2014), 211–217.
+[19]BenHardekopfandCalvinLin.2011. Flow-sensitivepointeranalysisformillions
+of lines of code. In CGO’11. 289–298.
+[20]NevinHeintzeandOlivierTardieu.2001. Demand-DrivenPointerAnalysis.In
+PLDI’01. 24–34.
+[21]Julien Julien Bertrane, Patrick Cousot, Radhia Cousot, Jérôme Feret, Laurent
+Mauborgne, Antoine Miné, and Xavier Rival. 2011. Static analysis by abstract
+interpretationofembeddedcriticalsoftware. ACMSIGSOFTSoftwareEngineering
+Notes36, 1 (2011), 1–8.
+[22]DanielKroeningandMichaelTautschnig.2014.CBMC–CBoundedmodelchecker.
+InTACAS’14. 389–391.
+[23]William Landi and Barbara G Ryder. 1992. A safe approximate algorithm for
+interprocedural aliasing. In PLDI’92. 235–248.
+[24]WeiLeandMaryLouSoffa.2008. Marple:Ademand-drivenpath-sensitivebuffer
+overflow detector. In FSE’08. 272–282.
+[25]Byoungyoung Lee, Chengyu Song, Yeongjin Jang, Tielei Wang, Taesoo Kim,
+Long Lu, and Wenke Lee. 2015. Preventing use-after-free with dangling pointers
+nullification.. In NDSS’15.
+[26]Ondrej Lhoták and Kwok-Chiang Andrew Chung. 2011. Points-to analysis with
+efficient strong updates. In POPL’11. 3–16.
+[27]Lian Li, Cristina Cifuentes, and Nathan Keynes. 2010. Practical and effective
+symbolic analysis for buffer overflow detection. In FSE’10. 317–326.
+[28]Lian Li, Cristina Cifuentes, and Nathan Keynes. 2011. Boosting the performance
+of flow-sensitive points-to analysis using value flow. In FSE’11. 343–353.[29]RavichandhranMadhavanandRaghavanKomondoor.2011. Nulldereferencever-
+ification via over-approximated weakest pre-conditions analysis. In OOSPLA’11.
+1033–1052.
+[30]Santosh Nagarakatte, Jianzhou Zhao, Milo MK Martin, and Steve Zdancewic.
+2010. CETS: Compiler enforced temporal safety for C. In ISMM’10. 31–40.
+[31]Nicholas Nethercote and Julian Seward. 2007. Valgrind: A framework for heavy-
+weight dynamic binary instrumentation. In PLDI ’07. 89–100.
+[32]GeneNovarkandEmeryDBerger.2010. DieHarder:Securingtheheap.In CCS’10.
+573–584.
+[33]MadsChrOlesen,RenéRydhofHansen,JuliaLLawall,andNicolasPalix.2014.
+Coccinelle: Tool support for automated CERT C secure coding standard certifica-
+tion.Science of Computer Programming 91 (2014), 141–160.
+[34]ThomasReps,SusanHorwitz,andMoolySagiv.1995. Preciseinterprocedural
+dataflow analysis via graph reachability. In POPL’95. 49–61.
+[35]Konstantin Serebryany, Derek Bruening, Alexander Potapenko, and Dmitriy
+Vyukov.2012. AddressSanitizer:Afastaddresssanitychecker.In USENIXATC’12.
+309–318.
+[36]LeiShang,XinweiXie,andJinglingXue.2012. On-demanddynamicsummary-
+based points-to analysis. In CGO’12. 264–274.
+[37]FabioSomenzi. CUDD:CUDecisionDiagramPackage(3.0.0).http://vlsi.colorado.
+edu/~fabio/CUDD/cudd.pdf.
+[38]Johannes Späth, Lisa Nguyen Quang Do, Karim Ali, and Eric Bodden. 2016.
+Boomerang:Demand-drivenflow-andcontext-sensitivepointeranalysisforJava.
+InECOOP’16. 22:1–22:26.
+[39]Manu Sridharanand Rastislav Bodík.2006. Refinement-based context-sensitive
+points-to analysis for Java. In PLDI’16. 387–400.
+[40]Yulei Sui,Peng Di, andJingling Xue.2016. Sparseflow-sensitive pointeranalysis
+for multithreaded programs. In CGO’16. 160–170.
+[41]Yulei Sui, Yue Li, and Jingling Xue. 2013. Query-directed adaptive heap cloning
+for optimizing compilers. In CGO’13. 1–11.
+[42]YuleiSuiandJinglingXue.2016. On-demandstrongupdateanalysisviavalue-
+flow refinement. In FSE’16. 460–473.
+[43]Yulei Sui and Jingling Xue. 2016. SVF: Interprocedural static value-flow analysis
+in LLVM. https://github.com/unsw-corg/SVF. In CC’16. 265–266.
+[44]YuleiSui,DingYe,andJinglingXue.2012. Staticmemoryleakdetectionusing
+full-sparse value-flow analysis. In ISSTA’12. 254–264.
+[45]Yulei Sui, Ding Ye, and Jingling Xue. 2014. Detecting memory leaks statically
+withfull-sparsevalue-flowanalysis. IEEETransactionsonSoftwareEngineering
+40, 2 (2014), 107–122.
+[46]YuleiSui,SenYe,JinglingXue,andPen-ChungYew.2011. SPAS:ScalablePath-
+Sensitive Pointer Analysis on Full-Sparse SSA. In APLAS’11. 155–171.
+[47]Erik van der Kouwe, Vinod Nigade, and Cristiano Giuffrida. 2017. DangSan:
+Scalable use-after-free detection.. In EuroSys’17. 405–419.
+[48]Kostyantyn Vorobyov and Padmanabhan Krishnan. 2010. Comparing model
+checkingandstaticprogramanalysis:Acasestudyinerrordetectionapproaches.
+InSSV’10. 1–7.
+[49] National vulnerability database. http://nvd.nist.gov/.
+[50]YichenXieandAlexAiken.2007.Saturn:Ascalableframeworkforerrordetection
+usingbooleansatisfiability. ACMTransactionsonProgrammingLanguagesand
+Systems29, 3 (2007), 16.
+[51]Wei Xu, Daniel C DuVarney, and R Sekar. 2004. An efficient and backwards-compatibletransformationtoensurememorysafetyofCprograms.In FSE’12.
+117–126.
+[52]SenYe,YuleiSui,andJinglingXue.2014. Region-basedselectiveflow-sensitive
+pointer analysis. In SAS’14. 319–336.
+[53]Yves Younan. 2015. FreeSentry: Protecting against use-after-free vulnerabilities
+due to dangling pointers. In NDSS’15.
+[54]Hongtao Yu, Jingling Xue, Wei Huo, Xiaobing Feng, and Zhaoqing Zhang. 2010.
+Levelbylevel:Makingflow-andcontext-sensitivepointeranalysisscalablefor
+millions of lines of code. In CGO’10. 218–229.
+[55]Jianzhou Zhao, Santosh Nagarakatte, Milo M.K. Martin, and Steve Zdancewic.
+2012. FormalizingtheLLVMintermediaterepresentationforverifiedprogram
+transformations. In POPL’12. 427–440.
+[56]Xin Zheng and Radu Rugina. 2008. Demand-driven alias analysis for C. In
+POPL’08. 197–208.
+337
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:52:13 UTC from IEEE Xplore.  Restrictions apply. 

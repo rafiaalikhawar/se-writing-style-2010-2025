@@ -1,0 +1,1499 @@
+Understanding and Detecting Server-SideRequestRaces
+in Web Applications
+Zhengyi Qiu
+Departmentof ComputerScience
+North Carolina StateUniversity
+Raleigh,North Carolina, USA
+zqiu2@ncsu .eduShudiShao
+Departmentof ComputerScience
+North Carolina StateUniversity
+Raleigh,North Carolina, USA
+sshao@ncsu .edu
+QiZhao
+Departmentof ComputerScience
+North Carolina StateUniversity
+Raleigh,North Carolina, USA
+qzhao6@ncsu .eduGuoliang Jin
+Departmentof ComputerScience
+North Carolina StateUniversity
+Raleigh,North Carolina, USA
+guoliang_jin@ncsu .edu
+ABSTRACT
+Modernwebsitesoftenrunwebapplicationsontheservertohandle
+HTTPrequestsfromusersandgeneratedynamicresponses.Dueto
+their concurrent nature,web applications are vulnerable to server-
+side request races. The problem becomes more severe with the
+ever-increasing popularity ofwebapplications.
+Wefirstconductacomprehensivecharacteristicstudyof157real-
+world server-side request races collected from different, popular
+typesofwebapplications.Thefindingsofthisstudycanprovide
+guidance for future development support in combating server-side
+request races.
+Guided by our study results, we develop a dynamic framework,
+ReqRacer , for detecting and exposing server-side request races in
+web applications. We propose novel approaches to model happens-
+beforerelationshipsbetweenHTTPrequests,whichareessential
+to web applications. Our evaluation shows that ReqRacer can
+effectivelyandefficientlydetectknownandunknownrequestraces.
+CCS CONCEPTS
+·Software and its engineering →Software defect analysis ;
+Softwarereliability ;Softwaretestinganddebugging ;Concur-
+rency control ;Organizing principles for web applications ; Consis-
+tency.
+KEYWORDS
+web-applicationrequestraces,characteristicstudy,racedetection,
+happens-before relationships
+Permissionto make digitalor hard copies of allorpart ofthis work for personalor
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+onthefirstpage.Copyrights forcomponentsofthisworkownedbyothersthanthe
+author(s)mustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,or
+republish,topostonserversortoredistributetolists,requirespriorspecificpermission
+and/or a fee. Request permissions from permissions@acm.org.
+ESEC/FSE ’21, August 23ś28,2021, Athens,Greece
+©2021 Copyright heldby the owner/author(s). Publicationrightslicensed to ACM.
+ACM ISBN 978-1-4503-8562-6/21/08...$15.00
+https://doi .org/10.1145/3468264 .3468594ACMReference Format:
+Zhengyi Qiu, Shudi Shao, Qi Zhao, and Guoliang Jin. 2021. Understand-
+ingandDetectingServer-SideRequestRacesinWebApplications.In Pro-
+ceedingsofthe29thACMJointEuropeanSoftwareEngineeringConference
+andSymposiumontheFoundationsofSoftwareEngineering(ESEC/FSE’21),
+August 23ś28, 2021, Athens, Greece. ACM, New York, NY, USA, 13pages.
+https://doi .org/10.1145/3468264 .3468594
+1 INTRODUCTION
+Upon receiving HTTP requests, modern web sites dynamically
+generateresponsesbyrunningsomeprogramsontheserver.We
+refer to these programs as server-side web applications , and we
+refer to the code that handles each HTTP request as a request
+handler.Duetovarioustypesofconcurrentactivitiesinserver-side
+webapplications,requesthandlersservingHTTPrequestscould
+encounter race conditions while accessing shared resources and
+leadtoerroneousbehaviorsdependingontheorderoftheseshared-
+resource accesses. Since these races happen on the server side of
+webapplicationswhilehandlingHTTP requests,werefertosuch
+racesasserver-siderequestraces orshortlyas requestraces .
+Several high-profile software failures were caused by request
+races, e.g., Instacart coupon double redemption [ 26], Starbucks
+gift-card duplicate balance transfer [ 36], and Flexcoin bankruptcy
+causedbywallet overdraw [ 30].
+In the Instacart incident, a user reported that he was able to
+redeem the same coupon more than once with savings stacked
+by sending the coupon-redemption request multiple times [ 26].
+Figure1shows a high-level explanation based on the incident
+description. While serving onecoupon-redemption request, the
+corresponding request handler will issue multipledatabase queries,
+i.e., one query will first check whether a given coupon has been
+redeemed, and if it has not, more queries will markthe couponas
+beingredeemedandupdatetheuseraccountwiththeredeemedsav-
+ings. Figure 1ashows the case when these two coupon-redemption
+requests are sentsynchronously,i.e., sending one request after re-
+ceiving the response of the previous request. In this case, these
+two requests are handled one-by-one, where only the first request
+will add savings to the user account, but the second request will
+inform the user that the coupon has already been redeemed. How-
+ever, ifauser sendsthe tworequests asynchronously asshown in
+842
+ESEC/FSE ’21, August 23–28, 2021,Athens,Greece ZhengyiQiu, Shudi Shao,Qi Zhao,andGuoliang Jin
+query response
+NoServer DB
+query
+“dallas20” used?
+query response
+Donequery
+use “dallas20”
+response 1
+OK
+query response
+Yesquery
+“dallas20” used?request 2
+use “dallas20”
+response 2
+cannot userequest 1
+use “dallas20”
+(a)Tworequests handled
+one-by-one
+request 1
+use “dallas20”Server DB
+query
+“dallas20” used? request 2
+use “dallas20” query
+“dallas20” used?
+query response
+No
+query response
+No
+query
+use “dallas20”
+query
+use “dallas20”
+query response
+Done
+query response
+Doneresponse 1
+OK
+response 2
+OK(b)Tworequests handled
+concurrently
+Figure 1:Ahigh-levelillustrationoftheInstacartincident
+Figure1b,i.e.,sendingonerequestbeforereceivingtheresponse
+of the previous request in a different, concurrent client session,
+the two requests are handled concurrently, and two concurrent
+instancesofthesamerequesthandlerareracing.Undertheinter-
+leaving shown in Figure 1b, both requests first see that the coupon
+hasnotbeenusedandthenbothusethecoupon,resultinginthe
+reportedcoupondouble-redemptionscenario.
+As exemplified by these incidents, request races can lead to
+seriousservicecorruption,severesecurityvulnerabilities,andhuge
+financiallosses.Tworecenttrendsmakerequestracesanemerging
+threattothereliabilityandsecurityofwebapplications.First,the
+development of cloud platforms greatly eases the deployment of
+web applications, and the number of web applications increases.
+Secondly, getting access to web sites is eased by the increasing
+population of handheld devices, and the chance of encountering
+requestracesincreaseswithmoreconcurrentrequests.Wearein
+great need of a comprehensive understanding of request races and
+effective techniques for detecting them.
+1.1 LimitationsofExistingWork
+Inthismulti-coreera,alotofresearcheffortshavebeenspenton
+thread races in multi-threaded programs. Researchers have con-
+ducted characteristic studies [ 34,55] and proposed various tech-
+niques for different purposes, e.g., bug detection [ 25,33,39,67,
+77,78], program testing [ 49,62,68,71,74], failure diagnosis [ 20,
+21,42,56], and fixing [ 41,43,52,53]. Since web applications are
+commonly hosted on top of some multi-threaded programs, e.g.,
+ApacheHTTPDandMySQL,onemayhavethemisconceptionthat
+request racesare asolved problemgiven the researchprogresson
+thread races.
+However,thread-racedetectiontechniques cannotdetectrequest
+races. The request race shown in Figure 1happens between two
+instancesofthesamerequesthandlerracingondatabaserecords,
+andthe problematicinterleavingondatabase queriesmanifests as
+an atomicity violation, where the violated atomicity assumption
+isamongmultiplequeriesissuedbyasinglerequesthandler.TherequestracecannotbedetectedasathreadraceintheHTTPserver
+program,astheshareddataisstoredinadatabasebutnotinthe
+shared memory of the HTTP server program. It also cannot be
+detectedasathreadraceinthedatabaseprogram,aseachdatabase
+query is atomically processed when the request race happens in
+Figure1.Therefore,thereisnothreadracefromtheviewpointof
+the HTTP serveror the database.Essentially,threadraces happen
+in the system layer, which is below the application layer where
+request races happen. Through the discussion above, we can see
+thatrequestracescanhappeneveniftherearenothreadraces,and
+thus thread-race techniques are not effective for request races.
+Recent techniques for process races on the operating-system
+level [47] anddistributed concurrency bugs in distributed and cloud
+systems [ 48,50,51,54] are also not effective for request races. The
+reasonsaregenerallytwo-folded.First,thesetechniquesalsotarget
+racesinthesystemlayerbutnotintheapplicationlayer,andthe
+racesdetectedbythesetechniquesarenotnecessarilyrequestraces.
+Secondly,evenifthesetechniquescandetectsomerequestraces,
+they could report many false positives, as they do not consider
+applicationsemanticswhilemodelinghappens-beforerelationships.
+We willexpand the discussiononthe secondpointlater.
+Not only one cannot directly use these existing techniques to
+detect request races, but server-side web applications also bring
+uniquechallengestoadaptexistingapproachestodetectrequest
+races. Dynamic race detection now commonly follows the tracing-
+inference-validation architecture, i.e., a tool first traces dynamic
+executionswhereracesdonotmanifest,theninfersracesfollowing
+common race manifestation characteristics, and finally validates
+the inferred races during replay runs. However, we face two major
+challengestoadaptthistracing-inference-validationarchitecture
+for request-race detection inwebapplications.
+First, we currently lack a comprehensive understanding of real-
+worldrequest-racecharacteristicstoguidethethreestagesinthe
+tracing-inference-validationarchitectureandmaketheapproach
+effectiveandefficient.Onlyrecentlyresearchershaveconducted
+characteristic studies on request races in applications developed
+with JavaScript on top of the Node.js framework [ 31,72]. However,
+these two studies do not specifically focus on web applications but
+includemanymiddlewareanddesktopapplications,andtheirstudy
+results cannot provide sufficient coverage for real-world request
+racesinrepresentative server-side webapplications.
+Secondly,server-sidewebapplicationsrequirenewtechniques
+to model happens-before relationships and determine which re-
+quest handlers can run concurrently. For example, one common
+way to establish a happens-before relationship between two re-
+quests is to send the second request by clicking a button on the
+web page returned for the first request. Such happens-before re-
+lationshipscannotbemodeledbyexistingtechniquesthatmostly
+focusonmodelinghappens-beforerelationshipsestablishedwith
+synchronizationoperations.
+Recently, client-side races in web applications have drawn much
+attentionfromtheresearchcommunity.Researchershaveproposed
+several techniques [ 18,24,40,58,63,64,76] for client-side race
+detection.SincetheyfocusontheinteractionbetweentheHTML
+Document Object Model (DOM) and asynchronous event-driven
+JavaScript executions on the client side, the happens-before rela-
+tionships modeled by existing techniques do not readily capture
+843UnderstandingandDetectingServer-SideRequest Racesin WebApplications ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+dependenciesbetweendifferentHTTPrequests.Althoughboththe
+clientsideandtheserversideareintegralpartsofwebapplications,
+requestracesontheserversidearearguablymorecriticalastheyof-
+ten affect persistent system resources, e.g., the coupon redemption
+information inthe Instacart incident storedinthe database.
+Lastly, specific to server-side request races, only a few groups
+ofresearchershave explored techniquestodetectthem so far and
+proposed dynamic [ 45,61], static [ 80], and model-checking [ 35]
+approaches. The dynamic and static approaches [ 45,61,80] only
+detect request races between two instances of the samerequest
+handler,andoneofthem[ 45]furtherlimitsitselftoonesub-type
+of request races. Since it is almost always possible to send the
+samerequestmultipletimesasynchronouslywithcommand-line
+toolsandinvokemultipleconcurrentinstancesofthesamerequest
+handler, there is no need to model happens-before relationships
+inthelimitedscopeofrequest racestargetedby thesetechniques.
+AlthoughtheycandetectrequestracesliketheoneinFigure 1,their
+designchoicesleadtomajorcoverageissues,andtheycannotdetect
+request races between distinctrequest handlers, leading to false
+negatives.Ifoneappliesthesepriortechniquesalsofordetecting
+races between different request handlers, every pair of request
+handlers will be considered as potentially concurrent, leading to
+a large number of false positives to be pruned with the costly
+replaystage.Ontheotherhand,themodel-checkingapproach[ 35]
+alleviates the need to model happens-before relationships between
+distinct request handlers by constructing concurrent test cases
+manually,limitingthe applicabilityofthe approach.
+1.2 Contributions
+To better understand request races and guide the design of request-
+racedetectors,wefirstconductacharacteristicstudyon157server-
+side request races collected from the bug-tracking systems of web
+applicationsdevelopedwithdifferentlanguagesandframeworks,
+coveringPHP,Perl,Python,C#,Java,Ruby-on-Rails,andNode.js.
+Ourstudyisthelargestandmostcomprehensivetodateforserver-
+side request races. It reveals many general findings on racing-
+resourcetypes, manifestationconditions,root-cause patterns,the
+effects of races, and fix strategies, which are useful to guide the
+developmentofcomprehensivetoolsupportforrequestraces.We
+also investigate how external factors, such as language/framework
+differences, affectthe characteristics ofrequest races.
+Our study confirms several observations we made earlier: (1)
+requestracesarenumerousandarealthreattothereliabilityand
+securityofserver-sidewebapplications,(2)requestracesareindeed
+different from system-layer racesthat the root causes and fixes of
+allthestudiedrequestracesareintheapplicationlayer,and(3)it
+is necessary to design new detection techniques that can handle
+requestracesbeyondthosebetweenmultipleinstancesofthesame
+requesthandler,asasignificantportionofthestudiedrequestraces
+are between distinct request handlers.
+We then present ReqRacer , a dynamic framework for detecting
+request races beyond those between two instances of the same
+requesthandler. Tomake iteasytodeployand broadlyapplicable,
+ReqRacer traces only on the server side and thus requires no
+changetobrowsersorotherformsofclients. ReqRacer currentlyfocuses on detecting request races manifest as atomicity violations,
+as they account for 137outof the 157request raceswe studied.
+ReqRacer follows the tracing-inference-validation architecture
+mentionedearlier,anditsdesignisguidedbysomekeyresultsfrom
+ourcharacteristicstudy.Specifically,ourstudyshowsthatallthe
+studied races manifestingas atomicity violations can be triggered
+bytwoconcurrentrequests,i.e.,thebuggyinterleavingsthatcan
+lead to erroneous behaviors only involve shared-resource accesses
+issuedbytwoconcurrentrequesthandlerswithonerequesthandler
+on each racing side. With this result, ReqRacer detects request
+racesbycheckingwhethertherearecommonlyseenunserializable
+interleaving patterns eitherbetweentwo instances of the samere-
+quest handler or between two distinct request handlers that can be
+concurrent. To this end, ReqRacer reports two request handlers as
+having a true, harmful race if their corresponding requests are con-
+currentandtheinferredunserializableinterleavingscauseerrors
+orundesiredbehaviors inreplayruns.
+Ourmajorcontributionliesin ReqRacer ’snovelapproachfor
+constructingadependencygraphtomodelhappens-beforerelation-
+ships between requests, with which ReqRacer recognizes requests
+that are potentially concurrent. ReqRacer models two types of
+dependenciesthatarecommoninwebapplications.Thefirstisa
+Request-Response-Request (RRR) dependency , and it exists when one
+request can only be sent after the response of the previous request
+has been received by the client. The second is a Select-by-Primary-
+Key (SPK) data dependency , and it exists when a latter SELECT
+query specifies a primary key and retrieves one row inserted by an
+earlier query. The RRR dependency is natural for web applications,
+and the purpose of the SPK-data dependency is to quickly prune
+requestracesthatwouldotherwiseresultinreplaydivergencesdur-
+ing thevalidation stage, where a replay divergencehappens when
+the request handlers involved in the request race to validate exe-
+cutesignificantly differentbusiness logic comparingtherecorded
+run and replay run. Similar to the previous work on detecting and
+validating process races [ 47],ReqRacer prunes a request race as a
+false positive when a replay divergence happens, and the SPK-data
+dependencycangreatlyreducethenumberoffalsepositivesthat
+needto be prunedthroughreplay.
+Weimplementedaprototypeof ReqRacer fortheLAMP(Linux,
+Apache, MySQL, and PHP) stack. We evaluated ReqRacer with
+12 requestraces thatwereproduced from ourstudied bugs. These
+12bugscoverallthefourwebapplicationsusedinourstudythat
+are developedwithPHP,i.e.,MediaWiki,WordPress, Moodle,and
+Drupal. Our evaluation results show that ReqRacer can effectively
+andefficientlydetectandexposetheseknownbugsbasedontraces
+fromrecordedrunswhererequestracesdonotmanifest. ReqRacer
+alsofoundatleastfournewrequestracesthatwereunknownto
+us withthe testing workloadsfor the 12 real-worldbugs, and two
+ofthemhave already been confirmedbydevelopers.
+2 SERVER-SIDE REQUEST-RACESTUDY
+In our characteristic study, we follow the same methodology as
+takenbyexistingstudiesonconcurrencybugsinmulti-threaded
+applications [ 55], races in Node.js applications [ 31,72], and perfor-
+mancebugsinwebapplications[ 69,73].Below,wefirstdescribe
+the methodology andthen detailthe results.
+844ESEC/FSE ’21, August 23–28, 2021,Athens,Greece ZhengyiQiu, Shudi Shao,Qi Zhao,andGuoliang Jin
+Table1:Webapplicationsandnumbersofbugsbeingstudied
+Application
+(Abbreviation)Server-Side
+LanguageNumberon
+ServerSideNumberon
+ClientSide
+WordPress (WP)[ 16] PHP 18 22
+MediaWiki (MW)[ 8] PHP 28 10
+Drupal (DPL)[ 5] PHP 31 7
+Moodle(MDL)[ 9] PHP 15 8
+BugZilla (BZ)[ 1] Perl 11 0
+Odoo(OD)[ 12] Python 2 8
+DNN (DNN) [ 4] C# 4 1
+OpenMRS (MRS) [ 13] Java 2 0
+Gitlab (GL) [ 6] Ruby 26 5
+Discourse (DC)[ 3] Ruby 7 2
+Redmine(RM) [ 14] Ruby 2 0
+Spree(SPR)[ 15] Ruby 0 2
+Node.js-based (Node.js) Javascript 11 1
+Total 157 66
+2.1 Methodology
+Table1summarizesthenumberofstudiedrace-inducedbugsand
+web applications from the bug-tracking systems of which these
+bugs are collected. We study bugs from two major types of web
+applications: (1) classical ones that access database by constructing
+SQLqueriesdirectly,and(2)thoseimplementedontopofRuby-on-
+Rails,whichprovidesObject-Relational-Mapping(ORM)support.
+Westartedwithpopularopen-sourcewebapplicationsthathave
+beenpreviouslystudiedbyexistingperformance-bugstudies[ 69,
+73], which have 7 non-ORM applications and 12 ORM applications,
+respectively. We also included extra non-ORM web applications
+that we have experience with.
+To collect races, we searched across the bug-tracking systems of
+these applications for closed bugs using keywords related to races,
+such as łrace(s),ž łconcurrency,ž łatomic,ž and łsynchronization.ž
+Then, we manually filtered out results obviously not related to
+races, e.g., łbracesž or łtracesž can be returned while searching for
+łrace.žAfterkeywordsearchandfiltering,weobtainedaround1400
+bug reports. We then manually examined each bug with sufficient
+informationforustounderstandtherootcause,andwecollected
+bugs with clear root causes that are related to races. Our final
+selection includes a total of 211 bugs from 12 popular open-source
+webapplicationscoveringsixdifferentserver-sideprogramming
+languages.We omit applicationswithoutany race-inducedbugs.
+We also included race-induced bugs in Node.js-based web appli-
+cations from the two previous studies on Node.js projects [ 31,72],
+the total of which is 12 as other bugs are either in Node.js-based
+middlewareordesktopapplicationsbutnotwebapplications.Since
+these 12 bugs are in 12 different Node.js web applications, we omit
+theirnames dueto spacelimit.
+After collecting race-induced bugs from the bug-tracking sys-
+tems of these web applications, two inspectors first independently
+checked all available resources, e.g., source code, developer discus-
+sions, and patches, compared their characterization results, and
+resolveddisagreement if any.
+Among the 223 bugs we collected, 157 are induced by server-
+side races, and 66 are induced by client-side races. Note that we
+includedallrace-inducedbugsthatwecouldunderstandregardless
+ofwhethertheyareontheserversideorontheclientsidewhile
+collecting the bugs, and the separation of server-side races from
+client-side races was done after we collected all race-induced bugs.Such a distribution shows that server-side races are indeed under-
+studiedcomparedwithclient-sideracesandwarrantmoreresearch
+attention.Ourinvestigationfocusedontheserver-sideraces,and
+future work can further study the client-sideraces.
+2.2 Characteristic-StudyResults
+Table2summarizes our findings. Before describing the details, we
+note that two general observations we made during our character-
+isticstudyarealignedwithourargumentmadeearlier,i.e.,existing
+system-layerracedetectiontechniquesarenoteffectiveforrequest
+races. First, all the server-side races in web applications we studied
+areintheapplicationlayerbutnotinthesystemlayer.Secondly,
+we do not see a case where developers used existing race detection
+toolstohelpdebugging,whicharguablyimpliesthat(1)practical
+thread-race detection tools commonly mentioned in thread-race
+bug reports are not useful for request races, and (2) tool support
+fordebuggingrequestracesisingreatneed.Below,wedetailthe
+resultsonthefollowingcharacteristics:racing-resourcetypes,root-
+cause patterns and manifestation conditions, the effects of races,
+and fix strategies. We end this section with a discussion on how
+theseresults depend onexternal factors.
+Racing-resource types. Databases, files, cache using modules
+like Redis or Memcached, and shared-memory data structures are
+the racing resources we found in our studied request races. Four
+bugsinvolveconsistencyissuesbetweendatabaseandcache,and
+their racing resources include both databases and cache. While
+thread-race techniques cover shared-memory data structure and
+process-race techniques [ 47] cover files asa racing resource, tools
+targeting request races need to further model and analyze accesses
+to databases and cache. Further, some races involve inconsistency
+between databaseandcache,whichneedsto be accountedfor.
+Root-cause patterns and manifestation conditions. In our
+studiedbugs,atomicityviolationandorderviolationarethetwo
+root-cause patternsof howthe shared-resourceaccessesin racing
+request handlers can lead to failures or undesirable effects. All
+studiedracesinvolvingonlyonerequest,i.e.,intra-requestraces,
+manifest as order violations, and all studied races involving two
+requests, i.e.,inter-request races, manifestas atomicity violations.
+For atomicity violations, all studied races can manifest with two
+racingrequesthandlers,andtheviolatedatomicityassumptionis
+on accesses within a single request handler but not across mul-
+tiple request handlers. As a result, we only need to check pairs
+of concurrent request handlers to detect request races manifest-
+ingasatomicityviolationsonshared-resourceaccesses.However,
+not all atomicity violations can manifest with two instances of the
+samerequest,whichwillbehandledbythesamerequesthandler.
+One-third of them require two requests that will be handled by
+differentrequesthandlers.Existingdynamicrequest-racedetection
+techniquesinliterature[ 45,61]onlycheckracesbetweenarequest
+handlerwithitself,andtheywillmissallracesrequiringtwodiffer-
+entrequesthandlers.Weareingreatneedoftechniquesthatcan
+detectrequest racesbetween distinct request handlers.
+Fororderviolations,allthestudiedcasesareduetoasynchronous
+execution. Since modern ORM and Node.js frameworks have built-
+insupportforasynchronousexecution,webapplicationsbuiltwith
+suchframeworksaremorepronetoorderviolations,whichispartly
+845UnderstandingandDetectingServer-SideRequest Racesin WebApplications ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+Table 2:Overallcharacteristic-study results
+WPMWDPLMDLBZODDNNMRSGLDCRMNode.js Total
+Number of bugs studied 1828311511242267211 157
+Racing-ResourceTypes
+Database 11201811111101952 5104
+File 331040131220 0 29
+Cachewith modules like Redis orMemcached 55410000100 0 16
+Shared-memorydata structure 01000001400 6 12
+Root CausePatterns and Manifestation Conditions
+Atomicityviolation with twoinstances of the same request handler 10212296232622 6 91
+Atomicityviolation with twodifferentrequest handlers 87964010630 2 46
+Orderviolation withinone request handler 000010001420 3 20
+Effects of Database Races
+Databaseerroronduplicatedata insertion 2111113000300 0 31
+Applicationerrorcaused by duplicatedata 40241110101 1 16
+Inconsistentorstale view 585670001140 4 50
+Misleadingerrormessage 01000000000 0 1
+Programcrash orfailure 00000000411 0 6
+FixStrategies for Database Races
+Atomicityviolation:Change applicationlogic 45321000710 0 23
+Atomicityviolation:Handle the race properlywhen it happens 26451000300 0 21
+Atomicityviolation:Guaranteecolumnvalueuniqueness 20031010101 1 10
+Atomicityviolation:Use duplication-tolerantSQL query 15000000000 0 6
+Atomicityviolation:Refactorquerystatement 01710100010 0 11
+Atomicityviolation:Addtransactionorleverageexistingtransaction 00003000010 0 4
+Atomicityviolation:Lock the table 02304000001 0 10
+Atomicityviolation:Use atomicAPI 00000000000 3 3
+Atomicityviolation:Fix in frontend 21100000000 0 4
+Orderviolation:Enforce orderby callbackfunction 00000000510 1 7
+Orderviolation:Use synchronous execution 00000000200 0 2
+Orderviolation:Removetransaction 00001000110 0 3
+Effects of File Races
+Duplicate file/directorycreation 11510110100 0 11
+Filedata corruption 11320010010 0 9
+Non-existingfile/directoryerror 11210010100 0 7
+Misleadingerrormessage 00000001010 0 2
+FixStrategies for File Races
+Atomicityviolation:Change applicationlogic 00110000000 0 2
+Atomicityviolation:Handle the race properlywhen it happens 01720101210 0 15
+Atomicityviolation:Guaranteefilenameuniqueness 12110000010 0 6
+Atomicityviolation:Addfilelock 20100030000 0 6
+Effects of Cache Races
+Inconsistentorstale view 55410000100 0 16
+FixStrategies for Cache Races
+Atomicityviolation:Change applicationlogic 24300000000 0 9
+Atomicityviolation:Handle the race properlywhen it happens 01110000000 0 3
+Atomicityviolation:Guaranteecachekeyuniqueness 30000000000 0 3
+Orderviolation:Use proper cacheAPI 00000000100 0 1
+Effects of Shared-MemoryData StructureRaces
+Applicationerrororexception 01000001400 0 6
+Request never beresponded to 00000000000 2 2
+Programcrash orfailure 00000000000 4 4
+FixStrategies for Shared-MemoryData StructureRaces
+Atomicityviolation:Use databaseinstead 01000000000 0 1
+Atomicityviolation:Addlanguage-provided lock 00000001000 0 1
+Orderviolation:Change applicationlogic 00000000200 4 6
+Orderviolation:Addcondition to enforce order 00000000000 2 2
+Orderviolation:Read again aftera delay 00000000200 0 2
+reflectedbythefactthatonlyoneoutofthe20orderviolationsare
+inthe firsteightnon-ORM, non-Node.js webapplications.
+Unserializableinterleavingpatternsinatomicityviolations.
+To summarize unserializable interleaving patterns in atomicity vio-
+lations,wefollowtheargumentsraisedbyZhengandZhang[ 80]in
+theirworkofstaticdetectionofrequestracesmanifestingasatomic-
+ity violations. Specifically, operations like file append and database
+delete cannot be modeled as write operations. For example, a local
+SELECTqueryandalocalDELETEqueryinterleavedwitharemoteDELETEqueryonthesamedatabaserecordisunserializableifthey
+aremodeledas 𝑅𝑊′𝑊.However,thisiswrongasithasthesame
+consequence as first performing the local SELECT and DELETE
+queries and then the remote DELETE query. Therefore, they in-
+troduced two new operation categories, i.e., 𝐴for append and 𝐷
+for delete, and 𝑊is now specifically for overwrite or update. With
+thesefourtypesofoperations, 𝐴𝐷𝑅𝑊,defined,alotofinterleaving
+patterns are possible. They further argued that a lot of them are
+unlikely in practice and suggested four unserializable interleaving
+846ESEC/FSE ’21, August 23–28, 2021,Athens,Greece ZhengyiQiu, Shudi Shao,Qi Zhao,andGuoliang Jin
+Table 3: The patterns of unserializable interleavings and
+their numbers inour studied request races
+Pattern Number
+1(𝜖|𝑅)𝑅′(𝐴|𝑊|𝐷)(𝐴′|𝑊′|𝐷′|𝑅′)114
+2 𝐴(𝐴′|𝑅′|𝑊′)𝐴 2
+3 𝑊(𝐴′|𝑅′)(𝑊|𝐴) 3
+4 𝐷𝐷′𝐴𝐴′4
+5 (𝐴|𝑊)(𝐴′|𝐷′|𝑊′)𝑅 14
+patternsthatcouldhappeninpractice:(1) 𝑅𝑅′(𝐴|𝑊|𝐷)(𝐴′|𝑊′),(2)
+𝐴(𝐴′|𝑅′|𝑊′)𝐴,(3)𝑊(𝐴′|𝑅′)(𝑊|𝐴),and(4)𝐷𝐷′𝐴𝐴′.1
+With these four unserializable interleaving patterns, we first
+matchedourstudiedatomicityviolationsinvolvingasingleresource
+against them. For those without an exact match, we modified a
+close match or proposed a new pattern. Table 3summarizes the
+results.Thefirstfourpatternsaremostlythesameastheonesby
+ZhengandZhang[ 80]withthefirstpatternmodified.Thesefour
+patterns cannot be further merged, as the first operations of the
+fourpatternsaredifferent.Amongthesefourpatterns,thefirstone
+isthemostcommoninourstudiedbugs.Wealsofoundonenew
+pattern with 14 bugs matching it, where most of these bugs are
+racesoncacheandshareddatastructures.WedidnotmergePattern
+(5) with Pattern (2), as that results in (𝐴|𝑊)(𝐴′|𝑅′|𝑊′|𝐷′)(𝐴|𝑅),
+but𝐴𝑅′𝑅is serializable. All the four races involving both database
+and cache are categorized as Pattern (5). Specifically, the buggy
+interleavingisthatonerequestfirst queriesdatabaseandcaches
+the queried results. Before the cached results are accessed, another
+requestupdatesthedatabasewithoutinvalidatingthecache,and
+the first request will later access stale data that is not consistent
+withthe database.
+Although the first four patterns are initially proposed by Zheng
+and Zhang [ 80] based on intuition, the value of our results lies
+in that we confirm that they are indeed the most common ones
+with our collected real-world bugs and we further refine them. We
+further summarize one new pattern, i.e., Pattern (5), which Zheng
+and Zhang [ 80] suggested as being unlikely, but we observed such
+a pattern in real-world request races partly due to our inclusion of
+request racesoncache andshareddata structures.
+Theeffectsofraces. 47 outofthe104studied request raceson
+databases can lead to duplicate data insertion. Among them, 31
+result in database errors, and 16 result in application errors. The
+majority of the remaining database races lead to inconsistent or
+stale views. File races can lead to various errors, such as duplicate
+file/directory creation or non-existing file/directory errors. File
+races can also lead to data corruptions. All cache races lead to
+inconsistentorstaleviews.Racesonshared-memorydatastructures
+canleadtovariousfailuresanderrors.Theycanalsoleadtorequests
+neverberespondedto,andsucheffectsarenotobservedonraceson
+otherresources.Forsomeoftheseraces,thefailureeffectsareeasy
+to detect,such asthoseresultingin explicit errors.For othersthat
+1Eachpatternhasfourorthreeoperations.Thefirstandthirdoperationsarefromone
+request.The secondand fourth,whichare marked ‘′’,are from the second request.If
+one operation has multiple possibilities, they will be put inside ł ()ž and separated by
+‘|’.𝐴stands for append operations, which include database insert, file append, file/dir
+create,andcacheadd; 𝐷standsfordeleteoperations, whichincludedatabasedelete,
+file/dir delete, and cachedelete; 𝑅stands for read operations, which include database
+select,file/dirread,cacheread; 𝑊standsforwriteoperations,whichincludedatabase
+update, fileoverwrite, and cacheset orreplace; and 𝜖stands for NULL operations.lead to inconsistent views or data corruptions on shared resources,
+sometypesofcheckerstakingapplicationsemanticsintoaccount
+are neededto catch the effects.
+Amongthe91racesontwoinstancesofthesamerequesthandler,
+63 of them are racing on databases. Further, the aforementioned
+47 races leading to duplicate data insertion with either database or
+application errors are all among these 63 and can manifest with
+two instances of the same request handler. These numbers suggest
+that we can use an effect-oriented approach [ 37,77,78] to find a
+large portion of database races between two instances of the same
+request handler by focusing on detecting request races with the
+duplicatedata-insertion effect.
+Fix strategies. 21 out of the 137 studied atomicity violations
+are fixed using database locks, transactions, file locks, or language-
+providedlockstoprovideatomicity.Thepatchesforthemajorityof
+remainingatomicityviolationsinvolve designorapplication-logic
+changes.Theseresultsareconsistentwiththeconventionalwisdom
+that there are few synchronization operations to use on the server
+side, and thus some design or logic changes are often needed to fix
+request races. For order violations, using callback functions and
+changing applicationlogic are the twomajorfixstrategies.
+Oneinteresting finding on fix strategies isthatfourserver-side
+requestracesare fixedbychangesinclient-side code,suchasdis-
+ablingabuttonontheclientsideifthebrowserhasnotyetreceived
+the response for an earlier request, which was sent by clicking the
+samebutton,toavoidtwoconcurrentinstancesofthesamerequest.
+Dependencyonexternalfactorsanddiscussion. Inourstudy,
+we paid attention to several external factors, including web-server
+configuration, database configuration, and development languages
+andframeworks, andstudiedthe impact of theseexternal factors.
+Some web servers, e.g., Apache HTTPD, commonly provide dif-
+ferentmulti-processingmodules,i.e.,prefork,worker,andevent[ 10],
+whilewebapplicationsbuiltontopoftheNode.jsframeworkuse
+theevent-basedmodel.Inourstudy,wedidnotfindtheunderlying
+multi-processingmodelaffectthewayhowwedefineserver-side
+requestraces,i.e.,thestudiedracesareonrequesthandlersupon
+receivingHTTPrequests.Suchadefinitionabstractsawaywhether
+a request is served by a process or thread and whether a request is
+served with an event-based model. On the other hand, we found
+requestraceswhose manifestationconditiondependsondatabase
+configuration. For example, the MyISAM storage engine in MySQL
+doesnotsupporttransactions[ 11],andwehaveseenMediaWiki
+racesthatarecausedbytheuseoftransactions,whichonlymanifest
+if MyISAM but not InnoDBisusedinMySQL.
+Intermsofthedependencyondevelopmentlanguagesandframe-
+works,built-insupportforasynchronousexecutioncouldmakeweb
+applications more prone to order violations as we discussed earlier.
+We alsonotethat non-ORM,non-Node.js webapplicationhasthe
+leastnumber ofracesracingonshared-memory datastructure,as
+theirdevelopmentlanguagesprovidelittlesupportforsharedmem-
+ory natively. On the other hand, some other number differences
+maynotbedependingonlanguage/framework.NoNode.jsrequest
+racesareonfileorcache,whichisprobablyduetothesmallertotal
+number of request races being studied. Also, the differences on the
+total numbers of request races we studied in different types of web
+applications,i.e.,westudythelargestnumberofrequestracesin
+non-ORM, non-Node.js web applications and the smallest number
+847UnderstandingandDetectingServer-SideRequest Racesin WebApplications ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+Backup and
+restoreTrace for
+replayClient
+DB
+Cache
+File
+Web ServerServer sideReq
+Offline
+analyzerTracing (deployed system) Validation (replay system) Inference
+True and
+harmful
+racesClient
+DB
+Cache
+File
+Web ServerServer sideReq
+Figure 2:The architecture of ReqRacer
+inNode.jswebapplications,aremorerelatedtothedevelopment
+history length ofwebapplicationsbeing studied.
+Although we included some bugs from Node.js-based web appli-
+cations, which were studied inearlier studies [ 31,72],our focus is
+different,aswespecificallyfocusonwebapplicationsbuttheirstud-
+ies include othertypes of applicationsbuilt on top ofNode.js, e.g.,
+middlewareanddesktopapplications.Duetothisdifference,our
+characteristicstudyisessentiallytargetingadifferentsubject.More-
+over, our study includes 146more request races from non-Node.js
+web applications, which allows us to both find characteristics that
+are common to all types of web applications and to understand the
+impact ofdevelopmentlanguage/framework differences.
+3 SERVER-SIDE REQUEST-RACEDETECTION
+Based on our characteristic-study results, we design a dynamic
+framework, ReqRacer , to detect and expose server-side request
+racesthat manifestasatomicity violations.Figure 2illustratesthe
+architectureof ReqRacer ,andithasthreemajorstages.Thefirst
+stage records four types of runtime information, and they are used
+fordeterminingshared-resourceaccesses,reasoningaboutdepen-
+dencies between requests, and enabling execution replay. The sec-
+ondstageconsumesthetracesrecordedduringthefirststageandin-
+fers potential unserializable interleavings to detect racing requests.
+The last stage replays the recorded traces,tries to enforce the unse-
+rializable interleavings inferred by the second stage, and observes
+their effects. Racing requests with triggered harmful unserializable
+interleavings willbe reported.
+3.1 IllustratingExample
+The key contribution of ReqRacer is to model happens-before
+relationshipsessential toHTTP requestsin webapplications with
+a novel form of dependency graphs, so that the well-established
+tracing-inference-validationarchitecturecanbeappliedtodetect
+request races.
+WewilluseWordPress11073toillustratethedependency-graph
+constructionprocessshowninFigure 3.Therequestraceisbetween
+adding a comment for a post and trashing the post. While trashing
+a post in one request, the IDs and current statuses of its comments
+are first backed up for possible future restoration, and then the
+statuses of all existing comments will be marked as trashed. In
+between these two steps, another concurrent request can add a
+newcommenttothepostbeingtrashed.Underthissituation,the
+comment is first successfully added to the post and displayed to
+Req14: GET trash page
+Req15: POST to trash
+Req16: GET the redirected pageReq2: GET add_post page
+Req3: Ajax POST autosave
+Req4: Ajax GET permeant link
+Req5: Ajax GET token update
+Req6: Ajax POST autosave
+Req7: POST to publish
+Req8: GET the redirected page
+Req17: GET untrash page
+Req18: POST to untrash
+Req19: GET the redirected pageReq10: GET comment page
+Req11: POST to submit
+Req12: GET the redirected pageReq1: GET admin page
+Grp1
+12
+3Req9: GET site home page
+Req13: GET admin pageGrp2. Add a new post
+Grp3. Go to site home
+Grp4. Add a comment
+Grp5. Go to admin page
+Grp6. Trash the post
+Grp7. Untrash the post
+Grp3Grp2
+Grp5Grp4
+Grp6
+Grp7Grp1. Go to admin pageFigure 3:Anexample ofdependency-graph construction
+the user, and it is then marked as trashed since the post is being
+trashed. However, the new comment is not backed up, and this
+commentcannotberestoredifthepostisuntrashedlater.Theuser
+whoaddedthenewcommentwillobserveinconsistentviews,as
+thecommentwasfirstaddedsuccessfully,butlaterthecomment
+willbegoneiftheuserrefreshesthepostthatjustwentthrough
+the trashanduntrash process.
+Now assuming a developer is doing some testing for WordPress.
+Inabrowser,thedeveloperfirstgoestotheadminpageandadds
+a new post, then goes to site home and adds a comment for the
+newly added post, and finally goes back to the admin page to trash
+and thenuntrashthe post.Inthis sequence,the harmfulraceis not
+triggered.Duringthisprocess, ReqRacer recordsasequentialtrace
+as shown in 1○, and it then constructs the dependency graph as
+shownin 3○.Notethattheboxessurroundingtherecordedrequests
+in1○are addedfor illustration purposes but not part of the trace.
+With these recorded requests, one extreme is to consider all
+recorded requests as totally ordered, under which case we will
+not be able to infer any potential races. The other extreme is to
+consider that allrequestscan potentially be sentconcurrentlyvia
+different browsers or tabs, under which we will be inferring too
+manyfalsepositives.Therefore,weonlyrelaxordersbetweentruly
+independentrequestsbutpreserveordersthat,oncerelaxed,can
+disable subsequent requests and lead to replay divergences. In Fig-
+ure3,ReqRacer will go through 1○→2○→3○to find potentially
+concurrentrequests from the sequenceof recordedrequests.
+From1○to2○,ReqRacer groupsrequeststhat have aRequest-
+Response-Request (RRR) dependency, i.e., one request can only be
+sentaftertheresponseofthepreviousrequesthasbeenreceived
+by the client. Such an RRR dependency can be established in three
+waysin Figure 3.First,aPOSTrequest could depend onthe previ-
+ous GET request, and this applies to Req2→Req7,Req10→Req11,
+Req14→Req15, andReq17→Req18. Second, a GET request to a
+redirectedpagedependsonthepreviousrequest,andthisapplies
+toReq7→Req8,Req11→Req12,Req15→Req16,andReq18→Req19.
+Third, Ajax requests depend on the previous GET request, and this
+848ESEC/FSE ’21, August 23–28, 2021,Athens,Greece ZhengyiQiu, Shudi Shao,Qi Zhao,andGuoliang Jin
+applies to Req2→{Req3,Req4,Req5,Req6}. Grouping requests with
+dependencies together, we get a total of seven groups shown in
+Figure3.2○.ReqRacer recognizestheseRRRdependenciesthrough
+programmodificationstoembedtokensintorequestsandresponses.
+NotethatthetextdescriptioninFigure 3.2○isjustaddedtoease
+understanding but not inferredby ReqRacer .
+From2○to3○,ReqRacer adds an edge between two request
+groupsifthereisaspecialtypeofdatadependenciesbetweenthem,
+i.e.,whenarequestissuesaSELECTquerywithaprimarykey,and
+thedatabasereturnsasinglerowthatwasinsertedbyaqueryfrom
+anearlierrequest.WenameitasSelect-by-Primary-Key(SPK)data
+dependency. The rationale is that if one considers two requests
+withanSPK-datadependencyasconcurrentandforcefullysendthe
+latterrequest before receivingtheresponse oftheformer request,
+theSELECTqueryinthelatterrequestwillreturnzerorows,which
+couldsignificantlyaffecttheexecutionofthecorrespondingrequest
+handlercomparedwiththerecordedrunwhereitgetsonerow,and
+itwillresult inareplaydivergence.
+For example, the SPK-data-dependency edge from Grp2toGrp4
+inFigure 3.3○isaddedbecauseonequerysenttodatabasewhile
+handling Req10queriesasingletonofresultspecifiedwithaprimary
+key that was inserted by Req7. As it is a singleton inserted by Req7,
+Req10willgetaNULLresultifwerelaxtheorderbetween Req7and
+Req10, which can significantly affect the request handlers handling
+Req10andotherrequestsfollowingitinthesamegroup.Asaresult,
+we will not be able to add comments to the post in Grp4if the post
+hasnotbeenaddedin Grp2yet.TheotherSPK-data-dependency
+edge is added for a similar reason. ReqRacer recognizes such data
+dependenciesbyrecordingdatabasequeriesandselectedresponses.
+Note that our SPK-data-dependency is different from general
+datadependencywherealatterqueryreadsdatainsertedorupdated
+byanearlierquery.Thisisbecausetheeffectofchangingtheorder
+oftwoquerieswiththegeneraldatadependencyhighlydepends
+on the business logic of the corresponding request handlers and
+canonlybeobservedduringreplayrunsingeneral.However,ifthe
+SELECT queryspecifies aprimary key, the corresponding request
+handler will have significantly different business logic for cases
+wherethequerygetsoneroworgetsnorow,andwecaninferthat
+there willbe replaydivergencesif the order isnot enforced.
+WiththedependencygraphinFigure 3.3○andrecordedtraces
+onaccessestosharedsystemresources,tworequestsarepotentially
+concurrentiftheyareindifferentrequestgroupsthatarenotreach-
+ableonthedependencygraph.InFigure 3,ReqRacer determines
+thatGrp4andGrp6are potentially concurrent, and they contain
+Req11andReq15,whicharetheracingrequestsinWordPress11073.
+Afterinferring concurrentrequests, ReqRacer further checks un-
+serializable interleavings and validates them, and the race between
+Req11andReq15willbe reportedas atrue,harmfulrequest race.
+3.2 Tracing andRequest-RaceInference
+ReqRacer employsserver-onlytracingbutrequiresnomodifica-
+tions on the client side, making it easy to deploy and broadly appli-
+cable. In particular, ReqRacer records (1) HTTP requests received
+by the HTTP server, (2) accesses to shared resources including
+database queries and calls to cache APIs, (3) the return value of
+functionsthat are usedto getthe primary key ofthe rowinsertedbyapreviousINSERTquery,and(4)uniquetokensgeneratedwhile
+formulatingHTTPresponses. Shared-resourceaccesses andtokens
+are attributedto the request that initiates them.
+With dynamic execution traces, ReqRacer first identifies con-
+flictingrequests,i.e.,apairofrequestswhoserequesthandlersboth
+accesssomesharedresourceincommonandatleastonerequest
+handler performs logical append, delete, or write operations to the
+resource. ReqRacer thenbuilds adependency graph asillustrated
+inFigure 3,andtworequesthandlersthatareindifferentgroups
+and not reachable from each other are considered as concurrent.
+Finally,ReqRacer reportstwoconflictingandconcurrentrequest
+handlers as racing if the two request handlers can exhibit unserial-
+izableinterleavingsofshared-resourceaccesses.Below,wedescribe
+each of these three steps, including what information is traced and
+howthe tracedinformation isanalyzed.
+Whileourframeworkcanbeusedforalltypesofracingresources
+thatwehaveseeninourstudy,ourprototypeimplementationof Re-
+qRacerhandlesdatabasesandcache.Toextend ReqRacer forfiles,
+oneneedstoincorporatetechniquesoftracingandanalyzingfile
+accessespreviouslyusedforprocessraces[ 46,47]intoourframe-
+work.Toextend ReqRacer forshared-memorydatastructures,one
+needs to further trace and analyze shared-memory accesses. In
+bothcases,happens-beforerelationshipsmodeledby ReqRacer ’s
+dependency graphs could be reused.
+3.2.1 IdentifyingConflictingRequests. ReqRacer considerstwore-
+questsasconflictingiftheircorrespondingrequesthandlerscontain
+conflicting accessesto eitherdatabasesorcache.
+On database queries, ReqRacer currently logs SELECT, INSERT,
+UPDATE,andDELETE.ForSELECT,UPDATE,andDELETEqueries,
+wedeterminetherowsofdataelementsbeingaccessedbasedonthe
+WHEREclause.AnINSERTqueryaddsanewrowtoatablewith
+thevalueofeachcolumnspecified.Weextractthecolumn-value
+pairs from an INSERT query string. These four types of queries are
+sufficient inour evaluation, andmore can be addedif necessary.
+For two INSERT queries, if they operate on the same unique
+key,andthevaluesinsertedtotheuniquekeyarethesame,these
+two INSERT queries are conflicting. Otherwise, if no unique key
+appears in an INSERT query string, ReqRacer currently considers
+twoINSERTqueriesconflicting if they insert the same data.
+To find conflicts between a query with a WHERE clause and an
+INSERTquery,wecomparetheWHERE-clauseconditionswiththe
+column-value pairs from the INSERT query. If the column-value
+pairssatisfy the conditions, the twoqueriesare conflicting.
+TofindtwoconflictingqueriesbothwithaWHEREclause,we
+compare their conditions. If there issome intersection,we conser-
+vativelyconsiderthesetwoqueriesas conflicting.
+One special case is a SELECT * query without a WHERE clause.
+For this type of SELECT query, we consider it as accessing the
+whole table and conflicting with any query that modifies the table.
+On cache accesses, ReqRacer currently logs Add, Delete, Get,
+Set,andReplaceoperations.Twocacheaccessesareconflictingif
+they have the same key and at least one of them is an Add, Delete,
+Set, orReplace operation.
+3.2.2 Dependency-GraphConstruction. AsillustratedinSection 3.1,
+ReqRacer constructsthe dependency graph intwosteps.
+849UnderstandingandDetectingServer-SideRequest Racesin WebApplications ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+To model the RRR dependency between two requests, where
+thesecondrequestcanonlybesentaftertheresponseofthefirst
+request has been received by the client, we modify the web ap-
+plicationtoincludearandomtokenuniquetoeachrequestwhen
+formulating responses to the client, and it leverages the request-
+response-requestchainestablishedbytherandomtokenembedded
+inresponses to capture RRRdependencies.
+Therearefourscenarioswherethistokenisembedded.Forforms
+inHTMLresponses,weaddanewhiddenfieldtotheformswith
+thetoken value.For embeddedURLs inHTMLresponses, weadd
+the token as a URL parameter. For HTTP redirection responses, we
+alsoaddaURLparametertotheresponseURL.Inthesethreecases,
+laterrequestssentthroughthetoken-embeddedHTMLelementsor
+URLswillautomaticallycarrytherandomtoken.ForallHTMLpage
+responses that could enable Ajax requests, we add the token value
+asametapropertyundertheheadtagoftheresponseHTMLand
+registersanewfunctionwithjQuery’sajaxPrefilterinterface,where
+thefunctionwillreadandattachthetokenvaluetoallAjaxrequests
+sent from this page. To avoid potential client-side races on these
+token values, the random token valueis always parsed and loaded
+aspartoftheresponsebeforesubsequentrequeststhatneedtocarry
+thetokenvaluecanbesent.Notethatsimilarmechanismsareused
+to implement Cross-Site Request Forgery (CSRF) tokens [ 2]. While
+CSRF token is unique for every web session, our new token will be
+unique for every response. Our implementation leverages existing
+CSRF-token code to embedour newtoken for RRRdependency.
+With these modifications, ReqRacer can establish a request-
+response-request chain and add an RRR-dependency edge between
+two requests, when the second request contains a token value
+that matches the token value embedded into the response of the
+first request. After identifying pair-wise dependencies based on
+tokens, these requests are further grouped until no two requests
+from differentgroupshave an RRRdependency.
+After grouping requests based on RRR dependencies, ReqRacer
+next adds edges between request groups with SPK-data dependen-
+cies, whichhappenswhenone SELECTquerywithaprimarykey
+specifiedinthesecondgroupgetsonerowinsertedbyaqueryin
+thefirst group.Specifically,if(1) arequest rqAiinrequest group
+GrpAcontainsanINSERTqueryandthenewlyinsertedrowhas
+value𝑣on a primary key column ColP, (2) a request rqBjin a dif-
+ferent request group GrpBwhich contains a SELECT query with a
+WHEREclause ColP=𝑣,and(3)GrpAappearsbefore GrpBinthe
+trace,ReqRacer adds an SPK-data dependency edge from GrpAto
+GrpB. Note that requests after rqAiinGrpAwill still be considered
+aspotentiallyconcurrentwithrequestsin GrpBandwillbechecked
+byReqRacer .
+We do not add data-related dependency edges on cache, as a
+requesthandlerwillusuallybringthedataintocachebyitselfin
+cases of cache misses without relying on other request handlers to
+bringthe data in.
+3.2.3 Request-Race Inference. ReqRacer currently focuses on de-
+tecting request races with atomicity violations as their root causes.
+With the dependency graph constructed, ReqRacer then checks
+whether two conflicting, concurrent request handlers have shared-
+resource accesses that can exhibit unserializable interleavings withthepatternsshowninTable 3.ReqRacer identifiespotentialrequest
+racesfor validation if unserializablepatterns are found.
+To detect races between two requests that will be served by two
+instances of the same request handler, ReqRacer duplicates the
+selectedrequesthandler,considerstheoriginalrequesthandlerand
+the duplicated request handler as concurrent, and applies the same
+checking of unserializable interleavings. The duplicated request
+handlerwillonlybecheckedagainstitsoriginbutnototherrequest
+handlers.Wefurtherfollowtheeffect-orientedapproach[ 37,77,78]
+to handle the majority of races between two instances of the same
+requesthandlerasdiscussedinSection 2.2,i.e.,wefocusonfinding
+duplicatedata-insertionracesbyduplicatingarequestonlyifthe
+corresponding requesthandler issuesoneSELECT queryandone
+INSERTquery that are conflicting.
+3.3 Replay-BasedValidation
+WhiletheRRRandSPK-dataedgeshelptoreducethenumberof
+falsepositivestobeprunedbythevalidationstage,replayisstill
+necessary to validate the remaining request races by observing
+the effect of enforcing specific interleavings to determine whether
+they lead to errors or replay divergences. ReqRacer reports a true,
+harmfulrequest raceonly if itdetectsfailures.
+In the replay stage, ReqRacer replays recorded requests and
+interceptstheirresponses.Inonereplaysession, ReqRacer replays
+requestsuntilreachingonerequestintherequestracetovalidate.
+Whilethisreplaysessionispausedbeforethefirstracingrequest,
+ReqRacer replays the other racing request in a different replay
+session, and all requests that the second racing request has general
+data dependence, as defined in Section 3.1, on but have not been
+replayed will be replayed in the order they appear in the trace.
+To validate duplicated instances of the same request handler, we
+simply replaythe same request twice.
+With both replay sessions pausing before racing requests, Re-
+qRacercontrols the execution of the racing request handlers to
+makeshared-resourceaccessesfollowtheorderofunserializable
+interleavings. To achieve this, we insert delays in the database
+execution engine and cache-access APIs to control the order of
+accessestodatabasesandcache.Asnotallinterleavingsarefeasible
+to enforce, ReqRacer gives up an interleaving if one access has
+beenwaitingforapre-definedtimeoutvaluebutitisnottheaccess
+to proceed according to the interleaving to enforce. ReqRacer cur-
+rentlysetsthetimeoutvalueto10seconds. ReqRacer alsogives
+up an interleaving if a response indicates an error and reports
+the request race as a true positive. If an interleaving is success-
+fully enforced, ReqRacer will detect failures by checking whether
+thereareapplicationerrors,databaseerrors,orerrorsemittedby
+programmer-suppliedapplication-specificcheckers.Ifafailure is
+detected, ReqRacer reportstherequestraceasatruepositive.Inall
+othercases,the inferredrequest raceisprunedas afalse positive.
+Toenablereplay-basedvalidation,weneedtocreatebackupsfor
+persistentsystemresourcessothattheycanberestoredontothe
+replaysystems.Fordatabasestates, ReqRacer usesthebackupand
+restore functionality provided by databases. As cache is less per-
+sistent, cache state is not backed up for restore, and it is populated
+duringreplaybasedondatabasestates.
+850ESEC/FSE ’21, August 23–28, 2021,Athens,Greece ZhengyiQiu, Shudi Shao,Qi Zhao,andGuoliang Jin
+Table 4: Overall evaluation results. łReqsž shows the number of requests in the workload. ł#Acc.ž represents the number of
+database or cache accesses in the trace. łConfl. Reqsž shows the number of conflicting request pairs. łRRRž, łSPKž, łSž, and
+łRžshowthenumbersofconflictingrequestpairsprunedbycheckingRRRdependency,SPK-datadependency,serializability,
+andreplay,respectively.łTPžandłFPžshowthenumbersoftruepositivesandfalsepositives.łLikelyTPžisforcasesthatcan
+be detected if application-specificcheckersare added.Numbers with an ‘*’are unknownto uswhile devising the workload.
+Buginformation Between distinctrequest handlersBetween twoinstances of
+the same request handler
+BugIDRacing
+resourceReqs#Acc.Confl.
+ReqsRRRSPK SRTPLikely
+TPFPConfl.
+ReqsSRTPLikely
+TPFP
+WP 11073 Database 24533 118 -22-15-74-610030-201*0
+WP 11437 Database 9181 26 -10-2-11-201*0100100
+WP 24933 Database 15277 18 -3-8-6010020-2000
+MW 40594 Database 181008 14 00-140000100100
+MW 69815 Database 232069 11 00-110000100100
+MDL28949 Database 472878 407 -37-51-297-1714*011 0-42/4* 1*0
+MDL43421 Database 311141 122 -11-48-44-1801*050-11/1* 1*1
+MDL51707 Database 14250 21 -40-1601003-30000
+MDL59854 Database 1011969 492 -25-81-375-1001*020-12-22/3* 1*0
+DPL 1484216 Database 11422 6 00-3-3000100100
+WP 15545 Cache 23412 24 -20-22000020011*0
+WP 20786 Cache& Database 14263 10 -20-701009-7-2000
+4 IMPLEMENTATION AND EVALUATION
+We implemented a ReqRacer prototype for the popular LAMP
+stack, i.e., Linux, Apache, MySQL, and PHP. The prototype con-
+sists of components for server-side tracing and replay-based val-
+idation, which is implemented by modifying PHP, MySQL, and
+application-specific cache APIs. The inference step is implemented
+using Python. We use an open-source tool, Gor [ 7], to capture and
+replayHTTPrequests.Toenabletoken-baseddependencytracking,
+wecurrentlymanuallymodifytheapplicationstoembedthetokens
+leveraging existing CSRF token sites. To embed tokens, we first
+determine the names of CSRF tokens used by an application. In
+our experiments, we can get the names effectively by checking the
+hidden-fieldnamesinHTMLresponsesthroughabrowser.Once
+wegetthenamesofCSRFtokens,wesearchtheapplicationcode
+to find the sites where such CSRF tokens are embedded. We finally
+embed andlog ourtokens at thesesites following the ruleof how
+CSRFtokens are embeddedinthe application.
+Wedonotautomatecache-APIchangesandtokenembedding,as
+they areapplication-specific.Fortunately,our experience suggests
+that places where we made changes are well modularized, and
+weexpecttheworkloadofporting ReqRacer tonewapplications
+underthe LAMP stack to be small.
+To evaluate the effectiveness and efficiency of ReqRacer in
+detecting request races, we mimic the way how developers may
+testtheirwebapplications,i.e.,byclickingbuttonsonthebrowserto
+visitvariouspagesandusevariousfunctionalities,andweleverage
+knownreal-worldbugstodevisebug-triggeringworkloads.Among
+all the bugs we have investigated in the characteristic study, we
+are currently able to reproduce a total number of 12 bugs from
+WordPress, MediaWiki, Moodle, and Drupal, and we used all these
+12real-worldbugstoevaluate ReqRacer ,coveringallthefourPHP
+webapplicationswestudied.Basedonthese12bugs,wedevisea
+workloadthatvisitsallthepagesinvolvedineachbug.Notethat
+the workloads we come up with just visit all the pages one-by-one
+butnotconcurrently,andtheracesarenottriggeredintherecorded
+runswithlimitedconcurrency.Wealsovisitsomepagesthatare
+not essentialto the buginour devisedtestingworkloads.All our experiments were conducted on a machine with an Intel
+Core i7-4790 CPU and 16GB memory. The software versions are
+Apache HTTPD 2.4.93, MySQL 5.6.44, and PHP 5.6.40. Cache is set
+up according to the requirement of each individual case, and we
+install the cache component only while evaluating with workloads
+for WP 15545 andWP 20786.
+4.1 Effectiveness Results
+Table4summarizestherace detectionresults.Notethat arequest
+racecouldmanifestunderdifferentworkloads,andwearereporting
+the numbers of unique request races. In total, ReqRacer detects
+and exposes 17 unique request races that are true and harmful,
+including13uniquerequestracesthatcanexplainthe12known
+bugsandfouruniquerequestracesthatarepreviouslyunknown
+to us while devising the workloads. ReqRacer also detects eight
+uniquerequestracesthatarelikelytruewithapplication-specific
+checkersadded.AsdiscussedinSection 2.2,theeffectsofrequest
+racesthatleadtoinconsistentviewsordatacorruptionscanonly
+becaughtwithsometypesofcheckerstakingapplicationseman-
+tics into account. To catch these request races, we came up with
+applicable-specificcheckersbasedonourunderstandingofapplica-
+tionswhilemanually checking false positives.
+For request races between distinct request handlers, Table 4
+shows the numbers of conflicting request pairs and false positives
+prunedbydifferentstrategies.Thenumbersshowthatafterpruning
+false positives by RRR dependency, SPK-data dependency, and seri-
+alizabilityinference,themajorityoffalsepositivesarepruned.This
+shows that these three strategies combined are very effective. The
+remainingfalsepositivesareduetoeitherourconservativeanal-
+ysisonWHEREclausesorfailure-freeexecutionsafterenforcing
+alternative interleavings, andthey are prunedbyreplay.
+For request races between two duplicated instances of a request
+handlerwithconflictingSELECTandINSERTqueries,two-thirds
+of the false positives are pruned by serializability checking, and
+the remainings are pruned by replay. For false positives pruned by
+replay,thereisnoapplicationerrorordatabaseerroruponduplicate
+data insertion. Our evaluation results show that the effect-oriented
+851UnderstandingandDetectingServer-SideRequest Racesin WebApplications ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+approach caneffectively find request racesbetween two instances
+ofthe same request handler.
+Weidentifiedlikelynewbugs,whichrequireapplication-specific
+checkers,bycheckingalltherequestracesprunedbyreplayand
+adding application-specific checkers designed based on studied
+requestracesresultingininconsistentandstaleviews.Forexample,
+weaddedcheckerstodisallowduplicatecommentsinWordPress
+anddisallowduplicateclass-namealiasesinMoodle.
+Fornewbugsandlikelynewbugs,wehaveverifiedthattheystill
+existinthelatestversion,andweareintheprocessofreportingand
+confirming with developers. So far, two bugs have been confirmed,
+including one that requires an application-specific checker, and
+othersare waiting for responses from developers.
+Manual checking of all the request races reported by ReqRacer
+revealedonefalsepositive,i.e.,althoughweareabletotriggeran
+error under the workload for MDL 43421 by duplicating a request,
+itisnotfeasibleinpracticeastheclientsidewilldisablethebutton
+while waiting for the response. We leave it for future work to
+addressthis limitationbyincorporatingmore client-sideanalysis.
+4.2 EfficiencyResults
+We evaluated theoverheadof ReqRacer ’srecording step by mea-
+suring the time between sending a request to and receiving the
+response from the server, and the overhead is between 2% to6%.
+Note that our numbers were measured with both the server and
+client on the same machine, and we expect the overhead to be
+smaller in a real-world deployment setting after including network
+latencies. In our evaluation, the inference step can finish within
+seconds, and the validation time varies from seconds to several
+minutes depending on the number of unserializable interleaving to
+prune. On the other hand, if a developer were to manually conduct
+stresstestingbyrepeatingthesequentialworkloadmanytimes,the
+bugs are unlikelyto be triggered. Even ifa bug is triggeredonce,
+it is difficult for the developer to know exactly how to trigger it,
+whileReqRacer can reliably trigger abugonceitisdetected.
+5 THREATS TO VALIDITY
+Characteristics studies are subject to validity problems, and our
+characteristic-study results need to be taken with the methodology
+and our selection of web applications in mind. One threat is the
+likely lack of representativeness of the studied applications and
+request races. To minimize this threat, we choose popular open-
+source web applications with a significant user base. Our choice
+of applications also covers several popular development languages
+and framework for the server side. The other threat is related to
+themanual inspectionof bugreports. Toalleviate thisthreat, two
+authors first independently study the collected bugs by thoroughly
+investigatingtheresourcesthatareavailabletous.Oncetheyfinish,
+they cross-checktheirresults anddraw aconclusion.
+The evaluation of ReqRacer is also subject to validity problems.
+One threat is the correctness of the implementation and the repre-
+sentativeness of bugs used for evaluation. To minimize this threat,
+weuseallknownbugsthatwecanreproducefromallfourPHPweb
+applications included in our study. Another threat is the validity
+ofthenewlydetectedbugsby ReqRacer .Wemitigatethisthreatbyreportingnewlydiscoveredbugstodevelopers,andtwoprevi-
+ouslyunknown bugs,oneof whichrequiresanapplication-specific
+checker, have been confirmed. Regarding the general applicability
+ofourproposedtechnique,ourcurrentimplementationonlyhan-
+dles web applications built on top of LAMP. During our evaluation,
+ReqRacer wasimplementedbeforewereproducedanyMoodleand
+Drupalbugs,andourexperiencesuggeststhatporting ReqRacer
+tonewLAMPapplicationswillbesmall.Wealsobelievethatour
+key contributions on modeling happens-before relationships could
+also apply to other types of web applications, e.g., ORM-based and
+Node.js-based,andwe willleave itfor future work.
+6 RELATED WORK
+Section1discussed some related work on several different types
+ofraces.Wenextdiscussotherrelatedwork.Server-sidewebap-
+plicationshavebeenthesubjectofalotofexistingresearch,and
+many different techniques have been proposed for improving their
+reliability [ 19,22,32,59,60,66,75], but none of them handles
+theconcurrency aspect. Some ofthese existingtechniqueshandle
+theinputgenerationproblem,and ReqRacer complementsthese
+techniques bysolving the buggy-interleavingexposing problem.
+Techniques focusing on the security aspect of web applications
+have been proposed, e.g., auditing [ 44,70], intrusion detection and
+recovery[ 27,28],andidentifyinginformationdisclosure[ 29].Races
+are considered severe security vulnerabilities [ 17], and they can
+enableconcurrency attacks[ 79]. Ourproposedtechniquescan also
+help improve thesecurity aspectof web applications by detecting
+andexposing races.
+Similar to detecting client-side races and Node.js races, tech-
+niques developed for Android applications also focus on the event-
+driven nature of the mobile platform [ 23,37,38,57,65]. Some
+Androidapplicationsalsohaveaclient-serverstructure,andtech-
+niques developedinthispaper could alsobe leveragedto handle
+racesintheirserver-side applications.
+7 CONCLUSION
+We present the first, to the best of our knowledge, comprehensive
+characteristic study of real-world server-side request races in web
+applications. Our results show that request races are indeed under-
+studied and need more research attention. We expect that future
+research can follow our study results to provide comprehensive
+support in combating request races. Guided by these results, we
+developReqRacer , a framework for detecting and exposing re-
+quest races. Our evaluation shows the effectiveness and efficiency
+ofReqRacer . Future work can adapt ReqRacer for other types of
+webapplications,repurposeitforproduction-rundeployment,or
+pursueclient/server combinedapproachesfor in-house testing.
+ACKNOWLEDGMENTS
+Theauthorswouldliketothanktheanonymousreviewersfortheir
+valuable feedback and helpful suggestions. The authors would also
+like to thank Martin Rinard for commenting on an early version of
+thispaperduringhisvisittoNCSUforgivingatalkintheTriangle
+Computer Science DistinguishedLecturer Series. This project was
+partly supported by the National Science Foundation under the
+grant CCF-2008056.
+852ESEC/FSE ’21, August 23–28, 2021,Athens,Greece ZhengyiQiu, Shudi Shao,Qi Zhao,andGuoliang Jin
+REFERENCES
+[1] [n.d.]. Bugzilla. https://github .com/bugzilla/bugzilla .
+[2][n.d.]. Cross-Site Request Forgery (CSRF) Prevention Cheat Sheet.
+https://cheatsheetseries .owasp.org/cheatsheets/Cross-Site_Request_Forgery_
+Prevention_Cheat_Sheet .html.
+[3] [n.d.]. Discourse. https://github .com/discourse/discourse .
+[4][n.d.]. DNN, howpublished = " https://github .com/dnnsoftware/Dnn .Platform",.
+[5] [n.d.]. Drupal. https://git .drupalcode .org/project/drupal .
+[6] [n.d.]. Gitlab. https://about .gitlab.com.
+[7] [n.d.]. GoReplay- testyoursystemwith realdata. https://goreplay .org/.
+[8] [n.d.]. MediaWiki. https://github .com/wikimedia/mediawiki .
+[9] [n.d.]. Moodle. https://github .com/moodle/moodle .
+[10][n.d.]. Multi-Processing Modules (MPMs) - Apache HTTP Server Version 2.4.
+https://httpd .apache.org/docs/2 .4/mpm.html.
+[11][n.d.]. MySQL8.0ReferenceManual:16.2TheMyISAMStorageEngine. https:
+//dev.mysql.com/doc/refman/8 .0/en/myisam-storage-engine .html.
+[12] [n.d.]. Odoo. https://github .com/odoo/odoo .
+[13] [n.d.]. OpenMRS. https://github .com/openmrs/openmrs-core .
+[14] [n.d.]. Redmine. https://www .redmine.org/.
+[15] [n.d.]. Spree. https://github .com/spree/spree .
+[16] [n.d.]. WordPress Trac. https://core .trac.wordpress .org/browser/trunk .
+[17]AaronHnatiw,SecurityCompass.[n.d.]. MovingBeyondTheOWASPTop10,
+Part1:RaceConditions. https://resources .securitycompass .com/blog/moving-
+beyond-the-owasp-top-10-part-1-race-conditions-2 .
+[18]Christoffer Quist Adamsen, Anders Mùller, and Frank Tip. 2017. Practical Initial-
+izationRaceDetectionforJavaScriptWebApplications. Proc.ACMProgram.Lang.
+1,OOPSLA, Article66(Oct.2017),22pages. https://doi .org/10.1145/3133890
+[19]ShayArtzi,AdamKiezun,JulianDolby,FrankTip,DanielDig,AmitParadkar,
+andMichaelD.Ernst.2010. FindingBugsinWebApplicationsUsingDynamic
+Test Generation and Explicit-State Model Checking. IEEE Trans. Softw. Eng. 36, 4
+(July2010),474ś494. https://doi .org/10.1109/TSE.2010.31
+[20]JoyArulraj,Po-ChunChang,GuoliangJin,andShanLu.2013. Production-run
+SoftwareFailureDiagnosisviaHardwarePerformanceCounters.In Proceedingsof
+the Eighteenth International Conference on Architectural Support for Programming
+Languages and Operating Systems (Houston, Texas, USA) (ASPLOS ’13) . ACM,
+NewYork, NY, USA,101ś112. https://doi .org/10.1145/2451116 .2451128
+[21]JoyArulraj,GuoliangJin,andShanLu.2014. LeveragingtheShort-termMemory
+of Hardware to Diagnose Production-run Software Failures. In Proceedings of the
+19thInternationalConferenceonArchitecturalSupportforProgrammingLanguages
+andOperatingSystems (SaltLakeCity,Utah,USA) (ASPLOS’14) .ACM,NewYork,
+NY, USA,207ś222. https://doi .org/10.1145/2541940 .2541973
+[22]Snigdha Athaiya and Raghavan Komondoor. 2017. Testing and Analysis of
+WebApplicationsUsingPageModels.In Proceedingsofthe26thACMSIGSOFT
+International Symposium on Software Testing and Analysis (Santa Barbara, CA,
+USA)(ISSTA 2017) . ACM, New York, NY, USA, 181ś191. https://doi .org/10.1145/
+3092703.3092734
+[23]Pavol Bielik, Veselin Raychev, and Martin Vechev. 2015. Scalable Race Detection
+for Android Applications. In Proceedings of the 2015 ACM SIGPLAN International
+ConferenceonObject-OrientedProgramming,Systems,Languages,andApplications
+(Pittsburgh,PA,USA) (OOPSLA2015) .ACM,NewYork,NY,USA,332ś348. https:
+//doi.org/10.1145/2814270 .2814303
+[24]Marina Billes, Anders Mùller, and Michael Pradel. 2017. Systematic Black-
+box Analysis of Collaborative Web Applications. In Proceedings of the 38th
+ACM SIGPLAN Conference on Programming Language Design and Implemen-
+tation(Barcelona, Spain) (PLDI 2017) . ACM, New York, NY, USA, 171ś184.
+https://doi .org/10.1145/3062341 .3062364
+[25]MichaelD.Bond,KatherineE.Coons,andKathrynS.McKinley.2010. PACER:
+ProportionalDetectionofDataRaces.In Proceedingsofthe31stACMSIGPLAN
+Conference on Programming Language Design and Implementation (Toronto,
+Ontario, Canada) (PLDI ’10) . ACM, New York, NY, USA, 255ś268. https:
+//doi.org/10.1145/1806596 .1806626
+[26]JackCable.[n.d.].RaceConditioninRedeemingCoupons. https://hackerone .com/
+reports/157996 .
+[27]RameshChandra,TaesooKim,MeelapShah,NehaNarula,andNickolaiZeldovich.
+2011. Intrusion Recovery for Database-backed Web Applications. In Proceedings
+oftheTwenty-ThirdACMSymposiumonOperatingSystemsPrinciples (Cascais,
+Portugal) (SOSP’11) .ACM,NewYork,NY,USA,101ś114. https://doi .org/10.1145/
+2043556.2043567
+[28]Ramesh Chandra, Taesoo Kim, and Nickolai Zeldovich. 2013. Asynchronous
+IntrusionRecoveryforInterconnectedWebServices.In ProceedingsoftheTwenty-
+Fourth ACM Symposium on Operating Systems Principles (Farminton, Pennsylva-
+nia)(SOSP ’13) . ACM, New York, NY, USA, 213ś227. https://doi .org/10.1145/
+2517349.2522725
+[29]HaogangChen,TaesooKim,XiWang,NickolaiZeldovich,andM.FransKaashoek.
+2014. Identifying Information Disclosure in Web Applications with Retroactive
+Auditing. In Proceedings of the 11th USENIX Conference on Operating Systems
+Design and Implementation (Broomfield, CO) (OSDI’14) . USENIX Association,Berkeley,CA,USA,555ś569. http://dl.acm.org/citation .cfm?id=2685048.2685092
+[30]Lucian Constantin. [n.d.]. Withdrawal vulnerabilities enabled bitcoin theft from
+Flexcoin andPoloniex. https://www .pcworld.com/article/2104940/withdrawal-
+vulnerabilities-enabled-bitcoin-theft-from-flexcoin-and-poloniex .html.
+[31]JamesDavis,ArunThekumparampil,andDongyoonLee.2017. Node.Fz:Fuzzing
+theServer-SideEvent-DrivenArchitecture.In ProceedingsoftheTwelfthEuropean
+ConferenceonComputerSystems (Belgrade,Serbia) (EuroSys’17) .ACM,NewYork,
+NY, USA,145ś160. https://doi .org/10.1145/3064176 .3064188
+[32]MichaelEmmi,RupakMajumdar,andKoushikSen.2007.DynamicTestInputGen-
+erationforDatabaseApplications.In Proceedingsofthe2007InternationalSym-
+posiumonSoftwareTestingandAnalysis (London,UnitedKingdom) (ISSTA’07) .
+ACM,NewYork, NY, USA,151ś162. https://doi .org/10.1145/1273463 .1273484
+[33]Cormac Flanagan and Stephen N. Freund. 2009. FastTrack: Efficient and Precise
+Dynamic Race Detection. In Proceedings of the 30th ACM SIGPLAN Conference on
+ProgrammingLanguageDesignandImplementation (Dublin,Ireland) (PLDI’09) .
+ACM,NewYork, NY, USA,121ś133. https://doi .org/10.1145/1542476 .1542490
+[34]Pedro Fonseca, Cheng Li, Vishal Singhal, and Rodrigo Rodrigues. 2010. A Study
+of the Internal and External Effects of Concurrency Bugs. In 2010 IEEE/IFIP
+International Conference on Dependable Systems Networks (DSN) . 221ś230. https:
+//doi.org/10.1109/DSN .2010.5544315
+[35]MilosGligoricandRupakMajumdar.2013. ModelCheckingDatabaseApplica-
+tions. InProceedings of the 19th International Conference on Tools and Algorithms
+fortheConstructionand AnalysisofSystems (Rome,Italy) (TACAS’13) .Springer-
+Verlag,Berlin,Heidelberg,549ś564. https://doi .org/10.1007/978-3-642-36742-
+7_40
+[36]Egor Homakov. [n.d.]. Hacking Starbucks for unlimited coffee. https://
+sakurity.com/blog/2015/05/21/starbucks .html.
+[37]Chun-HungHsiao,JieYu,SatishNarayanasamy,ZiyunKong,CristianoL.Pereira,
+Gilles A. Pokam, Peter M. Chen, and Jason Flinn. 2014. Race Detection for
+Event-driven Mobile Applications. In Proceedings of the 35th ACM SIGPLAN
+Conference on Programming Language Design and Implementation (Edinburgh,
+UnitedKingdom) (PLDI’14) .ACM,NewYork,NY,USA,326ś336. https://doi .org/
+10.1145/2594291 .2594330
+[38]Yongjian Hu and Iulian Neamtiu. 2018. Static Detection of Event-based Races
+in Android Apps. In Proceedings of the Twenty-Third International Conference
+on Architectural Support for Programming Languages and Operating Systems
+(Williamsburg, VA, USA) (ASPLOS ’18) . ACM, New York, NY, USA, 257ś270.
+https://doi .org/10.1145/3173162 .3173173
+[39]JeffHuang,PatrickO’NeilMeredith,andGrigoreRosu.2014. MaximalSoundPre-
+dictive Race Detection with Control Flow Abstraction. In Proceedings of the 35th
+ACMSIGPLANConferenceonProgrammingLanguageDesignandImplementation
+(Edinburgh, United Kingdom) (PLDI ’14) . ACM, New York, NY, USA, 337ś348.
+https://doi .org/10.1145/2594291 .2594315
+[40]Casper S. Jensen, Anders Mùller, Veselin Raychev, Dimitar Dimitrov, and Martin
+Vechev.2015. StatelessModelCheckingofEvent-drivenApplications.In Proceed-
+ingsofthe2015ACMSIGPLANInternationalConferenceonObject-OrientedPro-
+gramming, Systems, Languages, and Applications (Pittsburgh, PA, USA) (OOPSLA
+2015).ACM,NewYork,NY,USA,57ś73. https://doi .org/10.1145/2814270 .2814282
+[41]Guoliang Jin, Linhai Song, Wei Zhang, Shan Lu, and Ben Liblit. 2011. Automated
+Atomicity-violation Fixing. In Proceedings of the 32Nd ACM SIGPLAN Confer-
+ence on Programming Language Design and Implementation (San Jose, California,
+USA)(PLDI’11) .ACM,NewYork,NY,USA,389ś400. https://doi .org/10.1145/
+1993498.1993544
+[42]Guoliang Jin, Aditya Thakur, Ben Liblit, and Shan Lu. 2010. Instrumentation and
+Sampling Strategies for Cooperative Concurrency Bug Isolation. In Proceedings
+of the ACM International Conference on Object Oriented Programming Systems
+Languages and Applications (Reno/Tahoe, Nevada, USA) (OOPSLA ’10) . ACM,
+NewYork, NY, USA,241ś255. https://doi .org/10.1145/1869459 .1869481
+[43]Guoliang Jin, Wei Zhang, Dongdong Deng, Ben Liblit, and Shan Lu. 2012. Au-
+tomated Concurrency-bug Fixing. In Proceedings of the 10th USENIX Confer-
+ence on Operating Systems Design and Implementation (Hollywood, CA, USA)
+(OSDI’12) . USENIX Association, Berkeley, CA, USA, 221ś236. http://dl.acm.org/
+citation.cfm?id=2387880.2387902
+[44]Taesoo Kim, Ramesh Chandra, and Nickolai Zeldovich. 2012. Efficient Patch-
+based Auditing for Web Application Vulnerabilities. In Proceedings of the 10th
+USENIXConferenceonOperatingSystemsDesignandImplementation (Hollywood,
+CA, USA) (OSDI’12) . USENIX Association, Berkeley, CA, USA, 193ś206. http:
+//dl.acm.org/citation .cfm?id=2387880.2387899
+[45]Simon Koch, Tim Sauer, Martin Johns, and Giancarlo Pellegrino. 2020. Raccoon:
+Automated Verification of Guarded Race Conditions in Web Applications. ACM.
+[46] Oren Laadan,Nicolas Viennot,and JasonNieh. 2010. Transparent, Lightweight
+ApplicationExecutionReplayonCommodityMultiprocessorOperatingSystems.
+InProceedings of the ACM SIGMETRICS International Conference on Measurement
+andModelingofComputerSystems (NewYork,NewYork,USA) (SIGMETRICS’10) .
+ACM,NewYork, NY, USA,155ś166. https://doi .org/10.1145/1811039 .1811057
+[47]Oren Laadan, Nicolas Viennot, Chia-Che Tsai, Chris Blinn, Junfeng Yang, and
+Jason Nieh. 2011. Pervasive Detection of Process Races in Deployed Systems. In
+Proceedings of the Twenty-Third ACM Symposium on Operating Systems Principles
+853UnderstandingandDetectingServer-SideRequest Racesin WebApplications ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+(Cascais, Portugal) (SOSP ’11) . ACM, New York, NY, USA, 353ś367. https://
+doi.org/10.1145/2043556 .2043589
+[48]TanakornLeesatapornwongsa,JeffreyF.Lukman,ShanLu,andHaryadiS.Gu-
+nawi. 2016. TaxDC: A Taxonomy of Non-Deterministic Concurrency Bugs in
+Datacenter Distributed Systems. In Proceedings of the Twenty-First International
+ConferenceonArchitecturalSupportforProgrammingLanguagesandOperating
+Systems(Atlanta,Georgia,USA) (ASPLOS’16) .ACM,NewYork,NY,USA,517ś530.
+https://doi .org/10.1145/2872362 .2872374
+[49]Guangpu Li, Shan Lu, Madanlal Musuvathi, Suman Nath, and Rohan Padhye.
+2019. Efficient Scalable Thread-safety-violation Detection: Finding Thousands of
+ConcurrencyBugsDuringTesting.In Proceedingsofthe27thACMSymposium
+onOperatingSystemsPrinciples (Huntsville,Ontario,Canada) (SOSP’19) .ACM,
+NewYork, NY, USA,162ś180. https://doi .org/10.1145/3341301 .3359638
+[50]Haopeng Liu, Guangpu Li, Jeffrey F. Lukman, Jiaxin Li, Shan Lu, Haryadi S.
+Gunawi, and Chen Tian. 2017. DCatch: Automatically Detecting Distributed
+ConcurrencyBugsinCloudSystems.In ProceedingsoftheTwenty-SecondInter-
+national Conference on Architectural Support for Programming Languages and
+Operating Systems (Xi’an, China) (ASPLOS ’17) . ACM, New York, NY, USA, 677ś
+691.https://doi .org/10.1145/3037697 .3037735
+[51]Haopeng Liu, Xu Wang, Guangpu Li, Shan Lu, Feng Ye, and Chen Tian. 2018.
+FCatch:AutomaticallyDetectingTime-of-faultBugsinCloudSystems.In Pro-
+ceedings of the Twenty-Third International Conference on Architectural Support
+for Programming Languages and Operating Systems (Williamsburg, VA, USA)
+(ASPLOS ’18) . ACM, New York, NY, USA, 419ś431. https://doi .org/10.1145/
+3173162.3177161
+[52]Peng Liu, Omer Tripp, and Charles Zhang. 2014. Grail: Context-aware Fixing
+of Concurrency Bugs. In Proceedings of the 22Nd ACM SIGSOFT International
+SymposiumonFoundationsofSoftwareEngineering (HongKong,China) (FSE2014) .
+ACM,NewYork, NY, USA,318ś329. https://doi .org/10.1145/2635868 .2635881
+[53]Peng Liu and Charles Zhang. 2012. Axis: Automatically Fixing Atomicity Vi-
+olationsThroughSolvingControlConstraints.In Proceedingsofthe34thInter-
+national Conference on Software Engineering (Zurich, Switzerland) (ICSE ’12) .
+IEEEPress,Piscataway,NJ,USA,299ś309. http://dl.acm.org/citation .cfm?id=
+2337223.2337259
+[54]JieLu,FengLi,LianLi,andXiaobingFeng.2018. CloudRaid:HuntingConcur-
+rencyBugs in the Cloud viaLog-Mining. ACM.
+[55]ShanLu,SoyeonPark,EunsooSeo,andYuanyuanZhou.2008. Learningfrom
+Mistakes: A Comprehensive Study on Real World Concurrency Bug Characteris-
+tics.InProceedingsofthe13thInternationalConferenceonArchitecturalSupportfor
+ProgrammingLanguagesandOperatingSystems (Seattle,WA,USA) (ASPLOSXIII) .
+ACM,NewYork, NY, USA,329ś339. https://doi .org/10.1145/1346281 .1346323
+[56]BrandonLucia,BenjaminP.Wood,andLuisCeze.2011. IsolatingandUnderstand-
+ingConcurrencyErrorsUsingReconstructedExecutionFragments.In Proceedings
+of the 32Nd ACM SIGPLAN Conference on Programming Language Design and
+Implementation (San Jose, California, USA) (PLDI ’11) . ACM, New York, NY, USA,
+378ś388. https://doi .org/10.1145/1993498 .1993543
+[57]PallaviMaiya,AdityaKanade,andRupakMajumdar.2014. RaceDetectionfor
+Android Applications. In Proceedings of the 35th ACM SIGPLAN Conference on
+Programming Language Design and Implementation (Edinburgh, United King-
+dom)(PLDI’14) .ACM,NewYork,NY,USA,316ś325. https://doi .org/10.1145/
+2594291.2594311
+[58]ErdalMutlu,SerdarTasiran,andBenjaminLivshits.2015. DetectingJavaScript
+RacesThatMatter.In Proceedingsofthe201510thJointMeetingonFoundations
+ofSoftwareEngineering (Bergamo,Italy) (ESEC/FSE2015) .ACM, NewYork,NY,
+USA,381ś392. https://doi .org/10.1145/2786805 .2786820
+[59]HungVietNguyen,HoanAnhNguyen,TungThanhNguyen,AnhTuanNguyen,
+and Tien N. Nguyen. 2013. Dangling References in Multi-configuration and
+DynamicPHP-basedWebApplications.In Proceedingsofthe28thIEEE/ACMInter-
+national Conference on Automated Software Engineering (Silicon Valley, CA, USA)
+(ASE’13). IEEE Press, Piscataway, NJ, USA, 399ś409. https://doi .org/10.1109/
+ASE.2013.6693098
+[60]HungVietNguyen,HungDangPhan,ChristianKästner,andTienN.Nguyen.
+2019. Exploring Output-based Coverage for Testing PHP Web Applications.
+AutomatedSoftwareEngg. 26,1(March2019),59ś85. https://doi .org/10.1007/
+s10515-018-0246-5
+[61]RobertoPaleari,DavideMarrone,DaniloBruschi, andMattiaMonga.2008. On
+Race Vulnerabilities in Web Applications. In Proceedings of the 5th International
+Conference on Detection of Intrusions and Malware, andVulnerability Assessment
+(Paris, France) (DIMVA ’08) . Springer-Verlag, Berlin, Heidelberg, 126ś142. https:
+//doi.org/10.1007/978-3-540-70542-0_7
+[62]Soyeon Park, Shan Lu, and Yuanyuan Zhou. 2009. CTrigger: Exposing Atomicity
+Violation Bugs from Their Hiding Places. In Proceedings of the 14th International
+ConferenceonArchitecturalSupportforProgrammingLanguagesandOperating
+Systems(Washington,DC,USA) (ASPLOSXIV) .ACM,NewYork,NY,USA,25ś36.
+https://doi .org/10.1145/1508244 .1508249
+[63]BorisPetrov,MartinVechev,ManuSridharan,andJulianDolby.2012. RaceDetec-
+tion forWeb Applications. In Proceedingsof the 33rdACM SIGPLAN Conference
+onProgrammingLanguageDesignandImplementation (Beijing,China) (PLDI’12) .ACM,NewYork, NY, USA,251ś262. https://doi .org/10.1145/2254064 .2254095
+[64]Veselin Raychev, Martin Vechev, and Manu Sridharan. 2013. Effective Race
+Detection forEvent-drivenPrograms.In Proceedings ofthe 2013ACM SIGPLAN
+International Conference on Object Oriented Programming Systems Languages
+&#38;Applications (Indianapolis,Indiana,USA) (OOPSLA’13) .ACM,NewYork,
+NY, USA,151ś166. https://doi .org/10.1145/2509136 .2509538
+[65]Gholamreza Safi, Arman Shahbazian, William G. J. Halfond, and Nenad Med-
+vidovic. 2015. Detecting Event Anomalies in Event-based Systems. In Pro-
+ceedings of the 2015 10th Joint Meeting on Foundations of Software Engineering
+(Bergamo, Italy) (ESEC/FSE 2015) . ACM, New York, NY, USA, 25ś37. https:
+//doi.org/10.1145/2786805 .2786836
+[66]HesamSamimi, MaxSchäfer,ShayArtzi, ToddMillstein,FrankTip, andLaurie
+Hendren.2012. AutomatedRepairofHTMLGenerationErrorsinPHPApplica-
+tionsUsingStringConstraintSolving.In Proceedingsofthe34thInternationalCon-
+ference on Software Engineering (Zurich,Switzerland) (ICSE ’12) . IEEE Press, Pis-
+cataway, NJ, USA, 277ś287. http://dl.acm.org/citation .cfm?id=2337223.2337257
+[67]StefanSavage,MichaelBurrows,GregNelson,PatrickSobalvarro,andThomas
+Anderson. 1997. Eraser: A Dynamic Data Race Detector for Multithreaded
+Programs. ACM Trans. Comput. Syst. 15, 4 (Nov. 1997), 391ś411. https://doi .org/
+10.1145/265924 .265927
+[68]KoushikSen.2008. RaceDirectedRandomTestingofConcurrentPrograms.In
+Proceedings of the 29th ACM SIGPLAN Conference on Programming Language
+DesignandImplementation (Tucson,AZ,USA) (PLDI’08) .ACM,NewYork,NY,
+USA,11ś21. https://doi .org/10.1145/1375581 .1375584
+[69]Shudi Shao, Zhengyi Qiu, Xiao Yu, Wei Yang, Guoliang Jin, Tao Xie, and Xintao
+Wu.2020. Database-AccessPerformanceAntipatternsinDatabase-BackedWeb
+Applications. In 2020 IEEE International Conference on Software Maintenance and
+Evolution(ICSME) . 58ś69.https://doi .org/10.1109/ICSME46990 .2020.00016
+[70]ChengTan,LingfanYu,JoshuaB.Leners,andMichaelWalfish.2017. TheEfficient
+ServerAuditProblem,DeduplicatedRe-execution,andtheWeb.In Proceedingsof
+the26thSymposiumonOperatingSystemsPrinciples (Shanghai,China) (SOSP’17) .
+ACM,NewYork, NY, USA,546ś564. https://doi .org/10.1145/3132747 .3132760
+[71]ChaoWang,MahmoudSaid,andAartiGupta.2011. CoverageGuidedSystem-
+aticConcurrency Testing.In Proceedings ofthe 33rd International Conference on
+SoftwareEngineering (Waikiki,Honolulu,HI,USA) (ICSE’11) .ACM,NewYork,
+NY, USA,221ś230. https://doi .org/10.1145/1985793 .1985824
+[72]JieWang,WenshengDou,YuGao,ChushuGao,FengQin,KangYin,andJunWei.
+2017. AComprehensiveStudyonRealWorldConcurrencyBugsinNode.Js.In
+Proceedingsofthe32NdIEEE/ACMInternationalConferenceonAutomatedSoftware
+Engineering (Urbana-Champaign,IL,USA) (ASE2017) .IEEEPress,Piscataway,
+NJ, USA,520ś531. http://dl.acm.org/citation .cfm?id=3155562.3155628
+[73]Junwen Yang, Pranav Subramaniam, Shan Lu, Cong Yan, and Alvin Cheung.
+2018. HowNottoStructureYourDatabase-BackedWebApplications:AStudyof
+PerformanceBugsintheWild.In Proceedingsofthe40thInternationalConference
+on SoftwareEngineering (Gothenburg,Sweden) (ICSE ’18) .ACM,NewYork,NY,
+USA,800ś810. https://doi .org/10.1145/3180155 .3180194
+[74]Tingting Yu, Witawas Srisa-an, and Gregg Rothermel. 2014. SimRT: An Auto-
+matedFrameworktoSupportRegressionTestingforDataRaces.In Proceedingsof
+the36thInternationalConferenceonSoftwareEngineering (Hyderabad,India) (ICSE
+2014).ACM,NewYork,NY,USA,48ś59. https://doi .org/10.1145/2568225 .2568294
+[75]Xiao Yu and Guoliang Jin. 2018. Dataflow Tunneling: Mining Inter-request
+Data Dependencies for Request-based Applications. In Proceedings of the 40th
+InternationalConferenceonSoftwareEngineering (Gothenburg,Sweden) (ICSE’18) .
+ACM,NewYork, NY, USA,586ś597. https://doi .org/10.1145/3180155 .3180171
+[76]Lu Zhang and Chao Wang. 2017. RClassify: Classifying Race Conditions in Web
+Applications via Deterministic Replay. In Proceedings of the 39th International
+ConferenceonSoftwareEngineering (BuenosAires,Argentina) (ICSE’17) .IEEE
+Press,Piscataway, NJ, USA,278ś288. https://doi .org/10.1109/ICSE .2017.33
+[77]WeiZhang,JungheeLim,RamyaOlichandran,JoelScherpelz,GuoliangJin,Shan
+Lu, and Thomas Reps. 2011. ConSeq: Detecting Concurrency Bugs Through
+Sequential Errors. In Proceedings of the Sixteenth International Conference on
+ArchitecturalSupportfor ProgrammingLanguages andOperatingSystems (New-
+port Beach, California, USA) (ASPLOS XVI) . ACM, New York, NY, USA, 251ś264.
+https://doi .org/10.1145/1950365 .1950395
+[78]Wei Zhang, Chong Sun, and Shan Lu. 2010. ConMem: Detecting Severe Concur-
+rency Bugs Through an Effect-oriented Approach. In Proceedings of the Fifteenth
+InternationalConferenceonArchitecturalSupportforProgrammingLanguagesand
+Operating Systems (Pittsburgh, Pennsylvania, USA) (ASPLOS XV) . ACM, New
+York, NY, USA,179ś192. https://doi .org/10.1145/1736020 .1736041
+[79]ShixiongZhao,RuiGu,HaoranQiu,TszOnLi,YuexuanWang,HemingCui,and
+JunfengYang.2018. OWL:UnderstandingandDetectingConcurrencyAttacks.
+In2018 48th Annual IEEE/IFIP International Conference on Dependable Systems
+and Networks (DSN) . 219ś230. https://doi .org/10.1109/DSN .2018.00033
+[80]YunhuiZhengandXiangyuZhang.2012. StaticDetectionofResourceContention
+ProblemsinServer-sideScripts.In Proceedingsofthe34thInternationalConference
+on Software Engineering (Zurich, Switzerland) (ICSE ’12) . IEEE Press, Piscataway,
+NJ, USA,584ś594. http://dl.acm.org/citation .cfm?id=2337223.2337292
+854

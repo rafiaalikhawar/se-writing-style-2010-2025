@@ -1,0 +1,1402 @@
+Efficiently Manifesting Asynchronous Programming Errors in
+Android Apps
+Lingling Fan
+East China Normal University, ChinaTing Su∗
+East China Normal University, China
+Nanyang Technological University,
+SingaporeSen Chen
+East China Normal University, China
+Guozhu Meng
+Chinese Academy of Sciences, China
+Nanyang Technological University,
+SingaporeYang Liu
+Nanyang Technological University,
+SingaporeLihua Xu
+New York University Shanghai, China
+Geguang Pu
+East China Normal University, China
+ABSTRACT
+Android, the #1 mobile app framework, enforces the single-GUI-
+threadmodel, in which a single UI thread manages GUI rendering
+andeventdispatching.Duetothismodel,itisvitaltoavoidblocking
+theUIthreadforresponsiveness.Onecommonpracticeistooffloadlong-runningtasksintoasyncthreads.Toachievethis,Androidpro-
+videsvariousasyncprogrammingconstructs,andleavesdevelopers
+themselvestoobeytherulesimpliedbythemodel.However,asourstudyreveals,morethan25%appsviolatetheserulesandintroduce
+hard-to-detect,fail-stoperrors,whichwetermasaysncprogram-
+ming errors (APEs). To this end, this paper introduces APEChecker ,
+a technique to automatically and efficiently manifest APEs. The
+key idea is to characterize APEs as specific fault patterns, and syn-
+ergistically combinestatic analysisand dynamic UIexploration to
+detect and verify such errors. Among the 40 real-world Android
+apps,APEChecker unveilsandprocesses61APEs,ofwhich51are
+confirmed(83.6%hitrate).Specifically, APEChecker detects3Xmore
+APEsthanthestate-of-arttestingtools(Monkey,SapienzandStoat),
+and reduces testing time from half an hour to a few minutes. On a
+specifictypeofAPEs, APEChecker confirms5Xmoreerrorsthanthe
+data race detection tool, EventRacer, with very few false alarms.
+CCS CONCEPTS
+•Software and its engineering →Software testing and de-
+bugging;
+∗Ting Su is the corresponding author of this paper.
+Emails: ecnujanefan@gmail.com, tsuletgo@gmail.com, ecnuchensen@gmail.com, gz-
+meng@ntu.edu.sg, yangliu@ntu.edu.sg, lihua.xu@nyu.edu, ggpu@sei.ecnu.edu.cn
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+on the first page. Copyrights for components of this work owned by others than ACMmustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,orrepublish,topostonserversortoredistributetolists,requirespriorspecificpermissionand/ora
+fee. Request permissions from permissions@acm.org.
+ASE ’18, September 3–7, 2018, Montpellier, France
+© 2018 Association for Computing Machinery.
+ACM ISBN 978-1-4503-5937-5/18/09...$15.00
+https://doi.org/10.1145/3238147.3238170KEYWORDS
+Asynchronous programming error, testing, static analysis, Android
+ACMReference Format:
+LinglingFan,TingSu,SenChen,GuozhuMeng,YangLiu,LihuaXu,Geguang
+Pu.2018.Efficiently Manifesting Asynchronous Programming Errorsin
+Android Apps. In Proceedings of the 2018 33rd ACM/IEEE International
+Conference on Automated Software Engineering (ASE ’18), September 3–
+7, 2018, Montpellier, France. ACM, New York, NY, USA, 12pages.https:
+//doi.org/10.1145/3238147.3238170
+1 INTRODUCTION
+Most modern GUI frameworks such as Swing[48],SWT[79],An-
+droid[25],Qt[68],WxErlang [84], andMacOS Cocoa [7] enforce the
+single-GUI-thread model, in which one single UI thread instanti-
+ates GUI components and dispatches events. Specifically, UI thread
+fetches system or user events off an event queue, and dispatches
+them either to a responsible app component’s handler or to a UI
+widget’s event handler. These handlers run on the UI thread and
+exclusively update GUIs if necessary.
+Due to this single-GUI-thread model, it is vital to avoid block-
+ing the UI thread. Therefore, most GUI frameworks recommendto offload intensive tasks (
+e.g., network access, database queries)
+to async threads ( i.e., background threads). Take Android devel-
+opmentframework(ADF)asanexample,itprovidesmanyasync
+programming constructs ( e.g.,AysncTask ,Thread,AsyncTaskLoader ,
+IntentService ) to achieve this goal.
+Like other frameworks, ADF leaves developers themselves to
+properly handle the interactions between these async threads and
+the UI thread — obey the rules implied by the single-UI-threadmodel. However, our investigation on 930 apps that use asyncconstructs shows, more than 25% apps violate these rules, andintroduce fail-stopbugs. Forexample, ifa workerthreaddirectly
+updates the text displayed on the UI thread, the app will crash.
+Another example is, when an async thread finishes its background
+task, and tries to send a UI update event to a GUI component.
+Before the update takes effect, if the user rotates the screen, the UI
+threadwilldestroyandrecreatethatGUIcomponent.Bydefault,
+the update event is routed to the destroyed GUI rather than the
+newlycreatedone,whichmaycrashtheapp.Inthispaper,weterm
+486
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France L. Fan, T. Su, S. Chen, G. Meng, Y. Liu, L. Xu, and G. Pu
+such fatal programming errors that violate the rules implied by the
+single-UI-thread model as async programming errors (APEs).
+Such bugs in Android are not easy to detect manually, due to (1)
+they usually reside in the code of handling interactions between
+UI threadandasync threads,which canbe rathercomplicated for
+manualanalysis;(2)theycanonlybetriggeredattherightstatesof
+GUI components ( e.g., activity, fragment) with complicated lifecy-
+cle[21,30];(3)theyhavetobetriggeredatrightthreadscheduling,
+while the execution time of async threads is affected by the task
+and its running environment (e.g., network stability, system load).
+Evenworse, existingbugdetectiontechniquesareineffectivefor
+such bugs. First, most GUI testing techniques, e.g., random test-
+ing [39,57], search-based testing [ 58,60], and model-based test-
+ing [2,3,8,78,85], are designed for functional testing in general.
+Theyaimatenumeratingallpossibleeventsequences(GUI-level
+events in particular) to manifest bugs, which is unscalable and
+time-consuming. Additionally, they mainly aim at improving code
+coverage, which may not be sufficient for exhibiting APEs — re-
+quirespecificeventsequenceswithappropriatelifecyclestatesand
+threadscheduling.Second,staticanalysistools, e.g.,Lint[35],Find-
+Bugs [19] and PMD [ 67], although scalable, only enforce simple
+rules(syntaxortrivialcontrol/data-flowanalysis)tolocatesuspi-
+ciousbugs.Forexample,Lintdeclaresitcanfind“WrongThread"er-rors(onetypeofAPEs)[
+24].However, asourevaluationinSection 5
+demonstrates,Lint incursanumberof falsenegatives—failing to
+detectthosesophisticated“WrongThread"errorsaswellasother
+typesofAPEs.Third,otherfaultdetectiontechniques[ 10,45,59,88]
+(e.g.,dataracedetection)haveonlytackledpartsofAPEs.Tosys-
+tematicallytackleAPEs,weconductedaformativestudyon2097
+Android apps to understand them. First, we find the async con-
+structs areindeed widely usedin 48.6% apps,and AysncTask s and
+Threads account for the majority. Second, we identified 3 async pro-
+gramming rules (see Section 2.2) implied by the single-GUI-thread
+model by analyzing Android docs, technical posts and previousfault studies on async programming. Third, from 1019 apps that
+use async constructs, we found that developers do violate these
+rules and introduce APEs. We collected 375 real APEs, involving 9
+exceptiontypes(thrownfromapps), e.g.,CalledFromWrongThread ,
+IllegalStateException ,BadTokenException ,etc.
+Informedbytheaboveresults,wedevelopanapproach APEChecker .
+Itfirstcharacterizes3faultpatternsfrom375issuesbasedonthe
+3rules,andsynergisticallycombinesstaticanalysisanddynamic
+UI exploration to efficiently manifest APEs. Specifically, it encodes
+the fault patterns into a static analyzer, locates suspicious APEsin the app code, generates a set of program paths that can reach
+the faulty code, maps program traces to real event sequences with
+appropriateenvironment,andfinallyverifytheseerrorsontheapp.
+We evaluate APEChecker on a set of 40 real-world Android apps,
+andcompareitwiththreestate-of-the-artGUItestingtools(Mon-
+key[39],Sapienz[ 60],andStoat[ 78]),andtwofaultdetectiontools
+(Lint [35] and EventRacer [ 10]). The results show (1) APEChecker
+unveils and successfully processes 61 APEs, of which 51 can be
+reproduced(83.6%hitrate)withrealtests;(2) APEChecker detects
+3XmoreAPEsthanthetestingtools,andreducesdetectiontimefrom half an hour to a few minutes; and (3) within comparable
+analysistime, APEChecker detects5XmoreAPEsthanEventRacer
+with very few false positives.Async 
+Thread 1UI Thread
+LooperMessage 
+Queue
+DialogActivityFragmentActivity
+Async 
+Thread 2Async 
+Thread 3R1UI 
+eventsSystem
+eventsBroadcast
+ ReceiverService
+UI 
+events
+update createaccess R3 R2
+Figure 1: Single-GUI-thread model of Android and its three
+basic rules.
+To summarize, this paper makes the following contributions:
+•Weconductaformativestudyon2097Androidappstoinvesti-
+gate APEs, and identify three async programming rules implied
+by the single-GUI-thread model.
+•We develop APEChecker , a technique that synergistically com-
+bines static analysis and dynamic UI exploration, to efficiently
+detect and verify APEs.
+•Weevaluate APEChecker on40real-worldapps,andclearlydemon-
+strate its effectiveness over the state-of-the-art testing and other
+fault detection techniques on APEs.
+2 ASYNC PROGRAMMING ERRORS
+2.1 Async Programming in Android
+Fig.1depictsthesingle-GUI-threadmodelofAndroid.TheUIthread
+maintainsa MessageQueue ,andits HandlerenqueuessystemorUI
+eventsintothisqueue.Theseeventscomefromappcomponents
+(e.g.,BroadcastReceiver s,Services)orGUIs( e.g.,Activityanditsassoci-
+ated visible components like Dialogso rFragments). The UI thread’s
+Looperdequeueseventsinasequentialorderanddispatchesthemto
+theHandlerforprocessing.TheUIthreadinvokesthecorresponding
+event handler w.r.t.an event and updates GUIs if necessary.
+ADFprovidesvariousasyncprogrammingconstructs[ 23].There
+arefourtypicalconstructs, i.e.,AysncTask ,Thread,AsyncTaskLoader
+andIntentService . Among them, AsyncTask allows one to perform
+short background operations and publish results on the UI thread;
+ThreadisinheritedfromJava,andexecutestasksinthebackground;
+AsyncTaskLoader utilizesAysncTask to perform async data loading,
+and has similar callbacks as AsyncTask , but it is lifecyle aware: ADF
+binds/unbinds the worker thread according to GUI’s lifecyle. In-
+tentService handles async requests in an async thread, and sends
+the results to the UI thread vis a Broadcast Receiver . Fig.2illustrates
+the use of AysncTask si nADSdroid [15], it starts two async threads,
+i.e.,SearchByPartName (Lines 9-22) and DownloadDatasheet (Lines
+34-49)tosearchelectroniccomponents’datasheet,anddownload
+fromaremoteserverifrequested.Theactivity SearchPanel (Lines
+2-23) searches for the result with user input in the doInBackground ,
+showing a progress dialog in onPreExecute before searching, and
+dismissesitvia onPostExecute .Theresultsareshownina ListView
+oftheactivity PartList(Lines25-50),inwhichuserscanclickany
+matched item (Lines 28-32) for downloading.
+However,therearetwoAPEs(Lines17and46),neitherofwhich
+hasbeencoveredbydevelopers.TherootcausesforthesetwoAPEs
+aresimilar. Whenusers rotatethe screenright afterthe startof the
+487
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. Efficiently Manifesting Asynchronous Programming Errors in Android Apps ASE ’18, September 3–7, 2018, Montpellier, France
+1 // the acitivty that shows the search panel
+2 public class SearchPanel extends Activity {
+3 ProgressDialog mSearchDialog ;
+4 public void searchByPartName ( View view ) {
+5 mSearchDialog = new ProgressDialog ( this );
+6 new SearchByPartName ( searchMode , partName ) . exe cute () ;
+7 }
+8 / / AsyncTask to search parts
+9 private class SearchByPartName extends AsyncTask <...>{
+10 protected ArrayList <Part>doInBackground ( Void . . . ) {
+11 . . . // other stuffs
+12 return Search . searchByPartName ( partName , mode) ;
+13 }
+14 protected void onPostExecute ( ArrayList <Part>result ) {
+15 super . onPostExecute( result );
+16 / / mSearchDialog is shown in onPreExecute ( )
+1 7 mSearchDialog . d ismiss () ;
+18 if ( result != null ){
+1 9 Intent i ntent = new Intent ( SearchPanel . this ,
+PartList . class );
+2 0 intent . putExtra( PartList . PARTS , r e sult );
+2 1 startActivity ( i ntent ) ;
+22 }} ...
+23 }
+24 // the activity that shows the list of matched Parts
+25 public class PartList extends ListActivity {
+2 6 ProgressDialog mDownloadDialog;
+27 // the event handler for clicking l i s t item
+28 protected void onListItemClick (...) {
+2 9 Part selectedPart = new P a r t (...) ;
+30 mDownloadDialog = new ProgressDialog ( this );
+31 new DownloadDatasheet () . e xecute ( se lectedPart ) ;
+32 }
+33 / / AsyncTask to download the data sheet
+34 private class DownloadDatasheet extends AsyncTask <...>{
+35 protected String doInBackground ( Part . . . parts ) {
+3 6 Part selectedPart = parts [0];
+3 7 String f ileName = fileNameForPart ( sel ectedPart ) ;
+38 URLConnection pdfConnection = sel ectedPart .
+getPdfConnection () ;
+3 9 pdfConnection . connect () ;
+40 . . . // fetch data from net work and update progress
+41 return fileName ;
+42 }
+43 protected void onPostExecute( String result ) {
+44 super . onPostExecute( result );
+45 / / mDownloadDialog i s shown in onPreExecute ( )
+4 6 mDownloadDialog . dismiss () ;
+47 if ( result != null ){
+48 openPDF ( r esult );
+49 }
+50 }}}
+;;g
+mSearchDialog . d ismiss () ;
+l!
+g
+mDownloadDialog . dismiss () ;1
+2
+3
+4
+51
+2
+3
+4
+5
+Figure 2: Motivating Example
+aysnc tasks SearchByPartName andDownloadDatasheet but before
+they finish ( i.e., before the execution of onPostExecute s), the app
+will crash when mSearchDialog (Line 17) and mDownloadDialog (Line
+46) are dismissed. Because the rotation will destroy the current
+activity and create a new one, but the dialogs were attached to the
+original one, which does not exist anymore. This leads to a fatal
+BadTokenException . We can see the right timing and lifecycle states
+arecrucialtomanifesttheseAPEs.Thispaperaimsattacklingsuch
+hard-to-detect errors.
+2.2 Formative Study
+TounderstandAPEs,weconductedaformativestudytoinvestigate
+the following questions. This enables our problem definition in
+Section2.3and fault pattern analysis in Section 3.1.
+Q1:Areasyncconstructswidely-usedbyAndroiddevelopersto
+followthesingle-GUI-threadmodel? Toanswerthis,wefocuson
+thefourtypicalconstructsintroducedinSection 2.1,andinvestigate
+2097 open-source Android apps from F-droid to observe the useof these constructs since F-droid is one of largest Android apprepositories, which covers diverse application categories; and allapps are open-source and maintained on Github, Google Code, etc.
+WeuseSoot[ 81],astaticanalysistool,toidentifyaysncconstructs.
+Answer: Async constructs are widely-used by Android developers.
+We found 1019 out of 2097 apps use async constructs (account for
+48.6%). Among 1019 apps, 2968 AsyncTask s, 1248Threads, 286In-
+tentService s, and 35 AsyncTaskLoader s are used. AsyncTask andThread
+accountforthemajority,whichalsoconformstopriorwork[ 53,54].
+Q2:Arethereanybasicrulesimpliedbythesingle-GUI-threadmodelthatAndroiddevelopersshouldobeyinasyncprogram-ming? Are they common to other GUI frameworks?
+To answer
+this, we conducted a thorough and careful inspection on (1) An-droid docs and APIs [
+23], including the principle of single-GUI-
+thread model [ 40], various async programming constructs [ 27,32–
+34,37,38,41,42],GUIcomponents[ 21,28,30,36,43],etc;and(2)
+technical posts filtered from Stack Overflow (the largest developer
+Q&A community) by the keywords “Android” plus the names of
+asyncconstructs,tutorialsonasyncprogramming[ 13];and(3)fault
+studies on Android [18, 46,55,86].
+Answer: Weidentified3asyncprogrammingrules(Fig. 1annotated
+these rules as R1,R2andR3), which are also common to other
+modern GUI frameworks.
+•Rule1(AsyncthreadsshouldnotupdateGUIobjects) :Since
+Android UI toolkit is not thread-safe, the single-GUI-thread model
+requires that async threads should not directly manipulate GUI ob-
+jects. GUI objects include visible components (e.g., update a Dialog’s
+message) and data models (e.g., change the content of ArrayAdapter
+thatfitsinbetweena ListViewandanArrayList).Instead,theyshould
+designate the UI thread to handle GUI objects via UI-safe methods
+likeActivity#runOnUiThread [40]. This rule is also enforced by many
+GUI frameworks, e.g.,Swing,SWT,Qt, andCocoa.
+•Rule 2 (Async threads should not create GUI components
+in the background) : The UI thread by default is created with a
+HandlerandaLooper.TheHandlerenqueuesevents( e.g.,messages
+or runnable objects) into a message queue. These events come
+fromdifferentappcomponentsandGUIs.The Looperdequeuesand
+dispatches the events to the Handlerfor processing. However, an
+asyncthread(except HandlerThread )bydefaultisnotassociatedwith
+aHandler,therebyitshouldnotdirectlycreateGUIcomponents( e.g.,
+Toast#show ,Dialog#create )inthebackground.Instead,theyshould
+postGUIcreationsviaUIthread’s HandlerintoLooperforprocessing.
+Qt’seventloop andwxErlang’smailboxqueue enforcethissimilarrule.
+•Rule 3 (Async threads should avoid accessing GUIs or per-
+forming transactions inside async callbacks) : Async callbacks
+suchasonPostExecute runontheUIthread,buttheyhavenoknowl-
+edge of the current states of GUIs. Because they are called when
+theasyncthreadreturns.Asaresult,accessingGUIsorperforming
+transactionsfor Fragmentsinasynccallbacks( e.g.,AysncTask#onPost-
+Execute,LoaderCallbacks#onLoadFinished ) has the risks of sending
+GUI updates to destroyed GUIs and losing app state [ 31]. Cocoa
+Touch (GUI framework of iOS) also enforces this similar rule [6].
+Q3:Dodevelopersviolatetheserules?Arethereanychallenges
+tosolvesuchAPEs? Toanswerthis,weutilizeGithubandGoogle
+Code APIs to scrawl the issue reports of 1091 apps that uses async
+constructs in Q1. To identify APEs, we only collect issues that are
+reportedwithexceptiontraces,whichcontainthecallbacksofasyncconstructs;theninspecttheirissuedescriptions,comments,patches
+if available to confirm valid issues that do violate the three rules.
+488
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France L. Fan, T. Su, S. Chen, G. Meng, Y. Liu, L. Xu, and G. Pu
+Program trace 
+generationPatterns
+Event sequence 
+generationIssue 
+reports
+Static 
+detectionEnvironment 
+generationFault pattern 
+analysis
+Crash 
+reports Faults
+
+📷
+📷X
+Apktool
+Error 
+verification
+UiAutomator
+Figure 3: Workflow of APEChecker
+Answer: We finally got 375 valid APE issues. The number of valid
+issues is not large since many issues are reported without excep-
+tion traces. It is reported only 16% Github issues have exception
+traces[18].But ourevaluation(Section 5)revealsAPEs affectmore
+than 25% apps. These issues violate the rules in different forms, in-
+volving9differenttypesoffatalexceptions, e.g.,CalledFromWrongTh-
+read,IllegalStateException ,andBadTokenException .Theviolationsof
+Rule1and3accountforthemajorityinthese375issues(91.2%).By
+investigating the fixing process of these APEs on Github, we note
+developers face three main challenges: (1) Due to lack of adequate
+understanding, they usually use simple try-catches to fix APEs; (2)
+ManyAPEs resideinthe releasessince developersfailto discover
+them during development; (3) Due to the lack of reproducing tests,
+several developers complain about the difficulties of debugging.
+2.3 Problem Definition
+We name the errorsthat violate the threebasic rules as aysnc pro-
+gramming errors, and formulate our problem as follows.UI thread.
+AUIthread uisthemainthreadthatiscreatedwhen
+an app starts, and manages GUI components.
+Async thread. An async thread wis a worker thread that is in-
+stantiatedfrom anasyncconstruct ( e.g.,Thread),started bytheUI
+thread (e.g., Thread#run ), and executes a task.
+UI-accessingandUI-safemethods. AUI-accessingmethod(i.e.,
+muiaccess) may create a GUI component ( e.g.,Toast#show ), change
+a GUI component’s state ( e.g.,Dialog#dismiss ), or commit fragment
+transactions. A UI-safe method muisafepermits safe GUI access,
+e.g.,Activity#runOnUiThread ,Handler#post , or GUI state check, e.g.,
+Activity#isFinishing() .
+Program trace and its event sequence. A program trace tis a
+sequence of method calls, m1,...,mi,...,mn, on the call graph
+of an app. The event sequence sw.r.t.tis a set of user events,
+e1,...,ei,...,ek(k≤susuallyholds),thatcanexecuteout tunder
+thegivenenvironment E(e.g.,threadscheduling,networkstatus,
+app permissions, sensor inputs and platform versions).ProblemDefinition.
+Ourproblemistocheckwhetherthereexists
+anytrace tonwhich ucreatesanasyncthread w,andwinvokes
+any UI-accessing method that is not control-dependent on a UI-safe
+method. If texists, we find an event sequence lthat follows tto
+exhibit the error under given environment E.
+2.4 Prior Work
+Prior work has only tackled parts of this problem. One close work
+isfromZhang et al.[88],whichfindsinvalidthreadaccesserrors
+in Java GUI applications ( Swing,SWT,Android), and gives warnings
+intheformofmethodcallchains.However,thisworkhasseveral
+significantdifferencesfromours:First,theyonlyhandleasubset
+of errors w.r.t.Rule 1,i.e., an async thread directly accesses GUI
+components.Second,theyusestaticanalysistocheckwhetherathreadspawningcanreachaGUIobjectaccessingmethod,whichisdetermined by the
+ViewRoot#checkThread method in ADF. This is ad
+hoc and may miss many errors. Third, they do not confirm errors,
+whichmaybringmanyfalsepositives.Incontrast,weconductasys-
+tematicstudytounderstandAPEs,andcombinestaticanddynamic
+analysis to confirm errors with real tests. Lin et al.[54] investigate
+the uses of AsyncTask , and observe the invalid thread access errors.
+Buttheyaimtosolveanotherdifferentproblemofautomatically
+refactoring long-running tasks in UI thread into AysncTask s.
+Another area of relatedwork is detecting and reproducing con-
+currency bugs (data race in particular) [ 10,45,52,54,59,66,80].
+TheytreatsomeAPEs w.r.t.Rule3asdataraces.Forexample,the
+twoAPEsinFig. 2canbeinterpretedasdataracessincethe mPanels
+variableinsidetheframeworkclass PhoneWindow canbeaccessed
+simultaneously by the UI and async thread in which one access
+isawriteoperation.Existingdataracedetectiontools[ 10,45,59]
+exploit dynamically explored event traces to build a happen-before
+graph,andthenquerythegraphtofindpotentialdataraces.But
+they have several limitations in practice to detect APEs: First, their
+effectiveness heavily relies on the traces for building the graph. If
+the traces have not fully covered app code, the detection abilityis limited. Second, they usually generate a large number of false
+positivesduetoconservativeanalysis[ 47].Existingdataracerepro-
+ducing tools[ 66,80] arealso impractical sincethey either require
+user-providedtracesordependontheresultsofdataracedetection
+tools whenconfirming bugs.Section 5compares APEChecker with
+existing data race detection tools to confirm these observations.
+3 OUR APPROACH APECHECKER
+This section details our approach APEChecker . Figure3shows its
+workflow, which is composed of five key steps: APEChecker (1)
+summarizesasetoffaultpatternsfromthecollectedAPEissues,(2)
+encodesthesefaultpatternsintoastaticanalyzertolocatefaulty
+code,(3)generatesasetofprogramtracesthatcanreachthefaultycodefromtheappentry,(4)mapstheprogramtracesintorealevent
+sequences (tests) with appropriate environment; and (5) verifies
+APEs with the tests, and dumps crash reports for fixing.
+3.1 Fault Pattern Analysis
+We categorize 375 APE issues into three groups w.r.t.the rules
+summarized in the formative study. By analyzing these issues, we
+characterize these APEs as three fault patterns.
+•Fault Pattern 1: If an async thread wis started, and wcalls a
+UI-access method muiaccess, which is not control-dependent on
+aUI-safemethod muisafe.Thispatternviolates Rule 1,whichis
+represented as start(w)→¬muisafe→muiaccess. Fig.4shows
+suchanerrorof Pedometer [17],anappthatstorestheuser’sstep
+countperhour(thesymbol“+”denotesthecorrespondingpatch
+489
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. Efficiently Manifesting Asynchronous Programming Errors in Android Apps ASE ’18, September 3–7, 2018, Montpellier, France
+** "("(& %8/205
+
+  "!-
+
+ 	 + ,-
+"
+&!+ +,-
+
+ 	 +,-
++ ):##',-
+9 "+,&
++ +,-
+9 
+ 	 +,-
+'
+&"	+,$
+9 .
+....,$..0
+12345678
+0/00
+01
+Figure 4: Example of Fault Pattern 1
+++ 0(	!'3238
+
+#
+,)-(# ,-&
+	 	#
+ 
+ $
+=)>.
+ 	  ,(((!-.
+  < $,)-&
+, <<  %% )-.
+*
+(
+#,-(",-&
+; ,-&
+//
+;  ,(((! -.
+; (,! -&
+;
+(
+#,$(#,--(",-&/
+/23456
+7
+89:
+21222324
+Figure 5: Example of Fault Pattern 2
+to fix this error). In fragment MonthlyReportFragment , it starts an
+aysncthreadtogeneratethemonthlyreportandrefreshtheGUI
+by invoking notifyDataSetChanged , which crashes the app.
+•Fault Pattern 2: If an async thread wis started, and wcalls a
+GUI creation method muicreate, which is not posted on the UI
+thread by mpostlooper to execute. This pattern violates Rule 2,
+which is represented as start(w)→¬mpostlooper→muicreate.
+Fig.5shows such an error of gisapp[16], which is a user interface
+controls library for Android geo applications (the symbols “+” and
+“-” denote the corresponding patch to fix this error). gisappuses
+an async thread ExportTask to export the data by retrieving the
+database, and use Toast#makeText to show a message if no data is
+available.However, ExportTask hasnotreferredtotheUIthread’s
+Handlerto post messages, which crashes the app.
+•FaultPattern3: Ifanasyncthread wisstarted,andbefore wre-
+turns,thetargetactivityorfragment Aisdestroyedorstopped,and
+afterwreturns,itsasynccallbackcallsaUI-accessmethod muiacess,
+which is not control-dependent on a UI-safe method muisafe. This
+pattern violates Rule 3, which is represented as start(w)→de-
+stroy(A)orstop(A)→return(w)→¬muisafe→muiaccess.InFig.2,
+there are two such errors. When users rotate the screen right after
+thestartofthe AsyncTask sSearchByPartName andDownloadDatasheet
+butbeforetheyfinish,thedismissof mSearchDialog (Line17)and
+mDownloadDialog (Line 46) can crash the app.
+3.2 Static Fault Detection
+Algorithm 1detailsstaticfaultdetection.Ittakesasinputanapp,
+the lists of UI-accessing and UI-safe methods (summarized from
+Android docs), and outputs the APE locations (including the start-
+ingpointsofasyncthreads).Algorithm 1worksonthestaticcall
+graphofanapp,whereeachnodedenotesamethod,andeachedge
+/angbracketleftf,д/angbracketrightdenotes the call from the method ftoд. We first identify all
+method nodes that start async threads (Line 3) and check whether
+the use of corresponding asyncconstructs violate the rules (LinesAlgorithm 1: Static Fault Detection
+Input:apk: an Android app, uiAccessAPIs : list of UI-access methods,
+uiSafeAPIs : list of UI-safe methods
+Output:APEs: List <methodStartThread, stmtStartThread, methodAccessUI,
+stmtAccessUI >
+1APEs←∅
+2cд←buildCallGraph( apk)
+3asyncStartNodes ←getReachableAsyncStarts( cд)
+4foreachNodenode∈asyncStartNodes do
+5async←getAasyncClass( node)
+6o←getOverriddenMethods( async)
+7nodeList←getCalledMethodNodes( o,cд)
+8whilenodeList /nequal∅do
+9 node←nodeList .dequeue()
+10 ifisVisited(node)then
+11 continue
+12 ifnode∈uiAccessAPIs then
+13 if¬controlDepdent( node,uiSafeAPIs )then
+14 m←getCallingMethod( async)
+15 n←getCallingMethod( node)
+16 APEs←/angbracketleftbigm,async ,n,node/angbracketrightbig
+17 nodeList .enqueue(getCalledMethodNodes( node,cд))
+18returnAPEs
+4-17). For each aysnc construct, we get the overridden methods
+accordingtoitsclasstype(Lines5-6).Take AsyncTask asanexam-
+ple, weconsider its callbackmethods onPreExecute ,doInBackground
+andonPostExecute ,etc.Byqueryingthecallgraph,wegetsallthe
+nodescalledbythesemethods(Line7).IfaUI-accessingmethod
+node is not control-dependent on any UI-safe methods ( e.g.,Ac-
+tivity#runOnUiThread ),thisnodewillbetaggedassuspiciousAPE
+(Lines12-16).Notethatweconductbothintra-andinter-procedural
+control-dependentanalysistoreducefalsealarms.Algorithm 1also
+checks the successor methods that are called by this node (Line 17)
+to avoid false negatives.Example
+. In Fig.2,APEChecker identifies that searchByPartName
+startsan AsyncTask ,SearchByPartName .IntheonPostExecute callback,
+it locates a UI-accessing method ProgressDialog#dismiss (Line 17),
+which is not control-dependent on any UI-safe methods, e.g.,Activ-
+ity#isFinishing() ,tosafelycheckactivitystate.So APEChecker reports
+a suspicious APE.
+3.3 Program Trace Generation
+Algorithm 2detailstheprogramtracegeneration(theideaissimilar
+to backward symbolic execution [ 56,77]). It takes as input a target
+methodandstatement( i.e.,methodAccessUI andstmtAccessUI from
+Algorithm 1), and returns the traces ( i.e., method call sequences)
+thatcanreachtheAPE.Itstartswithanemptytrace t,andback-
+trackstoreachtheentryactivity(Lines5-30).Specifically,themax-
+imumnumberofgeneratedtraces( MaxTraceCnt ,Line17)andthe
+maximum trace length ( MaxTraceLen , Line 5) is configurable.
+During the analysis, each trace tmay have one of the three
+states,i.e.,pending(tis under propagation), terminated (treaches
+the entry activity), failed(the propagation fails due to dead code
+or limitations of static analysis tools). If no traces are pending,the analysis stops (Lines 6-7). Otherwise, the analysis continues
+untilthemaximumtracelengthisreached.Ateachiteration,the
+algorithm uses two important variables, i.e.,ptrMethod andptrStmt,
+pointingtothecurrentbacktrackpointof t.Whentispending,the
+490
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France L. Fan, T. Su, S. Chen, G. Meng, Y. Liu, L. Xu, and G. Pu
+algorithm queries the callers of tviagetAcyclicCallers (we details
+this function later). If there areno callers, twill be set as faileddue
+to the propagation cannot proceed (Lines 12-14). Otherwise, we
+updateptrMethod andptrStmtoft(Lines16-26).Specifically,if t’s
+ptrMethod has multiple callers, the algorithm will fork out a new
+tracet/primefromt(copying all previous backtrack information from t
+tot/prime), and add t/primeinto the list of traces (Lines 16-22).
+Here,updateTrace (Line 21 and 25) performs three operations:
+(1) check whether t’sptrMethod has reached the entry activity and
+updatet’s state accordingly. In particular, if ptrMethod is a callback
+method ( e.g., user event handler) of the entry activity, twill be
+set asterminated . (2) update the method call chain of tby adding
+ptrMethod . The method call chain will be later used to generate
+eventsequences.(3)recordtheconditionsinthebodyof ptrMethod
+thatptrStmtare control-dependent on. These conditions will be
+analyzed later to create necessary environment to improve the hit
+rate. Section 3.4will discuss the details of (2) and (3).
+The function getAcyclicCallers queries and returns the immediate
+callers of t’sptrMethod . It removes the visited callers to ensure the
+traces are acyclic. When backtrack, we differentiate three types of
+call relations that widely exist in Android.
+•Explicit Calls . The function fimmediately calls function д,i.e.,
+there exists an edge /angbracketleftf,д/angbracketrighton the call graph. For example, SearchBy-
+PartName#doInbackground is explicitly calledby searchByPartName
+viaAsyncTask#execute (see Fig.2).
+•ImplicitCalls .Androidsystemshavemanyimplicitcallsthrough
+itsframework.Animplicitcallfromfunction ftoдindicates fcalls
+дasynchronously.Forexample,thecallback onPostExecute ofSearch-
+ByPartName isimplicitlycalledwhenthecallback doInbackground
+returns (see Fig. 2).
+•Inter-Component Transition Calls . Android system uses In-
+tents to start activities or services. For example, in SearchByPart-
+Name, the activity PartListis called by the callback onPostExecute
+viastartActivity (see Fig.2).
+Example. WeexplainAlgorithm 2onADSdroid (Fig.2).Algorithm 1
+reportstwosuspicious faults,oneofwhichisin the onPostExecute
+callback, which dismisses mDownloadDialog without any UI-safe
+methods (Line 46). Algorithm 2first initializes a pending trace,
+whoseptrMethod issetas onPostExecute andptrStmtasthedismiss
+statement. Itthen finds doInBackground is animplicit caller of on-
+PostExecute (see5/circlecopyrt). Next, it finds onListItemClick explicitly calls
+doInBackground viaexecute(see4/circlecopyrt).Next,itfindstheactivity PartList
+is called by SearchByPartName#onPostExecute (see3/circlecopyrt), and update
+ptrMethod asonPostExecute andptrStmtas thestartActivity statement
+(Line 21). Similarly, it finally finds the method searchByPartName
+starts the SearchByPartName (see1/circlecopyrt). The final trace is searchByPart-
+Name→onListItemClick (only user event handlers are shown).
+3.4 Event Sequence and Environment
+Generation
+This step converts the program traces from Section 3.3into action-
+able event sequences with appropriate environment.
+EventSequenceGeneration .APEChecker considerstwomaintypes
+of callbacks when converting a program trace.
+•Usereventhandlercallbacks. APEChecker mapseacheventhan-
+dler on the trace to a corresponding action w.r.t.a UI widget orAlgorithm 2: Program Trace Generation
+Input:method : the target method, stmt: the target statement
+Output:traces: the list of candidate traces
+1lettbe an initially empty trace
+2lettraceLen be the current trace length (initialized as 0)
+3t.ptrMethod←method ,t.ptrStmt←stmt
+4traces←{t}
+5whiletraceLen <MaxTraceLen do
+6if¬hasPendingTrace( traces)then
+7 returntraces
+8new_traces←{}
+9foreachTracet∈tracesdo
+10 ifisPending(t)then
+//tis a pending trace
+11 t.callers←getAcyclicCallers( t.ptrMethod)
+12 ift.callers ==∅then
+// sett’s state as failed
+13 updateTrace( t)
+14 continue
+15 letcbe the first caller of t.callers
+16 foreachCallerc/prime∈t.callers\{c}do
+17 ifcount(traces)<MaxTraceCnt then
+18 t/prime←fork(t)
+19 t/prime.ptrMethod←getMethod( c/prime)
+20 t/prime.ptrStmt←getCallsite( c/prime)
+21 updateTrace( t/prime)
+22 new_traces←new_traces∪{t/prime}
+23 t.ptrMethod←getMethod( c)
+24 t.ptrStmt←getCallsite( c)
+25 updateTrace( t)
+26 new_traces←new_traces∪{t}
+27 else
+//tis a terminated or failed trace
+28 new_traces←new_traces∪{t}
+29traces←new_traces
+30traceLen←traceLen +1
+view. For example, in Fig. 2, the event handler onListItemClick(...)
+is mapped to a clickaction on a ListViewitem;searchByPartName
+(declared in the XML layout file) is mapped to a clickaction on
+the “Search" button. To achieve this, APEChecker maintains a view-
+handler mapping table, which supports event handler callbacks
+registered in both app code and XML layouts [70, 75].
+•Activity/Fragment lifecycle callbacks. Foranactivityorfrag-
+ment lifecycle callbacks ( e.g.,onRestart,onResume ,onDestroy )o n
+thetrace, APEChecker automaticallysubstitutesthecallbackwith
+special events that can force app to execute it. For example, for
+onRestart,APEChecker generates along-press “Home”action (show
+the list of recently-opened apps) followed by a touch action on this
+app(switchbacktothepreviousappagain),triggeringthelifecycletransition
+onStop→onRestart;foronDestroy ,APEChecker generatesa
+device-rotation event, triggering the transition onStop→onDestroy
+→onStart.Currently, APEChecker considers Activity,Fragment and
+other lifecycle-aware components (e.g., Loader).
+Environment Generation .APEChecker automatically constructs
+appropriate environment for event sequences. During the trace
+generation, APEChecker recordsthecontrol-dependentconditions
+ofanAPE,andanalyzesthemtoderivetheenvironment. APEChecker
+currently focuses on three types of environment, which we find
+they can cover most of cases.
+491
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. Efficiently Manifesting Asynchronous Programming Errors in Android Apps ASE ’18, September 3–7, 2018, Montpellier, France
+•Specific user inputs. APEChecker tracks the constraints on user
+inputsthatcanaffecterrorverification.Itcurrentlysupportstwo
+lightweight strategies: (1) infer the required input formats ( e.g.,
+email address,phone number) fromthe property android:inputType
+in the UI layout files; and (2) track the intra-procedural data-flows
+ofinputsandinfertherequiredcontentsbyanalyzingsimplestring
+APIs (e.g., equal to a constant string, contain a specific character).
+•Explicitsystemsettingsorpermissions. APEChecker analyzesspecific
+APIs in the recorded conditions to infer necessary system settings
+orpermissions.Forexample,if ¬WifiManager#isWifiEnabled() isthe
+condition, APEChecker will disable WiFi before replaying the test; if
+Camera#open() is thecondition, APEChecker will grantthe camera
+access permission at runtime when required.
+•Specific Exception Handling. Some APEs reside in exception han-
+dlingcode,andtheycannotbemanifestedwithouttriggeringthe
+corresponding exception. For example, if the APE can be only
+reached by an IOException when the app fails to access a remote
+server via network, APEChecker will disconnect the network before
+replayingthe testtosimulatethe exception. APEChecker onlyhan-
+dles specific cases of IOException (e.g., cannot access network or
+files),butitcanbeextendedtosupportotherexceptionsifrequired.
+Currently, APEChecker supportslimitedenvironment( e.g.,spe-
+cific user inputs, network connection, camera access, file access) in
+our evaluated subjects, and does not consider external events ( e.g.,
+sensor inputs and intents). The environment can be extended in
+the future by using more sophisticated techniques like symbolic
+analysis [69] and exception handling [87].
+3.5 Error Verification
+ToconfirmanAPE,wereplaythegeneratedeventsequencewith
+appropriate environment on the target app, and monitor the in-
+tended9exceptiontypesviaAndroidDebuggingBridge( adblogcat).
+For those APEs whose manifestations require specific activity/frag-
+ment state and thread scheduling (Fault Pattern 3 in particular), we
+instrument the original app AtoA/primeby adding semaphore opera-
+tionsP(waiting) and V(release) at appropriate program locations.
+Forasuspiciousfaultystatement iinthecallbackofasyncthread
+w, we insert a Poperation (in the background callback) before ito
+wait for a signal; at the right activity or fragment lifecycle callback
+ontheUIthread U,weinserta Voperationtosendthesignal.Asa
+result, we are able to control the thread scheduling and make sure
+the scheduling happen at the right lifecycle state. Note that if an
+appcorrectlyfollowsthe3asyncprogrammingrules,thecontrol
+of thread scheduling will not introduce APEs or force the app to
+crash.Theinstrumentationmethodonlyamplifiesthepossibility
+of the long execution time to simulate real possible scenarios ( e.g.,
+delay of network access, wait of data download), and thus will not
+introducenewbehaviorsorchangeoriginalbehaviors.Addition-
+ally,theinstrumentationlocationsdependonthefaulttypes.For
+example, to manifest activity state loss, the Voperation will be
+added in onStopsince state loss always happens after onStop.
+Example. TheAPEin SearchByPartName#onPostExecute inFig2vi-
+olatesRule 3. To manifest this error, APEChecker instruments a P
+operation in the end of doInBackground , and instruments a Vop-
+eration at the beginning of SearchPanel#onDestroy . By doing this,
+APEChecker can easily manifest this error by a two-event sequence,
+i.e., click the “Search" button and rotate the screen.4 IMPLEMENTATION
+APEChecker is implemented in Java(5K LOC) and Python(1K LOC),
+and built on several existing tools to automatically manifest APEs.
+ItusesSoot[ 81]tobuildcallgraph,staticallydetectsAPEsbasedon
+the three fault patterns, and generatesprogram traces. When gen-
+erating program traces, it extends IC3 [ 65] to handle inner classes,
+fragments, and other public classes to reduce false negatives. It
+currentlyconsidersacyclictraces,andsetsthemaximumnumber
+oftracesto10andmaximumtracelengthto20.ItutilizesGator[ 70]
+(theGUIHierarchyPrinterClient clientinparticular)tosetupthemap-
+pingrelationsbetweenusereventhandlersandUIelements,and
+convertsthehandlers(inthegeneratedtrace)toaneventsequence
+(e.g., click a button, choose an item in the list). The mapped UI ele-
+ments usually have unique IDs or texts, which enables APEChecker
+to interact with them. It now supports back,rotate,Home(send the
+apptobackground), long-press-Home-and-back ,Screen(screenon/off)
+to tweak lifecycle. Apktool [ 14] instruments semaphore P/V op-
+erations into the UI thread and async threads to control thread
+scheduling. UIAutomator [26] is used to execute tests, and Android
+Debugging Bridge ( adb)[22] monitors whether the app throws the
+intended 9 exception types.
+5 EVALUATION
+We applied APEChecker on 40 real-world Android apps, and com-
+pared it with three state-of-the-art GUI testing tools (Monkey,
+Sapienz,andStoat),theGoogleofficialstaticanalysistoolLint,and
+thestate-of-the-artdataracedetectiontool,EventRacer,tomeasure
+its effectiveness. We aim to answer these research questions.
+•RQ1:Howeffectiveis APEChecker fordetectingAPEsinAndroid
+apps? Can Lint detect them?
+•RQ2:Howeffectiveis APEChecker againstexistingGUItesting
+techniques (Monkey, Sapienz, and Stoat) for APEs?
+•RQ3:Howeffectiveis APEChecker againstexistingdatarace de-
+tection techniques, for detecting specific types of APEs?
+5.1 Evaluation Setup
+Subjects.Wechoosesubjectsfrom(1)F-droid,thelargestrepository
+for open-source apps; and (2) Google Play Store, the official app
+store from Google. We crawled all 2097 unique apps from F-droid,
+and3107popularappsfromGooglePlaywithover10Kinstallations.
+Sootsuccessfullyprocessed1654F-droidappsand2719GooglePlay
+apps. Among them, 930 F-droid apps and 1274 Google Play apps
+useasyncconstructs.Next, APEChecker identifies866APEsin234
+F-droid apps (25.2%=234/930) and 1161 APEs in 201 Google Play
+apps (15.8%=201/1274) that contain suspicious APEs, respectively.Environment
+.APEChecker runs on a 64-bit Ubuntu 14.04 machine
+with12cores(3.50GHzIntelCPU)and32GBRAM.WeverifyAPEs
+on both an Android emulator (SDK 4.4.2) and an LG Nexus 5X
+mobile phone (SDK 7.1.1).Studies
+.Weconductedthreecasestudies.In Study 1,weanswer
+RQ1. Weneed to manuallyanalyze eachreported APE, anddeter-
+mine the true positives and false positives, which requires a lot
+ofhumanefforts.Therefore,werandomlyselectedaround10%F-
+droidandGooglePlayapps,respectively(theappsrequiringuser
+credentialsareexcluded):(1)25F-droidappsfrom234suspicious
+faultyapps,with30374executablelinesofcode(LOC)(in Jimple),
+143 classes, 680 methods and 6 activities on average; and (2) 15
+492
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France L. Fan, T. Su, S. Chen, G. Meng, Y. Liu, L. Xu, and G. Pu
+Table 1: Subjects used in the experiment and evaluation results of APEChecker and Lint.
+App Name #ELOC #Classes #Methods #Activities#Time
+(min)#APEs
+(detected)#APEs
+(processed)#Repro. #FPFault
+Type#APEs
+by Lint
+Open Manager 11477 56 227 6 1.0 2 2 203 0
+ADSdroid 2310 17 60 2 1.0 2 2 203 0
+DeskCon 11264 80 317 5 9.8 7 5 403 0
+TuCanMobile 24264 113 494 10 3.6 2 2 203 0
+RadioDroid 19248 109 443 2 2.8 3 1 123 0
+filmChecker 2739 28 67 2 2.9 1 1 103 0
+QuranForMyAndroid 14170 99 414 11 2.5 4 4 202, 3 0
+MoTAC 30857 135 748 6 1.8 3 2 202 0
+MaximaOnAndroid 11357 43 211 4 2.5 2 2 203 0
+DebianDroid 14133 88 413 3 3.1 8 0 00- 0
+NextGIS Mobile 12150 71 300 3 3.2 1 0 00- 0
+A2DP Volume 21502 115 555 6 3.7 6 6 502, 3 0
+Andor 87818 445 2198 19 3.0 4 3 313 0
+Mitzuli 23615 135 517 2 3.4 2 1 103 0
+Commons 32767 177 912 9 4.1 3 1 103 0
+AdAway 21443 131 535 8 4.2 2 0 00- 0
+ServeStream 64866 300 1777 8 4.8 1 1 103 0
+Navit 19336 69 360 3 1.7 2 0 01- 0
+JKU App 52654 223 1263 7 5.2 2 0 00- 0
+HomeManager 9184 54 185 2 1.8 1 1 101 0
+Transports Bordeaux 21840 180 668 16 7.3 3 1 01- 0
+MTG Familiar 84544 341 1529 12 7.2 1 0 00- 0
+Cowsay 4149 22 92 1 1.1 1 1 101 1
+AeonDroid 23037 128 604 4 3.6 3 1 103 0
+Addi 138716 404 2119 2 1.4 1 0 00- 0
+Average 30374 143 680 6 3.5 2.8 - --- -
+MalayalamNewspaper 7093 51 181 4 8.2 1 1 103 0
+Drum Solo 17819 80 270 4 2.6 1 0 00- 0
+Smart Poker 38835 219 1020 7 5.1 3 3 103 0
+Lojas Renner 24758 210 756 11 5.6 1 1 103 0
+Messaging 114001 446 3103 13 13.2 1 0 00- 0
+Recarga Vivo 61913 369 1809 25 13.8 1 0 00- 0
+InstaCartoonPhoto 1693 26 60 6 6.8 1 1 103 0
+Fingerprint Lock 17833 123 475 13 6.9 1 0 00- 0
+Salmos 19527 110 402 4 5.9 2 2 203 0
+Santander 166101 902 3457 5 9.8 3 2 103 0
+Biblia Sagrada 41170 153 648 10 16.6 7 2 213 0
+Trade Accounting 85485 450 2018 34 11.8 2 0 00- 0
+PremiumWallpaper 52156 203 1321 10 8.3 4 4 402, 3 0
+Tebak Lagu 23017 158 667 12 11.5 9 7 502, 3 0
+WorldNews Live24 104436 515 2298 10 19.8 3 1 103 0
+Average 51722 267 1232 12 9.9 2.7 - --- -
+GooglePlayappswith51722LOC,267classes,1232methodsand
+12 activities on average, shown in Table 1. We measured the static
+analysistime(thetimeofreplaytestsisomitted,sinceitonlytakes
+a few seconds), the number of detected APEs, the number of APEs
+thatcanbeprocessed(limitedbytheabilitiesofSoot,IC3,Gator),
+the number of APEs that can be reproduced (#Repro.), false posi-
+tives (#FP), the types of faults, and the number of APEs that can be
+detected by Lint.
+InStudy2,weanswer RQ2bycomparing APEChecker withMon-
+key, Sapienz, and Stoat, which have proven effectiveness on bug
+detection [ 12,60,78]. 10 apps are randomly selected from 234 F-
+droid apps that contain APEs. Each tool is allocated with one hour
+with default settings. The number of confirmed ( i.e., successfully
+triggered)APEs,theanalysistimeandthelengthoftests( i.e.,event
+sequences) are recorded. From the perspective of their approach
+workflow, all tools are given the original rather than the instru-
+mented apps ( cf.Section3.5) as input to achieve fair comparison
+—Monkey,SapienzandStoatdonotrequiretheinstrumentation
+for bug detection as their algorithms do not need instrumentation
+(otherwise they may be adversely affected, e.g., stuck by the thread
+scheduling),and alsodonot haveideaof wheretoinstrument. To
+alleviatetherandomness,weruneachtool10timestoaveragedata.InStudy3,weanswer RQ3bycomparing APEChecker withEven-
+tRacer[10].Wedidnotchooseotherdataracetools, e.g.,CAFA[45]
+(notavailable)andDroidRacer[ 29,59](lesseffecitveandprecise
+than EventRacer [ 10]). In detail, we (1) randomly selected 10 F-
+droidapps(sincethesourcecodeisrequiredtoconfirmtheAPEs
+reported by EventRacer, listed in Table 2) with at least one APE
+ofFault Pattern 3 (treated as data races by EventRacer); (2) only
+considertheracesreportedbetweenUIthreadandasyncthreads;
+and (3) allocated 10,000 events for EventRacer (by default, only
+1,000 events) to generate event sequences, which on average costs
+15minutesperapp(comparabletotherunningtimeof APEChecker ).
+EventRacer generates a lot of false positives, but to our knowledge,
+noreproducingtoolscanfacilitateouranalysis:AsyncDroid[ 66]re-
+quiresuser-providedeventtraces,RacerDroid[ 80]adoptsmanually
+analysis and ERVA [ 47] is not available. Therefore, we manually
+analyzed the races, and resorted to developers for confirmation.
+5.2 Study 1: Effectiveness of Detecting APEs
+Table1showstheresultsof APEChecker onthe40apps.Itidentified
+107APEsintotalwith67and40fromF-droidandGooglePlayapps,
+respectively.Amongthem,duetothelimitationsofunderlyingtools,
+61 APEscan be processed, ofwhich 51 aresuccessfully confirmed
+withrealtests,achieving83.6%(51/61)hitrate.Onaverage,ittakes
+493
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. Efficiently Manifesting Asynchronous Programming Errors in Android Apps ASE ’18, September 3–7, 2018, Montpellier, France
+6.7 minutes for one app, with 3.5 minutes for one F-droid app and
+9.9 minutes for one Google Play app. In contrast, Lint only detects
+one APE, which is ineffective. We detail the results below.
+Effectiveness. APEChecker successfullyreproducesallAPEsof Fault
+Pattern1. HomeManager managesandswitchesbetweenhomeap-
+plications. Once started, it scans the installed apps on the devicein an async thread, which modifies the data list of app info asy-
+chronously (with a ListView). When the scan is finished, it notifies
+the UI thread to refresh the ListViewwith the new list. However, if
+thelistischangedagain(anotherasyncthreadiscreated)during
+the refresh, the app can be crashed by an IllegalStateException .
+InFault Pattern 2, MTG Familiar is an offline database app for
+magic cards. It takes the photos of cards to identify the magic card.
+Aftertakingaphoto,itstartsloadingthephotowitha ProgressDialog
+andcalls Toast#makeText inanasyncthread.However,itfailstopost
+Toastcreation onto the UI thread, which causes a RuntimeException .
+APEChecker successfully reproducesmost APEs of Fault Pattern
+3. For example, Mitzuli, a translator app, starts an async thread
+tocheckversionupdate,andshowsadialogtonotifytheresults.
+However,ifusersrotatethedevicebeforethethreadreturns,afatal
+BadTokenException occurs.
+Hit Rate. APEChecker achieves an 83.6% (51/61) hit rate. We an-
+alyzed the failed cases, and found most of them require special
+constraints. We summarize the main scenarios below.
+(1)Externalenvironment.TransportsBordeaux,atransportationapp,
+searchesforpathsfromthestartstodestinations. APEChecker can
+generateaprogramtracebutcannotgenerateaneventsequence
+to trigger the error, since the app registers a Broadcast Receiver
+for receiving specific intents. APEChecker cannot infer this now.
+QuranForMyAndroid isatranslatorfor“TheQuran".If“Back"button
+ispressedafteredittingthetext,itstartsathreadtosavethetext
+into storage and shows a message via Toast#makeText only when no
+data storage is available. APEChecker cannot reproduce such errors.
+(2) Complicated Exceptions. APEChecker currently cannot infer com-
+plicated exceptions such as file not found and database corruption.
+One APE in A2DP Volume is that it tries to show a message via
+Toast#makeText intheexceptionhandling’s catchstatementwhich,
+however,isonlyreachablewhenthedatabasetobeloadediscor-
+rupted in trystatement.
+FalsePositives. APEChecker onlyreports6falsepositives(5.6%=6/107).
+Themainreasonisthatsomemethodsorclassesareactuallyun-
+reachable.Forexample,in RadioDroid, APEChecker identifies3po-
+tential APEs, 2 of which are false positive since they reside in adeadactivity(
+ActivityRadioStationDetail )thatcannotbestartedby
+any other activities.
+In summary, on the evaluated apps, APEChecker can efficiently mani-
+fest APEs in a few minutes with 83.6% hit rate and 5.6% false alarms.
+5.3 Study 2: Comparison with Testing Tools
+Fig.6compares APEChecker andthethreetestingtoolsinthenumber
+ofconfirmedAPEs,theanalysistime(inminutes)andthelengthof
+eventsequence(inlogarithmicscale)thattriggerstheerrors.The
+resultsarepresentedinthreebarplotswitherrorbars(shownas
+black lines), where each bar’s height indicates the average value,
+and the error bar represents the standard deviation of uncertainty.
+APEChecker confirms many more APEs than the testing tools. In
+the10runs, APEChecker totallyconfirms32uniqueAPEsfromtheseFigure6:Comparisonbetween APEChecker andtestingtools.
+10apps,whileMonkey,SapienzandStoat,respectively,confirm7,8,
+and9.Moreover,noneofthetestingtoolsuncoverAPEsinsubjects
+9and10whileAPEChecker finds 3 and 2 ones, respectively. The
+error bars of testing tools show obvious data variance, i.e., testing
+tools are very likely to miss APEs.
+Forthetestingtools,theanalysistimeofanerrorisitsfirstoccur-
+rencetimesinceoneerrorcanbetriggeredmultipletimesduring
+one run. We can see APEChecker takes much less time than the
+testingtoolsexceptforthesubjects 4and7.Onaverage, APEChecker
+takes2.9minutes,whileMonkey,Sapienz,andStoatrequire32.7,
+14.3and37.1minutes,respectively.Sapienzcaneasilyhitoneofthe
+errors in the subject 4but take more time for the other twos. Stoat
+takes less time on the subject 7, but only hits that APE once during
+the 10 runs. Additionally, in terms of the event sequence length,
+APEChecker provides shorter (more usable) tests than the testing
+tools.TheaverageeventsequencelengthofMonkey,Sapienz,Stoat
+andAPEChecker is 35725, 411, 12, 4, respectively.
+Insummary,ontheevaluatedapps, APEChecker detects3XmoreAPEs
+thantesting tools,reducesdetectiontime fromhalfan hourtoafew
+minutes, and provides more usable reproducing tests.
+5.4 Study 3: Comparison with EventRacer
+Table2compares APEChecker andEventRaceron10F-droidappsin
+the number of detected APEs. For EventRacer, we give the number
+of reported data races and true positives under two configurations
+(1K-eventand10K-event).Toconfirmtruepositives,wefollowed
+the approach of EVRA [ 47] and remove duplicated races: if data
+racesarereportedondifferentvariablesinADFbutrefertothesame
+locationofappcode,wetreatthemasonetruepositive.Because
+the races actually indicate the same error in the app.
+FromTable 2,wecansee APEChecker ismoreeffectivethanEven-
+tRacerforthespecificAPEsof FaultPattern3. APEChecker detects
+and reproduces 32 out of 38 APEs while EventRacer (10K-event)
+only finds 6 ones. By comparing the results between 1K-event and
+10K-event, we can note the effectiveness of EventRacer heavily
+depends on the number of given events. Although EventRacer can
+detect 5 more APEs with 10K-event, it reports 14X more false posi-
+tives,whichoverwhelmsusers.ThisisalsoobservedbyEVRA[ 47]
+thatonly3%dataracesreportedbyEventRacerareharmful.Wealso
+observethatthereportedracesarehighlyrandom,whichfurther
+undermines its effectiveness for detecting these specfic APEs.
+494
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France L. Fan, T. Su, S. Chen, G. Meng, Y. Liu, L. Xu, and G. Pu
+Table 2: Comparison between APEChecker and EventRacer
+App Name#APEs
+(Patt.3)APECh.
+#Repro.EventRacer (1K) EventRacer (10K)
+#Reported #TP#Reported #TP
+A2DPVolume 5 5 41 0 1249 1
+TuCanMobile 2 2 12 0 53 0
+OpenManager 2 2 0 0 27 1
+Andor 4 3 0 0 0 0
+Maxima 2 2 1 0 36 1
+filmChecker 1 1 36 0 139 0
+DeskCon 7 5 0 0 29 1
+RadioDroid 3 1 15 1 48 1
+ADSdroid 2 2 2 0 1 0
+AnyMemo 10 9 19 0 206 1
+Total 38 32 126 1 1788 6
+Insummary,ontheevaluatedapps, APEChecker detects5XmoreAPEs
+than EventRacer on a specific APE type with very few false alarms.
+5.5 Limitations and Threats to Validity
+Limitations. APEChecker builds on several popular research tools,
+i.e.,Soot,IC3,andGator,whichrepresentthestate-of-the-art.How-
+ever,theystillhaveseverallimitationsinpractice,whichdirectly
+failAPEChecker on programtrace generation.For example,even if
+Sootsuccessfullyprocessesanapp,thecallgraphcanstillbeincom-
+plete (21.3% cases in our evaluation). Moreover, IC3 cannot handle
+ICCs in inner classes or fragments, and Gator cannot handle third-
+partyUIcontrols.Tocounterthis,wehavealreadyextendedIC3
+and Gator in these aspects (Section 4). ButAPEChecker still cannot
+generate valid program traces for 46 APEs detected in the evalu-
+atedapps( e.g.,DebianDroid )duetothelimitationsofunderlying
+tools.Webelievemoreengineeringeffortsonthesetoolscansig-
+nificantly improve APEChecker . Additionally, APEChecker now only
+infers simple environment, which lowers the hit rate. Future work
+will integrate more sophisticated analysis techniques to overcome
+this.Aditionally,applying APEChecker todetectAPEsforotherGUI
+frameworks like Qtrequires proper extensions [72].
+ThreatstoValidity. APEChecker isonlyevaluatedon40apps,and
+thusourconclusionmaynotbegeneraltoallapps.Thesummarized
+async programming rules and fault patterns may be incomplete,
+and thus APEChecker may suffer from false negatives. But we have
+thoroughly inspected all relevant resources, and the fault patterns
+havecoveredall375realAPEsfrom1091apps.Toeasetheverifica-tion of APEs,
+APEChecker simulates specific execution environment
+bycontrollingthreadscheduling( e.g.,increasethewaittimeofnet-
+workaccess).SosometriggeredAPEsmaynotbeeasilymanifested
+by users although they are real faults under specific conditions.
+6 RELATED WORK
+Automated GUI Testing Many GUI testing techniques, e.g., ran-
+dom testing [ 57], search-based testing [ 58,60], symbolic execu-
+tion [5,63,82], model-based testing [ 2,3,8,11,76,78,85] and
+other approaches [ 61,62,75,83], have been proposed for Android
+apps. As we discussed in Section 1and demonstrated in the evalua-
+tion, these techniques are ineffective for APEs due to lack of prior
+knowledge(faultpatterns).Incontrast, APEChecker leveragesthis
+knowledge to efficiently manifest APEs.
+APEChecker tackles specific bugs that violate the rules of single-
+GUI-thread model. QUANTUM [ 86] uses model-based testing to
+tackle app-agnostic bugs. For example, when rotation happens,
+thescreenshouldshowthesamecontentandsupporttheactions
+asbefore.Thor[ 1]amplifiesexistingtestsbyrandomlyinjecting
+neutraleventsequences( e.g.,doublerotation,pause-and-resume)that should not affect the outputs of original tests. Amalfitano
+et al.[4]proposeasimilarideabyexhaustivelyinjectingorientation
+changes to expose GUI failures. However, these techniques may
+notbe effectiveforAPEs. First,their effectivenessdependson the
+quality of an existing GUI model or test suite, which are usually
+notavailable[ 51].Second,thesetechniquesarerandom,anddonot
+explicitlyconsidertheinteractionsbetweenUIandaysncthreads.
+Graziussi [ 44] encodes some specific patterns into Lint to detect
+lifecycle bugs. KREfinder [ 74] finds restart-and-resume errors that
+cause app data loss. APEChecker tackles APEs which have not been
+systematically investigated before.Concurreny Bugs
+AsdiscussedinSection 2.4,someAPEscanbe
+treatedasconcurrencybugs.Totacklethem,anumberofdatarace
+detection tools [ 10,45,59,71] and data race reproducing tools [ 47,
+66,80] are developed. However, as our evaluation shows, data race
+detection tools are ineffective for these APEs. AsyncDroid [ 66]
+and RacerDroid [ 80] are impractical since they either require user-
+provided traces or depend on the results of data race detection
+tools.ERVA[ 47]utilizesdependencygraphandeventflippingto
+reproduce races, and uses state comparison techniques to identify
+harmful ones. AATT [ 52] manifests concurrency bugs whose race
+points at the app code level. However, it can only manifest races
+whose conflicting events are in the same page or race points in
+the user code. Other bug reproducing tools like RERAN [ 20] and
+CrashScope [ 64] require user interactions. In contrast, APEChecker
+automatically generates event sequences to verify APEs.Guided Test Generation
+Our work uses static analysis to locate
+suspiciousAPEs,andthenguidesGUIinteractionstoverifythem.
+ThisideaisalsoadoptedinotherapplicationdomainsofAndroid.
+SmartDroid [ 89] guides tests to reach certain APIs to manifest the
+maliciousbehaviors.However,itexploreseveryUIelementoneach
+pagetofindtherightviewtoclick.Brahmastra[ 9]drivesappsto
+reach third-party components to test security issues; MAMBA [ 50]
+guidesteststorevealpotentialaccessestoprivacy-sensitivedata;
+FuzzDroid [ 69] utilizes a search-based algorithm combined with
+static and dynamic analysis to manifest malicious behaviors. How-
+ever, none of these tools can be directly compared with APEChecker
+fordetectingAPEs.OthertargetedtestingtoolsincludeCollider[ 49],
+ConDroid[ 73],A3E[8].However,they areeithernot availableor
+requiring human intervention.
+7 CONCLUSION
+This paper introduces APEChecker , a technique to efficiently mani-
+fest APEs. First, we conduct a formative study to understand the
+aysnc programming rules implied by the single-GUI-thread model,
+and collect a set of real APE issues. Second, informed by these
+results,wedistillthreefaultpatterns,andlocatesuspiciousAPEs
+viastaticfaultpatternanalysis,andthenverifythemwithrealtests.
+The evaluation shows APEChecker is useful and effective.
+ACKNOWLEDGMENTS
+Weappreciatethereviewers’constructivefeedback.Thisworkis
+partially supported by NSFC Grant 61502170, NTU Research Grant
+NGF-2017-03-033 and NRF Grant CRDCG2017-S04. Lingling Fan is
+partlysupportedbyECNUProjectofFundingOverseasShort-termStudies,TingSuispartiallysupportedbyNSFCGrant61572197and
+61632005, and Geguang Pu is partially supported by MOST NKTSP
+Project 2015BAG19B02 and STCSM Project 16DZ1100600.
+495
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. Efficiently Manifesting Asynchronous Programming Errors in Android Apps ASE ’18, September 3–7, 2018, Montpellier, France
+REFERENCES
+[1]Christoffer Quist Adamsen, Gianluca Mezzetti, and Anders Møller. 2015. System-
+aticExecutionofAndroidTestSuitesinAdverseConditions.In Proceedingsof
+the2015 InternationalSymposium onSoftware Testingand Analysis (ISSTA2015).
+ACM, New York, NY, USA, 83–93.
+[2]DomenicoAmalfitano,AnnaRitaFasolino,PorfirioTramontana,SalvatoreDe
+Carmine, and Atif M. Memon. 2012. Using GUI ripping for automated testing
+of Android applications. In IEEE/ACM International Conference on Automated
+Software Engineering, ASE’12, Essen, Germany, September 3-7, 2012. 258–261.
+[3]DomenicoAmalfitano,AnnaRitaFasolino,PorfirioTramontana,BryanDzung
+Ta, and Atif M. Memon. 2015. MobiGUITAR: Automated Model-Based Testing of
+Mobile Apps. IEEE Software 32, 5 (2015), 53–59.
+[4]Domenico Amalfitano, Vincenzo Riccio, Ana C. R. Paiva, and Anna Rita Fasolino.
+2018. Why does the orientation change mess up my Android application? From
+GUI failures to code faults. Softw. Test., Verif. Reliab. 28, 1 (2018).
+[5] Saswat Anand,MayurNaik,MaryJean Harrold,andHongseokYang.2012. Au-
+tomated concolic testing of smartphone apps. In 20th ACM SIGSOFT Symposium
+ontheFoundationsofSoftwareEngineering(FSE-20),SIGSOFT/FSE’12,Cary,NC,
+USA - November 11 - 16, 2012. 59.
+[6]Apple. 2018. App Programming Guide for iOS. Retrieved 2018-7 from https:
+//developer.apple.com/library/content/navigation/
+[7]Apple. 2018. MacOS Cocoa. Retrieved 2018-7 from https://developer.apple.com/
+macos/
+[8]TanzirulAzimandIulianNeamtiu.2013. Targetedanddepth-firstexploration
+for systematic testing of Android apps. In Proceedings of the 2013 ACM SIGPLAN
+InternationalConferenceonObjectOrientedProgrammingSystemsLanguages&
+Applications,OOPSLA2013,partofSPLASH2013,Indianapolis,IN,USA,October
+26-31, 2013. 641–660.
+[9]Ravi Bhoraskar, Seungyeop Han, Jinseong Jeon, Tanzirul Azim, Shuo Chen,
+JaeyeonJung,SumanNath,RuiWang,andDavidWetherall.2014. Brahmastra:
+Driving Apps to Test the Security of Third-party Components. In Proceedings of
+the23rdUSENIXConferenceonSecuritySymposium(SEC’14).USENIXAssociation,
+Berkeley, CA, USA, 1021–1036.
+[10]Pavol Bielik, Veselin Raychev, and Martin Vechev. 2015. Scalable Race Detectionfor Android Applications. In Proceedings of the 2015 ACM SIGPLAN International
+ConferenceonObject-OrientedProgramming,Systems,Languages,andApplications
+(OOPSLA 2015). ACM, New York, NY, USA, 332–348.
+[11]Wontae Choi, George C. Necula, and Koushik Sen. 2013. Guided GUI testing
+ofAndroidapps withminimalrestartand approximatelearning.In Proceedings
+ofthe2013ACMSIGPLANInternationalConferenceonObjectOriented Program-
+ming Systems Languages & Applications, OOPSLA 2013, part of SPLASH 2013,
+Indianapolis, IN, USA, October 26-31, 2013. 623–640.
+[12]Shauvik Roy Choudhary, Alessandra Gorla, and Alessandro Orso. 2015. Au-tomated Test Input Generation for Android: Are We There Yet? (E). In 30th
+IEEE/ACMInternationalConferenceonAutomatedSoftwareEngineering,ASE2015,
+Lincoln, NE, USA, November 9-13, 2015. 429–440.
+[13]CodePath. 2018. CodePath Android Cliffnotes. Retrieved 2018-7 from http:
+//guides.codepath.com/android
+[14]Apktool developers. 2018. A tool for reverse engineering Android apk files.
+Retrieved 2018-7 from https://ibotpeaches.github.io/Apktool/
+[15]Adsdroid Developers. 2018. Adsdroid. Retrieved 2018-7 from https://github.
+com/dnet/adsdroid
+[16]Android Gisapp Developers. 2018. Android Gisapp. Retrieved 2018-7 from
+https://github.com/nextgis/android_gisapp
+[17]Privacy Friendly Pedometer Developers. 2018. Privacy Friendly Pedometer.
+Retrieved 2018-7 from https://github.com/SecUSo/privacy-friendly-pedometer
+[18]LinglingFan,TingSu,SenChen,GuozhuMeng,YangLiu,LihuaXu,GeguangPu,
+andZhendong Su.2018. Large-scaleanalysisof framework-specificexceptions
+inAndroidapps. In Proceedingsofthe 40thInternationalConferenceonSoftware
+Engineering, ICSE 2018, Gothenburg, Sweden, May 27 - June 03, 2018. 408–419.
+[19]FindBugs.2018. FindBugs. Retrieved2018-7from http://findbugs.sourceforge.
+net/
+[20]Lorenzo Gomez, Iulian Neamtiu, Tanzirul Azim, and Todd D. Millstein. 2013.RERAN: timing- and touch-sensitive record and replay for Android. In 35th
+International Conference on Software Engineering, ICSE ’13, San Francisco, CA,
+USA, May 18-26, 2013. 72–81.
+[21]Google.2018.ActivityLifecycle. Retrieved2018-7from https://developer.android.
+com/guide/components/activities/activity-lifecycle.html
+[22]Google.2018. AndroidDebugBridge. Retrieved2018-7from https://developer.
+android.com/studio/command-line/adb.html
+[23]Google. 2018. Android Developers Documentation. Retrieved 2018-7 from
+https://developer.android.com
+[24]Google. 2018. Android Lint Checks. Retrieved 2018-7 from http://tools.android.
+com/tips/lint-checks
+[25]Google.2018. AndroidPlatform. Retrieved2018-7from https://www.android.
+com/
+[26]Google.2018. AndroidUIAutomator. Retrieved2018-7from http://developer.
+android.com/tools/help/uiautomator/index.html[27]Google.2018. AsyncTask. Retrieved2018-7from https://developer.android.com/
+reference/android/os/AsyncTask.html
+[28]Google. 2018. Dialogs. Retrieved 2018-7 from https://developer.android.com/
+guide/topics/ui/dialogs.html
+[29]Google. 2018. DroidRacer. Retrieved 2018-7 from https://bitbucket.org/iiscseal/
+droidracer
+[30]Google. 2018. Fragment Lifecycle. Retrieved 2018-7 from https://developer.
+android.com/guide/components/fragments.html
+[31]Google. 2018. Fragment Transactions and Activity State Loss. Re-
+trieved 2018-7 from https://www.androiddesignpatterns.com/2013/08/
+fragment-transaction-commit-state-loss.html
+[32]Google.2018. Handler. Retrieved2018-7from https://developer.android.com/
+reference/android/os/Handler.html
+[33]Google. 2018. HandlerThread. Retrieved 2018-7 from https://developer.android.
+com/reference/android/os/HandlerThread.html
+[34]Google.2018. IntentService. Retrieved2018-7from https://developer.android.
+com/reference/android/app/IntentService.html
+[35]Google.2018. Lint. Retrieved2018-7from https://developer.android.com/studio/
+write/lint.html
+[36]Google. 2018. List View. Retrieved 2018-7 from https://developer.android.com/
+guide/topics/ui/layout/listview.html
+[37]Google.2018. Loaders. Retrieved2018-7from https://developer.android.com/
+guide/components/loaders.html
+[38]Google. 2018. Looper. Retrieved 2018-7 from https://developer.android.com/
+reference/android/os/Looper.html
+[39]Google. 2018. Monkey. Retrieved 2018-7 from http://developer.android.com/
+tools/help/monkey.html
+[40]Google.2018. ProcessesandThreads. Retrieved2018-7from https://developer.
+android.com/guide/components/processes-and-threads.html
+[41]Google. 2018. Thread. Retrieved 2018-7 from https://developer.android.com/
+reference/java/lang/Thread.html
+[42]Google. 2018. ThreadPoolExecutor. Retrieved 2018-7 from https://developer.
+android.com/reference/java/util/concurrent/ThreadPoolExecutor.html
+[43]Google. 2018. Toasts. Retrieved 2018-7 from https://developer.android.com/
+guide/topics/ui/notifiers/toasts.html
+[44]SimoneGraziussi.2016. LifecycleandEvent-BasedTestingforAndroidApplications .
+Master’s thesis. School Of Industrial Engineering and Information, Politecnico.
+[45]Chun-Hung Hsiao, Cristiano Pereira, Jie Yu, Gilles Pokam, Satish Narayanasamy,PeterM.Chen,ZiyunKong,andJasonFlinn.2014.Racedetectionforevent-driven
+mobile applications. In ACM SIGPLAN Conference on Programming Language
+Designand Implementation,PLDI ’14,Edinburgh,United Kingdom-June 09- 11,
+2014. 326–336.
+[46]Cuixiong Hu and Iulian Neamtiu. 2011. Automating GUI Testing for Android
+Applications. In Proceedings of the 6th International Workshop on Automation of
+Software Test (AST ’11). ACM, New York, NY, USA, 77–83.
+[47]Yongjian Hu, Iulian Neamtiu, and Arash Alavi. 2016. Automatically Verifying
+and Reproducing Event-based Races in Android Apps. In Proceedings of the 25th
+International Symposium on Software Testing and Analysis (ISSTA 2016). ACM,
+New York, NY, USA, 377–388.
+[48]JDK. 2018. JDK Swing Platform. Retrieved 2018-7 from https://docs.oracle.com/
+javase/7/docs/technotes/guides/swing/
+[49]Casper Svenning Jensen, Mukul R. Prasad, and Anders Møller. 2013. Automated
+testing with targeted event sequence generation. In International Symposium on
+Software Testing and Analysis, ISSTA ’13, Lugano, Switzerland, July 15-20, 2013.
+67–77.
+[50]Joseph Chan Joo Keng, Lingxiao Jiang, Tan Kiat Wee, and Rajesh Krishna Balan.
+2016. Graph-aided Directed Testing of Android Applications for Checking Run-
+time Privacy Behaviours. In Proceedings of the 11th International Workshop on
+Automation of Software Test (AST ’16) . ACM, New York, NY, USA, 57–63.
+[51]PavneetSinghKochhar,FerdianThung,NachiappanNagappan,ThomasZimmer-
+mann,andDavidLo.2015. UnderstandingtheTestAutomationCultureofApp
+Developers. In 8th IEEE International Conference on Software Testing, Verification
+and Validation, ICST 2015, Graz, Austria, April 13-17, 2015. 1–10.
+[52]Qiwei Li, Yanyan Jiang, Tianxiao Gu, Chang Xu, Jun Ma, Xiaoxing Ma, and Jian
+Lu.2016. EffectivelyManifestingConcurrencyBugsinAndroidApps.In 23rd
+Asia-PacificSoftwareEngineeringConference,APSEC2016,Hamilton,NewZealand,
+December 6-9, 2016. 209–216.
+[53]Yu Lin, Semih Okur, and Danny Dig. 2015. Study and Refactoring of Android
+AsynchronousProgramming(T).In 30thIEEE/ACMInternationalConferenceon
+AutomatedSoftwareEngineering,ASE2015,Lincoln,NE,USA,November9-13,2015.
+224–235.
+[54]Yu Lin, Cosmin Radoi, and Danny Dig. 2014. Retrofitting Concurrency for
+Android Applications Through Refactoring. In Proceedings of the 22Nd ACM
+SIGSOFTInternationalSymposiumonFoundationsofSoftwareEngineering (FSE
+2014). ACM, New York, NY, USA, 341–352.
+[55]MarioLinares-Vásquez,GabrieleBavota,MicheleTufano,KevinMoran,Massi-
+miliano Di Penta, Christopher Vendome, Carlos Bernal-Cárdenas, and Denys
+496
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France L. Fan, T. Su, S. Chen, G. Meng, Y. Liu, L. Xu, and G. Pu
+Poshyvanyk. 2017. Enabling Mutation Testing for Android Apps. In Proceedings
+of the 2017 11th Joint Meeting on Foundations of Software Engineering (ESEC/FSE
+2017). ACM, New York, NY, USA, 233–244.
+[56]Kin-KeungMa,YitPhangKhoo,JeffreyS.Foster,andMichaelHicks.2011. Di-
+rectedSymbolicExecution.In StaticAnalysis-18thInternationalSymposium,SAS
+2011, Venice, Italy, September 14-16, 2011. Proceedings. 95–111.
+[57]Aravind Machiry, Rohan Tahiliani, and Mayur Naik. 2013. Dynodroid: an input
+generationsystemforAndroidapps.In JointMeetingoftheEuropeanSoftware
+Engineering Conference and the ACM SIGSOFT Symposium on the Foundations of
+Software Engineering, ESEC/FSE’13, Saint Petersburg, Russian Federation, August
+18-26, 2013. 224–234.
+[58]RiyadhMahmood,NarimanMirzaei,andSamMalek.2014. EvoDroid:segmented
+evolutionarytestingofAndroidapps.In Proceedingsofthe22ndACMSIGSOFT
+International Symposium on Foundations of Software Engineering, (FSE-22), Hong
+Kong, China, November 16 - 22, 2014. 599–609.
+[59]Pallavi Maiya, Aditya Kanade, and Rupak Majumdar. 2014. Race detection for
+Androidapplications.In ACMSIGPLANConferenceonProgrammingLanguage
+Designand Implementation,PLDI ’14,Edinburgh,United Kingdom-June 09- 11,
+2014. 316–325.
+[60]KeMao,MarkHarman,andYueJia.2016. Sapienz:multi-objectiveautomated
+testing for Android applications. In Proceedings of the 25th International Sympo-
+siumonSoftwareTestingandAnalysis,ISSTA2016,Saarbrücken,Germany,July
+18-20, 2016. 94–105.
+[61]KeMao,MarkHarman,andYueJia.2017.Crowd intelligenceenhancesautomated
+mobile testing. In Proceedings of the 32nd IEEE/ACM International Conference on
+AutomatedSoftwareEngineering,ASE2017,Urbana,IL,USA,October30-November
+03, 2017. 16–26.
+[62]NarimanMirzaei,JoshuaGarcia,HamidBagheri,AlirezaSadeghi,andSamMalek.
+2016. ReducingCombinatoricsinGUITestingofAndroidApplications.In Pro-
+ceedingsofthe38thInternationalConferenceonSoftwareEngineering (ICSE’16).
+ACM, New York, NY, USA, 559–570.
+[63]Nariman Mirzaei, Sam Malek, Corina S. Pasareanu, Naeem Esfahani, and Riyadh
+Mahmood. 2012. Testing Android apps through symbolic execution. ACM
+SIGSOFT Software Engineering Notes 37, 6 (2012), 1–5.
+[64]Kevin Moran, Mario Linares Vásquez, Carlos Bernal-Cárdenas, Christopher Ven-
+dome, and Denys Poshyvanyk. 2016. Automatically Discovering, Reporting and
+Reproducing Android Application Crashes. In 2016 IEEE International Conference
+on Software Testing, Verification and Validation, ICST 2016, Chicago, IL, USA, April
+11-15, 2016. 33–44.
+[65]Damien Octeau, Daniel Luchaup, Matthew Dering, Somesh Jha, and Patrick
+McDaniel. 2015. Composite Constant Propagation: Application to Android Inter-
+component Communication Analysis. In Proceedings of the 37th International
+Conference on Software Engineering - Volume 1 (ICSE ’15). IEEE Press, Piscataway,
+NJ, USA, 77–88.
+[66]Burcu Kulahcioglu Ozkan, Michael Emmi, and Serdar Tasiran. 2015. Systematic
+Asynchrony Bug Exploration for Android Apps. In Computer Aided Verification -
+27th International Conference, CAV 2015, San Francisco, CA, USA, July 18-24, 2015,
+Proceedings, Part I. 455–461.
+[67] PMD. 2018. PMD. Retrieved 2018-7 from https://pmd.github.io/
+[68] Qt. 2018. Qt. Retrieved 2018-7 from https://www.qt.io/
+[69]SiegfriedRasthofer,StevenArzt,StefanTriller,andMichaelPradel.2017. Making
+Malory Behave Maliciously: Targeted Fuzzing of Android Execution Environ-
+ments.In Proceedingsofthe39thInternationalConferenceonSoftwareEngineering
+(ICSE ’17). 300–311.
+[70]AtanasRountevandDacongYan.2014. StaticReferenceAnalysisforGUIObjects
+inAndroidSoftware.In 12thAnnualIEEE/ACMInternationalSymposiumonCode
+GenerationandOptimization,CGO2014,Orlando,FL,USA,February15-19,2014.
+143.
+[71]GholamrezaSafi,ArmanShahbazian,WilliamG.J.Halfond,andNenadMedvi-
+dovic. 2015. Detecting Event Anomalies in Event-based Systems. In Proceedings
+of the 2015 10th Joint Meeting on Foundations of Software Engineering (ESEC/FSE
+2015). ACM, New York, NY, USA, 25–37.
+[72]Anirudh Santhiar, Shalini Kaleeswaran, and Aditya Kanade. 2016. Efficient
+race detection in the presence of programmatic event loops. In Proceedings ofthe25thInternationalSymposiumonSoftwareTestingandAnalysis,ISSTA2016,
+Saarbrücken, Germany, July 18-20, 2016. 366–376.
+[73]Julian Schütte, Rafael Fedler, and Dennis Titze. 2015. ConDroid: Targeted Dy-
+namicAnalysisofAndroidApplications.In 29thIEEEInternationalConferenceon
+Advanced Information Networking and Applications, AINA 2015, Gwangju, South
+Korea, March 24-27, 2015. 571–578.
+[74]ZhiyongShan,TanzirulAzim,andIulianNeamtiu.2016. FindingResumeand
+Restart Errors in Android Applications. In Proceedings of the 2016 ACM SIGPLAN
+InternationalConferenceonObject-OrientedProgramming,Systems,Languages,
+and Applications (OOPSLA 2016). ACM, New York, NY, USA, 864–880.
+[75]WeiSong,XiangxingQian,andJeffHuang.2017. EHBDroid:BeyondGUITesting
+for Android Applications. In Proceedings of the 32Nd IEEE/ACM International
+ConferenceonAutomatedSoftwareEngineering(ASE2017).IEEEPress,Piscataway,
+NJ, USA, 27–37.
+[76]TingSu.2016. FSMdroid:guidedGUItestingofandroidapps.In Proceedingsof
+the 38th International Conference on Software Engineering, ICSE 2016, Austin, TX,
+USA, May 14-22, 2016 - Companion Volume. 689–691.
+[77]TingSu,ZhoulaiFu,GeguangPu,JifengHe,andZhendongSu.2015. CombiningSymbolicExecutionandModelCheckingforDataFlowTesting.In 37thIEEE/ACM
+International Conference on Software Engineering, ICSE 2015, Florence, Italy, May
+16-24, 2015, Volume 1. 654–665.
+[78]TingSu,GuozhuMeng,YutingChen,KeWu,WeimingYang,YaoYao,GeguangPu,
+YangLiu,and ZhendongSu.2017. Guided,StochasticModel-basedGUITesting
+of Android Apps. In Proceedings of the 2017 11th Joint Meeting on Foundations of
+Software Engineering (ESEC/FSE 2017). ACM, New York, NY, USA, 245–256.
+[79] SWT. 2018. SWT. Retrieved 2018-7 from https://www.eclipse.org/swt/
+[80]HongyinTang,GuoquanWu,JunWei,andHuaZhong.2016. GeneratingTest
+CasestoExposeConcurrencyBugsinAndroidApplications.In Proceedingsof
+the 31st IEEE/ACM International Conference on Automated Software Engineering
+(ASE 2016). ACM, New York, NY, USA, 648–653.
+[81]RajaVallée-Rai,PhongCo, EtienneGagnon,Laurie Hendren,PatrickLam, and
+VijaySundaresan.1999. Soot-aJavabytecodeoptimizationframework.In Pro-
+ceedings of the 1999 conference of the Centre for Advanced Studies on Collaborative
+research. IBM Press, 13.
+[82]Heila van der Merwe, Brink van der Merwe, and Willem Visser. 2012. Verifying
+Android Applications Using Java PathFinder. SIGSOFT Softw. Eng. Notes 37, 6
+(Nov. 2012), 1–5.
+[83]MarioLinaresVásquez,MartinWhite,CarlosBernal-Cárdenas,KevinMoran,and
+DenysPoshyvanyk.2015. MiningAndroidAppUsagesforGeneratingActionableGUI-BasedExecutionScenarios.In 12thIEEE/ACMWorkingConferenceonMining
+Software Repositories, MSR 2015, Florence, Italy, May 16-17, 2015. 111–122.
+[84]wxErlang.2018. wxErlang. Retrieved2018-7from http://erlang.org/doc/apps/
+wx/index.html
+[85]Wei Yang, Mukul R. Prasad, and Tao Xie. 2013. A Grey-Box Approach for Auto-
+matedGUI-ModelGenerationofMobileApplications.In FundamentalApproaches
+to Software Engineering - 16th International Conference, FASE 2013, Held as Part of
+theEuropeanJointConferencesonTheoryandPracticeofSoftware,ETAPS2013,
+Rome, Italy, March 16-24, 2013. Proceedings. 250–265.
+[86]RaziehNokhbehZaeem,MukulR.Prasad,andSarfrazKhurshid.2014. Automated
+Generation of Oracles for Testing User-Interaction Features of Mobile Apps.
+InProceedings of the 2014 IEEE International Conference on Software Testing,
+Verification, and Validation (ICST ’14). IEEE Computer Society, Washington, DC,
+USA, 183–192.
+[87]Pingyu Zhang and Sebastian G. Elbaum. 2014. Amplifying Tests to Validate
+ExceptionHandlingCode:AnExtendedStudyintheMobileApplicationDomain.
+ACM Trans. Softw. Eng. Methodol. 23, 4 (2014), 32:1–32:28.
+[88]Sai Zhang, Hao Lü, and Michael D. Ernst. 2012. Finding Errors in Multithreaded
+GUIApplications.In Proceedingsofthe2012InternationalSymposiumonSoftware
+Testing and Analysis (ISSTA 2012). 243–253.
+[89]Cong Zheng, Shixiong Zhu, Shuaifu Dai, Guofei Gu, Xiaorui Gong, Xinhui Han,
+andWeiZou.2012. SmartDroid:AnAutomaticSystemforRevealingUI-based
+TriggerConditionsinAndroidApplications.In ProceedingsoftheSecondACM
+Workshop on Security and Privacy in Smartphones and Mobile Devices (SPSM ’12).
+ACM, New York, NY, USA, 93–104.
+497
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 13:26:09 UTC from IEEE Xplore.  Restrictions apply. 

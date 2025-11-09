@@ -1,0 +1,967 @@
+TRANSCODE : Detecting Status Code Mapping
+Errors in Large-Scale Systems
+Wensheng Tang∗, Yikun Hu∗, Gang Fan∗, Peisen Y ao∗, Rongxin Wu†,
+Guangyuan Bai‡, Pengcheng Wang‡, and Charles Zhang∗
+∗The Hong Kong University of Science and Technology
+Hong Kong, China
+{wtangae, yikunh, gfan, pyao, charlesz}@cse.ust.hk†Xiamen University
+China
+wurongxin@xmu.edu.cn
+‡Tencent, Inc.
+China
+{neobai, hadeswang}@tencent.com
+Abstract —Status code mappings reveal state shifts of a pro-
+gram, mapping one status code to another. Due to careless
+programming or the lack of the system-wide knowledge of awhole program, developers can make incorrect mappings. Sucherrors are widely spread across modern software, some of whichhave even become critical vulnerabilities. Unfortunately, existingsolutions merely focus on single status code values, while neverconsidering the relationships, that is, mappings, among them.Therefore, it is imperative to propose an effective method todetect status code mapping errors.
+In this paper, we propose T
+RANSCODE to detect potential
+status code mapping errors. It ﬁrstly conducts value ﬂow analysisto efﬁciently and precisely collect candidate status code values,that is, the integer values, which are checked by followingconditional comparisons. Then, it aggregates the correlatedstatus codes according to whether they are propagated with thesame variable. Finally, T
+RANSCODE extracts mappings based
+on control dependencies and reports the mapping error if onestatus code is mapped to two others of the same kind. We haveimplemented T
+RANSCODE as a prototype system, and evaluated
+it with 5real-world software projects, each of which possesses
+in the order of a million lines of code. The experimental resultsshow that T
+RANSCODE is capable of handling large-scale systems
+in both a precise and efﬁcient manner. Furthermore, it hasdiscovered 59new errors in the tested projects, among which 13
+have been ﬁxed by the community. We also deploy T
+RANSCODE
+in WeChat, a widely-used instant messaging service, and havesucceeded in ﬁnding real mapping errors in the industrialsettings.
+I. I NTRODUCTION
+Many large-scale systems use status codes to represent
+program states. There are mappings among status codes since a
+system may describe the same program state at different levelsof abstraction (e.g., disk failure v.s. IO error). These mappingsare, unfortunately, error-prone. As an example, CVE-2010-
+0408
+1records a vulnerability of Apache Httpd v2.2 that is
+caused by a status code mapping error. In Figure 1, the variable
+status receives status codes indicating the result of handling
+a client request. In line 4, a different code HTTP INTERNAL
+* Yikun Hu and Peisen Y ao are the corresponding authors.
+1https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-2010-04081int ap_proxy_ajp_request(){
+2 status = ap_get_brigade();
+3if(status != APR_SUCCESS){
+4 return HTTP_INTERNAL;
+5}
+6...
+7}
+(a)1int ap_xml_parse_input(){
+2 status = ap_get_brigade();
+3if(status != APR_SUCCESS) {
+4 result = HTTP_BAD_REQUEST;
+5 return result;
+6}
+7}
+(b)
+Fig. 1. (a) CVE-2010-0408 : A status mapping error found in Apache Httpd
+v2.2 later causes a DoS vulnerability. (b) A correct error handling example
+that returns the correct status code. The status code alias names have beensimpliﬁed.
+is returned to the caller (status code mapping) for any status
+codes that are not APR SUCCESS . Such mappings make the
+server to keep re-processing incorrect requests2. As a conse-
+quence, a malicious client could launch a denial-of-serviceattack against a server. Worse still, these mapping errorsare hard-to-be-detected since they seldom cause immediatesymptoms (e.g., program crashes). The imperative of thisresearch is to propose a practical solution to detect such statuscode mapping errors.
+To achieve this goal, we have to address two challenges.
+The ﬁrst challenge is how to efﬁciently and precisely trackthe propagation status codes (C1). Simply tracking the prop-agation of status codes via data-ﬂow analysis inevitably in-troduces false results because some infeasible paths disallowsome status codes to pass through. However, employing path-sensitive analysis would worsen the scalability issue because,for every path, we need to check whether each status codecan pass through by constraint solving. Owing to the presenceof massive status codes in large-scale systems, it would becomputationally expensive to solve feasibility queries for eachpath per status code. For instance, even just 34 status codes inthe Linux kernel will touch all ﬁle systems and storage devicedrivers [1], burdening solvers with a high cost in feasibilityvalidation.
+2https://tools.ietf.org/html/rfc7231#section-6.6
+8292021 36th IEEE/ACM International Conference on Automated Software Engineering (ASE)
+DOI 10.1109/ASE51524.2021.000782021 36th IEEE/ACM International Conference on Automated Software Engineering (ASE) | 978-1-6654-0337-5/21/$31.00 ©2021 IEEE | DOI: 10.1109/ASE51524.2021.9678823
+978-1-6654-0337-5/21/$31.00  ©2021  IEEE
+The second challenge is how to automatically infer the
+functionality-correlated status codes (C2). Mappings originate
+from program state shifting, represented by status codes,reﬂecting the correlation among them. Therefore, such corre-lation is essential knowledge for determining mapping errors.Unfortunately, such knowledge is not explicitly available in aprogram. In particular, as a convention, the developer deﬁnesfunctionality-correlated status codes (e.g., HTTP responsecodes) in various data structures, where many are undocu-mented and might even be distributed across random sourceﬁles.
+There are also numerous efforts on differentiating error sta-
+tus codes and non-error codes [1–7] that are not applicable forreasoning correlated status codes. In particular, some programsperform checks in the form of
+if(err >0) that coarsely take
+positive numbers as errors and vice versa. However, existingstudies discard the correlation of status codes, e.g., HTTPresponse codes are only used to making server responses andconsist of both errors and non-errors.
+This paper proposes T
+RANSCODE that automatically detects
+status code mapping errors via inconsistencies in mappings. Itﬁrstly conducts a path-sensitive value ﬂow analysis to collectcandidate values of state codes. A domain inference algorithmis then applied according to whether one function transitivelyreceives status codes from another. After that, T
+RANSCODE
+extracts mappings on control ﬂow graphs and then reinforcesthem with domain information. At last, mapping errors arereported if one status code is inconsistently mapped to twoother correlated relations.
+Speciﬁcally, to tackle the challenge of the efﬁcient and
+precise status code value collection (C1), we present aninterpolation-guided algorithm [8, 9] that mitigates the costs of
+frequently invoking solvers. The insight of the approach is thatsome common infeasible paths could ﬁlter many invalid statuscodes. To tackle the challenge of reasoning correlations ofstatus codes (C2), we propose an approach that automaticallyinfers functionality-correlated status codes from value ﬂowsof status codes. We base it on a convention that each functionoutputs status codes of correlated functionalities only.
+We evaluated T
+RANSCODE on ﬁve real-world software
+projects, each of which has 0.38-4.81 million lines of code.The experimental results show that T
+RANSCODE can precisely
+and efﬁciently obtain status code values during propagationand infer their functionality correlation. For each project, theabove analysis is ﬁnished within half an hour. Moreover, itﬁnds 59 new errors in the tested projects, 13 of which have
+been ﬁxed by the developers.
+In summary, the paper makes the following contributions:
+•We introduce T RANSCODE , a novel approach for detect-
+ing mapping errors occurring among status codes. To thebest of our knowledge, this work is the ﬁrst research effortfocusing on status code mappings.
+•We implement the prototype of T RANSCODE , which is
+capable of handling real-world, large-scale applicationsprecisely as well as efﬁciently.
+•We conduct the experiments on ﬁve real-world softwareprojects and discovered 59new errors, among which 13
+have been ﬁxed by the community.
+II. T RANSCODE IN A NUTSHELL
+In this section, we ﬁrst use an example to illustrate the
+incorrect status code mapping problem. We then present anoverview of our approach to resolving this problem.
+Figure 2(a) is a code snippet that contains a mapping error.
+Lines 1-8 are the status codes deﬁned via two types of datastructures. In function f
+2, two mappings are present, giving
+two branches that go to different return statements. In particu-lar, upon a status code
+DECLINED returned by function f0,
+a new status code HTTP_BAD_REQUEST is returned, com-
+posing a mapping from DECLINED toHTTP_BAD_REQUEST
+on Lines 18-19. Similarly, a mapping from DECLINED to
+HTTP_OK can be found on Lines 20-21. However, these two
+mappings de facto make an error because the same statuscode
+OK is mapped to two different HTTP response codes.
+Hence, mapping errors like this and the one in Section I
+not only lead to error mishandling but also compromise theprogram.
+How to detect the above mapping error is a non-trivial
+task. It ﬁrst requires precisely revealing the propagation ofstatus codes. For instance, the value check at Line 13 decideswhether the variable rv will continue to propagate some
+status code values. A second imperative is to determine whichstatus codes represent the same sort of functionality becausethe inconsistencies only occur when two destination statuscodes are functionality-correlated. For example,
+HTTP_OK and
+HTTP_BAD_REQUEST are highly-correlated since they are all
+HTTP response codes. The challenging part of this goal ishow to automatically infer such correlations without any priorknowledge because they are mostly project-speciﬁc heuristics.These heuristics for grouping status codes include naming,data structures, and values that often vary widely from onecode base to another. Needless to say that providing theknowledge requires expertise and tedious examination of thesource code.
+To conquer the beasts, we propose a systematic approach,
+namely T
+RANSCODE , of which a workﬂow is given in Fig-
+ure 3. We begin with collecting the status code returned each
+function as the initial summaries via a path-sensitive value-ﬂow analysis (§IV -A). These summaries are further examinedfor inferring the underlying correlations of status codes, that is,whether two status codes are of the same kind (§ IV -B). At last,
+aided with the correlations, we can demystify mapping errorsby exposing the inconsistencies between status codes map-pings where destination status codes are correlated (§IV -C).
+As a running example, Figure 2(b) exempliﬁes how
+our value-ﬂow analysis tracks the propagation of sta-tus codes. Speciﬁcally, function f
+0 inherits the sta-
+tus codes from function f1, thus resulting in a sum-
+mary{OK,DECLINED ,DONE,SUSPENDED }. The summary is
+then reduced to {OK,DECLINED }, because neither DONE
+norSUSPENDED can become a return value, as they are
+obviously ﬁltered by the condition rv > DONE . To further
+830 	
+ 			 
+	
+! 	
+  "
+0% 	/
+1% 
+&0
+2% &1
+3%  &2
+4%
+  !+
+5% .	91//#
+6% ..93/27% ,$8%(-0 ! + 	# # 
+# , -(
+0/%	!..!)*$ ((0
+00%	!.)*+ ((/
+01% "9!..!)*$ ((0
+02% )": *+
+03% 	
+"$
+04% ,05% ,
+06%	)*+ ((1
+07% )!.)*'9	*
+08% 	
+..$
+1/% )!.)* '9 *
+10% 	
+.	$
+11% ,  
+	
+
+
+
+	
+
+
+
+	
+
+	 
+
+
+
+	
+
+
+
+
+
+Fig. 2. A motivation example.
+	 	
+
+ 
+
+
+			 
+
+		 
+
+
+
+Fig. 3. System Overview of T RANSCODE
+group correlated status codes, we unify the overlapping sets
+of status codes returned by some functions, such that twogroups of status codes {
+OK,DECLINED ,DONE,SUSPENDED }
+and{HTTP_OK ,HTTP_BAD_REQUEST }are established and
+clearly distinguishable from one another. As revealed bycontrol-ﬂow paths at Lines 18-21, two status code mappingsare identiﬁed as well (Figure 2(c)). Thus, the two mappings
+compose an inconsistency, since they both occur betweentwo groups of status codes. That is, the inconsistency oftwo mappings,
+DECLINED /mapsto→HTTP_OK andDECLINED /mapsto→
+HTTP_BAD_REQUEST , reveals the culprit of a mapping error.
+III. P ROBLEM FORMULA TION
+In this section, we ﬁrst present the fundamental deﬁnitions
+and terminologies, and then formulate the mapping errordetection problem.
+A. Preliminaries
+We begin with the formal deﬁnitions of status codes and
+their domains:
+Deﬁnition III.1 (Status Code). A status code cis a constant
+integerc∈Zserved as program state indicators.Deﬁnition III.2 (Status Code Domain). A status codes domain
+is a set of status codes C={c
+1,c2,...,c n}, describing the
+states of a functionality-independent software feature3.F o r
+simplicity, we abbreviate “status code domain” to “domain”
+for short in the rest of the paper.
+Example III.1. Consider the program in Figure 2.
+HTTP_BAD_REQUEST is a status code from HTTP domain D,
+representing a type of HTTP response errors. The domain is
+also used to differentiate status codes with the same value butdifferent meanings.
+A status code mapping occurs when a status code stops
+propagating, and in the same function, a new status code startsto propagate. Formally, a mapping instance can be deﬁned interms of status codes and domains:
+Deﬁnition III.3 (Status Code Mapping). The mapping relation
+is formalized as a partial function [11] in mathematics between
+a domain Cand a co-domain D, denoted by Γ:C/arrowrighttophalfD , such
+that there exists at least one status code c∈C and another
+status code d∈D satisfying Γ(c)=d. In the remaining
+sections, we use an alternative representation to explicitly mark
+a mapping with its corresponding domain and co-domain:(c,C)/mapsto→(d,D)
+45.
+Example III.2. As exempliﬁed in Figure 2, there is a
+mapping (DECLINED ,C)/mapsto→(HTTP_BAD_REQUEST ,D)at
+Lines 18-19, where DECLINED is a status code received from
+a call site to f1at Line 18.
+B. Problem Statement
+Mapping errors originate from inconsistencies. As illus-
+trated in the former section, one status code might be mapped
+3It is a formalized deﬁnition originated from Apple [10].
+4The mapping of a mapping might be inferred across many functions but
+not speciﬁc to local facts within one function.
+5The pairing representation always references a unique status code in a
+program, regardless of its value equivalence over other status code values.
+831into two different status codes of the same domain. In this
+paper, we aim to automatically detect such inconsistencies.Formally, we deﬁne the mapping error as follows.
+Deﬁnition III.4 (Mapping Error). A mapping error occurs
+when multivalued mappings are detected, making the mapping
+relation no longer a partial function. Formally, there exist
+(c,C)/mapsto→(d,D), and(c,C)/mapsto→(d
+/prime,D), whered/negationslash=d/prime.
+Example III.3. At Lines 17-20 in Figure 2, the two in-
+consistent mappings are (DECLINED ,C)/mapsto→(HTTP_OK ,D)
+and(DECLINED ,C)/mapsto→(HTTP_BAD_REQUEST ,D), because
+they are across two consistent domains CandD, but the
+destination status codes diverge.
+Detecting mapping errors raises two major challenging
+issues. The ﬁrst is how to efﬁciently and precisely track thepropagation of status codes. To validate each propagation, wehave to consider its path-feasibility. Assuming a path conditionisφand a return variable is rv, there would be an excessive
+amount of path-feasibility queries subject to each status codevalue of the form φ∧(rv=c
+1),...,φ∧(rv=cn). Compared
+to solving the path condition φalone, those massive queries
+for each status code can overload the solvers, leading to asigniﬁcant scalability problem.
+The second issue in detecting mapping errors is automat-
+ically inferring the domainCof status codes. Providing that
+status code deﬁnitions are capricious in large software systems,a simple pattern-based code scan will bring false positivesor false negatives and requires expertise to adapt to broadersoftware systems.
+Based on the discussion above, our problem in terms of
+mapping error detection can be summarized as follows:
+Given a program P, efﬁciently and precisely track the
+propagation of status codes and infer the underlyingdomains of each status code.
+IV . A
+PPROACH
+This section presents a value ﬂow analysis for status code
+collection, domain inference from collected status codes, andthe mapping error detection process.
+A. V alue-Flow Analysis F or Status Code Collection
+Path-sensitive Value Flow Analysis. The ﬁrst stage of
+T
+RANSCODE is a value ﬂow analysis for analyzing the status
+code values returned by each function, which is the key
+input of domain inference (§IV -B). Speciﬁcally, T RANSCODE
+selectively searches from the deﬁnition of constant integervalues to the return statements that they ﬂow to. Similar toprevious program analysis [12, 13], our design adopts bottom-
+up summary-based techniques to boost the performance of theinter-procedural analysis.
+At a high level, the value ﬂow analysis summarizes intra-
+procedural sub-paths to build the full paths from sources tosinks, where a source is the origin of a status code and a sink isthe end of its propagation. More concretely, our analysis tracksand composes the following sub-paths, where /squiggleright operatordenotes if some value v
+1can reach to another value v2via
+assignments.
+•c/squigglerightreturnv: A path from a constant integer cto return
+value.
+•c/squigglerightcallf(...,arg,... ): A path from a constant inte-
+gercto a callee’s argument arg .
+•arg/squigglerightreturnv: A path from a function argument to
+return value.
+•v1←callf(...)/squigglerightreturnv2: A path from a callee’s
+return values to a return value of the current function.
+During the analysis, if a composite path of the above sub-
+paths is c/squigglerightreturnv, the status code cis added to the
+summary of all status codes returned by function f, denoted
+asRet(f). Moreover, by leveraging the function summary,
+a caller function can inherit the callee’s results if there is apathv
+1←callg(...)/squigglerightreturnv2. Formally, two inference
+rules collecting status codes of function fare given:
+/lscript1:c/squiggleright/lscript2:returnv
+c∈Ret(f)(1)
+/lscript1:v1←callg(...)/squiggleright/lscript2:returnv2
+Ret(g)⊆Ret(f)(2)
+To obtain a more precise result from the above rules, we
+can ﬁlter infeasible propagation via a path-sensitive analysis.We follow the previous work on a compositional and efﬁcientencoding to collect each return statement’s path condition [ 12].
+Speciﬁcally, assume the path condition is φand there exists
+a set of candidate status codes c
+1,c2,...,c nto be veriﬁed.
+Then, we construct and solve feasibility queries in the formofφ∧(rv=c
+1),φ∧(rv=c2),...,φ∧(rv=cn), respectively.
+If one query φ∧rv=ciisUNSA T, then we can exclude ci
+fromRet(f).
+Example IV .1. Consider the function f0in Figure 2. After
+running a value ﬂow analysis, we can acquire the initial sum-mary of f
+0:Ret(f0)={ OK,DECLINED ,DONE,SUSPENDED }.
+We then construct path-feasibility queries for each statuscode and solve φ∧(rv=
+OK),φ∧(rv=DECLINED ),
+φ∧(rv=DONE), andφ∧(rv=SUSPENDED )separately.
+The ﬁnalized summary of f0is:
+Ret(f0)={OK,DECLINED }.
+Interpolation-guided Reﬁnement. Recall that to compute
+the summary for a function f, we need to solve instances of
+path-feasibility queries of the form φ∧(rv=ci). However,
+if the number of functions and the number of status codes areboth large, the path-sensitive value ﬂow analysis can result ina huge number of SMT solver calls, leading to performanceissues.
+To potentially reduce the number of solver calls, we present
+an interpolation-based optimization [8, 9]. The key insight of
+our optimization is that the facts disallowing some status codevalues to be propagated can be used to determine the feasibilityof other status codes, thus enabling us to potentially pruneunnecessary calls to solvers.
+832Algorithm 1: Interpolation-guided Reﬁnement
+Input: The path condition φand a set of
+constraints S={rv=c1,...,rv=cn}
+Output: Decide the satisﬁability of each
+φ∧rv=ci(1≤i≤n)
+1foreachψi∈Sdo
+2 ifφ∧ψiisUNSA T then
+3 I←GetInterpolant( φ,ψi);
+4 foreachψj:(rv=cj)∈Sdo
+5 // no solver required
+6 ifI[cj/rv]=false then
+7 eliminate ψjfromS;
+8 else
+9 //ciwill be added to Ret (f)
+10 Markφ∧ψias satisﬁable;
+Deﬁnition IV .1. An interpolant for a pair of inconsis-
+tent formulas (A,B)(i.e.,A∧B= UNSA T)i saf o r -
+mulaIsatisfying (1) A⇒I(2)I∧B= UNSA T
+(3)Vars(I)=Vars(A)∩Vars(B), whereVars(P)denotes
+the variables referenced by predicate P.
+Note that, for a pair of inconsistent ﬁrst-order formulas A
+andB, there must exist at least one interpolant [14]. For
+example, a<1∧a=4 isUNSA T, and an interpolant for
+(a<1,a=4 ) can bea<3.
+In our context, the constraints are of the form φ∧rv=ci,
+whereφis the path condition and ciis a constant status code.
+Consequently, if φ∧rv=ciisUNSA T, an interpolant I
+of(φ,rv=ci)must exist, and it only references rv, i.e.,
+Vars(I)={rv}.
+Thus, the key idea underlying our approach is to use
+the interpolant Iof(φ,rv=ci)to potentially prune the
+satisﬁability queries of other constraints φ∧rv=cj(i/negationslash=j).
+In particular, if I∧rv=cjisUNSA T, then φ∧rv=cjmust
+also be UNSA T, because φ⇒I. Notably, since Ireferences
+only one variable rv, it is unnecessary to invoke a solver to
+determine the satisﬁability of I[cj/rv].
+Based on the above idea, we apply Algorithm 1to optimize
+the computation of summary Ret(f). For instance, assume an
+interpolant rv < c iis available upon an unsatisﬁable formula
+φ∧rv=ci, which provides a detailed explanation of why the
+predicate rv=ciconﬂicts with the path condition (Line 3).
+Other predicates might potentially conﬂict with the interpolantas well, indicating their unsatisﬁability of not invoking a solver(Lines 4-7). Note that an interpolant might not always be the
+most precise. Still, since the interpolant involves the returnvariable rvonly, it would be showing great potential to be
+precise and conﬂict with other queried formulas.
+Example IV .2. When checking the path-feasibility of sta-
+tus code
+DONE , the solver answers that φ∧(rv=DONE)
+isUNSA T At the same time, an interpolant I=(rv≤DONE)recorded during solving serves as a precondition sub-
+ject torv. This interpolant can then be applied to ﬁlter
+other infeasible status code predicates, for example, (rv=
+SUSPENDED ). A conﬂict between the interpolant and the predi-
+cate is observed in I[SUSPENDED /rv]. Therefore, we conclude
+that SUSPENDED is pruned without a solver: Ret(f0)=
+{OK,DECLINED }.
+Remarks We also record status code naming from macros,
+enumerable types, and various data structures in the pre-
+processing stage at the source code level and feed it to the post-processing stage (value ﬂow analysis). Our analysis, therefore,can distinguish all status codes even with the same value butdifferent names.
+B. Status Code Domain Inference
+From §IV -A, the returned status codes of each function is
+collected. However, it remains to distinguish whether some
+status codes belong to the same domain for mapping errordetection.
+Domain-speciﬁc expertise may help deﬁne these domains
+manually, yet it requires considerable effort and may causefalse results. The key reason is the existence of a massiveamount of status codes, and its declaration method variesfrom projects favoring different programming conventions. Forinstance, multiple domains of status codes are declared in theheader ﬁle httpd.h, and there are also status codes deﬁned
+in multiple ﬁles that compose the same domain. Besides,these domains can be declared in various data structuressuch as macros, global variables, enumerable types, and classmembers, increasing the difﬁculty for developers to providesuch speciﬁcations.
+Return Conventions of Status Codes. To automatically
+infer the domains from the programs, we utilize an observationabout the return convention of status codes. Speciﬁcally, asfound in past research [1, 4], some implementation-speciﬁc
+status codes are internally used at callee functions and will notcontinue to propagate to the caller functions. In order words, afunction only returns correlated status codes within the samedomain.
+Example IV .3. Figure 4presents the propagation of status
+codes for Figure 2. Function f
+0takes status codes from f1
+and continues to propagate them. Therefore, both functions f0
+andf1return status codes within the same domain.
+Uniﬁcation-based Domain Inference. By the observation,
+we can infer each function’s domain by a uniﬁcation-based
+Algorithm 2. The key idea is that we unify all non-disjoint
+sets of returned status codes for each function and obtain theresulting disjoint sets as domains.
+Example IV .4. Consider the domain inference of func-
+tionsf
+0,f1,f2. From§IV -A, we obtained the sets of status
+codes for each function Ret(fi). By unifying all non-disjoint
+833Algorithm 2: Domain Inference
+Input: Returned status codes of each function Ret(fi)
+Output: Sets of status code domains D
+1 D={A=Ret(f0),B=Ret(f1),...,N=Ret(fn)};
+2foreach(I,J)∈ D× D,I /negationslash=Jdo
+3 // pairwise set intersection
+4 ifI∩J/negationslash=∅then
+5 I←I∪J ;
+6 eleminate Jfrom D;
+7return D;
+Domains Call edgesࣞ: HTTP Status Codes
+f1 f0 f2
+OK
+DECLINEDDONESUSPENDEDOKDECLINEDHTTP_OKHTTP_BAD_REQUESTࣝ: Httpd Internal Status Codes
+Fig. 4. Propagation of status codes in Figure 2. Status codes of func-
+tions f1,f0have no overlap of status codes of f2.
+sets, we obtain domain facts as follows:
+C={OK,DONE,DECLINED ,SUSPENDED }
+D={HTTP_OK ,HTTP_BAD_REQUEST }.
+The algorithm above mainly utilizes set intersections and
+unions. However, previous program analyses based on set
+operations have been proved with high time and space com-plexity [15–17], giving the massive functions and status codesin large-scale software systems. In consequence, pairwise set-intersections among all sets of returned status codes might leadto deﬁciencies.
+Value-Flow-Aided Domain Inference. As exempliﬁed in
+the previous example, the domains of different status codescan be identiﬁed by performing pair-wise set unions of thecollected status codes. However, a key problem with Algo-rithm 2is that some set intersections at Line 4are redundant
+if the algorithm is aware of the propagation facts during thevalue ﬂow analysis. In particular, we can directly ﬁnd outif the status codes returned by some functions overlap ornot using intermediate value ﬂow information. For examplein Figure 4, function f
+0takes status codes from f1so that
+status codes in Ret(f0)andRet(f1)are in the same domain,
+without the need to examine their concrete status codes. Withthis observation, we propose to optimize domain inference byrecording summaries during value-ﬂow analysis.
+To leverage the observation, we further identify two sub-
+scenarios and make the corresponding reactions to acceleratedomain inference. The three types of intermediate value ﬂowinformation are illustrated in Figure 4:
+•Overlapping. During value ﬂow analysis, it is foundthatf
+0returns status codes directly received from f1,1:intrv = dialup_handler(); //f 0
+2:Ʌ1=( r v! =O K )BB1:
+3:return HTTP_BAD_REQUEST;BB2:T F
+4:intrv2 = dialup_handler(); //f0
+5:Ʌ2=( r v 2! =S U S P E N D E D )BB3:
+6:return HTTP_OK;BB4:T
+Fig. 5. The control-ﬂow graph of function f2in Figure 2
+indicating Ret(f0)\Ret(f1)/negationslash=∅. For this case, status
+codes from both functions must be in the same domain.
+•Separation. During value ﬂow analysis, it is known f2
+receives status codes from f0but does not continue to
+return them, i.e., Ret(f0)∩Ret(f2)=∅. Therefore, there
+is no need to perform set intersections between Ret(f0)
+andRet(f2).
+The above relations can be directly recorded during value
+ﬂow analysis without additional cost. Before Line 2, we can
+query the value ﬂow summary if two sets are in the aboverelations. Once an overlapping relation is detected, we can skip
+the set intersections at Line 4and directly merge all included
+status codes as one domain. Similarly, if separation relation is
+found, i.e., two sets belonging to two distinct domains, thereis no need to test the two sets, thus skipping entry to the loopand Line 2. Therefore, our optimization saves on the costs of
+all-pairs square-time set intersections.
+Example IV .5. Figure 4has present value ﬂow summaries
+composed of f
+0,f1,f2and their status codes returned. Owing
+to the overlapping relation between f0andf1, we only
+need to take the union of two sets Ret(f0)∪Ret(f1)as a
+domain. Besides, there exists separation relation between f0
+andf2becausef2no longer propagates f0’s status codes. We
+might skip the comparison of f0andf2entirely. Compared
+toC2
+3=3 pairwise set intersections in the original algorithm,
+we make no set intersections at all with the help of value ﬂow
+summaries.
+C. Mapping Error Detection
+Once the domain information is exposed to the detector, the
+mapping error detection problem can be reduced to discovering
+domain inconsistencies among code-to-code mappings.
+Mapping Identiﬁcation. As also mentioned in IV -B, map-
+pings occur in a function when status codes do not continue topropagate, and some new status codes emerge. For example, inFigure 4, function f
+0is a callee of f2butRet(f0)andRet(f2)
+belong to different domains. Since there is no common sta-tus code between Ret(f
+0)andRet(f2), it is possible that
+mappings from status codes in Ret(f0)to those in Ret(f2)
+exist. The next question is how to infer concrete mappings infunctionf
+2.
+834Algorithm 3: Mapping Identiﬁcation in a Function
+Input: A statement /lscriptrcv that receives status codes R
+from a domain C
+Input: A return statement /lscriptret that outputs a status
+codedin another domain D
+Output: Mapping relation Γ
+1if/lscriptrcv can reach /lscriptreton the control-ﬂow graph then
+2 Collect path conditions Φ/lscriptrcv→/lscriptret;
+3 foreachc∈Rdo
+4 ifΦ/lscriptrcv→/lscriptret∧rv=cisSA T then
+5 Γ←{c/mapsto→d};
+6returnΓ;
+We propose to identify these mappings from a control
+ﬂow graph of one function via Algorithm 3. In Figure 5,
+at each statement that receives status codes from f0that
+are from one domain, e.g., Line 1 of Figure 5,w ec a n
+traverse the control-ﬂow graph to check if that statement can
+reach some statements that returns status codes of anotherdomain. For instance, our analysis begins searching fromLine 1, where the return value rv can be
+OK orDECLINED .
+Along the control-ﬂow path, a return statement at Line 3does return a status code of the HTTP domain. It can befurther inferred that reachability is guarded by ¬(rv/negationslash=
+OK).
+The guard is satisﬁable when ﬁlling rv=DECLINED ,
+where DECLINED is a status code from f0. Therefore, a map-
+ping DECLINED /mapsto→HTTP_BAD_REQUEST is found. Similarly,
+another mapping DECLINED /mapsto→HTTP_OK is constructed in a
+path from Line 5 to Line 6. Note that our identiﬁcation islanguage-agnostic because it only as Algorithm 3only takes
+a control-ﬂow graph and mapping-related statements as input.
+Inconsistency Detection. In this procedure, the goal of
+inconsistency detection is to detect whether destination statuscodes diverge. Hence, once all mappings are collected, weonly need to compare mappings within the same source anddestination domain. For every mapping originating from thesame status code that maps to two other different status codesof the destination domain, T
+RANSCODE reports it as an error:
+(ci,C)/mapsto→(cj,D)(ci,C)/mapsto→(ck,D)cj/negationslash=ck
+{ci/mapsto→cj,ci/mapsto→ck}∈E(3)
+Example IV .6. Considering the example in Figure 2,w e
+extract two mappings from the two functions, respectively:
+(DECLINED ,C)/mapsto→(HTTP_OK ,D)
+(DECLINED ,C)/mapsto→(HTTP_BAD_REQUEST ,D)
+We infer the belonging domain of the three status codes, andthe two mappings are indeed from the same status code totwo destination status codes of the same domain. Hence, weconclude that there is some inconsistency. The inconsistencyalso matches our manual inspection that status codes of arequest ﬁlter are inconsistently mapped to two different HTTPresponse codes.T ABLE I
+Code metrics of evaluated projects
+Project Domain Version ID Language(s) KLoC
+WolfSSL Encryption 44e575b C 926
+Httpd Web Server abe9502 C 382
+SQLite Database a90d817 C 383
+GRPC RPC Library 81299e2 C, C++ 1,967
+Asterisk V oice over IP 2a6a280 C, C++ 4,812
+V. I MPLEMENT A TION
+We have implemented T RANSCODE on top of the LL VM
+3.6 framework [18]. the Z3 SMT solver [19] with extensiveuse of Standard Template Library (STL).
+Pointers, Loops and errno In the value ﬂow analy-
+sis (§IV -A), there may be status codes stored to or loadedfrom pointer variables. As presented in previous approacheson value-ﬂow analysis [12, 20, 21], T
+RANSCODE adopts a
+fast uniﬁcation-based alias analysis [ 22] to resolve C style
+function pointers and employs a class hierarchy analysis [23]to resolve virtual function calls. For loops, we unroll eachloop once in the control ﬂow graphs and treat the remainingiterations guarded by the loop guard. This tradeoff is sound forstatus codes collection and mapping identiﬁcation because ouranalysis permits propagation of each feasible status code onlythrough constant’s propagation. Besides, we also consider thesemantics of system-wide status code errno in the implementa-
+tion. However, since errno can also be set by library functions,
+static results could be incomplete. Nevertheless, as a commonpractice [12, 24], our analysis does treat errno as a global
+variable by copying it as an auxiliary variable to complementits value ﬂow.
+Pre-processing Status Code Values. Most status codes do
+not have corresponding variable names since they are usuallydeﬁned using macros and various data structures. Speciﬁcally,in LL VM IR, all status code identiﬁers have already beenoptimized as unnamed integers. Therefore, in addition, theClang [25] compiler frontend is employed to preprocess thesource code to obtain names of status codes, and thus is able todifferentiate among status codes with identical integer values.
+VI. E
+V ALUA TION
+In this section, we evaluate T RANSCODE by answering the
+following questions:
+RQ1: How efﬁciently does T RANSCODE analyze on real-
+world programs?
+RQ2: How precisely does T RANSCODE infer domains of
+status codes?
+RQ3: Can T RANSCODE detect real-world status code map-
+ping errors?
+A. Experiment Setup
+To answer the three research questions, We conduct three
+experiments for the above three research questions on real-world projects. For the experiment subjects, we choose ﬁverepresentatives, widely-used and large-sized projects from
+835T ABLE II
+Analysis Performance (in Seconds). VFA Sand VFA Idenotes value ﬂow
+analysis using pure solver or applying interpolants-guided reﬁnement,
+respectively. DI denotes the stage of domain inference. TD denotes the stage
+of mapping error detection. The last two columns are the total running times
+without and with reﬁned value ﬂow analysis.
+Project VFA S VFA I DI TD Total S Total I
+WolfSSL 4,465 450 3 764 5,232 1,217
+Httpd 454 285 2 27 483 314
+SQLite 329 83 4 24 357 111
+GRPC 880 791 15 5 900 811
+Asterisk 1,169 805 248 92 1,509 1,145
+Total 7,297 2,414 272 912 8,481 3,598
+different domains: WolfSSL, Apache Httpd, Google RPC,
+Asterisk and SQLite, ranging in size from 0.38 MLoC to4.81 MLoC. Table Ishows more details of these subjects. All
+projects are the latest version from its code repositories at thetime of the experiment.
+All experiments are conducted on a computer with an Intel
+Quad-Core i5-6500 3.20GHz CPU and 8 GB RAM.
+B. Performance
+We divide our analysis into three stages: (i) extracting
+status code values for each function by value-ﬂow analysis;
+(ii) inferring domains; and (iii) mapping error detection.
+Table IIshows the analysis time of each stage (VFA, DI
+and TD), and the overall analysis time with two differentvalue ﬂow analyses (Total
+S,Total I). Overall, the T RANSCODE
+approach (Total I) ﬁnishes analyzing each project in less than
+twenty-one minutes on a moderate computer, which demon-strates that our approach scales well for real-world projects.The time consumption is mostly dominated by the value-ﬂow analysis (VFA, §IV -A) stage (2,414/3,598=67%). This isreasonable since the value-ﬂow analysis is a context- and path-sensitive inter-procedural analysis, and it relies on a heavy-weight SMT solver for resolving path feasibility. Basically,the analysis time for a project is related to its size and thenumber of status codes it has. For example, the analysis forWolfSSL, which has the largest number of status codes andfunctions, is the most time-consuming of the ﬁve projects.
+By comparing the two different value-ﬂow analyses ( VFA
+S
+and VFA I), it is obvious that the interpolants-guided ﬁlter-
+ing (§IV -A) is effective in reducing the cost. For example, theinterpolation approach is able to reduce 77% (=1-1,217/5,232)of the analysis cost for WolfSSL. This is because the approachcan speed up the path feasibility veriﬁcation process byleveraging the interpolant of UNSA T queries to skip othersimilar UNSA T queries, thus improving the efﬁciency.
+The time cost for domain inference (DI, § IV -B) and
+mapping error detection is considerably small. For domaininference, our algorithm, relying on set operations, has asquare time complexity in the worst cases. However, in ourexperiment, the time cost is small (2-15s) for four out of ﬁveprojects. It only becomes non-trivial (248s) for Asterisk, whichhas the largest number of domains.T ABLE III
+Inferred facts for each project. Status Codes denote the total inferred status
+codes. Domains denote the number of inferred domains.
+Project Functions Status Codes Domains
+WolfSSL 13,889 79,607 24
+Httpd 9,302 9,240 17
+SQLite 3,301 3,485 78
+GRPC 19,734 2,653 14
+Asterisk 13,704 13,996 95
+Time consumption of mapping error detection (TD, §IV -C)
+typically remains at a low level, because our algorithm es-sentially takes the previous two stages as input and performsan intra-procedural analysis. The only exception is WolfSSL,which has the most status codes. It needs considerably moretime to check whether a presumed mapping is valid.
+Answer to RQ1: T RANSCODE is efﬁcient in analyzing
+real-world programs. It can scale to projects with mil-lions of lines of code and can ﬁnish the analysis intwenty-one minutes.
+C. Results of Domain Inference
+Ground Truth. The ground truth of all domains for ﬁve
+applications is manually collected. We ﬁrst refer to ofﬁcialdocuments, if any, that describe the status codes’ function-ality [26, 27]. The rest of the unspeciﬁed status codes are
+classiﬁed manually according to whether they have relatedfunctionality in the source code.
+Metric of Correctness. The correctness of domain infer-
+ence is measured by how many domains match the ones inthe ground truth. In the program source code, not all deﬁnedstatus codes are used and returned. Hence, the matching isdeﬁned by a subset of operations as follows:
+D
+i⊆DjDi∈Domain, Dj∈Ground Truth
+Match←Di(4)
+In the above formula, Domains denotes the superset of
+all domains inferred by T RANSCODE ,Ground Truth are
+manually-collected domains of each program for ﬁve appli-cations, and Match denotes all inferred domains that match
+the ground truth.
+Deﬁnition VI.1. Match Rate is deﬁned as:
+MatchRate =#Match
+#Domain(5)
+The experimental results are listed in Table IV. In total,
+TRANSCODE has inferred 228 domains in ﬁve programs, and
+218 of them match with the ground truth, achieving a match
+rate of 95.6%. The results also suggest inferred domains arecapable as inputs to error detection of T
+RANSCODE .
+The main source of mismatches is when a small number
+of functions do not follow the convention to produce statuscodes within the same domain. For example, Figure 6shows
+a function that returns status codes from two domains from
+836T ABLE IV
+Results of Domain Inference
+Project Matches Inferred Match Rate
+WolfSSL 20 24 0.833
+Httpd 13 17 0.765
+SQLite 76 78 0.974
+GRPC 14 14 1.000
+Asterisk 95 95 1.000
+Total 218 228 0.956
+1static int authn_cache_post_config(...)
+2{
+3 if(!configured)
+4 return OK;
+5 if(socache_provider == NULL)
+6 return 500; // An HTTP status would be a misnomer!
+7}
+Fig. 6. Example of outputting status codes from multiple domains
+the ground truth. The status code OK returned at Line 4refers
+to a group of status codes only internally used in Httpd, and
+status code 500 at Line 6is an HTTP status code. As such,
+TRANSCODE allows both status codes to be grouped, i.e., these
+two codes, which in fact belong to two domains, are classiﬁedinto one domain. Line 4is an unﬁxed defect as the developer’s
+comments indicate: An HTTP status would be a misnomer,
+meaning that HTTP status codes should never be returnedhere. Applications like SQLite and WolfSSL also have a fewfunctions that return status codes of multiple domains, causingmismatches.
+The results also imply that developers usually differen-
+tiate among status codes in a program when implement-ing different features. For example, Httpd outputs
+HTTP_OK
+to the clients when the HTTP request is valid, and sig-nals
+HTTP_BAD_REQUEST when invalid. In either case, it
+never outputs status codes unrelated to HTTP operations,like
+FTP_ERROR , which cannot be interpreted and handled
+correctly by its users.
+Answer to RQ2: Overall, 95.6% of domains inferred by
+TRANSCODE match the ground truth.
+D. Effectiveness of Mapping Error Detection
+In this section, we evaluate the performance of T RANSCODE
+in detecting mapping errors on ﬁve real-world applications.
+Overall Results. We apply T RANSCODE to 5 real-world
+applications: WolfSSL, Httpd, SQLite, Google RPC, andAsterisk. Table Vlists numbers of mapping error reports.
+Regarding the number of bug reports, at least two authorsparticipate in the bug conﬁrmation
+6. In general, T RANSCODE
+reports 60 status code mapping errors in total, among which59(=42+4+13) errors have been conﬁrmed by ourselves, andwe also ﬁnd one report is a false positive. All conﬁrmed reports
+6Most authors agreed that all reports are true reports, so we do not adopt
+Kappa score to measure the quality.T ABLE V
+Results of Mapping Error Detection
+Projects Reports FalseConﬁrmed
+Validated Reviewing Fixed
+WolfSSL 31 1 22 0 8
+Httpd 7 0 5 0 2
+SQLite 9 0 9 0 0
+Asterisk 4 0 4 0 0
+GRPC 9 0 2 4 3
+Total 60 1 42 4 13
+1static int read_request_line(...){
+2. . .
+3 rv = ap_rgetline(...);
+4 if(APR_STATUS_IS_ENOSPC(rv)) {
+5 return HTTP_REQUEST_URI_TOO_LARGE;
+6}
+7 else if (APR_STATUS_IS_TIMEUP(rv)) {
+8 return HTTP_REQUEST_TIME_OUT;
+9}
+10 + else if (APR_STATUS_IS_BADARG(rv))
+11 + return HTTP_BAD_REQUEST;
+12 +}
+13 else if (APR_STATUS_IS_EINVAL(rv)) {
+14 return HTTP_BAD_REQUEST;
+15 }
+16 ...
+17 return HTTP_OK;
+18 }
+Fig. 7. Improper mapping of a status code APR_BADARG . The green code is
+the developers’ patch of this bug.
+have been submitted to developers via issue trackers or forums.The row validated denotes the numbers of conﬁrmed bugs that
+have not been ﬁxed. Thus far, 13 mapping errors have beenﬁxed by developers or patches proposed by ourselves, and 4reports are under review.
+Conﬁrmed Errors in Apache Httpd. T
+RANSCODE iden-
+tiﬁed 7 mapping errors in Apache Httpd, where 2 of themhave been ﬁxed by the developers. Figure 7shows an example
+of mapping errors
+78. The variable rv saves the status codes
+from callee function ap_rgetline. After that, it only maps three
+status codes APR_ENOSPC ,APR_TIMEUP andAPR_EINVAL
+and returns the corresponding HTTP status codes. T RANS -
+CODE found another mapping also receiving status codes
+from ap_rgetline() but performing a mapping APR_BADARG
+/mapsto→HTTP_BAD_REQUEST , inconsistent to this example. Then,
+there exists an inconsistency of mapping the same code totwo different ones. Apparently,
+APR_BADARG in the example
+is silently discarded and directly mapped to HTTP_OK , leaving
+the hidden errors buried. The developer also expressed thedifﬁculty in determining which status code should be mappedfor these status codes without strong prior knowledge.
+Conﬁrmed Errors in Google RPC.T
+RANSCODE identiﬁed
+9 new bugs in Google RPC, where 3 have been ﬁxed by itsdevelopers. In Figure 8, the developers forgot to map the status
+codes in variable
+status to a status code GRPC_ERROR_NONE
+7https://bz.apache.org/bugzilla/show_bug.cgi?id=63669
+8https://svn.apache.org/viewvc?view=rev&rev=1873394
+8371static grpc_error add_socket_to_server(...) {
+2 status = WSAIoctl(...);
+3 if(status != 0) {
+4- return NULL;
+5+ return GRPC_ERROR_NONE;
+6}
+7. . .
+8}
+Fig. 8. An incorrect status code mapping in Google RPC, where Lines 5-6
+are the ﬁx made by a developer.
+rather than a NULL value. T RANSCODE identiﬁes it be-
+cause the same status codes are inconsistently mapped into
+GRPC_ERROR_NONE in another function tcp_connect. We re-
+ported two mappings to the developers, and they conﬁrm that
+the second mapping is correct.
+A False Positive in WolfSSL. Among all reported bugs
+in WolfSSL, one is regarded as a false positive, though aninconsistency of returned status codes is found by our tool
+9.
+The developer argued that the only functional status code isset to a ﬁeld of a speciﬁc structure
+ssl->err , so there is
+no need to care about the returned status codes. While thereport is marked as a false positive, it does not compromiseour approach. One may still complement the semantics byconsidering the speciﬁc ﬁeld as a destination in the mappingidentiﬁcation stage.
+Reports Under Review. There are four reports of GRPC
+currently waiting for more information. To the best of ourknowledge, the impact of mapping errors is not trivial todiscover because it does not cause any visible effects suchas crashes. However, to understand its real impact, expert-level domain knowledge is required to trigger the handlingcode of inconsistent mappings and monitor whether they leadto misbehaviors. Besides, even if these errors do not haveimmediate effects, they might mislead the future users of thesefunctions and possibly leads to new bugs.
+Answer to RQ3: T RANSCODE reports 60 mapping errors
+among ﬁve real-world large-scale applications, of which59 have been conﬁrmed, and 13 have been ﬁxed bydevelopers.
+E. Industry Experience
+We have deployed T
+RANSCODE to large-scale microservice
+systems in WeChat, which process tens of millions of queriesper day. T
+RANSCODE manages to ﬁnd status code mapping
+errors10. These errors, nevertheless, are missed by the devel-
+opers, regression testing, and industry-strength code analyzersin WeChat. Developers have ﬁxed these errors to avoid theinstability of microservice systems. We have received verypositive feedback from the head of the development centerfor our high applicability in industrial settings.
+9https://github.com/wolfSSL/wolfssl/issues/3213
+10Due to a security contract, we are not permitted to disclose either details
+or the number of discovered bugs.F . Threats to V alidity
+Threats to External Validity . The major threat to external
+validity is the representativity of evaluated subjects. Theprograms in the experiment might not be general enoughto expose mapping behaviors. T
+RANSCODE ’s implementation
+may not suit some applications with other status code designsor merely using exceptions. However, we argue that these ap-plications are representatives of different software eras in bothC and C++. Besides, according to previous studies [28, 29],
+constraint solvers can also fail and report false results insome cases. We adopt the latest stable version of Z3 SMTSolver (v4.8.2) at the time we implement T
+RANSCODE to
+mitigate possible negative effects.
+Threats to Internal Validity. There are mainly two factors
+that impact the practicality of mapping error detection.
+The ﬁrst threat is that the oracle for identifying mapping
+errors might not hold and be adequate at all places. Morespeciﬁcally, it is possible on some projects that one statuscode is considered valid to be mapped into two differentones under different conditions. However, the problem mightbring a few false positives as we have not encountered thatin our evaluated subjects. In addition, merely detecting viainconsistencies might mean some rare mapping errors wouldbe missed if the only mapping is the bad mapping or mappingsare all incorrect.
+The second threat is the soundness of the status code
+propagation itself. We currently model all constant integersthat can propagate to return statements as status codes. It ispossible that status codes in some projects are wrapped inother types, like strings. To this end, one can easily extendour algorithm by considering type semantics.
+VII. D
+ISCUSSION
+Identifying Status Code Mappings. Earlier propagation-
+based techniques [1, 2] detect missing-checks of status codes.
+Existing error-handling bug detectors [4, 5] merely concen-
+trates on whether status codes are in the proper ranges.However, in fact, as pinpointed by [30], status codes arenot general, and are divided into idiosyncratic sets of them.According to Gunawi et al. [1], one status code value may bemapped to another, typically from one domain to another. Thisis in order to exhibit its different functionality, in which casetheir solution cannot detect their errors of them. Numerousexisting efforts mention these complex characteristics, yetnone of them really make an effort to solve the problemsamong idiosyncratic sets of status codes. Thus, we present theﬁrst work to detect status code mapping errors in real-worldsystems.
+Identifying Domains of Status Codes. Status codes are
+commonly divided into domains in real-world software, as ob-served in many software documents when working on differentprogram parts [10, 27]. However, status codes are deﬁned in
+various ways, making it hard to guess which domains theybelong to. For many large-scale projects, status codes aremingled in different structures, involving pure magic integers,
+838enumerate types, and a series of macros, located in different
+ﬁles and classes. It is impossible to infer domain semanticsfrom their deﬁnitions without a close look at their use patterns.For instance, most status codes of Httpd are deﬁned in thesame header
+httpd.h , but there exists no regular indicator for
+which status codes represent the related functionality. Insteadof extracting domains from deﬁnitions, we propose to inferthem directly from uses.
+Conﬁrming Mapping Error Reports. The long reviewing
+period of submitted reports might lead to an underestimation ofthe impact of mapping errors. Some issues have not receivedresponses from developers after several months. One of thereasons might be the complexity of reports for mapping errors.For each error report, since mapping errors are composed ofat least two inconsistent mappings, the developer needs tomanually track down the propagation of more than two statuscodes across several ﬁles. Nevertheless, to our knowledge,we explained in detail how these errors occur when reportingthem. Therefore, a possible future direction is to automaticallygenerate an explanation of reports that help developers tounderstand a mapping error.
+Extensions to Other Error-handling Mechanisms. Our
+status code mapping error detection establish mainly on lan-guages that mainly adopts status codes as their error-handlingmechanisms. There also exists others, e.g., exceptions in
+Java and Python. In particular, a similar term “rethrow" ofexceptions to status code mappings, denoting throw anotherexception during the handling of an exception, is studied inprevious work [31]. A similar static analysis can be appliedto check whether two rethrown exceptions are valid under thesame context. One may implement a type inference and data-ﬂow analysis to capture the exception ﬂows [32] and applyour domain-based method to detect mapping errors.
+VIII. R
+ELA TED WORK
+Error Propagation Analysis. Existing methods track the
+error codes to detect error propagation bugs. Gunawi et al.[1] track POSIX status codes over call graphs to detect thepropagation bugs. Rubio-González et al. [ 2] use an inter-
+procedural data-ﬂow analysis to analyze error codes of ﬁlesystems. Weiss et al. [30] scale this method to large systemsby storing the error propagation paths in a database. There arealso statistical methods [33–35] infer the probabilities of errorpropagation.
+All these methods only analyze the propagation of prede-
+ﬁned error codes, while T
+RANSCODE analyzes the propagation
+of all status codes, a more general and broader problem.
+Mining Error-handling Speciﬁcations. There are many
+approaches to inferring error-handling speciﬁcations. Weimerand Necula [36] mine the code for temporal speciﬁcations anddetect error-handling bugs by verifying typestate properties.Acharya and Xie [37] automatically mine API error-check andcleanup speciﬁcations from the source code. A later work,
+F
+UNC 2VEC [38] improves the quality of API speciﬁcations
+by mining static program traces generated from random walksof the inter-procedural control ﬂow graph of the program.Eberhardt et al. [39] leverage unsupervised learning to learnAPI aliasing speciﬁcations, which could be further used todetect error-handling errors. Provided with domain knowl-edge, DeFreez et al. [6] and Zhou et al. [40] can generateerror speciﬁcations via error path inference. Machine learningtechniques [7] and probabilistic methods [ 41] are also used
+to predict error paths and mine error speciﬁcations. Typeinference methods [42, 43] infer type comparable variables,
+and thus can be used to detect inconsistencies of programoperations.
+Our approach uses an inter-procedural value-ﬂow analysis
+for inferring status code speciﬁcations, which lead to moreﬁned-grained, and more precise error speciﬁcations beingdiscovered.
+Detecting Error-handling Bugs. Rubio-González and Lib-
+lit [44] claim the bugs if they ﬁnd inconsistent handling to thesame error codes between documentation and the source code.Weimer and Necula [3] detect error-handling bugs by tracingthe propagation of unchecked exceptions in Java applications.EPEx [4] leverages the error speciﬁcations from APEx [41]t odetect error-handling bugs via symbolic execution. ErrDoc [5]improves EPEx to detect wider categories of error-handlingbugs and generate bug-ﬁxes automatically.
+Although previous techniques might detect few bugs over-
+lapped with those detected by T
+RANSCODE , in general, status
+code mapping errors, consisting of more complex semanticinformation, are much harder to detect. T
+RANSCODE can
+automatically detect them without relying on extra knowledge,for example, what are the errors and non-errors. Besides,
+T
+RANSCODE employs static program analysis instead of sym-
+bolic execution. Thus, it scales to large-scale software systems.
+IX. C ONCLUSION
+Mapping status codes is a common programming pattern in
+software development. To the best of our knowledge, we arethe ﬁrst to focus on detecting errors in status code mappings.In this paper, we propose T
+RANSCODE to automatically detect
+such errors in large software projects. It is evaluated on ﬁvereal-world software projects. The results show T
+RANSCODE
+is promising in detecting status code mapping errors: it hasdiscovered 59 mapping errors in ﬁve projects, 13 of which
+have been ﬁxed by the developers.
+A
+CKNOWLEDGEMENT
+We thank the anonymous reviewers for their insightful
+comments. We also appreciate engineers from Tencent inassisting system integrations. Rongxin Wu is supported bythe Leading-edge Technology Program of Jiangsu Natural Sci-ence Foundation (BK20202001) and NSFC 61902329. Otherinstitutional authors are supported by the RGC16206517 andITS/440/18FP grants from the Hong Kong Research GrantCouncil, and the donations from Microsoft and Huawei.
+R
+EFERENCES
+[1] Haryadi S. Gunawi, Cindy Rubio-González, Andrea C. Arpaci-Dusseau,
+Remzi H. Arpaci-Dussea, and Ben Liblit. Eio: Error handling is
+839occasionally correct. In Proceedings of the 6th USENIX Conference on
+File and Storage Technologies, FAST 2008, pages 14:1–14:16, Berkeley,
+CA, USA, 2008. USENIX Association. URL http://dl.acm.org/citation.
+cfm?id=1364813.1364827.
+[2] Cindy Rubio-González, Haryadi S. Gunawi, Ben Liblit, Remzi H.
+Arpaci-Dusseau, and Andrea C. Arpaci-Dusseau. Error propagationanalysis for ﬁle systems. In Proceedings of the 30th ACM SIGPLAN
+Conference on Programming Language Design and Implementation,PLDI 2009, pages 270–280, New Y ork, NY , USA, 2009. ACM. ISBN978-1-60558-392-1. doi: 10.1145/1542476.1542506. URL http://doi.
+acm.org/10.1145/1542476.1542506.
+[3] Westley Weimer and George C. Necula. Finding and preventing run-
+time error handling mistakes. In Proceedings of the 19th Annual ACM
+SIGPLAN Conference on Object-Oriented Programming, Systems, Lan-guages, and Applications, OOPSLA 2004, October 24-28, 2004, V ancou-ver , BC, Canada, pages 419–431, 2004. doi: 10.1145/1028976.1029011.URL https://doi.org/10.1145/1028976.1029011.
+[4] Suman Jana, Y uan Jochen Kang, Samuel Roth, and Baishakhi Ray.
+Automatically detecting error handling bugs using error speciﬁ-cations. In 25th USENIX Security Symposium (USENIX Secu-
+rity 16), pages 345–362, Austin, TX, 2016. USENIX Association.ISBN 978-1-931971-32-4. URL https://www.usenix.org/conference/
+usenixsecurity16/technical-sessions/presentation/jana.
+[5] Y uchi Tian and Baishakhi Ray. Automatically diagnosing and repairing
+error handling bugs in c. In Proceedings of the 2017 11th Joint Meeting
+on F oundations of Software Engineering, ESEC/FSE 2017, pages 752–762, New Y ork, NY , USA, 2017. ACM. ISBN 978-1-4503-5105-8. doi:10.1145/3106237.3106300. URL http://doi.acm.org/10.1145/3106237.
+3106300.
+[6] Daniel DeFreez, Haaken Martinson Baldwin, Cindy Rubio-González,
+and Aditya V . Thakur. Effective error-speciﬁcation inference via domain-knowledge expansion. In Proceedings of the 2019 27th ACM Joint
+Meeting on European Software Engineering Conference and Symposiumon the F oundations of Software Engineering, ESEC/FSE 2019, pages466–476, New Y ork, NY , USA, 2019. ACM. ISBN 978-1-4503-5572-8. doi: 10.1145/3338906.3338960. URL http://doi.acm.org/10.1145/
+3338906.3338960.
+[7] Baijun Wu, John Peter Campora III, Yi He, Alexander Schlecht, and
+Sheng Chen. Generating precise error speciﬁcations for c: A zero shotlearning approach. Proc. ACM Program. Lang., 3(OOPSLA):160:1–
+160:30, October 2019. ISSN 2475-1421. doi: 10.1145/3360586. URLhttp://doi.acm.org/10.1145/3360586.
+[8] A ws Albarghouthi, Arie Gurﬁnkel, Yi Li, Sagar Chaki, and Mar-
+sha Chechik. Ufo: V eriﬁcation with interpolants and abstract inter-pretation. In Proceedings of the 19th International Conference on
+Tools and Algorithms for the Construction and Analysis of Systems ,
+T ACAS’13, page 637–640, Berlin, Heidelberg, 2013. Springer-V erlag.ISBN 9783642367410. doi: 10.1007/978-3-642-36742-7_52. URLhttps://doi.org/10.1007/978-3-642-36742-7_52.
+[9] Kenneth L. McMillan. Lazy abstraction with interpolants. In Pro-
+ceedings of the 18th International Conference on Computer AidedV eriﬁcation, CA V’06, page 123–136, Berlin, Heidelberg, 2006. Springer-V erlag. ISBN 354037406X. doi: 10.1007/11817963_14. URL https:
+//doi.org/10.1007/11817963_14.
+[10] Apple Developer. Error domain, 2021. URL https://developer.apple.
+com/documentation/foundation/nserror.
+[11] Paul R. Halmos. Naive Set Theory. Springer New Y ork, New Y ork, NY ,
+1974. ISBN 978-1-4757-1645-0. doi: 10.1007/978-1-4757-1645-0_8.URL https://doi.org/10.1007/978-1-4757-1645-0_8.
+[12] Qingkai Shi, Xiao Xiao, Rongxin Wu, Jinguo Zhou, Gang Fan, and
+Charles Zhang. Pinpoint: Fast and precise sparse value ﬂow analysisfor million lines of code. In Proceedings of the 39th ACM SIGPLAN
+Conference on Programming Language Design and Implementation,
+PLDI 2018, pages 693–706, New Y ork, NY , USA, 2018. ACM. ISBN
+978-1-4503-5698-5. doi: 10.1145/3192366.3192418. URL http://doi.
+acm.org/10.1145/3192366.3192418.
+[13] Isil Dillig, Thomas Dillig, and Alex Aiken. Sound, complete and scalable
+path-sensitive analysis. In Proceedings of the 29th ACM SIGPLAN
+Conference on Programming Language Design and Implementation,PLDI ’08, page 270–280, New Y ork, NY , USA, 2008. Association forComputing Machinery. ISBN 9781595938602. doi: 10.1145/1375581.1375615. URL https://doi.org/10.1145/1375581.1375615.
+[14] William Craig. Three uses of the herbrand-gentzen theorem in relating
+model theory and proof theory. The Journal of Symbolic Logic,2 2
+(3):269–285, 1957. ISSN 00224812. URL http://www.jstor.org/stable/2963594.
+[15] Marc Berndl, Ondrej Lhoták, Feng Qian, Laurie Hendren, and Navindra
+Umanee. Points-to analysis using bdds. In Proceedings of the ACM
+SIGPLAN 2003 Conference on Programming Language Design andImplementation, PLDI ’03, page 103–114, New Y ork, NY , USA, 2003.Association for Computing Machinery. ISBN 1581136625. doi:10.1145/781131.781144. URL https://doi.org/10.1145/781131.781144.
+[16] Jianwen Zhu and Silvian Calman. Symbolic pointer analysis revisited.
+InProceedings of the ACM SIGPLAN 2004 Conference on Programming
+Language Design and Implementation, PLDI ’04, page 145–157, NewY ork, NY , USA, 2004. Association for Computing Machinery. ISBN1581138075. doi: 10.1145/996841.996860. URL https://doi.org/10.
+1145/996841.996860.
+[17] John Whaley and Monica S. Lam. Cloning-based context-sensitive
+pointer alias analysis using binary decision diagrams. In Proceedings of
+the ACM SIGPLAN 2004 Conference on Programming Language Designand Implementation, PLDI ’04, page 131–144, New Y ork, NY , USA,2004. Association for Computing Machinery. ISBN 1581138075. doi:10.1145/996841.996859. URL https://doi.org/10.1145/996841.996859.
+[18] Chris Lattner and Vikram Adve. Llvm: A compilation framework
+for lifelong program analysis & transformation. In Proceedings of
+the International Symposium on Code Generation and Optimization:Feedback-Directed and Runtime Optimization , CGO ’04, page 75, USA,
+2004. IEEE Computer Society. ISBN 0769521029. doi: 10.5555/977395.977673. URL http://doi.acm.org/10.5555/977395.977673.
+[19] Leonardo de Moura and Nikolaj Bjørner. Z3: An efﬁcient smt solver.
+In C. R. Ramakrishnan and Jakob Rehof, editors, Tools and Algorithms
+for the Construction and Analysis of Systems, pages 337–340, Berlin,Heidelberg, 2008. Springer Berlin Heidelberg. ISBN 978-3-540-78800-3.
+[20] Sigmund Cherem, Lonnie Princehouse, and Radu Rugina. Practical
+memory leak detection using guarded value-ﬂow analysis. In Proceed-
+ings of the 28th ACM SIGPLAN Conference on Programming LanguageDesign and Implementation, PLDI ’07, pages 480–491, New Y ork, NY ,USA, 2007. ACM. ISBN 978-1-59593-633-2. doi: 10.1145/1250734.1250789. URL http://doi.acm.org/10.1145/1250734.1250789.
+[21] Y ulei Sui and Jingling Xue. Svf: Interprocedural static value-ﬂow
+analysis in llvm. In Proceedings of the 25th International Conference on
+Compiler Construction, CC 2016, pages 265–266, New Y ork, NY , USA,2016. ACM. ISBN 978-1-4503-4241-4. doi: 10.1145/2892208.2892235.URL http://doi.acm.org/10.1145/2892208.2892235.
+[22] Qirun Zhang, Michael R. Lyu, Hao Y uan, and Zhendong Su. Fast algo-
+rithms for dyck-cﬂ-reachability with applications to alias analysis. 48(6):435–446, June 2013. ISSN 0362-1340. doi: 10.1145/2499370.2462159.URL https://doi.org/10.1145/2499370.2462159.
+[23] Jeffrey Dean, David Grove, and Craig Chambers. Optimization of object-
+oriented programs using static class hierarchy analysis. In Proceedings of
+the 9th European Conference on Object-Oriented Programming , ECOOP
+’95, page 77–101, Berlin, Heidelberg, 1995. Springer-V erlag. ISBN3540601600. doi: 10.5555/646153.679523. URL http://doi.acm.org/10.
+5555/646153.679523 .
+[24] Lian Li, Cristina Cifuentes, and Nathan Keynes. Boosting the perfor-mance of ﬂow-sensitive points-to analysis using value ﬂow. In Pro-
+ceedings of the 19th ACM SIGSOFT Symposium and the 13th EuropeanConference on F oundations of Software Engineering, ESEC/FSE 2011,pages 343–353, New Y ork, NY , USA, 2011. ACM. ISBN 978-1-4503-0443-6. doi: 10.1145/2025113.2025160. URL http://doi.acm.org/10.
+1145/2025113.2025160.
+[25] Chris Lattner and Vikram Adve. Llvm: A compilation framework
+for lifelong program analysis & transformation. In Proceedings of
+the International Symposium on Code Generation and Optimization:Feedback-directed and Runtime Optimization, CGO ’04, pages 75–,Washington, DC, USA, 2004. IEEE Computer Society. ISBN 0-7695-2102-9. URL http://dl.acm.org/citation.cfm?id=977395.977673.
+[26] Google. Status codes and their use in grpc, 2021. URL https://github.
+com/grpc/grpc/blob/master/doc/statuscodes.md.
+[27] Apache. Apr error space, 2021. URL https://apr.apache.org/docs/apr/1.
+6/group___a_p_r___e_r_r_o_r__map.html.
+[28] Peisen Y ao, Heqing Huang, Wensheng Tang, Qingkai Shi, Rongxin Wu,
+and Charles Zhang. Skeletal approximation enumeration for smt solvertesting. In Proceedings of the 29th ACM Joint European Software
+Engineering Conference and Symposium on the F oundations of SoftwareEngineering, ESEC/FSE 2021. Association for Computing Machinery,2021. doi: 10.1145/3468264.3468540.
+840[29] Peisen Y ao, Heqing Huang, Wensheng Tang, Qingkai Shi, Rongxin
+Wu, and Charles Zhang. Fuzzing smt solvers via two-dimensional
+input space exploration. In Proceedings of the 30th ACM SIGSOFT
+International Symposium on Software Testing and Analysis, ISST A 2021,page 322–335, New Y ork, NY , USA, 2021. Association for ComputingMachinery. ISBN 9781450384599. doi: 10.1145/3460319.3464803.URL https://doi.org/10.1145/3460319.3464803.
+[30] Cathrin Weiss, Cindy Rubio-González, and Ben Liblit. Database-
+backed program analysis for scalable error propagation. In Proceedings
+of the 37th International Conference on Software Engineering - V ol-ume 1, ICSE ’15, pages 586–597, Piscataway, NJ, USA, 2015. IEEEPress. ISBN 978-1-4799-1934-5. URL http://dl.acm.org/citation.cfm?
+id=2818754.2818827.
+[31] Chen Fu and Barbara G Ryder. Exception-chain analysis: Revealing ex-
+ception handling architecture in Java server applications. In Proceedings
+- International Conference on Software Engineering, pages 230–239,2007. ISBN 0769528287. doi: 10.1109/ICSE.2007.35.
+[32] Martin P . Robillard and Gail C Murphy. Static analysis to support
+the evolution of exception structure in object-oriented systems. ACM
+Transactions on Software Engineering and Methodology, 12(2):191–221,2003. ISSN 1049331X. doi: 10.1145/941566.941569.
+[33] Xiaocheng Ge, Richard Paige, and John McDermid. Probabilistic failure
+propagation and transformation analysis. pages 215–228, 09 2009. ISBN978-3-642-04467-0. doi: 10.1007/978-3-642-04468-7_18.
+[34] Petar Popic, D. Desovski, Walid Abdelmoez, and Bojan Cukic. Error
+propagation in the reliability analysis of component based systems.volume 2005, pages 10 pp.–, 12 2005. ISBN 0-7695-2482-6. doi:10.1109/ISSRE.2005.18.
+[35] M. Hiller, A. Jhumka, and N. Suri. An approach for analysing the
+propagation of data errors in software. In 2001 International Conference
+on Dependable Systems and Networks, pages 161–170, July 2001. doi:10.1109/DSN.2001.941402.
+[36] Westley Weimer and George C. Necula. Mining temporal speciﬁcations
+for error detection. In Nicolas Halbwachs and Lenore D. Zuck, editors,Tools and Algorithms for the Construction and Analysis of Systems,pages 461–476, Berlin, Heidelberg, 2005. Springer Berlin Heidelberg.ISBN 978-3-540-31980-1. doi: 10.1007/978-3-540-31980-1_30.
+[37] Mithun Acharya and Tao Xie. Mining api error-handling speciﬁcations
+from source code. In Marsha Chechik and Martin Wirsing, editors,Fundamental Approaches to Software Engineering, pages 370–384,Berlin, Heidelberg, 2009. Springer Berlin Heidelberg. ISBN 978-3-642-00593-0. doi: 10.1007/978-3-642-00593-0_25.
+[38] Daniel DeFreez, Aditya V . Thakur, and Cindy Rubio-González. Path-based function embedding and its application to error-handling speci-ﬁcation mining. In Proceedings of the 2018 26th ACM Joint Meeting
+on European Software Engineering Conference and Symposium on theF oundations of Software Engineering, ESEC/FSE 2018, page 423–433,New Y ork, NY , USA, 2018. Association for Computing Machinery.ISBN 9781450355735. doi: 10.1145/3236024.3236059. URL https:
+//doi.org/10.1145/3236024.3236059.
+[39] Jan Eberhardt, Samuel Steffen, V eselin Raychev, and Martin V echev.
+Unsupervised learning of api aliasing speciﬁcations. In Proceedings of
+the 40th ACM SIGPLAN Conference on Programming Language Designand Implementation, PLDI 2019, page 745–759, New Y ork, NY , USA,2019. Association for Computing Machinery. ISBN 9781450367127.doi: 10.1145/3314221.3314640. URL https://doi.org/10.1145/3314221.
+3314640.
+[40] Chunjie Zhou, Xiongfeng Huang, Xiong Naixue, Y uanqing Qin, and
+Shuang Huang. A class of general transient faults propagation analysisfor networked control systems. IEEE Transactions on Systems, Man, and
+Cybernetics: Systems, 45(4):647–661, April 2015. ISSN 2168-2232. doi:10.1109/TSMC.2014.2384480.
+[41] Y uan Kang, Baishakhi Ray, and Suman Jana. Apex: Automated
+inference of error speciﬁcations for c apis. In Proceedings of the
+31st IEEE/ACM International Conference on Automated Software En-gineering, ASE 2016, pages 472–482, New Y ork, NY , USA, 2016.ACM. ISBN 978-1-4503-3845-5. doi: 10.1145/2970276.2970354. URLhttp://doi.acm.org/10.1145/2970276.2970354.
+[42] Michael D. Ernst, Jeff H. Perkins, Philip J. Guo, Stephen McCamant,
+Carlos Pacheco, Matthew S. Tschantz, and Chen Xiao. The daikonsystem for dynamic detection of likely invariants. Sci. Comput. Pro-
+gram., 69(1-3):35–45, 2007. doi: 10.1016/j.scico.2007.01.015. URLhttps://doi.org/10.1016/j.scico.2007.01.015.
+[43] Robert O’Callahan and Daniel Jackson. Lackwit: A program under-
+standing tool based on type inference. In Proceedings of the 19th
+International Conference on Software Engineering, ICSE ’97, page338–348, New Y ork, NY , USA, 1997. Association for ComputingMachinery. ISBN 0897919149. doi: 10.1145/253228.253351. URLhttps://doi.org/10.1145/253228.253351.
+[44] Cindy Rubio-González and Ben Liblit. Expect the unexpected: Error
+code mismatches between documentation and the real world. InProceedings of the 9th ACM SIGPLAN-SIGSOFT Workshop on ProgramAnalysis for Software Tools and Engineering, P ASTE ’10, page 73–80,New Y ork, NY , USA, 2010. Association for Computing Machinery.ISBN 9781450300827. doi: 10.1145/1806672.1806687. URL https:
+//doi.org/10.1145/1806672.1806687.
+841

@@ -1,0 +1,525 @@
+When Function InliningMeetsWebAssembly: Counterintuitive
+Impacts onRuntime Performance
+Alan Romano
+ajromano@usc.edu
+Universityof SouthernCalifornia
+USAWeihang Wang
+weihangw@usc.edu
+Universityof SouthernCalifornia
+USA
+ABSTRACT
+TheWebAssemblystandarddeﬁnesabytecodeformatservingas
+acompilationtargetforlanguagessuchasC,C++,andRust.We-
+bAssemblycompilersarebuiltontopofexistingcompilerinfras-
+tructures such as LLVM and newly developed compiler toolchains
+suchas Binaryen,handlingvariousnewfeaturesofthe WebAssem-
+blylanguage.However,weobservethatboththesenewandexisting
+infrastructures implicitly assume that the executionenvironments
+ofnativeandWebAssemblyapplicationsarethesame,ignoringthe
+presence of browser compilers in the WebAssembly pipeline. This
+incorrectassumptionoftenmisguidesfunctioninliningoptimiza-
+tions,resultinginaslowerWebAssemblymodulewhenfunction
+inliningisapplied.Thispaperistheﬁrsttoinvestigatethecoun-
+terintuitive impacts of function inlining on WebAssembly runtime
+performance. We inspect the inlining optimization passes of the
+LLVMand Binaryeninfrastructures usedin the EmscriptenC/C++-
+to-WebAssemblycompiler.Ourinvestigationon127C/C++samples
+from the LLVM test suite shows that 66 samples exhibit counterin-
+tuitive behavior dueto functioninlining, particularly frominlining
+hotfunctionsintolong-runningfunctions.Wehopeourﬁndings
+motivate further work onrevising existingoptimizations with the
+unique characteristics ofWebAssemblyenvironments inmind.
+CCS CONCEPTS
+•Softwareanditsengineering →Compilers ;•Information
+systems →Webapplications .
+KEYWORDS
+WebAssembly,Function Inlining, LLVM,Binaryen, Emscripten
+ACMReference Format:
+Alan Romano and Weihang Wang. 2023. When Function Inlining Meets
+WebAssembly:CounterintuitiveImpactson RuntimePerformance.In Pro-
+ceedings of the 31st ACM Joint European Software Engineering Conference
+andSymposiumontheFoundationsofSoftwareEngineering(ESEC/FSE’23),
+December 3–9, 2023, San Francisco, CA, USA. ACM, New York, NY, USA,
+13pages.https://doi.org/10.1145/3611643.3616311
+1 INTRODUCTION
+WebAssembly (abbreviated Wasm) [ 34] is a low-level, statically
+typedlanguageaimingtoserveasauniversalcompilationtarget
+ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA,USA
+©2023 Copyright heldby the owner/author(s).
+ACM ISBN 979-8-4007-0327-0/23/12.
+https://doi.org/10.1145/3611643.3616311for the Web. It is designed to be fast to compile and run; to be
+portable,i.e.,language-,hardware-,andplatform-independent;and
+to have formal type and memory safety guarantees. WebAssem-
+blyissupportedonallfourmajorbrowsers(i.e.,Chrome,Firefox,
+Safari, and Edge) [ 51] and compiles from several programming
+languages, including C, C++, C#, Rust, and Go [ 26]. Recent studies
+have shown that one out of every 600 websites use WebAssem-
+bly[35]forpurposessuchasgames[ 40,69],cryptography[ 60,70],
+machine learning[ 66], andmedical research [ 33,38].
+WebAssembly compilers leverage the same compiler infrastruc-
+turesascompilersoftraditionallanguages.Forexample,theEm-
+scripten C/C++-to-WebAssembly compiler [ 10], the Rustc com-
+piler [17], and Intel’s oneAPI compiler [ 6] all use the LLVM [ 7]
+compilerinfrastructure.Unfortunately,weobservethatWebAssem-
+blycompilersleverageexistinginfrastructureswithoutconsidering
+the diﬀerences between WebAssemblyandnative applications.
+Liftoff TurboFan Execution Pipeline
+JavaScript starts 
+Wasm moduleMain Thread
+$f1
+$f2
+1
+JavaScript 
+calls $main2
+$main calls 
+$f24
+$main calls 
+$f15$f2 $f1
+$f1$main
+$main
+calls $f13$f1$f1 $main
+$f2 $f2$mainJavaScript
+$mainCompilation 
+Threads
+Figure1:Chromiumtier-upprocess.Inthisexample,func-
+tion$mainusestheLiftoﬀ-generatedcodewhenﬁrstcalled
+asitistheonlycodeavailable. $maincalls$f1whichonlyhas
+Liftoﬀcodeready. $f2usestheTurboFan-generatedcodeas
+it is available at the ﬁrst call. On the second call to $f1, its
+TurboFan-generated codeis availableand used forthe call.
+OneofthesubstantialdiﬀerencesisthatWebAssemblyhasthe
+additional compilation layer at runtime running within browsers,
+generatingtheﬁnalmachinecodeforWebAssemblyinstructions.
+Browsers,suchasChromium[ 2]andFirefox[ 13],typicallyinclude
+atleasttwo WebAssemblycompilers:afastcompileremittingun-
+optimized code and a slow compiler emitting highly optimized
+code. Browsers use both compilers to ensure the machine code for
+WebAssemblyfunctionsisavailableearlyandcanperformfaster
+oncetheoptimizedcodeisavailable.Whentheoptimizedcodeis
+ready,thecodeis tiered-up onthefollowingfunctioncallinvoca-
+tion by replacing the unoptimized code with the optimized code.
+Thetiering-upprocessonlyoccursonafunctioncallbecausethe
+ThisworkislicensedunderaCreativeCommonsAttribution-ShareAlike4.0
+InternationalLicense.
+350
+351When Function InliningMeetsWebAssembly: Counterintuitive ImpactsonRuntimePerformance ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+function (e.g., a heuristic on the function’s code size) to determine
+if it is beneﬁcial to inline. The Middle-end component passes the
+optimized IR to the CodeGen component to create a WebAssem-
+bly module. Next, the module is passed to Binaryen’s wasm-opt
+tool [18], which applies Binaryen’s set of optimization passes to
+the module. In Binaryen, function inlining is performed by the
+inlining-optimizing pass. Similar to the inlinepass in LLVM, the
+inlining-optimizing passmoves functioninstructionsinto theloca-
+tionoftheoriginalcallsiteifthecalculatedinliningcostislessthan
+athreshold value. Diﬀerences betweenthese passes include the IR
+structures thatare inlined asLLVM can alsoinline its blockstruc-
+tures.Besides,Binaryencansupportpartialinliningofearly-return
+conditionalstatements[ 18].Figure3illustratesBinaryen’sfunction
+inlining. Finally, the compilation pipeline outputs the optimized
+WebAssemblybinary andJavaScript support code.
+2.2 WebAssembly Execution Pipeline
+ThegeneratedWebAssemblymoduleandJavaScriptﬁlesarerun
+by a browser such as Chromium [ 2] or Firefox [ 54], which each
+have diﬀerent internal compilers to generate machine code for the
+WebAssembly module. For example, Chromium is powered by the
+V8JavaScriptandWebAssemblyengine[ 16],whichincludestwo
+compilationenginestogeneratemachinecodeforWebAssembly.
+The ﬁrst compiler, Liftoﬀ[25], is a single-pass compiler that emits
+machine instructions immediately after reading in a WebAssembly
+instruction at the expense of the number of optimizations that it
+applies. As a result, the Liftoﬀ code can perform sub-optimally
+whenexecuted.Thesecondcompiler, TurboFan [14],isamulti-pass
+compilerthatappliesseveraloptimizationpassestothemachine
+code. While TurboFan generates faster code, this compiler takes
+muchlongertogeneratecodethanLiftoﬀ.Tobalancestart-upspeed
+with execution performance, Chromium ﬁrst generates code for
+WebAssembly functions with Liftoﬀ and immediately starts the
+TurboFan compilation. When the TurboFan code for a function
+is ready, the function code tiers-upby replacing the Liftoﬀ code
+with the TurboFan code. Firefox uses the SpiderMonkey JavaScript
+and WebAssembly engine [ 13] to handle WebAssembly execution.
+Similar to V8, SpiderMonkey contains two compilation engines for
+WebAssembly.Theﬁrstcompiler, Wasm-Baseline ,performsafast
+translationofWebAssemblyinstructionstomachinecodeforquick
+startup. The second engine, Wasm-Ion , applies optimizations on
+the emitted machine code. SpiderMonkey follows the tiering-up
+scheme by using Wasm-Baseline to emit machine code quickly
+whileWasm-Ion generatesbetter-performingmachine code.
+3 COUNTERINTUITIVE INLININGEXAMPLE
+Wedemonstratehowfunctioninliningcancounterintuitivelyim-
+pactruntimebehaviorusingasamplebenchmarkingprogram, ran-
+dom.cpp,asanexample.Wepresentitssourcecodeandcompiled
+WebAssembly code in Figure 4. We highlight the impact on two of
+thesample’sfunctionswhenthefunctioninliningisenabledand
+disabled.Figure 4(a)showstheC++sourcecodeimplementationof
+the functions gen_random andmain.gen_random uses the constants
+IM,IA, andICto generate a pseudo-random number. The mainfunction calls gen_random in a long-running whileloop perform-
+ing400millioniterations,making gen_random ahotfunction.Fig-
+ure4(b)showstheWebAssemblycodeof wasm-function[13] and
+wasm-function[14] when function inlining is disabled. The export
+sectiononline180showsthat wasm-function[13] implements main.
+Inspectingtheloopcodewithin wasm-function[13] showsthatit
+callswasm-function[14] with the value 100.0 passed in as an ar-
+gument,meaningthat wasm-function[14] implements gen_random .
+Figure4(c) shows the WebAssembly code for the mainfunction,
+wasm-function[13] ,producedwheninliningisenabled.Inspecting
+Figure4(b) and Figure 4(c) reveals that wasm-function[14] from
+Figure4(b)has been inlinedinto wasm-function[13] .
+WhentheChromiumbrowserrunsthisWebAssemblymodule,
+machinecodeforeachfunctionisﬁrstgeneratedusingtheLiftoﬀ
+compiler.Oncethiscompilerﬁnishesgeneratingcodeforafunction,
+thefunctioncanbeginexecuting.Inthebackground,theoptimizing
+TurboFan compilerbegins generatingbetter-performing machine
+code for that function. When TurboFan ﬁnishes generating the ma-
+chine code, the browser switches out the Liftoﬀ-generated code for
+the TurboFan-generated code on the following function call. How-
+ever, since mainin a C program is onlyinvoked once,the browser
+does notswitchto theTurboFan-generated code.Becausethe hot
+function gen_random has been inlined into main,gen_random also
+usestheslowerLiftoﬀcode,andtheprogramruntimeperformance
+is negatively impacted. This example shows how function inlining
+can cause counterintuitive runtimebehaviorinWebAssembly.
+4 METHODOLOGY
+We aim to understand the counterintuitive eﬀects of function inlin-
+ingonWebAssemblyprogramruntime.Wedeﬁnea counterintuitive
+eﬀect as producing a binary with a slower runtime performance
+than if the optimization was disabled. Speciﬁcally, we focus on the
+following researchquestions:
+•RQ1 – Signiﬁcance: How often does function inlining coun-
+terintuitively impact WebAssembly modules, and are the eﬀects
+unique to WebAssembly?
+•RQ2 – Function Characteristics: Which characteristics of the
+inlinedfunctionscause the counterintuitive behavior?
+•RQ3–Quantiﬁcation: Howdoesexcludingcertainfunctions
+from inliningimpact the counterintuitive eﬀects?
+Toanswer thesequestions, we use samples from theLLVM test
+suitetoperformﬁvesetsofexperiments.Next,wediscusstheC/C++
+sourceprograms andthe experiments indetail.
+4.1 C/C++SourcePrograms
+Tomeasuretheruntimeperformanceimpactsofdiﬀerentoptimiza-
+tion conﬁgurations, we select 143 C/C++ samples totaling over
+34,000linesofcode(LOC)fromtheLLVMtestsuite[ 8].Thetest
+suite contains benchmarking samples measuring LLVM compi-
+lation performance. We focus on the samples within the Single-
+Source/Benchmarks directory, listed in Table 2, as these samples
+aredesignedtotriggeroptimizationsandcanbecompiledbyEm-
+scripten without code changes. We select this test suite for its
+inclusionofsamplesusedinpriorworksanditeaseofcompilation.
+This test suite includes samples from the Polybench benchmark
+suite[59],whichwasusedbyJangdaetal.tocompareWebAssembly
+352353354355356357358359When Function InliningMeetsWebAssembly: Counterintuitive ImpactsonRuntimePerformance ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+7 DISCUSSION
+7.1 Limitations
+OurinvestigationofWebAssemblyperformancesuﬀersfromtwo
+main limitations. First, the precision of our custom-built JavaScript
+measurementtoollimitsthedepthofourinvestigation.Mostbrowsers
+limit JavaScript timers to millisecond resolution [ 52], which is too
+coarsetomeasureatypicalWebAssemblycall.Asaresult,wefocus
+on samples that have long running functions with runtimes in the
+magnitude of seconds. We also focus on samples with a percent
+decreasegreater than5% to account for the lackofprecision.
+Our second limitation is that we only inspect two browsers,
+Chromium and Firefox. Inspecting each browser adds additional
+manual work, and we are limited by our budget of manual eﬀort
+available.WeacceptthislimitationasChromium-basedbrowsers
+andFirefox account for 74%ofthe browsermarketshare [ 1].
+7.2 Threatsto Validity
+7.2.1 Internal Validity. Our study results are subject to possible
+errorsinthemanualinspectionprocesses.Wemanuallyinspectthe
+emitted code to ensure that function inlining is present or omitted
+as per the tested conﬁguration. We use the average of 10 runs to
+ensure changesare notcausedbysmall runtimevariations.Multi-
+plefactors,suchashardware,operatingsystem,andsystemload,
+makeitdiﬃculttoreproducetheexactruntimevalueswerecord.
+However,wedescribethestepsusedtoestablishourBaselineex-
+periment. The counterintuitive behavior, relative to the baseline,
+should remainconsistent acrossdiﬀerentexperimental setups.
+7.2.2 ExternalValidity. Weusebenchmarkingsamplesfromthe
+LLVMtestsuite.AsEmscriptenisanLLVM-basedcompiler,weﬁnd
+thatthiscollectionofbenchmarkscuratedbytheLLVMdevelop-
+mentteamiswell-suitedtoassessthecompilationeﬀectscausedby
+the inlining passes. The compiler benchmark samples also perform
+intensive computations,an intendeduse caseofWebAssembly.
+7.2.3 Construct Validity. We identify the runtime impacts of func-
+tion inlining optimizations by measuring the program runtime
+through browser execution timing, native execution timing, and
+eventproﬁlingtools.Thesemeasurementmethodsshouldhighlight
+changes causedbydiﬀerentoptimizations usedinthe samples.
+7.3 FutureWork
+Our currentwork only investigates the counterintuitive behavior
+oftwoinliningoptimizationpasses.Ourmeasurementsshowcases
+wherethesetwopassesalonecannotexplainthecounterintuitive
+behavior,indicatingthatotheroptimizationpassesalsocausethe
+behavior.WeplantostudytheotherLLVMandBinaryenpasses
+for similar counterintuitive behavior.
+Our current analysis only focuses on a single metric for coun-
+terintuitive behavior: runtime performance. We plan to investigate
+possible counterintuitive changes in other metrics, such as code
+size,memory usage,andenergy consumption.
+8 RELATED WORK
+CompilerOptimizations. Existingworkstudiestheimpactsofdif-
+ferent optimizations on speciﬁc processor architectures [ 28] andhigh-level synthesis [ 30]. Some work proposes optimization frame-
+works improving SIMD performance [ 36]. Other works leverage
+machine learning techniques on optimization selection [ 41,48].
+Theodoridis et al. describe LLVM inlining heuristics improvements
+in native applications [ 68]. To our knowledge, our work is the ﬁrst
+to study inliningperformance inWebAssemblycompilers.
+Compiler Studies. Previous compiler studies investigate the preva-
+lenceofcompilerbugs[ 62,67]andsurveydiﬀerentcompilertesting
+approaches[ 29].Otherstudiesdevelopcompilertestingtechniques,
+suchasequivalencemoduloinputs[ 42,43]andskeletalprogram
+enumeration[ 74].
+WebAssembly Performance Measurements. Yan et al. [ 72] ﬁnd ev-
+idence of optimizations causing counterintuitive eﬀects. Jangda
+et al. [37] compare the performance of C programs compiled to
+WebAssembly and native code. In contrast, our work focuses on
+eﬀectsoffunction inliningonWebAssemblyapplications.
+WebAssembly Program Analysis and Security. Several works ana-
+lyze WebAssembly execution and security. Hilbig et al. [ 35] report
+the use cases and statistics of real-world WebAssembly binaries.
+SeveraltoolsdynamicallyanalyzeWebAssemblyexecution[ 45,64],
+identifymodulepurposes[ 63],andrecoverhigh-leveltypeinforma-
+tion from the binaries [ 46]. Prior work proposes speciﬁcation and
+compilerextensionstoimprovesecurity[ 32,39,56,70,71].Other
+worksidentifyvulnerabilitiesinWebAssemblyapplications[ 44,47],
+propose attack strategiesusing WebAssembly[ 61], anddetectma-
+liciousWebAssemblymodules[ 65].
+9 CONCLUSION
+FunctioninliningoptimizationsinWebAssemblycompilersfailto
+consider the presence of multiple browser compilers, leading to
+runtime performance issues. We provide the ﬁrst in-depth inves-
+tigationonthecounterintuitiveimpactthatfunctioninliningcan
+have on WebAssembly modules. Inlining can prevent hot function-
+ality in the modules from leveraging optimized machine code if
+the functions are inlined into long-running or seldomly invoked
+functions, leading to noticeable performance degradation of the
+wholeapplication. Weﬁndthatthisbehavioreﬀects66out of127
+samplesintheLLVMtestsuiteandiscausedbytheinliningpasses
+in both the LLVM and Binaryen components of Emscripten. We
+hope our work highlights the need to revisit existing optimization
+techniques for optimal WebAssemblyusage.
+10 DATA AVAILABILITY
+Wemakeourexperimentresultsanddatacollectionscriptsavailable
+on Zenodo at https://zenodo.org/record/7041455 [23]. This artifact
+containsthemeasuredruntimeresultsforallofourexperiments
+andthe scripts usedto run the experiments.
+ACKNOWLEDGMENTS
+Wethanktheanonymousreviewersfortheirconstructivefeedback.
+This work was partially supported by the US National Science
+Foundation under Grant No. 2047980. Any opinions, ﬁndings, and
+conclusions in this paper are those of the authors only and do not
+necessarily reﬂectthe viewsof our sponsors.
+360ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA RomanoandWang
+REFERENCES
+[1][n.d.]. BrowserMarketShareWorldwide. https://gs.statcounter.com/browser-
+market-share.
+[2] [n.d.]. Chromium. https://www.chromium.org/Home/.
+[3] [n.d.]. Clang CLanguage FamilyFrontendfor LLVM. https://clang.llvm.org/.
+[4][n.d.]. Clang.Cindex — Libclang 14.0.6 Documentation.
+https://libclang.readthedocs.io/en/latest/_modules/clang/cindex.html.
+[5][n.d.]. Inline Functions, C++ FAQ. https://isocpp.org/wiki/faq/inline-
+functions#inline-and-perf.
+[6][n.d.]. Intel C/C++ Compilers Complete Adoption of LLVM.
+https://www.intel.com/content/www/us/en/developer/articles/technical/adoption-
+of-llvm-complete-icx.html.
+[7] [n.d.]. The LLVM CompilerInfrastructureProject. https://llvm.org/.
+[8][n.d.]. Llvm-Test-Suite/Matrix.c at Main ·Llvm/Llvm-Test-Suite.
+https://github.com/llvm/llvm-test-suite.
+[9][n.d.]. LLVM’s Analysis and Transform Passes — LLVM 13 Documenta-
+tion. https://releases.llvm.org/13.0.0/docs/Passes.html#argpromotion-promote-
+by-reference-arguments-to-scalars.
+[10][n.d.]. Main — Emscripten 3.1.1-Git (Dev) Documentation.
+https://emscripten.org/.
+[11][n.d.]. Optimizing Code — Emscripten 3.1.6-Git (Dev) Documentation.
+https://emscripten.org/docs/optimizing/Optimizing-Code.html.
+[12][n.d.]. Puppeteer | Tools for Web Developers.
+https://developers.google.com/web/tools/puppeteer.
+[13][n.d.]. SpiderMonkey — Firefox Source Docs Documentation. https://ﬁrefox-
+source-docs.mozilla.org/js/index.html.
+[14] [n.d.]. TurboFan ·V8. https://v8.dev/docs/turbofan.
+[15][n.d.]. UsingJavaScriptandWebCLforNumericalComputations:AComparative
+Study of Native and Web Technologies: ACM SIGPLAN Notices: Vol 50, No 2.
+https://dl.acm.org/doi/abs/10.1145/2775052.2661090.
+[16] [n.d.]. V8 JavaScript Engine. https://v8.dev/.
+[17][n.d.]. What Is Rustc? - The Rustc Book. https://doc.rust-
+lang.org/rustc/index.html.
+[18] 2022. Binaryen. WebAssembly.
+[19] 2022. Libsodium. https://www.npmjs.com/package/libsodium.
+[20]2022. Llvm/Llvm-Test-Suite/SingleSource/Benchmarks/Misc-C++/Bigﬁb.Cpp.
+LLVM.
+[21]2022. Llvm/Llvm-Test-Suite/SingleSource/Benchmarks/Misc-C++/Huﬀbench.c.
+LLVM.
+[22]2022. Llvm/Llvm-Test-Suite/SingleSource/Benchmarks/Polybench/Linear-
+Algebra/Kernels/Cholesky/Cholesky.c. LLVM.
+[23]Alan and Weihang. [n.d.]. Dataset for "When Function Inlining Meets WebAssem-
+bly: A Counterintuitive Eﬀect on Runtime Performance" .https://doi.org/10.5281/
+zenodo.7041455
+[24] Antoine. 2013. Answer to "Clang Optimization Levels".
+[25]ClemensBackes.[n.d.]. Liftoﬀ:ANewBaselineCompilerforWebAssemblyin
+V8·V8. https://v8.dev/blog/liftoﬀ.
+[26] MatteoBasso. 2022. AwesomeWasm.
+[27]Eli Bendersky. [n.d.]. Parsing C++ in Python with Clang.
+https://eli.thegreenplace.net/2011/07/03/parsing-c-in-python-with-clang.
+[28]Aart JC Bik, David L Kreitzer, and Xinmin Tian. 2008. A case study on compiler
+optimizationsfortheIntel ®CoreTM2DuoProcessor. InternationalJournalof
+ParallelProgramming 36,6 (2008), 571–591.
+[29]JunjieChen,JibeshPatra,MichaelPradel,YingfeiXiong,HongyuZhang,Dan
+Hao, and Lu Zhang. 2020. A Survey of Compiler Testing. Comput. Surveys 53, 1
+(Feb. 2020),4:1–4:36. https://doi.org/10.1145/3363562
+[30]JasonCong,BinLiu,RaghuPrabhakar,andPengZhang.2012. Astudyontheim-
+pactofcompileroptimizationsonhigh-levelsynthesis.In InternationalWorkshop
+onLanguages and Compilers for ParallelComputing . Springer, 143–157.
+[31] Frank Denis.2023. Libsodium.Js.
+[32]CraigDisselkoen,JohnRenner,ConradWatt,TalGarﬁnkel,AmitLevy,andDeian
+Stefan.2019. PositionPaper:ProgressiveMemorySafetyforWebAssembly.In
+Proceedings of the 8th International Workshop on Hardware and Architectural Sup-
+port for Security and Privacy (HASP ’19) . Association for ComputingMachinery,
+NewYork, NY, USA,1–8. https://doi.org/10.1145/3337167.3337171
+[33]RichardFinneyand DaoudMeerzaman. 2018. Chromatic: WebAssembly-Based
+Cancer Genome Viewer. Cancer Informatics 17 (Jan. 2018), 1176935118771972.
+https://doi.org/10.1177/1176935118771972
+[34]Andreas Haas, Andreas Rossberg, Derek L Schuﬀ, Ben L Titzer, Michael Holman,
+Dan Gohman, Luke Wagner, Alon Zakai, and JF Bastien. 2017. Bringing the
+web up to speedwith WebAssembly. In Proceedingsofthe38thACM SIGPLAN
+Conference onProgrammingLanguage Designand Implementation . 185–200.
+[35]Aaron Hilbig, Daniel Lehmann, and Michael Pradel. 2021. An Empirical Study of
+Real-WorldWebAssemblyBinaries:Security,Languages,UseCases.In Proceedings
+oftheWebConference2021(WWW’21) .AssociationforComputingMachinery,
+NewYork, NY, USA,2696–2708. https://doi.org/10.1145/3442381.3450138[36]Manuel Hohenauer, Felix Engel, Rainer Leupers, Gerd Ascheid, and Heinrich
+Meyr.2009. ASIMDoptimizationframeworkforretargetablecompilers. ACM
+Transactions onArchitectureand CodeOptimization(TACO) 6,1 (2009), 1–27.
+[37]Abhinav Jangda, Bobby Powers, Emery D Berger, and Arjun Guha. 2019. Not so
+fast: analyzing the performance of webassembly vs. native code. In 2019 USENIX
+Annual TechnicalConference (USENIXATC 19) . 107–120.
+[38]SébastienJodogne.2018. TheOrthancEcosystemforMedical Imaging. Journal
+of Digital Imaging 31, 3 (June 2018), 341–352. https://doi.org/10.1007/s10278-
+018-0082-y
+[39]Evan Johnson, David Thien, Yousef Alhessi, Shravan Narayan, Fraser Brown,
+Sorin Lerner, Tyler McMullen, Stefan Savage, and Deian Stefan. 2021. , : SFI
+safetyfornative-compiledWasm.In Proceedings2021NetworkandDistributed
+SystemSecuritySymposium .Internet Society,Virtual. https://doi.org/10.14722/
+ndss.2021.24078
+[40]Jukka Jylänki. [n.d.]. WebAssembly for Native Games on the Web – Mozilla
+Hacks-theWebDeveloperBlog. https://hacks.mozilla.org/2017/07/webassembly-
+for-native-games-on-the-web.
+[41]Yuriy Kashnikov, Jean Christophe Beyler, and William Jalby. 2012. Compiler op-
+timizations:Machinelearningversuso3.In InternationalWorkshoponLanguages
+and Compilers for ParallelComputing . Springer, 32–45.
+[42]Vu Le, Mehrdad Afshari, and Zhendong Su. 2014. Compiler Validation via
+EquivalencemoduloInputs. ACMSIGPLANNotices 49,6(June2014),216–226.
+https://doi.org/10.1145/2666356.2594334
+[43]VuLe,ChengnianSun,andZhendongSu.2015. FindingDeepCompilerBugsvia
+GuidedStochasticProgram Mutation. ACMSIGPLANNotices 50,10 (Oct. 2015),
+386–399. https://doi.org/10.1145/2858965.2814319
+[44]Daniel Lehmann, Johannes Kinder, and MichaelPradel. 2020. Everything OldIs
+New Again: Binary Security of {WebAssembly}. In 29th USENIX SecuritySympo-
+sium (USENIXSecurity20) . 217–234.
+[45]Daniel Lehmannand MichaelPradel. 2019. Wasabi:Aframeworkfor dynami-
+callyanalyzingwebassembly.In ProceedingsoftheTwenty-FourthInternational
+ConferenceonArchitecturalSupportforProgrammingLanguagesandOperating
+Systems. 1045–1058.
+[46]DanielLehmannandMichaelPradel.2022. FindingtheDwarf:RecoveringPecise
+Types from WebAssembly Binaries. In Proceedings of the 43rd ACM SIGPLAN
+InternationalConferenceonProgrammingLanguageDesignandImplementation
+(PLDI2022) .AssociationforComputingMachinery,NewYork,NY,USA,410–425.
+https://doi.org/10.1145/3519939.3523449
+[47]DanielLehmann,MartinToldamTorp,andMichaelPradel.2021. Fuzzm:Finding
+Memory Bugs through Binary-Only Instrumentation and Fuzzing of WebAssem-
+bly.https://doi.org/10.48550/arXiv.2110.15433 arXiv:2110.15433 [cs]
+[48]Rahim Mammadli, Marija Selakovic, Felix Wolf, and Michael Pradel. 2021. Learn-
+ing to Make Compiler Optimizations More Eﬀective. In Proceedings of the 5th
+ACM SIGPLAN International Symposium on Machine Programming (MAPS 2021) .
+Association for Computing Machinery, New York, NY, USA, 9–20. https:
+//doi.org/10.1145/3460945.3464952
+[49]Jan Kasper Martinsen and Håkan Grahn. 2011. A Methodology for Evaluat-
+ing JavaScript Execution Behavior in Interactive Web Applications. In 2011
+9th IEEE/ACS International Conference on Computer Systems and Applications
+(AICCSA) . 241–248. https://doi.org/10.1109/AICCSA.2011.6126611
+[50]JanKasperMartinsen,HåkanGrahn,andAndersIsberg.2011. AComparative
+Evaluation of JavaScript Execution Behavior. In Web Engineering (LectureNotes
+inComputerScience) ,SörenAuer,OscarDíaz,andGeorgeA.Papadopoulos(Eds.).
+Springer, Berlin, Heidelberg, 399–402. https://doi.org/10.1007/978-3-642-22233-
+7_35
+[51]Judy McConnell. [n.d.]. WebAssembly Support Now Shipping in All Major
+Browsers|TheMozilla Blog. https://blog.mozilla.org/en/mozilla/webassembly-
+in-browsers/.
+[52]MDN contributors. [n.d.]. Performance.Now() - Web APIs | MDN.
+https://developer.mozilla.org/en-US/docs/Web/API/Performance/now.
+[53] BenediktMeurer. [n.d.]. AnOverviewof the TurboFan Compiler.
+[54]Mozilla. [n.d.]. Download the Fastest Firefox Ever. https://www.mozilla.org/en-
+US/ﬁrefox/new/.
+[55]Paul Muntean, Sebastian Würl, Jens Grossklags, and Claudia Eckert. 2018. Cast-
+San: Eﬃcient Detection of Polymorphic C++ Object Type Confusions with
+LLVM: 23rd European Symposium on Research in Computer Security, ES-
+ORICS 2018, Barcelona, Spain, September 3-7, 2018, Proceedings, Part I. 3–25.
+https://doi.org/10.1007/978-3-319-99073-6_1
+[56]ShravanNarayan,CraigDisselkoen,DanielMoghimi,SunjayCauligi,EvanJohn-
+son,ZhaoGang,AnjoVahldiek-Oberwagner,RaviSahita,HovavShacham,Dean
+Tullsen, and Deian Stefan. 2021. Swivel: Hardening {WebAssembly} against
+Spectre. In 30thUSENIXSecuritySymposium(USENIXSecurity21) . 1433–1450.
+[57] Node.js.[n.d.]. Node.Js. https://nodejs.org/en/.
+[58]Phu H. Phung, David Sands, and Andrey Chudnov. 2009. Lightweight Self-
+Protecting JavaScript. In Proceedings of the 4th International Symposium on In-
+formation,Computer,andCommunicationsSecurity (ASIACCS’09) .Association
+for Computing Machinery, New York, NY, USA, 47–60. https://doi.org/10.1145/
+1533057.1533067
+361When Function InliningMeetsWebAssembly: Counterintuitive ImpactsonRuntimePerformance ESEC/FSE ’23, December3–9, 2023,San Francisco, CA, USA
+[59]Louis-Noël Pouchet and Tomofumi Yuki. [n.d.]. PolyBench/C.
+https://web.cse.ohio-state.edu/~pouchet.2/software/polybench/.
+[60]JonathanProtzenko,BenjaminBeurdouche,DenisMerigoux,andKarthikeyan
+Bhargavan. 2019. Formally Veriﬁed Cryptographic Web Applications in We-
+bAssembly. In 2019 IEEE Symposium on Security and Privacy (SP) . IEEE, San
+Francisco, CA, USA,1256–1274. https://doi.org/10.1109/SP.2019.00064
+[61]Alan Romano, Daniel Lehmann, Michael Pradel, and Weihang Wang. [n.d.].
+Wobfuscator:ObfuscatingJavaScriptMalwareviaOpportunisticTranslationto
+WebAssembly. ([n.d.]), 16.
+[62]AlanRomano,XinyueLiu,YonghwiKwon,andWeihangWang.2021. AnEm-
+pirical Study of Bugs in WebAssembly Compilers. In 2021 36th IEEE/ACM In-
+ternational Conference onAutomatedSoftwareEngineering(ASE) . 42–54. https:
+//doi.org/10.1109/ASE51524.2021.9678776
+[63]Alan Romano and Weihang Wang. 2020. WASim: Understanding WebAssem-
+bly Applications through Classiﬁcation. In Proceedings of the 35th IEEE/ACM
+International Conference on Automated Software Engineering (ASE ’20) . Asso-
+ciation for Computing Machinery, New York, NY, USA, 1321–1325. https:
+//doi.org/10.1145/3324884.3415293
+[64]Alan Romano and Weihang Wang. 2020. WasmView: Visual Testing for We-
+bAssemblyApplications.In Proceedingsofthe42ndInternationalConferenceon
+SoftwareEngineering Companion .
+[65]AlanRomano,YunhuiZheng,andWeihangWang.2020. MinerRay:Semantics-
+Aware Analysis for Ever-Evolving Cryptojacking Detection. In Proceedings of
+the35thIEEE/ACMInternationalConference onAutomated SoftwareEngineering
+(ASE’20).AssociationforComputingMachinery,NewYork,NY,USA,1129–1140.
+https://doi.org/10.1145/3324884.3416580
+[66]DanielSmilkov,NikhilThorat,andAnnYuan.[n.d.]. IntroducingtheWebAssem-
+blyBackendfor TensorFlow.Js.[67]Chengnian Sun, Vu Le, Qirun Zhang, and Zhendong Su. 2016. Toward under-
+standingcompilerbugsinGCCandLLVM.In Proceedingsofthe25thInternational
+Symposium on Software Testing and Analysis (ISSTA 2016) . Association for Com-
+putingMachinery,NewYork,NY,USA,294–305. https://doi.org/10.1145/2931037.
+2931074
+[68]Theodoros Theodoridis, Tobias Grosser, and Zhendong Su. 2022. Understand-
+ing and Exploiting Optimal Function Inlining. In Proceedings of the 27th ACM
+InternationalConferenceonArchitecturalSupportforProgrammingLanguagesand
+OperatingSystems (ASPLOS2022) .Association forComputingMachinery, New
+York, NY, USA,977–989. https://doi.org/10.1145/3503222.3507744
+[69]Marco Trivellato. [n.d.]. WebAssembly Is Here!
+https://blog.unity.com/technology/webassembly-is-here.
+[70]ConradWatt,JohnRenner,NataliePopescu,SunjayCauligi,andDeianStefan.
+2019. CT-wasm: Type-Driven Secure Cryptography for the Web Ecosystem. Pro-
+ceedings of the ACM on Programming Languages 3, POPL (Jan. 2019), 77:1–77:29.
+https://doi.org/10.1145/3290390
+[71]ConradWatt,AndreasRossberg,andJeanPichon-Pharabod.2019. Weakening
+WebAssembly. ProceedingsoftheACMonProgrammingLanguages 3,OOPSLA
+(Oct.2019),133:1–133:28. https://doi.org/10.1145/3360559
+[72]Yutian Yan, Tengfei Tu, Lijian Zhao, Yuchen Zhou, and Weihang Wang. 2021.
+Understanding the Performance of Webassembly Applications. In Proceedings
+ofthe21stACMInternetMeasurementConference .ACM,VirtualEvent,533–549.
+https://doi.org/10.1145/3487552.3487827
+[73] AlonZakai.2018. The Binaryen OptimizerGoesUp To4.
+[74]QirunZhang,ChengnianSun,andZhendongSu.2017. SkeletalProgramEnu-
+meration for Rigorous Compiler Testing. In Proceedings of the 38th ACM SIG-
+PLANConferenceonProgrammingLanguageDesignandImplementation(PLDI
+2017). Association for Computing Machinery, New York, NY, USA, 347–361.
+https://doi.org/10.1145/3062341.3062379
+Received 2023-02-02; accepted 2023-07-27
+362

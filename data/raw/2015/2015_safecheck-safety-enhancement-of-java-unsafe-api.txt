@@ -1,0 +1,1076 @@
+SafeCheck: Safety Enhancement of Java Unsafe API
+Shiyou Huang∗, Jianmei Guo†, Sanhong Li†, Xiang Li†, Yumin Qi†, Kingsum Chow†and Jeff Huang∗
+∗Department of Computer Science, Texas A&M University, USA
+†Alibaba Group, China
+huangsy@tamu.edu, {jianmei.gjm, sanhong.lsh, x.li, yumin.qi, kingsum.kc }@alibaba-inc.com, jeff@cse.tamu.edu
+Abstract —Java is a safe programming language by providing
+bytecode veriﬁcation and enforcing memory protection. For
+instance, programmers cannot directly access the memory, but
+have to use object references. Y et, the Java runtime provides an
+Unsafe API as a backdoor for the developers to access the low-
+level system code. Whereas the Unsafe API is designed to be used
+by the Java core library, a growing community of third-party
+libraries use it to achieve high performance. The Unsafe API is
+powerful, but dangerous, which leads to data corruption, resource
+leaks and difﬁcult-to-diagnose JVM crash if used improperly.
+In this work, we study the Unsafe crash patterns and propose
+a memory checker to enforce memory safety, thus avoiding the
+JVM crash caused by the misuse of the Unsafe API at the
+bytecode level. We evaluate our technique on real crash cases
+from the openJDK bug system and real-world applications from
+AJDK. Our tool reduces the efforts from several days to a few
+minutes for the developers to diagnose the Unsafe related crashes.
+We also evaluate the runtime overhead of our tool on projects
+using intensive Unsafe operations, and the result shows that our
+tool causes a negligible perturbation to the execution of the
+applications.
+Index T erms —Java Unsafe API, dynamic analysis, bytecode,
+memory safety
+I. I NTRODUCTION
+Java is designed as a high-level programming language of
+strong type and memory safety guarantees [1]. The security
+model of Java is guaranteed by running the program on the
+Java Virtual Machine (JVM), which is responsible for loading,
+linking and executing the Java bytecode in the same way
+across different platforms [2]. Before the JVM executes the
+untrusted bytecode, it checks if the code respects the security
+model. For example, the JVM prohibits pointer arithmetic, and
+ensures that every piece of memory is well typed. Moreover,
+the JVM provides an automated memory manager ( i.e.,a
+garbage collector), and the memory allocation and deallocation
+in Java is exclusively done by the underlying JVM, thus
+avoiding the memory problems [3].
+However, the Java runtime includes an API that allows the
+programmers to perform low-level operations that can bypass
+the security checks of Java bytecode. This API is provided in
+an undocumented class, sun.misc.Unsafe , which is intended to
+be used inside the core Java library. Because most methods in
+sun.misc.Unsafe are deﬁned as Java Native Interface (JNI) [4],
+This work was done during the summer research internship at Alibaba
+Group, USA.
+Fig. 1: Issues related to Unsafe in the openJDK bug database.
+it provides a backdoor for the programmers to interact with the
+code written in C/C++. For instance, the Unsafe API allows
+users to manually manage the memory, which is essentially
+implemented by malloc /free in C. If misused, it may cause
+memory leaks or corrupt the data, even crash the JVM.
+Although it is not encouraged to use the Unsafe API in
+the user application, sun.misc.Unsafe is still increasingly used
+by third-party frameworks, libraries, and even non-expert pro-
+grammers for achieving better performance. One prior work
+[5] analyzed 74 GB of compiled Java bytecode and found out
+that25% of code directly or indirectly depend on third parties
+that use sun.misc.Unsafe . However, using the Unsafe API in
+the program is dangerous and error-prone. Figure 1 shows the
+results of searching the issue database of the openJDK with the
+keyword unsafe crash1which accounts for 2.4%of the total
+crashes in the system. Worse yet, it is difﬁcult to diagnose
+the root cause if the JVM is crashed due to the misuse of
+the Unsafe API. When a JVM crash happens, people have to
+analyze the corresponding hserr pid*.log ﬁle, which involves
+the low-level JVM code and could be hard for non-expert
+developers. Even for skillful Java users, it may take several
+hours to diagnose the failure according to our evaluation. We
+got an ask-for-help about the use of Unsafe API from online:
+1https://bugs.openjdk.java.net/secure/Dashboard.jspa
+8892019 IEEE/ACM 41st International Conference on Software Engineering (ICSE)
+1558-1225/19/$31.00 ©2019 IEEE
+DOI 10.1109/ICSE.2019.00095
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. but I didn’t really know where to discuss this. Since
+many of you use Unsafe I thought you might be able
+to help me understand what’s happening or direct
+me to the correct mailing list.2
+It is challenging to debug such crashes for three reasons.
+First of all, it is difﬁcult to reproduce the crashes as they
+may only manifest in a certain environment. Second, few
+information is given when the crash incurs. It is difﬁcult to
+ﬁgure out the root cause for the crash. Third, even if knowing
+that it is due to the misuse of the Unsafe API, it is difﬁcult to
+locate where the crash happens. When developers fail to solve
+the crash by themselves, they usually ask for help online or
+ﬁle an issue on the openJDK bug system, which has to go
+through a long process before the issue is resolved. If there is
+no obvious clue to the crash, it is likely to get the following
+response for the users.
+The direct use of Unsafe like this is not supported.
+If you use it and you get a crash then that is your
+problem. Unsafe is intended for use internal to the
+JDK where such usage has been established to be
+correct and safe.3
+Considering the increasing impact of Unsafe in the wild
+and the challenges of diagnosing the Unsafe errors, we pro-
+pose SafeCheck , a bytecode-level transformation for inserting
+runtime checks to enhance the safety of the Unsafe API in
+the wild. As far as we know, this is the ﬁrst work to enforce
+the safety of Unsafe API. To that end, we analyze more than
+20 crash cases related to Unsafe from the bug system of the
+openJDK and Alibaba JDK (AJDK), which builds large web
+applications using Java, and uses Unsafe API to improve the
+performance. In this work, we focus on the memory errors
+caused by the improper use of the Unsafe API. We insert
+checks to the bytecode when JVM loads the class. SafeCheck
+records the base and bound of the memory allocated via the
+Unsafe API to avoid out-of-bound memory accesses. It inserts
+checks to enforce the type consistency before accessing the
+ﬁeld of an object or the element of an array. Also, it checks
+the use-after-free and double-free errors caused by improper
+manual memory management.
+To evaluate the effectiveness of our approach, we run the
+crash cases collected from the openJDK bug system and AJDK
+against our tool. We ask the developers to diagnose the root
+cause of ﬁve crash cases with and without the help of our
+tool, and compare the efforts cost, respectively. The time
+spent on diagnosing the crash by manually debugging the
+program ranges from several hours to one week, while our
+tool immediately reports the root cause or warning information
+to help the developer to ﬁx the issue in a few minutes. We
+also evaluate our tool’s performance overhead by testing four
+projects which heavily use Unsafe methods. The result shows
+that our tool incurs a small overhead, 2.8%on average.
+2http://cs.oswego.edu/pipermail/concurrency-interest/2014-
+September/012953.html
+3https://bugs.openjdk.java.net/browse/JDK-8177860In summary, this paper makes the following contributions:
+•We identify the memory errors in Unsafe Java by studying
+the crash cases from the openJDK bug system and AJDK.
+•We propose a bytecode-level transformation to help de-
+velopers diagnose the root cause of the Unsafe crash
+efﬁciently.
+•We test one real-world application in AJDK and other
+four crashes from the openJDK bug system with our tool
+to show the efﬁciency of the approach.
+•The tool incurs a low runtime overhead, which makes it
+possible to be employed to the production runs.
+The rest of this paper is organized as follows: Section II
+introduces the basics of the Unsafe API; Section III illustrates
+the common memory errors in Java caused by the Unsafe API;
+Section IV presents the details of our memory check; Section
+V presents a real crash case provided by AJDK; Section
+VI reports our evaluation results; Section VIII discusses the
+related work and Section IX concludes this paper.
+II. B ACKGROUND
+Since the mid of 90s, Java has grown to be one of the most
+popular programming language. The applications written in
+Java are not compiled to the executable machine code directly,
+but rather to the bytecode for a virtual machine, called as Java
+Virtual Machine (JVM). This not only enables the execution
+of the programs written in different languages, such as Java,
+Scala, and Clojure on different platforms, but also makes the
+execution more secure. First, the higher-level bytecode cannot
+access the hardware resources directly but can only perform
+suitable accesses via a set of carefully designed APIs. Second,
+the bytecode needs to be veriﬁed ﬁrst before it can run on the
+JVM thus avoiding the damage by the untrusted bytecode.
+Moreover, most JVM implementations also contain a Garbage
+Collector (GC), which helps the programmer automatically
+manage the memory. So the programmers do not need to worry
+about the memory leaks or accessing an invalid memory.
+In this section, we ﬁrst brieﬂy introduce some essential
+properties veriﬁed by the Java veriﬁer and then the basics
+of the Unsafe API and how it can circumvent the safety
+guarantees. At last, we present the impact of the Unsafe API
+in the wild and illustrate why it is difﬁcult to diagnose the
+Unsafe errors.
+A. Java Bytecode V eriﬁcation
+Before the Java bytecode can be executed, it needs to be
+loaded into the runtime. In most JVM implementations, when
+a class is loaded by the Class Loader , a veriﬁer will ﬁrst
+automatically examine it. First, the veriﬁer will check the cor-
+rectness of the format of a class ﬁle . Then it veriﬁes properties
+which do not need to analyze the bytecode. For example, all
+ﬁeld and method references in the constant pool must have
+legal names, legal classes, and a legal type signature. By
+performing the data-ﬂow analysis on the bytecode, the veriﬁer
+ensures that the following conditions [6] at least are satisﬁed:
+•Type correctness : the parameters of the bytecode instruc-
+tions are always of the types expected by the instructions.
+890
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. •No stack overﬂow or underﬂow : an instruction never pops
+an argument off an empty stack, nor pushes a result on a
+full stack (whose size is equal to the maximal stack size
+declared for the method).
+•Objects initialization: when an instance of a class C is
+created, one of the initialization methods for class C
+(corresponding to the constructors for this class) must
+be invoked before the class instance can be used.
+•Register initialization: a load from a register must always
+follow at least one store in this register.
+•Access control: private, public, protected, and default
+accesses are legal.
+Though the veriﬁer enforces the safety of the bytecode, it
+fails to check the native C/C++ methods, invoked though the
+Java Native Interface (JNI). In the next section, we introduce
+the Java Unsafe API, which consists of a mass of JNI methods,
+making the program as vulnerable as C programs. For instance,
+theUnsafe API allows the users to create uninitialized objects,
+modify the ﬁnal ﬁelds of an object, store a value of any type
+in a ﬁeld, and so on. These powerful features provided by
+this API jeopardize the safety guarantees of the Java security
+model. In Section III, we present the common problems caused
+by the misuse of the Unsafe API.
+B. The Java Unsafe API in the wild
+The design of the Java Unsafe API is intended to only be
+used inside the core Java library. However, the sun.misc.Unsafe
+class is increasingly being used in third-party frameworks and
+libraries such as org.springframework4and com.google.guava5
+for achieving a better performance.
+The prior work [5] makes a comprehensive study on the
+usage of the Unsafe API in the wild. They mine the Maven
+Central repository to collect the artifacts to analyze the per-
+centage of the Unsafe methods used. In total, they download
+86,479 artifacts, including 74 GB of data from .jar,.war,.ear
+and .ejb ﬁles. A project may indirectly use the Unsafe API,
+e.g., depending on a project that invokes the Unsafe methods.
+To identify the dependency information, they analyze the
+POM ﬁles, which describe the dependency and conﬁguration
+information of the Maven projects. Among the downloaded
+86,479 artifacts, 47,127 artifacts include such dependency
+information.
+According to the survey result, 21,297 artifacts ( 47% of
+the total 47,127 artifacts with dependency and 25% of the
+downloaded 86,479 artifacts) directly or indirectly depend on
+the sun.misc.Unsafe class. Therefore, sun.misc.Unsafe indeed
+impact a large fraction of projects in practice.
+C. Features of Unsafe Used
+The sun.misc.Unsafe class contains 90 public instance meth-
+ods, 20 public ﬁelds and 2 private ﬁelds (JDK 10). The prior
+work [5] categorizes the features of the methods into 15 groups
+based on the functionality, including CAS, fence, heap/off-heap
+operations, and so on.
+4https://mvnrepository.com/artifact/org.springframework
+5https://mvnrepository.com/artifact/com.google.guavaTABLE I: Unsafe methods usage on Maven Central.
+Group #CallSites Perc. (%)
+Heap Get 7,395 16.02%
+Heap Put 11,460 24.82%
+Heap Misc. 892 1.93%
+Off-Heap Get 1,344 2.91%
+Off-Heap Put 1,029 2.23%
+Off-Heap Misc. 483 1.05%
+Offset 5,318 11.52%
+Total 27,921 60.48%
+In this work, we mainly focus on methods that perform
+memory operations such as putInt /getInt and allocateMemory
+because these methods are used most frequently in practice
+according to the prior study [5]. Table I reports the usage
+of the Unsafe methods on Maven Central that we consider
+in this work. The data is collected from the prior work [5].
+The ﬁrst column shows the group of methods that have the
+similar functionality. For example, Heap Get refers to the load
+operations from the heap memory, such as getInt ,getLong ,
+and so on. Heap Misc. contains methods that manage the
+memory, e.g.,setMemory and allocateMemory . The second
+column shows how many times the methods are used across
+86,479artifacts on Maven Central. In [5], they implemented
+an analysis on top of ASM [7] to ﬁnd all the call sites where
+the call target is of type sun.misc.Unsafe . The last column
+shows the ratio of one speciﬁc group of methods to the total
+number of Unsafe method calls. In total, there are 46,169
+Unsafe method calls. The number of methods (listed in Table
+I) we check consists of 60.48% of the total method calls.
+Therefore, it is reasonable for us to focus on these methods
+to guarantee the safety of the execution.
+The second reason why we mainly handle methods for
+memory accesses is that the most frequent application of the
+Java Unsafe API is to improve the performance of serial-
+ization, i.e., converting an object into a byte stream. This
+operation usually needs to allocate large byte buffers. It is
+expensive for the Garbage Collector (GC) to move those
+large buffers if they reside in the heap memory. As a result,
+developers use the Java Unsafe API to allocate the buffer on
+raw (off-heap) memory that is not affected by the GC. Because
+memory access and alloc/free operations provided by the
+Unsafe API are essentially implemented by the pointer
+arithmetic andmalloc /free in C, the programs using
+the Unsafe API actually suffer from the same vulnerabilities,
+such as buffer overﬂow and use-after-free , as C code.
+D. Challenges of Diagnosing Unsafe Errors
+... with Netty that is being performance tested, and the
+JVM is crashing with the below report. I do not know
+how to repeat the crash, but it does happen regularly and
+only under heavy load. [8]
+Unsafe is dangerous. Moreover, it is challenging to locate
+the root cause of the error related to the Unsafe API even for
+experienced developers. There are three main challenges.
+891
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. a)Difﬁcult to reproduce :The ﬁrst challenge faced by
+the developers is that the JVM crash caused by the misuse of
+Unsafe APIs can not always be reproduced. This is because
+the debugging environment is usually different from the pro-
+duction runs with respect to the size of memory speciﬁed,
+operating systems, user input and so on. We analyzed an
+interesting and strange crash case from AJDK. More details
+are presented in Section V. We found that this crash only
+occurs under a speciﬁc Linux system, but disappears when
+the application is re-executed under other Unix-like systems,
+even that the same JDK and JVM options are used. It is
+difﬁcult to ﬁgure out the exact reason for the crash at ﬁrst
+sight. According to our analysis (Section V), it is very likely
+that the size of memory on different systems and hardware
+inﬂuences the execution results.
+b)Difﬁcult to analyze the JVM dump ﬁle :The JVM
+dump ﬁle is generated when a JVM crash occurs. The dump
+ﬁle provides abundant runtime information when the JVM
+crashes, including the stack trace, values in registers, thread
+information, machine instructions triggering the crash and so
+on. However, it is not easy to analyze the dump ﬁle because
+all of the information is presented in a low-level format. We
+present a real unsafe crash collected from AJDK in Section V.
+We ﬁrst let a less experienced developer to analyze the reason
+for the crash with the dump ﬁle and source code. It took about
+a week for the developer to ﬁgure out the possible cause for
+the crash. Even so, what exact statements lead to the crash are
+still unclear.
+c)Difﬁcult to locate the root cause :Even though we
+can reproduce the failure and ﬁgure out why the crash happens
+from the dump ﬁle, it is still challenging to locate where the
+failure happens. Real applications are usually very complicated
+and contains a mass of lines of code. It is a nightmare for the
+developers (usually not the authors of the code) to debug the
+root cause by manually inspecting the code.
+Considering the increasing impact of Unsafe in the wild
+and the challenges of diagnosing the Unsafe errors, we are
+motivated to develop a tool that helps developers automatically
+check the problematic use of Unsafe methods and locate the
+root cause instantly.
+III. M EMORY ERRORS IN UNSAFE
+In this section, we introduce the basic usage of
+sun.misc.Unsafe and present the memory errors caused by the
+misuse of the Unsafe API.
+[caption={Instantiating an Unsafe object},
+label ={eg:ins}]
+Field f = Unsafe. class .getDeclaredField( "theUnsafe" );
+f.setAccessible( true );
+Unsafe unsafe = (Unsafe) f.get( null );
+To use the methods provided by the Unsafe API, we ﬁrst
+need to create an instance of the Unsafe class. Since the con-
+structor of the Unsafe class is private, it is not straightforward
+to create the instance. Unsafe class contains its instance called
+theUnsafe , which is private. We can get this variable viaJava reﬂection. We provide with one way to create an unsafe
+object shown in Listing ??.
+This is not the only way to obtain an unsafe object. One
+can also invoke the private constructor via reﬂection. Given
+the unsafe object, we can now invoke the methods deﬁned in
+sun.misc.Unsafe .
+As shown in Section II-B, Unsafe memory operations
+account for a large portion of the total use of the Unsafe API.
+As a result, we focus on the errors caused by invalid memory
+access by Unsafe in this work. We have studied failures caused
+by the improper use of the Java Unsafe API, and the crash
+cases are collected from the openJDK bug system and AJDK.
+We presented four types of crash patterns from those reported
+crashes.
+A. Violating Type Safety
+Java is a strongly typed language. For instance, it is impos-
+sible to store a long value in a variable of type int. However,
+Unsafe can violate the type safety by storing a value to a
+variable of any type in a ﬁeld or an array element.
+class C{
+public int a=0 ;
+public int b=0 ;
+}
+Fiel da=C . class .getDeclaredField( "a")
+long fieldOffset = unsafe.objectFieldOffset(a);
+Co= new C();
+unsafe.putLong(o, fieldOffset, 0xffffffff);
+if(o.b != 0) error!
+Listing 1: An example shows a type violation
+Consider the example in Listing 1. When Unsafe writes the
+value 0xffffffff to the ﬁeld a, it exceeds the maximal
+value of an integer variable. So the value of the ﬁeld bis
+overwritten, making the ifcondition o.b/negationslash=0 satisﬁed. Then
+the error is triggered.
+B. Out-of-bounds Memory Access
+One of most common cases that uses Unsafe oper-
+ations is handling large byte buffer. The Unsafe class
+provides two ways to access an element in an array.
+Users could access the memory via an absolute address
+(e.g.,Unsafe.getLong(null, addr) ) or an offset
+with the base address ( e.g.,Unsafe.getLong(object,
+offset) ). But computing the address of the expected mem-
+ory is error prone. Therefore the memory can be corrupted if
+the given address is beyond the range of the allocated memory.
+The example below shows how a programmer can pass a
+wrong offset (beyond the range of the array) to the Unsafe
+method.
+byte [] arr = new byte [1024];
+long off = arr.length + 4
+unsafe.putLong(arr, off, 0x0);
+Listing 2: An example shows an out-of-bounds memory access
+892
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. C. Use-after-free
+Class java.nio.ByteBuffer provides an API allocateDirect to
+allow the programmers to allocate native (off-heap) memory
+directly. Essentially, allocateDirect is implemented by invok-
+ingunsafe.allocateMemory() . The memory allocated
+via allocateDirect will be freed when the object referencing it
+becomes phantom reachable. It can cause a use-after-free error
+when trying to access the released memory again. Consider the
+example in Listing 3.
+private long allocateMemory( int capacity) {
+ByteBuffer bb = ByteBuffer.
+allocateDirect(capacity);
+return ((DirectBuffer) bb).address(); }
+long addr = allocateMemory(1024);
+while (true ){
+...
+unsafe.getLong( null , addr);
+...
+}
+Listing 3: An example shows a use-after-free error
+The function allocateMemory() creates a piece of
+native memory via allocateDirect() , and returns the
+base address of the memory. Then the program can access
+the memory by the methods provided by sun.mics.Unsafe .
+However, in this example, the ByteBuffer object bbis no longer
+in use after the function returns. bblater will be released
+when GC is triggered, and the corresponding native memory is
+freed. The while loop here is to delay the execution so that the
+GC has a chance to collect bb. Next time when the memory
+is accessed again, the data has already been invalid. Though
+this may not crash the JVM, it introduces uncertainties to the
+program and makes the program difﬁcult to debug when the
+program behaves abnormally.
+D. Double Free
+Similar to the use-after-free problem, the improper use
+of Unsafe APIs also introduces a double-free risk. As the
+native memory allocated via allocateDirect is not man-
+aged by the Garbage Collector (GC), users need to call
+unsafe.freeMemory() to release the allocated native
+memory as the example in Listing 4 shows.
+int loop = 100_000;
+while (loop-->0) {
+ByteBuffer bb = ByteBuffer.allocateDirect(4096);
+...
+unsafe.freeMemory(((DirecBuffer) bb).address()); }
+Listing 4: An example shows a double-free error
+The example in Listing 4 above contains a double free
+error. It ﬁrst creates a direct byte buffer, and then releases
+it byunsafe.freeMemory() . Due to the forloop, Young
+Generation will be ﬁlled up by the ByteBuffer objects. Then
+GC will be triggered, and remove the unused ByteBuffer
+object bb. However, when bbbecomes phantom reachable, the
+allocated native memory will be released again by triggering
+the cleaning operations (more details are presented in SectionIV), thus crashing the JVM with the error information pointer
+being freed was not allocated .
+IV . T HESAFECHECK APPROACH
+In order to guarantee the safety of the use of Unsafe meth-
+ods, we present, SafeCheck , a memory checker that inserts
+memory checks to the bytecode to enforce the validity of a
+memory access at runtime. Based on the types of the memory
+errors we present in Section III, we design four kinds of checks
+as follows.
+A. Type Check
+To protect the program from the type violation, we check
+if the expected type of the method call consistent with the
+actual type of the variable in the memory. For instance,
+if the program invokes unsafe.getLong(object, offset) ,w e
+check if the type of the memory at the address speciﬁed by
+base(object)+offset isLong or other primitive type
+that can be cast to Long . If the type is not matched, we report
+the information to the developer, and print the stack trace when
+the program crashes.
+When the GetorPutmethods access an element of an array,
+it is straightforward to compare the types. However, the type
+is unknown if we are accessing the ﬁeld of an object. In this
+case, we ﬁrst get the ﬁeld from the object according to the
+value of the offset by analyzing the memory layout of the
+object.
+Take the program in Listing 1 as an example. SafeCheck
+inserts code to guarantee the type correctness:
+Field f = getField(o.getClass(), fieldOffset);
+assert (f.getType() == Long);
+//original access
+unsafe.putLong(o, fieldOffset, 0xffffffff);
+Where getField(Class c, long offset) is de-
+ﬁned as:
+Unsafe u = getUnsafe();
+while (c != Object. class ){
+for (Field f : c.getDeclaredFields()) {
+if((f.getModifiers() & Modifier.STATIC) == 0)
+{
+long off = u.objectFieldOffset(f);
+if(off == offset)
+return f;
+}
+}
+c = c.getSuperclass();
+}
+We recursively visit the class of the object and its parent
+class until we ﬁnd the ﬁeld, the offset of which equals to the
+value passed by the parameter.
+B. Memory Bound Check
+When accessing the heap memory speciﬁed by the address
+base+offset by the Unsafe method, we instrument checks
+to guarantee that the address falls within the valid range. We
+analyze the layout of an object to compute the size of an
+object. A valid offset to access the ﬁeld of an object should
+be greater than the size of the header of the object and smaller
+than the size of the object.
+893
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. In order to check the accesses to the off-heap memory, we
+record the base and bound information for each memory as
+metadata. We instrument the Unsafe.allocateMemory
+andUnsafe.freeMemory to update the metadata. For in-
+stance, each time when a piece of native memory is allocated,
+we create the metadata /angbracketleftaddress, capacity /angbracketrightto record the base
+address and the capacity of that memory. When the memory
+is released or reallocated, we update the information of the
+metadata accordingly. When accessing the off-heap memory,
+we ﬁrst check if the address to be accessed is valid by querying
+if the address is recorded by the entry.
+Consider the example in Listing VII. SafeCheck inserts the
+following code:
+assert (ARRAY_BASE_OFFSET < off
+&& arr + off < capacity);
+//original access
+unsafe.putLong(arr, off, 0x0);
+Where ARRAY_BASE_OFFSET refers to the size of the
+header of an array object, which is a constant of value 16, on
+the 64-bit architecture.
+C. Use-after-free Check
+A use-after-free error occurs when accessing a piece of
+memory that has been freed. This usually happens when the
+program perform a load orstore access to the direct byte
+buffer as shown in Listing 3. Because a direct byte buffer
+resides outside of the normal garbage-collected heap, the GC
+is not responsible for managing them. The off-heap memory
+are freed by calling freeMmeory() in the sun.misc.Unsafe
+class. However, the direct buffers could also be cleaned implic-
+itly during the GC phase. The cleaning action will be triggered
+when the direct buffer object becomes phantom reachable. We
+are not able to update the metadata information of the memory
+if it is freed in such a process as we do not instrument the GC
+code. In order to detect the use-after-free error, we extend the
+cleaning action to record the memory that has been released
+so that we can check the validity when the program accesses
+the memory next time.
+ 
+
+ 	
+		 			
+		
+	
+	
+				
+	
+
+	
+			
+Fig. 2: Memory allocation when initializing a direct byte
+buffer.
+JDK provides two ways to allocate direct byte buffers.
+Users can call allocateDirect() deﬁned in Class
+java.nio.ByteBuffer to allocate a direct byte buffer as shown
+in Listing 3. The other way is to map a ﬁle to a byte buffer
+via FileChannel.map() . It ﬁrst creates a channel for a ﬁle andthen correlates the channel to a direct byte buffer. Figure 2
+shows the memory allocation of the code in Listing 3. As
+we can see, when initializing a DirectByteBuffer object, it
+creates a Cleaner object accordingly, which is a ﬁnal ﬁeld
+of the DirectByteBuffer object. The Cleaner object is linked
+by a list, and the header is referenced by the ﬁrst object.
+The DirectByteBuffer object is added to the phantom reference
+queue.
+ 
+	 
+ 
+
+
+
+	
+		
+Fig. 3: A direct byte buffer becomes phantom reachable and
+released by the GC.
+When the DirectByteBuffer object becomes phantom reach-
+able, the clean function of Cleaner will be notiﬁed from the
+PhantomReference , and then the freeMemory function is in-
+voked to free the off-heap memory. After the DirectByteBuffer
+object is collected by GC, the cleaner object becomes the only
+one which contains the information of the off-heap memory,
+i.e., the base address and length. Our approach extends the
+original clean function to mark that the off-heap memory
+corresponding to the DirectByteBuffer object as inaccessible
+when the cleaning action is executed. Then next time when the
+program accesses this piece of memory, we report the warning
+to the developers.
+D. Double-free Check
+The double-free error occurs when the a piece of memory
+is released twice. The root cause for the double-free problem
+byUnsafe is that the developer ﬁrst explicitly free the native
+memory by calling Unsafe.freeMemory() , and then the
+memory is released again when the DirectByteBuffer object
+becomes phantom. The clean() function is invoked to release
+the memory automatically as the DirectByteBuffer object be-
+comes phantom. To prevent this crash from happening at
+runtime, we instrument the freeMemory() function to record
+the base address of the memory that has been released. We
+also extend the clean function to check if the address of the
+memory to be freed has already been removed or not. If not,
+then the program could execute the clean() safely; otherwise
+adouble-free error is reported. Likewise, if the memory is
+freed by triggering clean ﬁrst, when the program tries to use
+freeMemory() to free it, our checker would also report the
+information to the developer.
+V. C ASE STUDY
+In this section, we present a real crash from AJDK as a
+case study. This application is for synchronizing the log ﬁle
+894
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. of a database. Basically, it creates a large byte array on the
+heap and uses Unsafe methods to write the log entries to the
+array. The application was tested on the Alibaba customized
+operating system with AJDK. A segmentation fault happened
+and crashed the JVM at runtime. Interestingly, this crash does
+not manifest each time and it disappears when the developer
+tries to reproduce it locally. We let one developer to diagnose
+the root cause of the failure with and without the help of
+our tool. Without the tool, it costed about one week for the
+developer to ﬁgure out the root cause. But it took only a few
+minutes to locate which statement results in the failure using
+our tool. In this section, we report the process of diagnosing
+the failure manually by the developer to show that it is non-
+trivial to analyze the JVM crash.
+First, the developer ﬁgured out the problematic frame from
+the stack trace reported by the crash dump ﬁle.
+V [libjvm.so+0x91f8c0] oopDesc *PSPromotionManager::
+copy_to_survivor_space< false >(oopDesc *)+144
+V [libjvm.so+0x91ef05] PSPromotionManager::
+drain_stacks_depth(bool)+1301
+V [libjvm.so+0x923631] StealTask::
+do_it(GCTaskManager *, unsigned int)+65
+V [libjvm.so+0x5bc592] GCTaskThread::run()+370
+V [libjvm.so+0x8ae232] java_start(Thread *)+242
+...
+The stack trace shows that the crash happens at the VM
+function copy_to_survivor_space() when GC moves
+the survived objects from the young generation to the old
+generation.
+He then checked the address of the instruction when
+the failure happens and disassembled the function
+copy_to_survivor_space() near the failed
+instruction.
+...
+0x00007ffff6b258b9 <+137>: mov %r10, %rax
+0x00007ffff6b258bc <+140>: and
+$0xfffffffffffffffd,%rax
+0x00007ffff6b258c0 <+144>: mov (%rax), %rdx
+...
+The JVM crashes at the instruction (highlighted by red)
+where we try to dereference the memory address stored in the
+register rax, which is equal to the value in r10. According to
+the hs err.log ﬁle, the value stored in rax andr10 is 0, which
+means that we dereference a null pointer. So the developer
+further checked where the value in r10 comes from.
+...
+0x00007ffff6b25860 <+48>: mov (%rdi), %rax
+0x00007ffff6b25863 <+51>: callq *0x118(%rax)
+0x00007ffff6b25869 <+57>: mov (%rax), %r10
+...
+The developer then reviewed the source code of oopDesc *
+PSPromotionManager::copy_to_survivor_space()
+and found out that r10 holds the value of the mark word of
+an object.
+oop PSPromotionManager::copy_to_survivor_space(oop o)
+{
+...
+markOop test_mark = o->mark();
+...
+}
+Fig. 4: The stack trace that leads to the crash.
+In Java, the mark word of an object is a pointer to a
+structure which holds the housekeeping information about the
+object. It should never be zero in a normal situation. Thus
+we can defer that this area must be overwritten by accident.
+It is probably overwritten by Unsafe operations as this API
+allows the program to directly access the native memory. Even
+if knowing why the JVM is crashed, the developer cannot
+know where the defect is in the program. The developer
+has to inspect and debug the source code by checking the
+Unsafe operations manually. This is another boring and time
+consuming process.
+However, if we run the application with our unsafe checker,
+the problematic statement will be reported immediately.
+buffer.zero(off, length);
+...
+The crash is caused by emptying the buffer, which sets the
+memory by calling the setMemory function of Unsafe .A s
+theoffpassed to the function is not checked and could exceed
+the size of buffer, this operation can corrupt the heap memory.
+If the neighbor address is exactly the header of an object, it
+crashes the JVM when GC moves the survived object to the
+old generation. SafeCheck prints the stack trace when it detects
+the risk as Figure 4 shows.
+VI. E V ALUATION
+We have implemented SafeCheck as a tool on top of ASM
+[7]. When a class is loaded, we visit each method call in this
+class and insert checks right before the call sites in which we
+are interested. In this section, we evaluate the efﬁciency of our
+approach on diagnosing the root cause of ﬁve real crash cases
+and runtime overhead imposed by our approach.
+A. Evaluation Methodology
+Our evaluation aims to answer the following research ques-
+tions:
+RQ1: How difﬁcult is it to debug the root cause when a
+JVM crash happens?
+RQ2: How effective is our approach for locating the root
+cause of the known crashes related to the misuse of Unsafe
+API?
+RQ3: How much runtime overhead is introduced by our
+approach?
+For the ﬁrst question, we collect issues from the openJDK
+bug database with the keyword Unsafe and other sources
+online. We also analyzed one Unsafe crash from AJDK, and
+the crash occurs during the execution of a real application.
+This application is a core part of the ﬁnancial system of
+895
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. TABLE II: JVM crashes due to the improper use of the Java Unsafe API.
+Application Description Affected JDK OS
+JDK-8058744 JVM crashes when using getByte/putByte to manipulate bits. JDK 8u40,9 Linux
+JDK-8202414 Unsafe.putInt after creating an array object alternates the length of an array. JDK 8,9,10 Linux
+JDK-8177860 JVM crashes when copying an object to a direct byte buffer by copyMemory JDK 8,9 Windows
+IPC Ping-pong JVM crashes when two threads communicate with each other via a shared ﬁle. JDK 8u74 LinuxMint
+Log Sync. A real application provided by AJDK, where a crash happens when emptying a byte buffer. JDK 8u171 Linux
+Ant Finance6, which is the largest ﬁnance business in China.
+To evaluate the difﬁculty of debugging the root cause of the
+unsafe-related JVM crash, we ask young developers who work
+on JVM less than one year to analyze the crash with whatever
+tools they prefer. On average, the time spent on locating the
+root cause of the crashes for the developers ranges from several
+hours to several days.
+For the second question, we re-execute the buggy programs
+with our memory checker to see if our tool can successfully
+report the root cause of the failure. Our tool does not require
+the crash to be reproduced. For example, the out-of-bounds
+memory access does not lead to the crash every time, but
+our tool can report the warning when it detects that the
+memory access is out of the range. The feedback can assist
+the developers to ﬁnd the cause quickly.
+To answer the last question, we collect four projects on
+GitHub, all of which perform intensive unsafe operations. We
+run the tests provided by these projects with and without our
+tool. We record the execution time and compute the runtime
+overhead caused by our tool to show the performance.
+B. Crashes Caused by Unsafe
+Table II lists the crashes related to the misuse of Unsafe
+API.
+JDK-80587447This case was reported on JDK bug database.
+A strange JVM crash happens when the programmer uses
+the getByte/putByte methods to manipulate bits, but it works
+ﬁne with getLong/putLong methods. Moreover, the bug only
+manifests in JDK 1.8.020but disappears in JDK 1.7.067.
+JDK-82024148This case states a strange program behavior
+that the primitive length of an array changes after performing
+aUnsafe.putInt operation.
+byte [] buf = new byte [397];
+Unsafe.putInt(buf,BYTE_ARRAY_BASE_OFFSET+1,buf.length);
+assert (buf.length == 397)
+...
+In the code snippet above, the assertion should never be
+changed. However, the assertion is violated which might be
+related to suspicious unsafe operation.
+JDK-81778609This crash occurs when the program tries
+to copy an object to the native memory. The program ﬁrst
+6https://www.antﬁn.com/
+7https://bugs.openjdk.java.net/browse/JDK-8058744
+8https://bugs.openjdk.java.net/browse/JDK-8202414
+9https://bugs.openjdk.java.net/browse/JDK-8177860allocates a direct byte buffer off-heap, the length of which
+is equal to the size of the object. Then it computes the
+address of the object, and copies the object by calling Un-
+safe.copyMemory . The program crashes because the address
+passed to the Unsafe.copyMemory function is invalid.
+IPC Ping-pong10This program implements a ping-pong test
+between two threads, which communicate with each other via
+a direct byte buffer. The buffer is created by mapping a ﬁle to
+the off-heap memory. The Publisher thread writes the value to
+the buffer, and the Subscriber thread reads the value from the
+buffer at the same address and checks if the value is expected.
+As reported by the author, the JVM always crashes when the
+two threads exchange data for 73,100 ( ±10) times. The reason
+for this crash is that the two threads keep communicating
+with each other even if the off-heap memory has already been
+released.
+Log Sync. This application comes from AJDK. The func-
+tionality of this application is to synchronize the log ﬁle of
+a database. The crash occurs when testing the consistency
+of performing read/write operations to a segment, which is
+implemented by a large byte buffer on heap. It uses Unsafe
+methods to access the buffer with the computed offset .H o w -
+ever, it writes past the bounds of the buffer and overwrites the
+header of a neighbor object, thus crashing the JVM.
+C. Failures Diagnosed by Our Approach
+Using the Unsafe API in programs is dangerous. Moreover,
+it is difﬁcult to debug the program when a crash or tricky error
+happens. In this section, we evaluate the effectiveness of our
+approach for helping developers to diagnose the root cause
+ofunsafe related failures. To evaluate the efﬁciency of the
+tool’s bug ﬁnding capabilities, we test the tool on crashes that
+cover all the types of memory errors introduced in the paper.
+Because most of the bugs reported in the JDK bug database
+did not include a test case or were the result of the JVM errors,
+we spent a large amount of effort to validate and categorize
+these crash cases.
+Table III reports the comparison results of diagnosing the
+root cause by manual debugging and checking with our tool.
+The second column lists the patterns of the crashes. We mark
+the pattern for JDK-8058744 as unknown because we fail
+to reproduce the crash reported by the author. This makes
+it impossible for our developers to analyze the reason for
+10https://groups.google.com/forum/#!topic/mechanical-
+sympathy/UCVLCHt MIw
+896
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. TABLE III: Failures detected by our tools vs.manual debug-
+ging.
+Application Pattern Manual Detected?
+JDK-8058744 Unknown /circleminus 
+JDK-8202414 Type Violation >5hours 
+JDK-8177860 Invalid Address >5hours 
+IPC Use-after-free >5hours 
+Log Sync. Out-of-Bound One week 
+this crash. In addition, our tool does not report any warning
+information on this case. As a result, we can not give the
+exact reason for this crash. In some situations, our tool may
+not be able to report the possible root cause, 1) the crash
+is caused by other Unsafe methods that our implementation
+does not check; 2) it is a JVM bug. Note that although our
+tool reports a type violation in JDK-8202414 , this may not
+be the exact cause for this crash. The crash can be avoided
+if the programmer modiﬁes the program according to the
+feedback provided by our tool. But a deeper reason for this
+crash is that the address given by the programmer is unaligned,
+which leaves an opportunity for the compiler to perform the
+optimization, thus overwriting the primitive length of the array.
+The third column presents the efforts cost for the pro-
+grammers to manually diagnose the root cause for the crash.
+The efforts may vary depending on the expertise of the
+programmers on JVM and Unsafe API, and the complexity
+of the programmers. In our evaluation, we ask two developers
+in Alibaba to help debug the crash independently. On average,
+the time spent on these crashes ranges from several hours to
+one week. As the bug JDK-8058744 is not reproduced, we
+mark the effort as /circleminus. For the crash in Log Sync. , it took our
+developer almost one week to ﬁgure out the reason. However,
+the root cause is reported immediately when executing the
+applications along with our tool. The last column shows if the
+failures are diagnosed successfully. Our tool detects all the
+crashes except the ﬁrst one.
+D. Performance
+To evaluate the perturbation brought by our tool, we test
+SafeCheck on several projects from GitHub, which perform
+intensive Unsafe operations, and using them makes a stronger
+case for the efﬁcacy of our tool. Table IV reports the per-
+formance comparison between the native execution and the
+execution with SafeCheck . All results are averaged over three
+runs.
+Cache11provides an implementation of the shared memory
+cache using Unsafe .UnsafeCollection12provides rich func-
+tions, such as simplifying the use of Unsafe API, reducing
+the GC overhead via Unsafe methods, and so on. UnsafeTools
+provides a collection of operations on off-heap memory and
+data structures. The runtime overhead introduced by SafeCheck
+ranges from 1.8%to6.0%, and is 2.8%on average. SafeCheck
+is a lightweight runtime checker which incurs low overhead.
+11https://github.com/odnoklassniki/shared-memory-cache
+12https://github.com/bramp/unsafeTABLE IV: Runtime overhead caused by SafeCheck .
+Applications #LoC Native SafeCheck OH
+Cache 449 9.1s 9.3s 2.2%
+UnsafeCollection 4.8K 12.6s 13.3s 5.6%
+UnsafeTools 6.1K 6.7s 7.1s 6.0%
+Log Sync. 8.9K 86.5s 88.1s 1.8%
+Avg. 5.1K 28.7s 29.5s 2.8%
+So it is very promising to deploy our tool in production runs
+to enhance the safety of the applications in the wild.
+VII. L IMITATIONS
+SafeCheck only checks the safety of a certain group of
+Unsafe methods related to direct memory operations because
+these methods are used more frequently than the rest. However,
+Unsafe provides other powerful functions, such as asymmetri-
+cally entering or exiting a monitor, thus leading to a monitor
+deadlock. SafeCheck is not able to detect such errors. In
+addition, SafeCheck can only guarantee the correctness of a
+unsafe method call, such as type consistency and not out-of-
+bounds, but fails to check errors caused by dangling pointers.
+This is because SafeCheck tracks the state of the memory
+instead of pointers. Consider the code below.
+long old_addr = Unsafe.allocateMemory(...);
+Unsafe.freeMemory(old_addr);
+long new_addr = Unsafe.allocateMemory(...);
+Unsafe.putInt(old_addr, ...);
+...
+As the memory is reused, it can be valid if the program
+accesses the memory with the old address old_addr (Un-
+safe.putInt(old addr , ...) ), which is actually not intended by
+the programmer. These limitations will be solved in the future
+work.
+VIII. R ELATED WORK
+Paul Sandoz performed an informal analysis of Maven
+artifacts and usages in Grepcode [10] and conducted a survey
+to study how Unsafe is used [11]. The prior work [5] went
+beyond Sandoz’ work to make a further study on the impact of
+Java Unsafe API in the wild with respect to what features of
+Unsafe are used, why they are used, and the potential problems
+it can cause. They mined a mass of code on the Maven Central
+repository to perform bytecode analysis, dependency analysis
+to detect the usage pattern of Unsafe . Different from [5], our
+work focuses on how to check the security violation caused by
+the improper use of the Unsafe methods, and we only check
+the crashes in the domain of memory corruption.
+SoftBound [12] presents a similar approach as ours to
+enforce the spatial memory safety for C. SoftBound inserts
+the bound checks at compile-time by associating a base and
+bound metadata with every pointer. Unlike prior approaches
+that change pointer representations and object layouts [13]–
+[15], SoftBound records the base and bound in a disjoint
+metadata that is accessed via explicit table lookups on loads
+and stores of pointer values. Instead of C, Our approach checks
+the memory safety of Java by recording the base and the bound
+897
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. of the memory allocated via Unsafe API when the class is
+loaded.
+Valgrind [16] is a binary instrumentation tool that uses
+shadow memory to record whether each byte of the application
+memory is safe to access. It instruments the application to
+check the shadow memory on each load orstore operation.
+Valgrind ﬁnds out-of-bounds and use-after-free bugs for heap
+memory with no false positives, but fails to ﬁnd the out-of-
+bounds bugs in the stack. AddressSanitizer (ASAN) [17] by
+Google takes a similar strategy as Valgrind to detect memory
+errors. But ASAN uses a more efﬁcient shadow mapping, and
+a more compact shadow encoding to detect errors in stack and
+global variables in addition to the heap. It encodes the state
+of the application heap memory into a single byte of shadow
+memory, and achieves an order of magnitude faster than the
+Valgrind-based tool.
+Though both of Valgrind and ASAN aim for C programs,
+they can be used to enforce the memory security of the
+native code in JDK. Most of the methods in sun.misc.Unsafe
+are invoked via the Java Native Interface (JNI), which is
+implemented by the native C/C++ code, thus leaving loopholes
+in the programs consisting of Java and C components. It
+might be interesting to combine them with the work that
+enforce the security of JNI [18]–[20]. SafeJNI [18] presented
+a framework called Safe Java Native Interface , which ensures
+type safety of heterogeneous programs that contain Java and
+C components. A type system is proposed in this work to
+model JNI-speciﬁc pointers in native C code to avoid direct
+accesses to opaque references. It also inserts checks before and
+after a JNI API function is invoked, which is similar to our
+approach for run-time checking. Tan et al. [19] performed an
+empirical security study to categorize the bugs in the native
+code of the JDK. Chisnall et al. [20] proposed a hardware
+assisted implementation of the Java native code interface,
+which extends the guarantees required for Java’s security
+model to native code.
+Manipulating the Java bytecode is the most common ap-
+proach for dynamic analysis of Java programs. ASM [7]
+provides a useful framework to instrument the bytecode, which
+is widely used in run-time veriﬁcation including monitoring-
+oriented programming [21], [22] and predictive trace analysis
+[23]–[25]. Huang et al. [26]–[28] invented a model checker
+with maximal causality reduction for Java programs on top of
+ASM.
+IX. C ONCLUSION
+In this work, we analyze the crash patterns caused by the
+misuse of the Unsafe API, and present SafeCheck , a tool to
+check the memory security and enforce the type integrity at
+runtime for Java programs. It is implemented at the bytecode
+level by recording the base and bound of unsafe memory.
+We evaluate the effectiveness of our tool for helping debug
+the unsafe JVM crashes by comparing the efforts taken to
+diagnose the crash with and without the assistance of our
+tool. The results show that the root cause can be reported
+immediately with our tool, instead of spending several dayson debugging the crash manually. We also evaluate our tool’s
+performance overhead by testing the projects which heavily
+use Unsafe methods. The result shows that our tool incurs a
+very small overhead, 2.8%on average.
+ACKNOWLEDGMENT
+The authors would like to thank the anonymous reviewers
+for their constructive comments on earlier versions of this
+paper. The work is partially supported by National Natural
+Science Foundation of China (No. 61772200), Shanghai Pu-
+jiang Talent Program (No. 17PJ1401900), Shanghai Municipal
+Natural Science Foundation (No. 17ZR1406900), and Alibaba
+Group.
+REFERENCES
+[1] L. Gong, M. Mueller, H. Prafullchandra, and R. Schemers, “Going
+beyond the sandbox: An overview of the new security architecture
+in the java development kit 1.2.” in USENIX Symposium on Internet
+Technologies and Systems , 1997, pp. 103–112.
+[2] J. Meyer and T. Downing, Java virtual machine . O’Reilly & Associates,
+Inc., 1997.
+[3] R. Jones and R. Lins, Garbage collection: algorithms for automatic
+dynamic memory management . Wiley Chichester, 1996, vol. 208.
+[4] S. Liang, The Java Native Interface: Programmer’s Guide and Speciﬁ-
+cation . Addison-Wesley Professional, 1999.
+[5] L. Mastrangelo, L. Ponzanelli, A. Mocci, M. Lanza, M. Hauswirth, and
+N. Nystrom, “Use at your own risk: The java unsafe api in the wild,” in
+Proceedings of the 2015 ACM SIGPLAN International Conference on
+Object-Oriented Programming, Systems, Languages, and Applications ,
+ser. OOPSLA 2015.
+[6] X. Leroy, “Java bytecode veriﬁcation: algorithms and formalizations,”
+Journal of Automated Reasoning , vol. 30, no. 3-4, pp. 235–269, 2003.
+[7] “Asm bytecode analysis framework.” http://asm .ow2.org/.
+[8] “A crash in netty 4.0.18,” https://stackoverﬂow .com/questions/25210480/
+netty-4-java-7-jvm-sigsegv-crash-under-load/25213653#25213653.
+[9] J. Manson, W. Pugh, and S. V . Adve, The Java memory model . ACM,
+2005, vol. 40, no. 1.
+[10] P. Sandoz, “Personal communication,” 2015.
+[11] P. Sandoz, “Safety not guaranteed: sun.misc.unsafe and the quest for
+safe alternatives,” 2015.
+[12] S. Nagarakatte, J. Zhao, M. M. Martin, and S. Zdancewic, “Softbound:
+Highly compatible and complete spatial memory safety for c,” in
+Proceedings of the 30th ACM SIGPLAN Conference on Programming
+Language Design and Implementation , ser. PLDI ’09, 2009.
+[13] T. M. Austin, S. E. Breach, and G. S. Sohi, “Efﬁcient detection
+of all pointer and array access errors,” in Proceedings of the ACM
+SIGPLAN 1994 Conference on Programming Language Design and
+Implementation , ser. PLDI ’94, 1994.
+[14] G. C. Necula, J. Condit, M. Harren, S. McPeak, and W. Weimer,
+“Ccured: Type-safe retroﬁtting of legacy software,” ACM Trans. Pro-
+gram. Lang. Syst. , vol. 27, no. 3, May 2005.
+[15] N. Nethercote and J. Fitzhardinge, “Bounds-checking entire programs
+without recompiling,” SPACE , 2004.
+[16] N. Nethercote and J. Seward, “Valgrind: A framework for heavyweight
+dynamic binary instrumentation,” in Proceedings of the 28th ACM
+SIGPLAN Conference on Programming Language Design and Imple-
+mentation , ser. PLDI ’07, 2007.
+[17] K. Serebryany, D. Bruening, A. Potapenko, and D. Vyukov, “Address-
+sanitizer: A fast address sanity checker.” in USENIX Annual Technical
+Conference , 2012, pp. 309–318.
+[18] G. Tan, A. W. Appel, S. Chakradhar, A. Raghunathan, S. Ravi, and
+D. Wang, “Safe java native interface,” in Proceedings of IEEE Interna-
+tional Symposium on Secure Software Engineering , vol. 97. Citeseer,
+2006, p. 106.
+[19] G. Tan and J. Croft, “An empirical security study of the native code in
+the jdk.” in Usenix Security Symposium , 2008, pp. 365–378.
+898
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. [20] D. Chisnall, B. Davis, K. Gudka, D. Brazdil, A. Joannou, J. Woodruff,
+A. T. Markettos, J. E. Maste, R. Norton, S. Son, M. Roe, S. W. Moore,
+P. G. Neumann, B. Laurie, and R. N. Watson, “Cheri jni: Sinking the
+java security model into the c,” in Proceedings of the Twenty-Second
+International Conference on Architectural Support for Programming
+Languages and Operating Systems , ser. ASPLOS, 2017.
+[21] D. Jin, P. O. Meredith, D. Grifﬁth, and G. Ros ¸u, “Garbage collection for
+monitoring parametric properties,” in Programming Language Design
+and Implementation (PLDI’11) . ACM, 2011, pp. 415–424.
+[22] P. Meredith, D. Jin, F. Chen, and G. Ros ¸u, “Efﬁcient monitoring of
+parametric context-free patterns,” in Proceedings of the 23rd IEEE/ACM
+International Conference on Automated Software Engineering(ASE ’08) ,
+2008.
+[23] F. Chen, T. F. S ¸erb ˘anut ¸˘a, and G. Ros ¸u, “jPredictor: a predictive runtime
+analysis tool for Java,” in ICSE ’08: Proceedings of the 30th Interna-
+tional Conference on Software Engineering , 2008.
+[24] T. F. Serbanuta, F. Chen, and G. Rosu, “Maximal causal models forsequentially consistent systems,” in Runtime V eriﬁcation (RV’12) , 2012.
+[25] J. Huang, P. O. Meredith, and G. Rosu, “Maximal sound predictive race
+detection with control ﬂow abstraction,” in ACM SIGPLAN Conference
+on Programming Language Design and Implementation , 2014, pp. 337–
+348.
+[26] J. Huang, “Stateless model checking concurrent programs with maximal
+causality reduction,” in Proceedings of the 36th ACM SIGPLAN Confer-
+ence on Programming Language Design and Implementation , ser. PLDI,
+2015.
+[27] S. Huang and J. Huang, “Maximal causality reduction for tso and pso,”
+inProceedings of the 2016 ACM SIGPLAN International Conference on
+Object-Oriented Programming, Systems, Languages, and Applications ,
+ser. OOPSLA, 2016.
+[28] S. Huang and J. Huang, “Speeding Up Maximal Causality Reduction
+with Static Dependency Analysis,” in 31st European Conference on
+Object-Oriented Programming (ECOOP 2017) , 2017.
+899
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 09:39:03 UTC from IEEE Xplore.  Restrictions apply. 

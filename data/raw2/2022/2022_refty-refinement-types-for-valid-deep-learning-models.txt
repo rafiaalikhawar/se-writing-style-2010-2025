@@ -1,0 +1,1457 @@
+Refty: Refinement Types for Valid Deep Learning Models
+Yanjie Gao
+Microsoft Research
+China
+yanjga@microsoft.comZhengxian Li∗
+Microsoft Research
+China
+v-zhli20@microsoft.comHaoxiang Lin†
+Microsoft Research
+China
+haoxlin@microsoft.com
+Hongyu Zhang
+The University of Newcastle
+Australia
+hongyu.zhang@newcastle.edu.auMing Wu
+Shanghai Tree-Graph Blockchain
+Research Institute, China
+ming.wu@confluxnetwork.orgMao Yang
+Microsoft Research
+China
+maoyang@microsoft.com
+ABSTRACT
+Deep learning has been increasingly adopted in many application
+areas. To construct valid deep learning models, developers must
+conform to certain computational constraints by carefully selecting
+appropriate neural architectures and hyperparameter values. For
+example, the kernel size hyperparameter of the 2D convolution
+operator cannot be overlarge to ensure that the height and width
+of the output tensor remain positive. Because model construction
+is largely manual and lacks necessary tooling support, it is possible
+to violate those constraints and raise type errors of deep learning
+models, causing either runtime exceptions or wrong output results.
+In this paper, we propose Refty, a refinement type-based tool for
+statically checking the validity of deep learning models ahead of job
+execution. Refty refines each type of deep learning operator with
+framework-independent logical formulae that describe the compu-
+tational constraints on both tensors and hyperparameters. Given
+the neural architecture and hyperparameter domains of a model,
+Refty visits every operator, generates a set of constraints that the
+model should satisfy, and utilizes an SMT solver for solving the
+constraints. We have evaluated Refty on both individual operators
+and representative real-world models with various hyperparameter
+values under PyTorch and TensorFlow. We also compare it with an
+existing shape-checking tool. The experimental results show that
+Refty finds all the type errors and achieves 100% Precision and
+Recall, demonstrating its effectiveness.
+CCS CONCEPTS
+•Software and its engineering →Software verification and
+validation.
+KEYWORDS
+deep learning, validity checking, type error, refinement type
+∗Work performed during the internship at Microsoft Research.
+†Corresponding author.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a
+fee. Request permissions from permissions@acm.org.
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+©2022 Association for Computing Machinery.
+ACM ISBN 978-1-4503-9221-1/22/05. . . $15.00
+https://doi.org/10.1145/3510003.3510077ACM Reference Format:
+Yanjie Gao, Zhengxian Li, Haoxiang Lin, Hongyu Zhang, Ming Wu, and Mao
+Yang. 2022. Refty: Refinement Types for Valid Deep Learning Models. In
+44th International Conference on Software Engineering (ICSE ’22), May 21–
+29, 2022, Pittsburgh, PA, USA. ACM, New York, NY, USA, 13 pages. https:
+//doi.org/10.1145/3510003.3510077
+1 INTRODUCTION
+In recent years, deep learning ( DL) has been successfully applied
+to many application areas such as image recognition, gaming, and
+natural language processing. To design layered data representations
+called deep learning models (aka deep neural networks) [ 9,24], de-
+velopers employ tensor-oriented mathematical operations provided
+by deep learning frameworks such as PyTorch [ 56] and Tensor-
+Flow [ 1]. These operations are known as operators that manipulate
+one or more tensors (i.e., multi-dimensional arrays), including, for
+example, matrix multiplication and 2D convolution. Developers use
+additional arguments called hyperparameters (e.g., the batch size
+and the kernel size) to control the model learning process.
+Like functions in conventional programming languages, oper-
+ators also enforce computational constraints on both tensors and
+hyperparameters to construct valid DLmodels. Let us take Conv2d
+[61,74], the 2D convolution operator, as an example for illustra-
+tion (a complete description is presented in Section 3.2). The input
+tensor of Conv2d should have exactly four dimensions: batch (N),
+channel (C), height (H), and width (W). Depending on the position
+of the channel dimension, NCHW (channels first) and NHWC (channels
+last) [ 44,52] are two widely used tensor formats. PyTorch accepts
+NCHW only [ 61]; TensorFlow supports both, but developers need
+to explicitly specify the actual format. The kernel size, a hyper-
+parameter of Conv2d that “specifies the height and width of the
+2D convolution window” [ 74], is an array of two positive integers.
+Besides, the values cannot be overlarge to ensure that the height
+and width of the output tensor remain positive too. Because model
+construction is largely manual and lacks necessary tooling support,
+it is possible to violate the above constraints and raise type errors of
+DLmodels just like those in conventional programs, causing either
+a training/inference job to crash (e.g., an overlarge kernel size) or a
+model to produce totally wrong output results (e.g., NHWC training
+data being fed to a PyTorch model by mistake).
+Recent empirical studies [ 30,85,87] indicate that type errors of
+DLmodels are not uncommon. For example, Zhang et al. [87] dis-
+covered that 24 out of the 175 (about 13.71%) TensorFlow program
+bugs collected from Stack Overflow andGitHub were caused by
+18432022 IEEE/ACM 44th International Conference on Software Engineering (ICSE)
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Yanjie Gao, Zhengxian Li, Haoxiang Lin, Hongyu Zhang, Ming Wu, and Mao Yang
+incompatible tensor shapes (i.e., the lengths of all dimensions). It is
+challenging to detect and eliminate these errors before job execu-
+tion (at compile-time) because the hybrid programming paradigm
+ofDLframeworks hides the internal computation from high-level
+programs written by developers. The type errors of DLmodels not
+only waste significant shared resources (including CPU, GPU, net-
+work I/O, and storage) but also severely slow down development
+productivity. Their ill effects are even worse in the widely adopted
+practice of automated machine learning (AutoML), where an ex-
+periment launches many trial jobs simultaneously. That is to say,
+if one trial job encounters a type error, other tens or hundreds of
+the jobs with similar neural architecture and hyperparameter vector
+(i.e., a value tuple of all hyperparameters) could also experience the
+same error and fail.
+A simple workaround is to run DLjobs for a while and check
+whether any runtime exception is thrown. However, such a dy-
+namic method is both resource- and time-consuming; it is espe-
+cially unaffordable in the AutoML scenario because a large number
+of possible neural architectures and hyperparameter vectors exist.
+Furthermore, invalid DLmodels that do not lead to job crashes
+but produce wrong output results cannot be caught. Type-based
+techniques [ 2,6,17,27,32,33,37,42,45,50,67,81] have been
+promising to detect type errors. However, these previous works
+target programs written in conventional programming languages
+such as Haskell, C, C++, or Java; therefore, we cannot apply them
+directly to DLmodels because of the wide differences in representa-
+tion structure. Recently, a few tools [ 15,40,78] such as Pythia [40]
+are able to find some shape incompatibility errors in certain DL
+programs. Nevertheless, their approaches are TensorFlow-specific
+and cannot capture non-shape issues.
+In this paper, we propose Refty, a refinement type -based tool for
+statically checking the validity of deep learning models. Refinement
+types [ 21] are types endowed with logical formulae that constrain
+values; for example, int{𝑣: 0<𝑣}stands for positive integers.
+We observe that the algorithmic execution of a DLmodel can be
+represented as iterative forward and backward propagation on the
+model’s computation graph [24] whose nodes denote operators. Our
+key insight is to refine each type of DLoperator with logical formu-
+lae that describe the computational constraints on both tensors and
+hyperparameters, including those on how the output tensors are
+produced. These logical formulae are framework-independent, be-
+ing formulated from the mathematical definitions of operators. To
+check whether a PyTorch or TensorFlow model is valid, developers
+provide its neural architecture (which is described in the Protocol
+Buffers [ 25] language or given from a serialized model file) and
+hyperparameter domains. Refty then traverses the computation
+graph in strict accordance with the operator execution ordering and
+generates a set of constraints [ 28] from the above logical formulae.
+Therefore, the problem of checking model validity is reduced to a
+constraint satisfaction problem (CSP) [ 64].Refty utilizes a satisfia-
+bility modulo theories (SMT) [ 12] solver (e.g., Microsoft Z3 [ 11]) to
+obtain the unsatisfiable hyperparameter vectors that result in po-
+tential type errors. To accelerate constraint solving, we apply some
+special optimization techniques. Refty is extensible to incorporate
+new operators and custom tensor shapes/element types/formats; it
+can also be adapted to other DL frameworks.1import torch.nn as nn
+2class CNNModel(nn.Module):
+3def __init__(self):
+4 super(CNNModel, self).__init__()
+5 self.conv =nn.Conv2d(in_channels = 1, out_channels = 16, kernel_size = 3)
+6 self.pool =nn.AvgPool2d(kernel_size = 2, stride = 2)
+7 self.fc =nn.Linear(in_features = 2704, out_features = 10)
+8 self.softmax =nn.Softmax(dim = 1)
+9
+10 def forward(self, x):
+11 x=self.conv(x)
+12 x=self.pool(x)
+13 x=x.reshape(x.size(0), -1)
+14 x=self.fc(x)
+15 x=self.softmax(x)
+16 return x
+Figure 1: A sample PyTorch model constructed with the
+Conv2d, AvgPool2d, Reshape, Linear, and Softmax operators.
+Figure 2: Computation graph for training the above model.
+We have implemented Refty and evaluated it on both individ-
+ualDLoperators ( Conv2d ,MaxPool2d ,Linear ,Add, and Concat )
+and representative real-world models ( AlexNet [39],VGG-16 [69],
+Inception-V3 [71],LSTM [29]-based Seq2Seq [70], and GRU [8]-
+based Seq2Seq ) under the PyTorch and TensorFlow frameworks.
+We also compare Refty with Pythia , a static shape-checking tool
+for TensorFlow Python programs. The experimental results show
+thatRefty finds all the type errors, achieves 100% Precision and Re-
+call [51], and outperforms Pythia, demonstrating its effectiveness.
+In summary, this paper makes the following contributions:
+(1)We propose a novel refinement type-based approach for
+checking the validity of DL models ahead of job execution.
+(2)We implement a tool named Refty that generates a set of
+constraints for DLmodels and utilizes an SMT solver to
+detect potential type errors.
+(3)We demonstrate the practical effectiveness of Refty with a
+rich set of experiments.
+2 BACKGROUND
+2.1 Deep Learning Models
+A deep learning ( DL) model is a layered data representation
+learned from massive training data [ 9,24]. The model is formalized
+by frameworks like PyTorch [ 56] and TensorFlow [ 1] as a computa-
+tion graph (i.e., a tensor-oriented, directed acyclic graph) [ 24]. Each
+graph node denotes a mathematical operation called an operator
+that manipulates a list of tensors. The node may contain numerical
+learnable parameters (i.e., weights and biases), which are iteratively
+updated during the model learning process. A directed edge from
+node𝐴to another node 𝐵delivers one output tensor of 𝐴to𝐵as
+1844
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. Refty: Refinement Types for Valid Deep Learning Models ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+Table 1: Common type errors of deep learning models.
+Dimension Category Description
+HyperparameterIllegal ValueThe value of a hyperparameter is outside the domain. For example, typical hyperparameters such
+as the batch size and stride are positive by definition, but zero or negative values are passed.
+Improper ValueThe value of a hyperparameter does not meet the computational constraints. For example, the
+stride mistakenly exceeds the kernel size of Conv2d, causing some input data to be skipped.
+TensorUnsupported Format The format of a tensor is not supported. For example, an NHWC tensor is fed to the PyTorch Conv2d .
+Illegal ShapeA certain dimensional length of a tensor is zero or negative. For example, if the kernel size of
+Conv2d is too large, the output height or width may be reduced to a non-positive value.
+Incompatible ShapeThe shape of a tensor is unacceptable, or multiple tensors do not have matched shapes. For example,
+the input tensor of Conv2d does not have exactly four dimensions.
+Incompatible Element Type A tensor’s element type
+is unacceptable, or multiple tensors do not have matched element types.
+input and specifies their execution dependency. In this paper, the
+terms “node” and “operator” are used interchangeably.
+Atensor is a multi-dimensional array of numerical values of
+the same element type. Its order (aka rank) is the number of di-
+mensions [ 55]. Let Rfdenote the set of all 32-bit floating-point
+numbers. Suppose that Xis an𝑛-order, 32-bit floating-point tensor,
+and𝐼𝑖is the length (a positive integer) of its 𝑖-th dimension where
+1≤𝑖≤𝑛. Then,X∈Rf𝐼1×𝐼2×···×𝐼𝑛. The array[𝐼1,𝐼2,···,𝐼𝑛]is
+called the shape ofX. For example, “[16,1,28,28]” is the shape of a
+4-order, NCHW tensor representing sixteen images of handwritten
+digits [ 14]. Because each dimension of Xmay have application-
+specific semantics (e.g., representing the batch size or the image
+width), dimensional orderings derive different tensor formats. For
+instance, NCHW (channels first) and NHWC (channels last) [ 44,52] are
+two widely used formats for a batch of 2D images.
+Figure 1 shows a simple PyTorch training program, which sets
+up a sequential model with the framework built-in Conv2d (2D con-
+volution with a 3×3kernel size), AvgPool2d (2D average pooling
+with 2×2kernel size and stride), Reshape (flattening the input into
+one dimension without affecting the batch size), Linear (fully con-
+nected layer with ten output features), and Softmax (normalizing
+“the probability distribution over 𝑘different classes” [ 24]) operators
+(lines 6–9, 14). The variables such as kernel_size ,stride , and
+out_features arehyperparameters since they participate in the
+computation of operators to control the learning process. To obtain
+the optimal model learning performance (e.g., predictive accuracy),
+developers largely adopt a trial-and-error strategy by running mul-
+tiple jobs, each with a different value tuple of all hyperparameters.
+Figure 2 demonstrates the corresponding computation graph for
+training the model. The operators on the left are specified by devel-
+opers in the training program. The auxiliary operators in the middle
+are automatically crafted by frameworks for computing gradients
+under backward propagation. An optimizer at the bottom right is
+responsible for weight update and loss minimization, marking the
+end of one training iteration.
+Although the model is simple enough, developers may make the
+same mistakes mentioned in Section 1 at Conv2d andAvgPool2d
+(lines 5–6). Furthermore, developers may pass a wrong number
+of input features to the Linear operator (via the in_features
+parameter in line 7) and raise an incompatible-tensor-shape error,
+because such a number has to be manually calculated from the
+output tensor shapes of the predecessor AvgPool2d andConv2d.2.2 Common Type Errors of DL Models
+Table 1 lists sixcategories of common type errors, which are sum-
+marized from related empirical studies [ 30,85–87] and our experi-
+ence. We further group these categories into two major dimensions:
+Hyperparameter and Tensor. Errors in the former dimension are
+directly caused by hyperparameter values. Illegal Value means that
+the value of a hyperparameter is outside the domain. Typical hyper-
+parameters are positive integers by definition; however, since they
+are declared as signed integers in Python, developers may pass zero
+or negative values by mistake. For example, a user encountered a
+crash when setting the stride to zero [ 59].Improper Value means
+that the value of a hyperparameter violates the intrinsic computa-
+tional constraints, although it is within the domain. For instance,
+the stride should be less than or equal to the kernel size; otherwise,
+some input data will be skipped [ 72]. Another example is that an
+out-of-bounds exception is thrown when the axis (specified by dim)
+of the PyTorch Gather operator exceeds the input tensor’s order.
+Tensor-related errors result from inappropriate formats, shapes,
+or element types of tensors. Unsupported Format means that the
+format of a tensor is not supported by the operator, which is demon-
+strated by the previous NHWC vs.NCHW example. Because the output
+shape is computed by the input shape(s) and hyperparameters, it
+is possible that a certain dimensional length of an output tensor
+becomes less than or equal to zero and raises an Illegal Shape error.
+For instance, if the kernel size of Conv2d is too large, the output
+height or width may be reduced to a non-positive value [ 54].In-
+compatible Shape means that the shape of a tensor is unacceptable
+or multiple tensors do not have matched shapes. This category is
+also referred to as Unaligned Tensor, Mismatched Tensor, or Shape
+Inconsistency in the related studies. ShapeFlow [78] shows an ex-
+ample that the developer mistakenly interchanged the images and
+their labels. Another example is that the two input tensors of the
+addition operator do not have exactly the same shape. Similarly,
+errors in the Incompatible Element Type category are caused by
+unacceptable or mismatched element types.
+2.3 Refinement Types
+In programming languages, the type system [ 57] is an important
+and useful formal method to enforce the expected behaviors of
+programs. A type is an attribute of data that permits developers
+to specify correct values for data operations. Therefore, a large
+portion of unintended software faults (aka type errors) occurring
+at run-time can be detected by compilers before execution.
+1845
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Yanjie Gao, Zhengxian Li, Haoxiang Lin, Hongyu Zhang, Ming Wu, and Mao Yang
+MatMul : :𝑥1:𝑡𝑠{𝑥1:𝑝𝑥1}→𝑥2:𝑡𝑠{𝑥2:𝑝𝑥2}→𝑡𝑠{𝑦:𝑝𝑦}
+𝑝𝑥1(𝑥1.order =2)∧( 0<𝑥1.shape[0])∧( 0<𝑥1.shape[1])
+𝑝𝑥2(𝑥2.𝑒𝑡=𝑥1.𝑒𝑡)∧(𝑥2.order=2)∧(𝑥2.shape[0]=𝑥1.shape[1])
+∧(0<𝑥2.shape[0])∧( 0<𝑥2.shape[1])
+𝑝𝑦(𝑦.𝑒𝑡=𝑥1.𝑒𝑡)∧(𝑦.order =2)∧(𝑦.shape[0]=𝑥1.shape[0])
+∧(𝑦.shape[1]=𝑥2.shape[0])
+Figure 3: Refinement type of the MatMul operator.
+In 1991, Freeman and Pfenning [ 21] first introduced the con-
+cept of refinement types to Standard Meta Language (SML) [ 49], a
+general-purpose functional programming language. A refinement
+type lets developers endow logical formulae (from a decidable logic)
+to limit the value set of the original type. For instance, the following
+natandposrefinement types specify non-negative integers and
+positive integers, respectively:
+nat=int{𝑣: 0≤𝑣}, pos=int{𝑣: 0<𝑣}.
+For another example, a finite set of positive integers {𝑛𝑖|𝑛𝑖∈
+N∧0<𝑛𝑖for𝑖∈[0,𝑘]}can be specified by the refinement type
+pos{𝑣:𝑣=𝑛1∨𝑣=𝑛2∨···∨𝑣=𝑛𝑘}.
+With refinement types, developers can write more precise con-
+tracts [47] for programs to improve code testing and verification. In
+the following, we take the MatMul (matrix multiplication) operator
+as an example and illustrate its refinement type in Figure 3. Let 𝑡𝑠be
+the basic tensor type. For a tensor variable 𝑥, we use𝑥.𝑒𝑡,𝑥.order ,
+and𝑥.shape to denote the element type (e.g., float ordouble ), or-
+der, and shape of 𝑥, respectively. 𝑥.shape[𝑖]refers to the length of
+the𝑖-th dimension of 𝑥. We ascribe MatMul a function type, specify-
+ing that it accepts two input tensor parameters (denoted by 𝑥1and
+𝑥2) and produces one output tensor parameter (denoted by 𝑦). The
+logical formula 𝑝𝑥1states that𝑥1is a legal matrix; that is to say, the
+order of𝑥1is 2, and the length of either dimension is positive. 𝑝𝑥2
+declares that 𝑥2is a legal matrix with the same element type as 𝑥1,
+and the number of rows of 𝑥2is equal to the number of columns of
+𝑥1. Finally,𝑝𝑦claims that the output tensor 𝑦is also a matrix with
+the same element type as the two inputs, and 𝑦has the number of
+rows of𝑥1and the number of columns of 𝑥2. To save space, we do
+not explicitly assert the legality of 𝑦, which has been implied by
+the existing formulae.
+2.4 Satisfiability Modulo Theories (SMT)
+In the fields of mathematical logic and computer science, satisfiabil-
+ity modulo theories (SMT) [12] refers to deciding the satisfiability
+of mathematical formulae. Compared with Boolean satisfiability
+(SAT), whose formulae are built up from only Boolean variables
+and logical connectives (e.g., negation and conjunction), SMT sig-
+nificantly generalizes the expressiveness by allowing more complex
+first-order formulae with equality, quantifiers ( ∀and∃), and sym-
+bols of constants (e.g., 0), functions (e.g., ×), and predicates (e.g., <).
+The satisfiability of SMT formulae is interpreted within a theory
+of integers, real numbers, bit vectors, arrays, strings, etc., which
+explains the origin of the name of SMT. The theory defines a vari-
+able domain (e.g., the set of real numbers) and assigns a definite
+meaning to each constant/function/predicate symbol (e.g., “ <” being
+the lexicographical ordering on strings). For example, the formula(𝑥×𝑦<12)∧(𝑦−𝑥=3)is satisfiable within the theory of integer
+arithmetic, and⟨𝑥=1,𝑦=4⟩is one solution.
+Satisfiability modulo theories library (SMT-LIB) [ 4] is a promi-
+nent standard that provides rigorous specifications of background
+theories and an input/output language for expressing SMT formu-
+lae. The syntax of the SMT-LIB language is very similar to that of
+Lisp [ 20]. The following shows a portion of the SMT-LIB program
+for the above formula, whose expressions use prefix notation.
+1(set-logic QF_NIA) ;quantifier-free integer arithmetic
+2(declare-const x Int) ;x is an integer variable
+3(declare-const y Int) ;y is an integer variable
+4(assert (and (<(*x y) 12) (= (-y x) 3)))
+SMT solvers are software tools that deduce whether or not a set
+of formulae is satisfiable, among which Microsoft Z3 [ 11], STP [ 22],
+and Yices [ 16] are popular. Most SMT solvers accept an SMT-LIB
+program as input. To facilitate writing formulae, they may also
+provide APIs for other programming languages (e.g., Python and
+Java). Because of the powerful functionality, SMT solvers have been
+adopted as an essential module for various tools across many appli-
+cation areas, such as software testing and program verification.
+3 APPROACH AND IMPLEMENTATION
+3.1 Problem Formulation
+We summarize the syntax of types [ 34] in Figure 4. An element type
+is an atomic primitive type (e.g., float for the set of 32-bit floating-
+point numbers). Currently, there are four allowable element types.
+Atensor type represents single- or multi-dimensional arrays whose
+elements have the same type. For convenience, we use x.et,x.order ,
+x.shape ,x.fmtto denote the element type, order (i.e., the number
+of dimensions), shape (i.e., an array of all dimensional lengths), and
+format of a tensor variable 𝑥:𝑡𝑠, respectively. Terms are mathe-
+matical expressions built from constants and variables by applying
+𝑛-place elementary operations [ 18]. Because binary operations such
+as addition, subtraction, multiplication, division, and modulo (de-
+noted by mod) are mainly used, we specifically list their syntax
+rules. In most cases, refinement types use quantifier-free formulae,
+including Boolean constants, arithmetic comparison between two
+terms, and negation/conjunction/disjunction of existing formulae.
+Certain formulae may involve every dimension of a tensor variable
+whose order is not known in advance. Therefore, we add an impli-
+cation rule with the universal quantifier ∀𝑣:𝑏.𝑝 1→𝑝2, meaning
+that for each 𝑣of basic type 𝑏, if the condition 𝑝1holds, then so
+must𝑝2. However, the usage is restricted by bounded quantifica-
+tion [ 18] to ensure that the generated constraints remain decidable;
+that is to say, 𝑣is placed under an upper bound in the condition
+𝑝1(e.g.,𝑣<𝑥.order ). A refinement{𝑣:𝑝}is a pair such that
+𝑣is a variable and 𝑝is a logical formula. Types then include ei-
+ther refined base types (i.e., basic types endowed with refinements)
+for tensors and hyperparameters or dependent function types [34]
+(i.e., function types depending on parameter values) for DLoper-
+ators. Note that the type of an operator with 𝑛inputs is written
+as𝑥1:𝜏1→···→𝑥𝑛:𝜏𝑛→𝜇. Acontext is a sequence of
+variable-type bindings to record which variables are in scope.
+The basic types are distinct from each other, so there is no sub-
+type relationship [ 57] between any two refined base types with
+1846
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. Refty: Refinement Types for Valid Deep Learning Models ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+⟨Symbols⟩𝑠𝑦::=0,−1,1,···|𝑣,𝑥,𝑦,··· (constants/variables)
+⟨Element Types⟩𝑒𝑡::=bool |int|float |double
+⟨Tensor Type⟩𝑡𝑠::=𝑒𝑡[𝑠𝑦]|𝑡𝑠[𝑠𝑦]
+⟨Basic Types⟩𝑏::=𝑒𝑡|𝑡𝑠
+⟨Terms⟩𝑒::=𝑠𝑦 (constants and variables)
+|𝑒1+𝑒2|𝑒1−𝑒2|𝑒1×𝑒2
+|𝑒1÷𝑒2|𝑒1mod𝑒2|··· (2-place expressions)
+|𝑓𝑒1···𝑒𝑛 (n-place expressions)
+⟨Formulae⟩𝑝::=true,false (Booleans)
+|𝑒1=𝑒2|𝑒1≤𝑒2|··· (2-place predicates)
+|¬𝑝|𝑝1∧𝑝2|𝑝1∨𝑝2 (negation/conjunction/disjunction)
+|∀𝑣:𝑏.𝑝 1→𝑝2 (implication)
+⟨Refinements⟩𝑟::={𝑣:𝑝} (known)
+⟨Types⟩𝜏,𝜇::=𝑏{𝑟} (refined base)
+|𝑣:𝜏→𝜇 (dependent function)
+⟨Context⟩Γ::=∅|Γ;𝑣:𝜏 (variable-type binding)
+Figure 4: Syntax of types.
+different basic types. Supposing that 𝑝is a formula, 𝑝[𝑣:=𝑧]de-
+notes that all the free(i.e., not restricted by quantifiers) occurrences
+of𝑣in𝑝are substituted by 𝑧[18]. Subtyping (denoted by ≺:) on
+𝑏{𝑥:𝑝𝑥}and𝑏{𝑦:𝑝𝑦}is defined as follows [34]:
+Γ⊢𝑏{𝑥:𝑝𝑥}≺:𝑏{𝑦:𝑝𝑦} ⇐⇒ Γ⊢∀𝑥:𝑏.𝑝𝑥→𝑝𝑦[𝑦:=𝑥].
+(Sub-Base)
+Therefore, posis a subtype of nat(i.e., pos≺:nat) because∀𝑣:
+int.0<𝑣→0≤𝑣is a valid formula. Another example is that the
+3×3matrix type is a subtype of the 2-order, valid tensor type (which
+is the type of the first input parameter of MatMul in Figure 3).
+As mentioned before, a DLmodelMis formally represented as
+the following directed acyclic computation graph [24]:
+M=⟨𝑉={𝑜𝑝𝑖}𝑁
+𝑖=1,𝐸={(𝑜𝑝𝑖,𝑜𝑝𝑗)}𝑖≠𝑗,𝐻𝑃={ℎ𝑝𝑖}𝐾
+𝑖=1⟩.
+Each node𝑜𝑝𝑖is an operator specified by developers (e.g., Conv2d
+andAvgPool2d in Figure 2). We ignore the automatically inserted
+operators for backward propagation because they are crafted by
+frameworks to calculate gradients in strict accordance with the
+forward operators. We assume that a backward operator should
+not introduce any type errors listed in Table 1 if its correspond-
+ing forward operator executes correctly. A directed edge (𝑜𝑝𝑖,𝑜𝑝𝑗)
+delivers a tensor from 𝑜𝑝𝑖to𝑜𝑝𝑗and specifies that 𝑜𝑝𝑗must wait
+until the execution of 𝑜𝑝𝑖finishes. Each hyperparameter ℎ𝑝𝑖is en-
+dowed with a refinement type 𝑏𝑖{ℎ𝑝𝑖:𝑝𝑖}that defines the domain
+ofℎ𝑝𝑖(denoted by Δ𝑖).𝑏𝑖is a basic type such as intor the basic
+tensor type, and 𝑝𝑖is a logical formula. For unified handling, the
+initial input tensors are treated as hyperparameters. We denote the
+hyperparameter configuration space ofMasΔ=Δ1×Δ2×···× Δ𝐾.
+Each𝜆∈Δis called a hyperparameter vector.
+First, we explain the methodology of checking the validity of M.
+LetΓ=ℎ𝑝1:𝑏1{ℎ𝑝1:𝑝1};···;ℎ𝑝𝐾:𝑏𝐾{ℎ𝑝𝐾:𝑝𝐾}be the context
+of the modelM. For an operator 𝑜𝑝𝑖(similar to a conventional
+function call), we check for each input argument 𝑣𝑖,𝑘whether its
+type is a subtype of (denoted by ≺:) that of the corresponding formal
+input parameter 𝑣𝑖,𝑘. In other words, the context Γmust deduce the
+following judgment:
+Γ⊢𝑏𝑣𝑖,𝑘{𝑣𝑖,𝑘:𝑝𝑣𝑖,𝑘}≺:𝑏𝑣𝑖,𝑘{𝑣𝑖,𝑘:𝑝𝑣𝑖,𝑘}. (Chk-In)If so, we conclude that each output argument 𝑦𝑖,𝑙is associated
+with (denoted by↦→) the type of the corresponding formal output
+parameter𝑦𝑖,𝑙(with variable substitution):
+Γ⊢𝑦𝑖,𝑙↦→𝑏𝑦𝑖,𝑙{𝑦𝑖,𝑙:𝑝𝑦𝑖,𝑙[𝑦𝑖,𝑙:=𝑦𝑖,𝑙]}. (Chk-Out)
+For a directed edge (𝑜𝑝𝑖,𝑜𝑝𝑗)(similar to an assignment statement),
+we conclude that 𝑜𝑝𝑗’s𝑛-th input tensor 𝑥𝑗,𝑛is associated with the
+type of𝑜𝑝𝑖’s𝑚-th output tensor 𝑦𝑖,𝑚(with variable substitution):
+Γ⊢𝑥𝑗,𝑛↦→𝑏𝑦𝑖,𝑚{𝑥𝑗,𝑛:𝑝𝑦𝑖,𝑚[𝑦𝑖,𝑚:=𝑥𝑗,𝑛]}. (Chk-Edge)
+Next, we show how to generate a set of constraints whose satisfi-
+ability implies that Mis valid. We observe that the algorithmic exe-
+cution ofMis represented as iterative forward and backward propa-
+gation on its computation graph. Model inference can be thought of
+as single-pass forward propagation. Let 𝑆=⟨𝑜𝑝𝑖1,𝑜𝑝𝑖2,···,𝑜𝑝𝑖𝑁⟩
+be the actual runtime execution ordering of operators, which is
+linearly extended from the edge ordering by referring to the frame-
+work implementations [ 41,60]. We traverse the computation graph
+by strictly following 𝑆and generate the constraints according to the
+above three judgments. For the Chk-In judgment, we first generate
+𝑏𝑣𝑖,𝑘=𝑏𝑣𝑖,𝑘(i.e., both basic types should be identical). We then
+generate∀𝑣𝑖,𝑘:𝑏𝑣𝑖,𝑘.𝑝𝑣𝑖,𝑘→𝑝𝑣𝑖,𝑘[𝑣𝑖,𝑘:=𝑣𝑖,𝑘]from the previous
+subtyping definition. However, since any defective hyperparameter
+vector leads to unsatisfiability, we eliminate the universal quantifier
+to discover all the defective vectors. We also notice that 𝑝𝑣𝑖,𝑘either is
+implied by Γ(if𝑣𝑖,𝑘is a hyperparameter) or has been generated dur-
+ing the visit of a predecessor operator. Therefore, we finally use the
+simplified constraint 𝑝𝑣𝑖,𝑘[𝑣𝑖,𝑘:=𝑣𝑖,𝑘]. For the Chk-Out judgment,
+we generate 𝑏𝑦𝑖,𝑙=𝑏𝑦𝑖,𝑙and𝑝𝑦𝑖,𝑙[𝑦𝑖,𝑙:=𝑦𝑖,𝑙]. For the Chk-Edge
+judgment, we generate a simpler constraint 𝑥𝑗,𝑛=𝑦𝑖,𝑚.
+Finally, we formulate the problem of checking the validity of
+Mas a constraint satisfaction problem (CSP) [ 64]. Being a general
+and useful concept, CSP abstracts a problem as finding a solution
+to a set of imposed constraints that must be satisfied as conditions
+by the variables. It is an important research subject in artificial
+intelligence (AI). Well-known CSPs include eight queens puzzle
+and graph coloring. Our problem is defined as a triple ⟨𝑉,𝐷,𝐶⟩[64]:
+𝑉={𝑉1,𝑉2,···,𝑉𝐾|𝑉𝑖=ℎ𝑝𝑖for𝑖∈[1,𝐾]},
+𝐷={𝐷1,𝐷2,···,𝐷𝐾|𝐷𝑖=Δ𝑖for𝑖∈[1,𝐾]},
+𝐶=(Ð𝑁
+𝑖=1𝐶𝑖)∪{𝑥𝑗,𝑛=𝑦𝑖,𝑚|(𝑜𝑝𝑖,𝑜𝑝𝑗)∈𝐸},
+𝐶𝑖={𝑏𝑣𝑖,𝑘=𝑏𝑣𝑖,𝑘, 𝑝𝑣𝑖,𝑘[𝑣𝑖,𝑘:=𝑣𝑖,𝑘]}
+∪{𝑏𝑦𝑖,𝑙=𝑏𝑦𝑖,𝑙, 𝑝𝑦𝑖,𝑙[𝑦𝑖,𝑙:=𝑦𝑖,𝑙]}.
+𝑉is a set of variables that are actually the hyperparameters. 𝐷
+represents the respective variable domains such that each 𝐷𝑖is
+the domain of ℎ𝑝𝑖.𝐶contains the generated constraints mentioned
+above. For a hyperparameter vector 𝜆=⟨𝑣1,𝑣2,···,𝑣𝐾⟩∈Δ,Mis
+valid with𝜆if the above set 𝐶is satisfiable when each 𝑉𝑖∈[1,𝐾]is
+assigned the corresponding 𝑣𝑖; otherwise, 𝜆results in type errors.
+3.2 Refinement Types of DL Operators
+In this section, we take Conv2d , the 2D convolution operator, as
+an example to demonstrate how to define refinement types. We
+consider the following hyperparameters: number of input channels
+(𝑖𝑐), number of output channels ( 𝑜𝑐), tensor format ( fmt), kernel size
+(𝑘𝑠), stride (𝑠𝑑), padding ( pad), dilation ( dil), and number of groups
+1847
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Yanjie Gao, Zhengxian Li, Haoxiang Lin, Hongyu Zhang, Ming Wu, and Mao Yang
+Conv2d : :𝑥:𝑡𝑠{𝑥:𝑝𝑥-1∧𝑝𝑥-2}→𝑖𝑐:pos→𝑜𝑐:pos→fmt:{NCHW,NHWC}→𝑘𝑠:pos[2]→ pad:pos[2]→ dil:pos[2]
+→𝑠𝑑:pos[2]{𝑠𝑑:𝑝𝑠𝑑-1∧𝑝𝑠𝑑-2}→𝑔𝑝:pos{𝑔𝑝:𝑝𝑔𝑝}→𝑡𝑠{𝑦:𝑝𝑦-1∧𝑝𝑦-2∧𝑝𝑦-3}
+𝑝𝑥-1(𝑥.order =4)∧( 0<𝑥.shape[0])∧( 0<𝑥.shape[1])∧( 0<𝑥.shape[2])∧( 0<𝑥.shape[3])∧((𝑥.𝑒𝑡=float)∨(𝑥.𝑒𝑡=double))
+𝑝𝑥-2(𝑥.fmt=fmt)∧(¬ IsPT∨(𝑥.fmt=NCHW))∧(𝑥.shape[CHANNEL] =𝑖𝑐)
+𝑝𝑠𝑑-1(𝑠𝑑[0]≤𝑘𝑠[0])∧(𝑠𝑑[1]≤𝑘𝑠[1])
+𝑝𝑠𝑑-2¬IsTF∨((dil[0]=1)∧( dil[1]=1))∨((𝑠𝑑[0]=1)∧(𝑠𝑑[1]=1))
+𝑝𝑔𝑝((𝑖𝑐mod𝑔𝑝)=0)∧((𝑜𝑐mod𝑔𝑝)=0)
+𝑝𝑦-1(𝑦.𝑒𝑡=𝑥.𝑒𝑡)∧(𝑦.order =𝑥.order)∧(𝑦.fmt=𝑥.fmt)∧(𝑦.shape[0]=𝑥.shape[0])∧(𝑦.shape[CHANNEL] =𝑜𝑐)
+𝑝𝑦-2(𝑦.shape[HEIGHT] =((𝑥.shape[HEIGHT]+ 2×pad[0]− dil[0]×(𝑘𝑠[0]− 1)− 1)÷𝑠𝑑[0]+ 1))
+∧(𝑦.shape[WIDTH] =((𝑥.shape[WIDTH]+ 2×pad[1]− dil[1]×(𝑘𝑠[1]− 1)− 1)÷𝑠𝑑[1]+ 1))
+𝑝𝑦-3(0<𝑦.shape[0])∧( 0<𝑦.shape[1])∧( 0<𝑦.shape[2])∧( 0<𝑦.shape[3])
+Figure 5: Refinement type of the Conv2d operator. Tunable hyperparameters include the numbers of input ( 𝑖𝑐) and output ( 𝑜𝑐)
+channels, tensor format (fmt ), kernel size ( 𝑘𝑠), stride (𝑠𝑑), padding (pad ), dilation (dil ), and number of groups ( 𝑔𝑝).posrefers to
+the refinement type of positive integers, and 𝑡𝑠is the basic tensor type. To save space, CHANNEL ,HEIGHT , and WIDTH denote the
+indices of the channel, height, and width dimensions, respectively. As usual, x.et,x.order ,x.shape ,x.fmtdenote the element type,
+order, shape, and format of the tensor variable 𝑥, respectively.
+(𝑔𝑝). The tensor format is either NCHW orNHWC ; other hyperparame-
+ters require positive integer values, although their declarations use
+the Python inttype. We assume that each of the kernel size, stride,
+padding, and dilation is an array of two positive integers that are
+used for the height and width dimensions, respectively.
+The core computation of Conv2d is described as follows [61]:
+𝑦(𝑖,𝑗)=bias(𝑗)+Í𝑖𝑐−1
+𝑘=0weight(𝑗,𝑘)★𝑥(𝑖,𝑘),
+where 0≤𝑖<the batch size ,0≤𝑗<𝑜𝑐,𝑥and𝑦are the input and
+output tensors, and ★is the 2D cross-correlation [ 80] operation.
+From the mathematical definition [ 24] and framework implementa-
+tions of Conv2d , we extract the following computational constraints
+on both tensors and hyperparameters and show the formalized re-
+finement type of Conv2d in Figure 5, where item labels correspond
+to the names of the logical formulae.
+𝑝𝑥-1The input tensor should have exactly four dimensions whose
+lengths are positive integers. Its elements are floating-point
+numbers, i.e., the element type is either float ordouble.
+𝑝𝑥-2The actual format of the input tensor should be equal to the
+tensor format hyperparameter; for PyTorch models, it must
+beNCHW . The latter is a PyTorch-specific constraint, so we
+use a Boolean control variable IsPT initialized to true when
+the framework is PyTorch. The length of the input tensor’s
+channel dimension should be equal to the number of input
+channels. Note that the dimensional indices except that of
+the batch dimension (always 0) are not constants because of
+two possible tensor formats. To save space in Figure 5, we
+useCHANNEL ,HEIGHT , and WIDTH to denote the indices of the
+channel, height, and width dimensions, respectively.
+𝑝𝑠𝑑-1Each element of the stride cannot exceed that of the kernel
+size; otherwise, some input data is mistakenly skipped.
+𝑝𝑠𝑑-2TensorFlow additionally requires that the stride and dilation
+cannot both be greater than 1 [ 74]. Similarly, we use another
+Boolean control variable IsTF in this constraint, which is
+initialized to true when the framework is TensorFlow.𝑝𝑔𝑝The number of groups specifies the “number of blocked
+connections from input channels to output channels” [ 61];
+therefore, the numbers of input and output channels should
+both be divisible by it.
+𝑝𝑦-1The output tensor has the same element type, order, format,
+and length of the batch dimension with the input tensor.
+The length of its channel dimension should be equal to the
+number of output channels.
+𝑝𝑦-2The output height and width are calculated as follows [61]:
+𝐻𝑜𝑢𝑡=𝐻𝑖𝑛+2×pad[0]− dil[0]×(𝑘𝑠[0]− 1)− 1
+𝑠𝑑[0]+1
+,
+𝑊𝑜𝑢𝑡=𝑊𝑖𝑛+2×pad[1]− dil[1]×(𝑘𝑠[1]− 1)− 1
+𝑠𝑑[1]+1
+.
+Both PyTorch and TensorFlow also allow developers to pass
+a string “valid” or “same” as the value of the padding hy-
+perparameter. “valid” means no padding. “same” means that
+the framework automatically pads the input evenly; there-
+fore, the above calculation can be simplified [ 75] as𝐻𝑜𝑢𝑡=
+⌈𝐻𝑖𝑛
+𝑠𝑑[0]⌉and𝑊𝑜𝑢𝑡=⌈𝑊𝑖𝑛
+𝑠𝑑[1]⌉. When using the “same” padding,
+PyTorch requires that both elements of the stride must be 1,
+so the output has the same height and width as the input.
+𝑝𝑦-3The output tensor is also legal; that is to say, each length of
+the four dimensions is a positive integer.
+At present, we support 70+types of DLoperators. Refty is
+extensible to incorporate new operators, which is discussed in
+Section 5.1.
+3.3 Workflow
+Figure 6 illustrates how Refty works. Refty accepts a computa-
+tion graph, a model specification, and a tool specification as input
+from developers or AutoML tools. The computation graph is recon-
+structed from a serialized PyTorch or TensorFlow model in the form
+of disk files, using our front-end parsers that invoke the framework
+built-in model deserialization APIs. Also, developers can describe
+1848
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. Refty: Refinement Types for Valid Deep Learning Models ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+Figure 6: Workflow of Refty.
+such a graph manually in the Protocol Buffers [ 25] language, using
+the intermediate representation of MMdnn [ 44], whose syntax is
+very similar to that of ONNX [ 53]. The model specification includes
+the tunable hyperparameters and their domain definitions. Unspec-
+ified hyperparameters will use the framework default values. The
+tool specification contains the framework type/version, solving
+mode, optimization choice, etc.
+Refty traverses the computation graph by following the opera-
+tor execution ordering to generate a set of constraints that the DL
+model should satisfy. It then utilizes Microsoft Z3 [ 11] to obtain
+the unsatisfiable hyperparameter vectors that result in type errors.
+Refty chooses SMT solvers for two reasons: (1) the constraints can
+be specified with SMT solvers’ built-in types (e.g., integer and array),
+algebraic data types (e.g., scalar and record), functions (e.g., mul-
+tiplication and modulo), and value comparison (e.g., equality and
+less-than); (2) they handle nonlinear (e.g., calculating the output size
+ofConv2d ) and higher-order mathematical expressions very effi-
+ciently. Nevertheless, the scalability of SMT solvers may potentially
+limit the usability of Refty, which is discussed in Section 5.2. In the
+final report to users, Refty presents the corresponding hyperparam-
+eter vector for each detected error. If needed for further diagnosis,
+Refty additionally reports all the error-related constraints and the
+operators to which these constraints belong.
+3.4 Graph Traversal and Constraint Generation
+For each supported type of operator, Refty aforehand translates the
+logical formulae of its refinement type to SMT-LIB [ 4] statements
+in a reusable template, using the Python API of Z3. The symbol
+names of tensors and hyperparameters are parameterized to handle
+variable substitution. Refty declares integer constants for the avail-
+able element types and known tensor formats. To denote the tensor
+type, it defines a custom record type with four fields, representing
+the element type, format, order (an integer), and shape (an array) of
+the tensor, respectively. The manipulation over all the dimensions
+of a tensor with a non-constant order (e.g., calculating the total
+number of tensor elements) is implemented by recursive functions.
+Refty first creates a Z3 instance, checks the basic types of the
+hyperparameters specified in the model specification, and defines
+all the hyperparameter symbols. It then traverses the computation
+graph one operator by another by following a predefined sequence
+𝑆=⟨𝑜𝑝𝑖1,𝑜𝑝𝑖2,···,𝑜𝑝𝑖𝑁⟩that denotes the actual runtime execu-
+tion ordering of operators. 𝑆is linearly extended from the edge
+ordering by reference to the framework implementations [ 41,60].When visiting an operator 𝑜𝑝,Refty locates the SMT-LIB template
+by𝑜𝑝’s type, checks the basic types of both input and output argu-
+ments against those of the corresponding formal parameters, fills
+in the actual symbol names derived from 𝑜𝑝’s name, and executes
+the SMT-LIB statements to add constraint formulae to the solver
+instance. Refty also inserts equality constraints that assert that
+𝑜𝑝’s input tensor arguments are exactly the same as those outputs
+of the immediate predecessors. After the graph traversal finishes,
+Refty finally adds multiple formulae defining the domain of each
+hyperparameter.
+3.5 Constraint Solving
+Refty utilizes Microsoft Z3 to solve the generated constraints. To
+reduce the nondeterminism in Z3’s conflict-driven clause learning
+(CDCL) [ 68] implementation, we split a constraint formula into as
+many smaller, self-contained ones as possible and add them one
+by one to the solver instance in our SMT-LIB templates. If users
+need to diagnose the root cause of an error, Refty employs the
+minimal unsatisfiable core (i.e., an unsatisfiable subset containing
+the least number of the original formulae) returned by Z3 to report
+all the error-related constraints and the operators to which these
+constraints belong.
+Refty implements two solving modes: individual mode and bulk
+mode. Under the individual mode, Refty independently solves
+the constraints for each vector in the hyperparameter configura-
+tion space. This mode is simple, requires less effort, and facilitates
+tool integration. For example, AutoML tools can work nearly as
+usual: they need to invoke Refty with the hyperparameter vector
+being explored just before launching a trial job. However, there
+exist continuous, significant warm-up overheads of traversing the
+computation graph, generating the constraints, and initializing the
+solver instance. Refty applies the context reuse technique to im-
+prove solving performance: it reuses the existing Z3 instance and
+almost all the initialized constraint formulae, pops out the domain
+definition formulae that were added last, and pushes new domain
+definition formulae for the next hyperparameter vector.
+Under the bulk mode, Refty solves the constraints for once with
+the whole hyperparameter configuration space. However, Z3 re-
+turns only one satisfiable hyperparameter vector when there is any,
+instead of supplying all at once. Therefore, Refty implements a
+simple AllSAT (all solutions SAT) [ 76] feature: it iteratively invokes
+the same Z3 instance by appending the negation of the newfound
+solution to derive the next one. Supposing that 𝜆=⟨𝑣1,𝑣2,···,𝑣𝐾⟩
+is a newfound satisfiable vector, Refty will append the constraint
+(ℎ𝑝1≠𝑣1)∧(ℎ𝑝2≠𝑣2)∧···∧(ℎ𝑝𝐾≠𝑣𝐾). As more and more so-
+lutions are discovered, AllSAT may get slower and slower because
+the appended negation formulae are becoming too many. After
+obtaining the set of the satisfiable hyperparameter vectors, Refty
+uses the set difference operation to derive all the unsatisfiable ones.
+Finally, it reruns completely from the beginning under the individ-
+ual mode for each unsatisfiable hyperparameter vector to get the
+minimal unsatisfiable cores.
+Constraint solving may slow down significantly if there exist a
+large number of constraints or a huge hyperparameter configura-
+tion space. Refty adopts two optimization techniques proposed by
+1849
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Yanjie Gao, Zhengxian Li, Haoxiang Lin, Hongyu Zhang, Ming Wu, and Mao Yang
+DnnSAT [ 23]. The first is parallel (using worker threads) and dis-
+tributed (using Spark [ 83]) solving, which divides the solving task
+into subtasks and processes them simultaneously. The other is tiny
+subspaces: the original hyperparameter configuration space is di-
+vided into numerous, disjoint, small subspaces to reduce the AllSAT
+overhead and tackle the skew problem [ 3]. These two techniques
+can be used in conjunction with context reuse.
+4 EVALUATION
+4.1 Experimental Design
+Refty is evaluated on individual operators and real-world models
+under two mainstream DLframeworks of PyTorch (v1.5.1) and
+TensorFlow (v1.13.1). We aim to answer the following research
+questions (RQs):
+RQ1: How effective is Refty on individual DL operators?
+RQ2: How effective is Refty on real-world DL models?
+RQ3: How efficient is Refty in constraint solving?
+RQ4: How does Refty compare with related work?
+We fine-tune several hyperparameters that are often tuned by
+developers in practice, including the batch size, input image size
+(“height×width” for convenience), tensor format, kernel size, stride,
+number of features, etc.For the hyperparameter values, we first
+select some typical ones, such as 8 and 16 [ 36] for the batch size,
+NHWC andNCHW for the tensor format, 1×1,3×3, and 5×5for
+the kernel size of Conv2d [69,71],2×2for the kernel size of
+MaxPool2d [69,71],1×1and 2×2for the stride [ 69,71], and
+256[63] for the number of features. The initial input size for the
+ImageNet dataset [ 13] is usually 224×224, while Inception-V3 uses
+299×299by default. Some neighboring values (e.g., 4×4for the
+kernel size and stride) are also selected. We further try a few smaller
+(e.g., 32 for the number of features), larger (e.g., 12×12for the kernel
+size), or even invalid values that may lead to potential errors.
+In order to obtain the ground truth of whether or not a hyper-
+parameter vector 𝜆results in type errors, we feed 𝜆to the model
+training program and run it with one batch of input data. Assertions
+are also added to the program to detect errors that may not fail the
+execution but cause the final model to produce wrong output results
+(e.g., an input tensor having an unsupported format). If the program
+crashes, we say that 𝜆is an actual positive; otherwise, 𝜆is an actual
+negative. We then run Refty on the hyperparameter configuration
+space of the model, compare each result (including the hyperpa-
+rameter vector and possible root cause) with the ground truth, and
+calculate the numbers of true positives, false positives (i.e., correct
+hyperparameter vectors being misreported as defective), true neg-
+atives, and false negatives (i.e., defective hyperparameter vectors
+not being detected).
+We adopt the standard metrics of Precision andRecall to assess
+the effectiveness of Refty, which are defined as follows [51]:
+Precision =tp
+tp+fp×100%, Recall =tp
+tp+fn×100%.
+The above tp,fp,tn, and fndenote the numbers of true positives,
+false positives, true negatives, and false negatives, respectively.
+Consequently, the numbers of actual positives and actual negatives
+are equal to tp+fnandfp+tn, respectively. The higher Precision
+and Recall values, the more effective Refty is.We conduct the experiments on an Azure Standard ND12 virtual
+machine [ 48] that has 12 Intel Xeon E5-2690V3 vCPUs (2.60 GHz,
+30M Cache) and 112 GB main memory, running Ubuntu 18.04.
+4.2 RQ1: How effective is Refty on individual
+DL operators?
+We select five typical operators of Conv2d ,MaxPool2d (2D max
+pooling), Linear ,Add(addition of two tensors), and Concat (con-
+catenation of a list of tensors in a given dimension) to evaluate the
+effectiveness of Refty.
+ForConv2d andMaxPool2d , we tune their batch size (8 and 16),
+tensor format ( NCHW andNHWC ), number of input channels (3), input
+image size (7×7,14×14,27×27, and 224×224), kernel size (3×3,
+6×6,9×9,12×12, and 15×15), and stride (1×1,2×2,4×4, and
+8×8,10×10).
+ForLinear , we use a 4-order image tensor as input and tune
+its batch size (8, 16, 24, and 32), number of input channels (3), and
+input image size (7 ×7,14×14,27×27, and 224×224). We also
+tune the numbers of input features (147, 588, 2187, and 150528) and
+output features (−128, 128, 256, 512, and 1024) of Linear.
+ForAdd, we use two 4-order image tensors and independently
+tune their batch size (8 and 16), input image size (7 ×7,14×14,
+27×27, and 224×224), and number of input channels (3, 6, and 9).
+ForConcat , the input sequence consists of two 4-order image
+tensors. We independently tune their element type ( float and
+bool ), batch size (8), input image size (7 ×7,14×14,27×27, and
+224×224), and number of input channels (3, 6, and 9).
+We devise the above hyperparameter domains to cover all the
+error categories shown in Table 1. For example, when the input
+image size is 7×7and the kernel size is 15×15in the Conv2d exper-
+iments, Illegal Shape errors are raised. We also use a negative value
+as the number of output features of Linear , which leads to Illegal
+Value errors. To obtain the ground truth, we compose a program
+for training a model that contains only the experimental operator.
+Because of the small hyperparameter configuration spaces, Refty
+runs under the individual solving mode for simplicity. The average
+warm-up time of Refty is 0.04 second for Conv2d ,MaxPool2d , and
+Linear and is 0.1 second for AddandConcat . The solving time is
+0.012 second per hyperparameter vector on average.
+Table 2 shows the experimental results. Refty finds all the type
+errors and does not introduce any false alarms. It achieves 100%
+Precision and Recall, which demonstrates the effectiveness of our
+formulated refinement types of DL operators.
+4.3 RQ2: How effective is Refty on real-world
+DL models?
+We evaluate Refty on five real-world DLmodels: AlexNet [39],
+VGG-16 [69],Inception-V3 [71],LSTM [29]-based Seq2Seq [70],
+andGRU [8]-based Seq2Seq . They are representative in the areas
+of computer vision, natural language processing, and speech recog-
+nition. Some of them, such as LSTM andGRU , are also widely used
+in various DLfor software engineering applications [ 26,31,43,84].
+ForAlexNet andVGG-16 , we set the number of input channels
+to 3, input batch size to 8 or 16, and input image size to 224×224.
+We tune the kernel size (3 ×3,6×6,9×9, and 12×12) and stride
+(1×1,2×2,4×4, and 8×8) of the first Conv2d operator. We also
+1850
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. Refty: Refinement Types for Valid Deep Learning Models ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+Table 2: Experimental results on individual operators.
+MetricsOperatorConv2d MaxPool2d Linear Add Concat
+PyTorch T
+otal 400 400 320 576 576
+True Positive 240 230 256 552 540
+True Negative 160 170 64 24 36
+False Positive 0 0 0 0 0
+False Negative 0 0 0 0 0
+Precision 100% 100% 100% 100% 100%
+Recall 100% 100% 100% 100% 100%
+TensorFlow T
+otal 400 400 320 576 576
+True Positive 240 230 256 552 540
+True Negative 160 170 64 24 36
+False Positive 0 0 0 0 0
+False Negative 0 0 0 0 0
+Precision 100% 100% 100% 100% 100%
+Recall 100% 100% 100% 100% 100%
+try different kernel sizes (1 ×1,2×2,4×4, and 8×8) and strides
+(1×1,2×2,4×4, and 8×8) for the first MaxPool2d operator.
+ForInception-V3 , we use identical hyperparameter domains except
+that the input batch size is 8 and the input image size is 299×299.
+For the other two Seq2Seq models, we tune the number of fea-
+tures in the hidden state (32, 64, 128, and 256) and the number of
+recurrent layers (32, 64, 128, and 256) for both encoder and decoder.
+We implement AlexNet by ourselves, download the training pro-
+grams and serialized model files of VGG-16 andInception-V3 from
+the official websites [ 62,82], and implement Seq2Seq by referring
+to open-source code [ 19,77]. It takes about 6 to 7 seconds to run
+the training programs with one batch of input data and one hy-
+perparameter vector for obtaining the ground truth, excluding the
+time of data preparation and model validation/testing. Refty still
+runs under the individual solving mode. The numbers of Z3 sym-
+bols and constraint formulae of AlexNet ,VGG-16 ,Inception-V3 ,
+LSTM -based Seq2Seq , and GRU -based Seq2Seq are 112/183, 196/345,
+920/1788, 16/28, and 16/28, respectively. The average warm-up time
+and solving time (in seconds) of Refty are 0.5/0.029, 0.67/0.045,
+3.17/0.18, 0.11/0.013, and 0.11/0.013, respectively.
+Table 3 shows the experimental results. Refty again achieves
+100% Precision and Recall in all the experiments, which demon-
+strates its effectiveness on DLmodels. We notice a discrepancy
+in the ground truth of the VGG-16 andInception-V3 experiments.
+The root cause lies in the differences between the official training
+programs. In the TensorFlow VGG-16 experiments, many hyper-
+parameter vectors cause the output shape of the last MaxPool2d
+to violate the requirement of the succeeding Linear , which brings
+120 more crashes. Instead, the PyTorch program inserts an extra
+AdaptiveAvgPool2d (2D adaptive average pooling) operator with
+proper padding to resolve this issue. In the PyTorch Inception-V3
+experiments, the fixed padding values make the PyTorch program
+more vulnerable to Illegal Shape errors and lead to 140 more crashes.
+4.4 RQ3: How efficient is Refty in constraint
+solving?
+We evaluate Refty on the constraint solving efficiency with the op-
+timization techniques mentioned in Section 3.5. Inception-V3 [71]Table 3: Experimental results on real-world DL models.
+MetricsModel
+AlexNet VGG-16 Inception-V3Seq2Seq Seq2Seq
+(LSTM) (GRU)
+PyTorch T
+otal 512 512 256 256 256
+True Positive 200 200 197 240 240
+True Negative 312 312 59 16 16
+False Positive 0 0 0 0 0
+False Negative 0 0 0 0 0
+Precision 100% 100% 100% 100% 100%
+Recall 100% 100% 100% 100% 100%
+TensorFlow T
+otal 512 512 256 256 256
+True Positive 200 320 57 240 240
+True Negative 312 192 199 16 16
+False Positive 0 0 0 0 0
+False Negative 0 0 0 0 0
+Precision 100% 100% 100% 100% 100%
+Recall 100% 100% 100% 100% 100%
+is selected as our experimental object; it is one of the representative
+real-world models in computer vision and has a more complex neu-
+ral architecture (in terms of width and height) than the other four
+DLmodels. The tunable hyperparameters include the input batch
+size (16 and 32), input image size ( {299,300,301}×{299,300,301}; 9
+different sizes), and kernel size ( {1,3,5}×{ 1,3,5}; 9 different sizes)
+for the first three Conv2d operators. Therefore, the hyperparameter
+configuration space of Inception-V3 consists of 13,122 vectors in to-
+tal. To increase the solving difficulty, we carefully devise the above
+hyperparameter domains to make every hyperparameter vector
+satisfy the constraints.
+For parallel solving, we create 1, 4, 8, and 12 worker threads.
+More threads are not considered since there are only 12 vCPUs
+on the experimental machine. For tiny subspaces, we try subspace
+sizes of equipartition, 200, 100, and 50. “Equipartition” means that
+the original hyperparameter configuration space is simply divided
+equally by the number of threads. For example, if we use 12 worker
+threads, each will independently solve one subspace that includes
+about⌈13,122
+12⌉=1,094hyperparameter vectors. Context reuse is
+enabled by default for all the experiments. The reason is that the
+overhead of a complete Z3 instance initialization is evident (3.17
+seconds on average, as reported in Section 4.3) and causes some
+experiments to run too long.
+Table 4 demonstrates the end-to-end execution time (in seconds)
+ofRefty under both individual and bulk solving modes. We also
+show the speedup relative to the baseline experiment (individual
+mode: 1 thread; bulk mode: 1 thread + equipartition). Our results
+confirm the strong effects of the optimization techniques. Under
+the individual mode, parallel solving achieves a near-linear speedup
+from 3.9X to 11.8X since the computational complexity of solving
+each hyperparameter vector is identical. Under the bulk mode,
+the overall speedup ranges from 3.5X to 51.0X. Simply creating
+more worker threads (see the “Equipartition” row) achieves a super-
+linear speedup from 10.3X to 43.4X because smaller hyperparameter
+configuration spaces observably reduce the overhead of AllSAT .
+Tiny subspaces (see the “1 thread” column) are also effective for the
+above same reason. After combining these two techniques, Refty
+achieves a more promising and near-linear speedup from 10.3X to
+1851
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Yanjie Gao, Zhengxian Li, Haoxiang Lin, Hongyu Zhang, Ming Wu, and Mao Yang
+Table 4: Runtime performance of Refty with parallel solving
+and tiny subspaces. Context reuse is enabled by default.
+ModeSize of Number of Threads
+Subspace 1 4 8 12
+Individual 11.0 3.9 7.9 11.8
+(2,365.3 s) (594.9 s) (298.8 s) (200.4 s)
+BulkEquipartition1.0 10.3 28.3 43.4
+(8,660.1 s) (835.3 s) (305.5 s) (199.4 s)
+2003.5 14.0 27.9 41.7
+(2,450.8 s) (615.4 s) (309.5 s) (207.5 s)
+1003.92 15.6 31.0 46.2
+(2,208.9 s) (554.7 s) (279.1 s) (187.3 s)
+504.3 17.2 34.2 51.0
+(1,998.1 s) (502.3 s) (252.9 s) (169.8 s)
+Note: The two values in
+a cell represent the speedup and execution time
+in seconds, respectively.
+51.0X. As the subspace size decreases, the overhead of AllSAT also
+continues to reduce, and the performance gain gradually increases.
+4.5 RQ4: How does Refty compare with related
+work?
+We compare Refty with Pythia [40], a static shape-checking tool for
+TensorFlow Python programs. Pythia detects incompatible shapes
+by modeling and tracking tensor shapes across TensorFlow API
+calls. The analysis of Pythia uses the WALA [ 79] framework and
+declarative Datalog [ 5] rules. We select the Unaligned-Tensor-1 (UT-
+1) program1as the experimental object because Pythia does not
+support the TensorFlow Slim API [ 66] used by the training programs
+of our evaluated real-world models (Section 4.3). UT-1 is one of
+the fourteen programs provided by Zhang et al. [87] that contain
+Unaligned Tensor bugs, and it has been successfully analyzed by
+Pythia . UT-1 trains a convolutional model for MNIST handwritten
+digit classification [ 14], which is much more complicated than those
+implemented in other UT programs.
+Since Pythia checks tensor shape mismatches, we devise the
+hyperparameter configuration space such that only Illegal Shape
+and Incompatible Shape errors, if any, may be raised. Before the
+experiment, we have actually tried some hyperparameter vectors
+that led to errors in the other four categories and noticed that
+Pythia could not detect them. UT-1 invokes the Primitive Neural Net
+API [ 73] (e.g., tf.nn.conv2d ) that uses a new filter hyperparameter
+instead of the kernel size for convolutional operators. The filter is a
+4-order tensor of the shape [kernel height, kernel width, number of
+input channels, number of output channels]. We randomly select 9
+and 10 shapes (such as “[5, 5, 1, 32]” and “[33, 33, 3, 64]”) for the filter
+hyperparameter of the two Conv2d operators, respectively. We also
+tune the kernel size (2 ×2,12×12, and 22×22) of the first MaxPool2d
+operator and set the padding of the two MaxPool2d operators to
+“valid”. Therefore, there are 270 hyperparameter vectors in total.
+For each vector, we fill the corresponding hyperparameter values
+in the UT-1 program and then pass the program file to Pythia for
+analysis. Pythia starts with a ten-minute warm-up, and after that,
+1https://github.com/ForeverZyh/TensorFlow-Program-Bugs/tree/master/
+StackOverflow/UT-1/38167455-buggy/mnist.pyTable 5: Comparison with Pythia.
+MetricsToolPythia Refty
+TensorFlow T
+otal 270 270
+True Positive 33 270
+True Negative 0 0
+False Positive 0 0
+False Negative 237 0
+Precision 100% 100%
+Recall 12.2% 100%
+each checking takes 12 seconds on average. Refty runs under the
+individual solving mode, and its warm-up time and solving time
+are about 0.037 second and 0.019 second per vector, respectively.
+Table 5 shows the experimental results. Refty still achieves 100%
+Precision and Recall. Although the Precision of Pythia is 100%, its
+Recall is only 12.2%, a rather low percentage. The reason is that
+Pythia does not detect 237 buggy cases. In 153 of them, a tensor
+of an illegal shape is produced by a Conv2d operator. In the other
+84 cases, the input and filter tensors of the first Conv2d operator
+do not have a matched number of input channels, which causes
+Incompatible Shape errors.
+5 DISCUSSION
+5.1 Extensibility of Refty
+Currently, Refty supports two mainstream DLframeworks (Py-
+Torch and TensorFlow) and 70+types of commonly used opera-
+tors. Refty can be adapted to other frameworks such as Apache
+MXNet [ 7] and ONNX [ 53] because they also adopt the same
+abstraction to represent models as tensor-oriented computation
+graphs. The syntax and semantics of their graphs and operators
+are very similar to those of PyTorch and TensorFlow; therefore,
+existing SMT-LIB templates of the refinement types can be reused
+with minor modifications. Nevertheless, the graph traversal may
+need to be adjusted to accord with the actual operator execution or-
+dering of other frameworks. Refty is also extensible to incorporate
+new DLoperators. To support a new type of operator, users need
+to extract the computational constraints, formulate a refinement
+type for each formal input/output parameter based on the opera-
+tor’s mathematical definition and framework implementations, and
+implement an SMT-LIB program template.
+5.2 Threats to Validity
+We discuss the following main threats to the validity of our work.
+Refinement types. We formulate the refinement types of DL
+operators by our domain experience based on their mathematical
+definitions. We also examine the source code of both PyTorch and
+TensorFlow to incorporate framework-specific computational con-
+straints into the formulation. Nevertheless, because of the large
+manual effort involved in formulating refinement types and prepar-
+ing SMT-LIB templates, there might be a potential inaccuracy. To
+mitigate this threat, we strived to reach group consensus before
+making decisions, and we continuously refined our approach by
+carefully referring to the documentation and framework source
+1852
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. Refty: Refinement Types for Valid Deep Learning Models ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+code. In our experiments, Refty achieves 100% Precision and Recall,
+confirming the validity of the refinement types of DL operators.
+SMT solving. Refty utilizes Microsoft Z3 to solve the gener-
+ated constraints. As DLmodels become more sophisticated and
+hyperparameter configuration spaces enlarge gradually, the compu-
+tational complexity of constraint solving will increase observably
+and thus may reduce the usability of our tool. Currently, Refty
+implements context reuse and adopts another two optimization
+techniques of parallel/distributed solving and tiny subspaces from
+DnnSAT [ 23] to accelerate constraint solving. Our experiments
+on a fairly large hyperparameter configuration space with 13,122
+vectors have demonstrated the strong effects of these optimiza-
+tions (Table 4). In the future, we may advance SMT solvers and try
+larger-scale distributed solving to better tackle this problem.
+6 RELATED WORK
+There are some recent empirical studies on deep learning program
+defects and job failures. Zhang et al. [87] studied 175 TensorFlow
+program bugs collected from Stack Overflow pages and GitHub
+commits, 24 (about 13.71%) of which were caused by unaligned
+tensors. Islam et al. [30] extended this work to cover more frame-
+works such as Torch [ 10] and Caffe [ 35]; they discovered that the
+same reason was a major root cause (about 13.48%) of the total 415
+bugs and was the leading cause of Torch bugs. Zhang et al. [85]
+conducted an empirical study on 4,960 failed DLjobs collected from
+an internal platform of Microsoft; they found that about 57 (8.53%)
+out of the 668 DL-specific failures were caused by mismatched ten-
+sors. Zhang et al. [86] examined 715 Stack Overflow questions to
+study common challenges in DLapplication development, many of
+which asked for help on shape inconsistency bugs. These empirical
+studies indicate that type errors of DLmodels are not uncommon
+and motivate us for a formal and systematic solution.
+There have been many type-based techniques to perform correct-
+ness checking on programs. Some works [ 6,17,27,32,33,50,67]
+enrich the type system with specific tensor properties for static
+verification. For example, Eaton [ 17] proposed strongly typed linear
+algebra for numerical algorithms in which the dimensions of matri-
+ces were exposed. A few others [ 2,37,45,81] reason whether the
+array index is out of bounds. For instance, Index Checker [ 37] is an
+open-source tool to discover array access errors in Java programs
+whose type system is conditioned by cooperating hierarchies of
+dependent types. As described before, these previous works target
+programs written in conventional programming languages (e.g.,
+Haskell and Java) and cannot be applied to DLmodels directly. Re-
+cently, Wen et al. [38] leveraged refinement types and constrained
+the values of tensor elements to verify the adversarial robustness
+of neural networks, which was “commonly characterised as the
+deviation in the neural network’s outputs given perturbations of its
+inputs” [ 38]. Two libraries implemented in F∗and Liquid Haskell
+were provided for constructing fully connected neural networks
+that use four common activation functions. To make verification
+tractable, users need to reduce the tensor dimensionality and model
+size manually. In comparison, Refty targets a different problem
+and supports more types of DLoperators: it constrains hyperpa-
+rameter values and tensor shapes/element types/formats to check
+the validity of models and eliminate common type errors. Leonardoet al. [58] proposed TensorSafe, a Haskell library that helps devel-
+opers define the neural architectures of DLmodels and leverages
+the Haskell type system to validate the structural correctness. Ten-
+sorSafe does not use refinement types to describe further compu-
+tational constraints on tensors and hyperparameters. Therefore,
+although TensorSafe detects Incompatible Shape errors, it cannot
+find errors in the other categories shown in Table 1.
+Popular DLframeworks adopt a hybrid programming paradigm:
+the runtime is implemented in C++ for high execution performance,
+while developers use other language bindings (e.g., Python) for
+flexible programmability. Some recent works try to integrate DL
+frameworks directly into programming languages. Swift for Ten-
+sorFlow [ 65] (which was archived in February 2021) implements
+language-integrated differentiable programming and allows devel-
+opers to construct models with the Swift language and the familiar
+TensorFlow API. ONNX-Scala [ 46] brings full support for ONNX
+to the Scala ecosystem. Powered by the type systems of Swift and
+Scala, the two works are able to detect some type errors of DL
+models at compile-time. For example, Swift for TensorFlow checks
+whether the types of hyperparameter arguments are expected, but
+it does not inspect hyperparameter values and track tensor shapes.
+Furthermore, they only support a specific framework and cannot
+be adapted to others.
+Recently, researchers proposed static and dynamic techniques
+to detect bugs in DLprograms. Ariadne [ 15] applies WALA [ 79]
+program analysis to TensorFlow Python code and tracks tensors
+via a custom type system. Pythia [40] is a static shape-checking
+tool for TensorFlow programs that uses WALA and declarative
+Datalog [ 5] rules. Pythia models and tracks tensor shapes across
+TensorFlow API calls and checks whether incompatible shapes exist.
+ShapeFlow [78] modifies the implementation of TensorFlow API
+to capture and manipulate tensor shapes and runs DLprograms
+to detect shape incompatibility issues. These tools are friendly to
+developers since they directly operate on Python code. However,
+they are TensorFlow-specific, focus on Incompatible Shape errors,
+and have difficulty detecting other errors caused by improper hy-
+perparameter values, unsupported tensor formats, etc.Refty is a
+novel refinement type-based tool for both PyTorch and TensorFlow.
+It rigidly formulates the computational constraints enforced by
+operators and systematically detects invalid DLmodels caused by
+sixcategories of type errors. Refty also achieves good runtime
+performance; for example, it checks 13,122 hyperparameter vectors
+of Inception-V3 in about 200 seconds.
+7 CONCLUSION
+In this paper, we have presented Refty, a refinement type-based
+tool for statically detecting common type errors of deep learning
+models. These errors are caused by tensors and hyperparameters
+that violate the computational constraints. The problem of checking
+the validity of a model is formulated as a constraint satisfaction
+problem, and Refty utilizes an SMT solver for solving the con-
+straints. Our experiments demonstrate that Refty is very effective
+at detecting potential type errors before job execution.
+REFERENCES
+[1]Martín Abadi, Paul Barham, Jianmin Chen, Zhifeng Chen, Andy Davis, Jef-
+frey Dean, Matthieu Devin, Sanjay Ghemawat, Geoffrey Irving, Michael Isard,
+1853
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Yanjie Gao, Zhengxian Li, Haoxiang Lin, Hongyu Zhang, Ming Wu, and Mao Yang
+et al.2016. TensorFlow: A System for Large-Scale Machine Learning. In 12th
+USENIX Symposium on Operating Systems Design and Implementation (OSDI
+16). USENIX Association, Savannah, GA, 265–283. https://www.usenix.org/
+conference/osdi16/technical-sessions/presentation/abadi
+[2]Periklis Akritidis, Manuel Costa, Miguel Castro, and Steven Hand. 2009. Baggy
+Bounds Checking: An Efficient and Backwards-Compatible Defense against
+out-of-Bounds Errors. In Proceedings of the 18th Conference on USENIX Security
+Symposium (Montreal, Canada) (SSYM ’09). USENIX Association, USA, 51–66.
+[3]Ganesh Ananthanarayanan, Sameer Agarwal, Srikanth Kandula, Albert Green-
+berg, Ion Stoica, Duke Harlan, and Ed Harris. 2011. Scarlett: Coping with Skewed
+Content Popularity in Mapreduce Clusters. In Proceedings of the Sixth Conference
+on Computer Systems (Salzburg, Austria) (EuroSys ’11). Association for Comput-
+ing Machinery, New York, NY, USA, 287–300. https://doi.org/10.1145/1966445.
+1966472
+[4]Clark Barrett, Pascal Fontaine, and Cesare Tinelli. 2017. The SMT-LIB Standard:
+Version 2.6. Technical Report. Department of Computer Science, The University
+of Iowa. Available at www.SMT-LIB.org.
+[5]S. Ceri, G. Gottlob, and L. Tanca. 1989. What You Always Wanted to Know About
+Datalog (And Never Dared to Ask). IEEE Transactions on Knowledge and Data
+Engineering 1, 1 (mar 1989), 146–166. https://doi.org/10.1109/69.43410
+[6]Tongfei Chen. 2017. Typesafe Abstractions for Tensor Operations (Short Paper).
+InProceedings of the 8th ACM SIGPLAN International Symposium on Scala (Van-
+couver, BC, Canada) (SCALA 2017). Association for Computing Machinery, New
+York, NY, USA, 45–50. https://doi.org/10.1145/3136000.3136001
+[7]Tianqi Chen, Mu Li, Yutian Li, Min Lin, Naiyan Wang, Minjie Wang, Tianjun
+Xiao, Bing Xu, Chiyuan Zhang, and Zheng Zhang. 2015. MXNet: A Flexible
+and Efficient Machine Learning Library for Heterogeneous Distributed Systems.
+CoRR abs/1512.01274 (2015). arXiv:1512.01274 http://arxiv.org/abs/1512.01274
+[8]Kyunghyun Cho, Bart van Merriënboer, Caglar Gulcehre, Dzmitry Bahdanau,
+Fethi Bougares, Holger Schwenk, and Yoshua Bengio. 2014. Learning Phrase
+Representations using RNN Encoder–Decoder for Statistical Machine Translation.
+InProceedings of the 2014 Conference on Empirical Methods in Natural Language
+Processing (EMNLP). Association for Computational Linguistics, Doha, Qatar,
+1724–1734. https://doi.org/10.3115/v1/D14-1179
+[9] François Chollet. 2017. Deep Learning with Python. Manning.
+[10] Ronan Collobert, Samy Bengio, and Johnny Mariéthoz. 2002. Torch: a modular
+machine learning software library. Idiap-RR Idiap-RR-46-2002. IDIAP.
+[11] Leonardo De Moura and Nikolaj Bjørner. 2008. Z3: An Efficient SMT Solver. In
+Proceedings of the Theory and Practice of Software, 14th International Conference
+on Tools and Algorithms for the Construction and Analysis of Systems (Budapest,
+Hungary) (TACAS ’08/ETAPS ’08). Springer-Verlag, Berlin, Heidelberg, 337–340.
+[12] Leonardo de Moura, Bruno Dutertre, and Natarajan Shankar. 2007. A Tutorial on
+Satisfiability modulo Theories. In Proceedings of the 19th International Conference
+on Computer Aided Verification (Berlin, Germany) (CAV ’07). Springer-Verlag,
+Berlin, Heidelberg, 20–36.
+[13] Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. 2009. Im-
+ageNet: A large-scale hierarchical image database. In 2009 IEEE Conference on
+Computer Vision and Pattern Recognition. 248–255. https://doi.org/10.1109/CVPR.
+2009.5206848
+[14] Li Deng. 2012. The MNIST Database of Handwritten Digit Images for Machine
+Learning Research [Best of the Web]. IEEE Signal Processing Magazine 29, 6
+(2012), 141–142. https://doi.org/10.1109/MSP.2012.2211477
+[15] Julian Dolby, Avraham Shinnar, Allison Allain, and Jenna Reinen. 2018. Ariadne:
+Analysis for Machine Learning Programs. In Proceedings of the 2nd ACM SIG-
+PLAN International Workshop on Machine Learning and Programming Languages
+(Philadelphia, PA, USA) (MAPL 2018). Association for Computing Machinery,
+New York, NY, USA, 1–10. https://doi.org/10.1145/3211346.3211349
+[16] Bruno Dutertre. 2014. Yices 2.2. In Computer-Aided Verification (CAV’2014) (Lec-
+ture Notes in Computer Science, Vol. 8559), Armin Biere and Roderick Bloem (Eds.).
+Springer, 737–744.
+[17] Frederik Eaton. 2006. Statically Typed Linear Algebra in Haskell. In Proceedings
+of the 2006 ACM SIGPLAN Workshop on Haskell (Portland, Oregon, USA) (Haskell
+’06). Association for Computing Machinery, New York, NY, USA, 120–121. https:
+//doi.org/10.1145/1159842.1159859
+[18] Herbert B. Enderton. 2001. A Mathematical Introduction to Logic, Second edition.
+Elsevier.
+[19] Matvey Ezhov. 2021. Simple dynamic seq2seq with TensorFlow. https://notebook.
+community/ematvey/tensorflow-seq2seq-tutorials/1-seq2seq.
+[20] John Foderaro. 1991. LISP: Introduction. Commun. ACM 34, 9 (sep 1991), 27.
+https://doi.org/10.1145/114669.114670
+[21] Tim Freeman and Frank Pfenning. 1991. Refinement Types for ML. In Proceedings
+of the ACM SIGPLAN 1991 Conference on Programming Language Design and
+Implementation (Toronto, Ontario, Canada) (PLDI ’91). Association for Computing
+Machinery, New York, NY, USA, 268–277. https://doi.org/10.1145/113445.113468
+[22] Vijay Ganesh and David L. Dill. 2007. A Decision Procedure for Bit-Vectors and
+Arrays. In Proceedings of the 19th International Conference on Computer Aided
+Verification (Berlin, Germany) (CAV ’07). Springer-Verlag, Berlin, Heidelberg,
+519–531.[23] Yanjie Gao, Yonghao Zhu, Hongyu Zhang, Haoxiang Lin, and Mao Yang. 2021.
+Resource-Guided Configuration Space Reduction for Deep Learning Models.
+In2021 IEEE/ACM 43rd International Conference on Software Engineering (ICSE)
+(Madrid, Spain) (ICSE ’21). 175–187. https://doi.org/10.1109/ICSE43902.2021.
+00028
+[24] Ian Goodfellow, Yoshua Bengio, and Aaron Courville. 2016. Deep Learning. MIT
+Press. http://www.deeplearningbook.org.
+[25] Google. 2008. Protocol Buffers - Google’s data interchange format. https://
+developers.google.com/protocol-buffers/.
+[26] Xiaodong Gu, Hongyu Zhang, Dongmei Zhang, and Sunghun Kim. 2016. Deep
+API Learning. In Proceedings of the 2016 24th ACM SIGSOFT International Sym-
+posium on Foundations of Software Engineering (Seattle, WA, USA) (FSE 2016).
+Association for Computing Machinery, New York, NY, USA, 631–642. https:
+//doi.org/10.1145/2950290.2950334
+[27] Troels Henriksen and Martin Elsman. 2021. Towards Size-Dependent Types
+for Array Programming. In Proceedings of the 7th ACM SIGPLAN International
+Workshop on Libraries, Languages and Compilers for Array Programming (Virtual,
+Canada) (ARRAY 2021). Association for Computing Machinery, New York, NY,
+USA, 1–14. https://doi.org/10.1145/3460944.3464310
+[28] C. A. R. Hoare. 1971. Procedures and Parameters: An Axiomatic Approach. In
+Symposium on Semantics of Algorithmic Languages, E. Engeler (Ed.). Springer
+Berlin Heidelberg, Berlin, Heidelberg, 102–116.
+[29] Sepp Hochreiter and Jürgen Schmidhuber. 1997. Long Short-Term Memory.
+Neural Comput. 9, 8 (Nov. 1997), 1735–1780. https://doi.org/10.1162/neco.1997.9.
+8.1735
+[30] Md Johirul Islam, Giang Nguyen, Rangeet Pan, and Hridesh Rajan. 2019. A
+Comprehensive Study on Deep Learning Bug Characteristics. In Proceedings of
+the 2019 27th ACM Joint Meeting on European Software Engineering Conference
+and Symposium on the Foundations of Software Engineering (Tallinn, Estonia)
+(ESEC/FSE 2019). Association for Computing Machinery, New York, NY, USA,
+510–520. https://doi.org/10.1145/3338906.3338955
+[31] Srinivasan Iyer, Ioannis Konstas, Alvin Cheung, and Luke Zettlemoyer. 2016.
+Summarizing Source Code using a Neural Attention Model. In Proceedings of
+the 54th Annual Meeting of the Association for Computational Linguistics (Volume
+1: Long Papers). Association for Computational Linguistics, Berlin, Germany,
+2073–2083. https://doi.org/10.18653/v1/P16-1195
+[32] C. Barry Jay. 1995. A semantics for shape. Science of Computer Programming 25,
+2 (1995), 251 – 283. https://doi.org/10.1016/0167-6423(95)00015-1
+[33] C. Barry Jay and Milan Sekanina. 1997. Shape Checking of Array Programs.
+InProceedings of 1997 Computing: The Australasian Theory Symposium (Sydney,
+Australia) (CATS ’97). Australian Computer Society, Inc., AUS.
+[34] Ranjit Jhala and Niki Vazou. 2020. Refinement Types: A Tutorial. CoRR
+abs/2010.07763 (2020). arXiv:2010.07763 https://arxiv.org/abs/2010.07763
+[35] Yangqing Jia, Evan Shelhamer, Jeff Donahue, Sergey Karayev, Jonathan Long,
+Ross Girshick, Sergio Guadarrama, and Trevor Darrell. 2014. Caffe: Convo-
+lutional Architecture for Fast Feature Embedding. In Proceedings of the 22nd
+ACM International Conference on Multimedia (Orlando, Florida, USA) (MM ’14).
+Association for Computing Machinery, New York, NY, USA, 675–678. https:
+//doi.org/10.1145/2647868.2654889
+[36] Ibrahem Kandel and Mauro Castelli. 2020. The effect of batch size on the gener-
+alizability of the convolutional neural networks on a histopathology dataset. ICT
+Express 6, 4 (2020), 312–315. https://doi.org/10.1016/j.icte.2020.04.010
+[37] Martin Kellogg, Vlastimil Dort, Suzanne Millstein, and Michael D. Ernst. 2018.
+Lightweight Verification of Array Indexing. In Proceedings of the 27th ACM
+SIGSOFT International Symposium on Software Testing and Analysis (Amsterdam,
+Netherlands) (ISSTA 2018). Association for Computing Machinery, New York, NY,
+USA, 3–14. https://doi.org/10.1145/3213846.3213849
+[38] Wen Kokke, Ekaterina Komendantskaya, Daniel Kienitz, Robert Atkey, and David
+Aspinall. 2020. Neural Networks, Secure by Construction. In Proceedings of the
+18th Asian Conference on Programming Languages and Systems (APLAS ’20), Bruno
+C. d. S. Oliveira (Ed.). Springer International Publishing, Cham, 67–85.
+[39] Alex Krizhevsky, Ilya Sutskever, and Geoffrey E. Hinton. 2012. ImageNet Classi-
+fication with Deep Convolutional Neural Networks. In Proceedings of the 25th
+International Conference on Neural Information Processing Systems - Volume 1
+(Lake Tahoe, Nevada) (NIPS ’12). Curran Associates Inc., Red Hook, NY, USA,
+1097–1105.
+[40] Sifis Lagouvardos, Julian Dolby, Neville Grech, Anastasios Antoniadis, and Yannis
+Smaragdakis. 2020. Static Analysis of Shape in TensorFlow Programs. In 34th
+European Conference on Object-Oriented Programming (ECOOP 2020) (Leibniz
+International Proceedings in Informatics (LIPIcs), Vol. 166), Robert Hirschfeld and
+Tobias Pape (Eds.). Schloss Dagstuhl–Leibniz-Zentrum für Informatik, Dagstuhl,
+Germany, 15:1–15:29. https://doi.org/10.4230/LIPIcs.ECOOP.2020.15
+[41] Rasmus Munk Larsen and Tatiana Shpeisman. 2019. TensorFlow Graph Opti-
+mizations.
+[42] Nico Lehmann, Rose Kunkel, Jordan Brown, Jean Yang, Niki Vazou, Nadia Po-
+likarpova, Deian Stefan, and Ranjit Jhala. 2021. STORM: Refinement Types
+for Secure Web Applications. In 15th USENIX Symposium on Operating Systems
+Design and Implementation (OSDI 21). USENIX Association, 441–459. https:
+1854
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. Refty: Refinement Types for Valid Deep Learning Models ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+//www.usenix.org/conference/osdi21/presentation/lehmann
+[43] Wang Ling, Edward Grefenstette, Karl Moritz Hermann, Tomás Kociský, An-
+drew W. Senior, Fumin Wang, and Phil Blunsom. 2016. Latent Predictor Net-
+works for Code Generation. CoRR abs/1603.06744 (2016). arXiv:1603.06744
+http://arxiv.org/abs/1603.06744
+[44] Yu Liu, Cheng Chen, Ru Zhang, Tingting Qin, Xiang Ji, Haoxiang Lin, and Mao
+Yang. 2020. Enhancing the Interoperability between Deep Learning Frameworks
+by Model Conversion. In Proceedings of the 28th ACM Joint Meeting on European
+Software Engineering Conference and Symposium on the Foundations of Software
+Engineering (Virtual Event, USA) (ESEC/FSE 2020). Association for Computing
+Machinery, New York, NY, USA, 1320–1330. https://doi.org/10.1145/3368089.
+3417051
+[45] Yutaka Matsuno and Hiroyuki Sato. 2003. Flow Analytic Type System for Array
+Bound Checks. Electronic Notes in Theoretical Computer Science 78 (04 2003),
+178–195. https://doi.org/10.1016/S1571-0661(04)81012-0
+[46] Alexander Merritt. 2020. ONNX-Scala: Typeful, Functional Deep Learning /
+Dotty Meets an Open AI Standard (Open-Source Talk). In Proceedings of the 11th
+ACM SIGPLAN International Symposium on Scala (Virtual, USA) (SCALA 2020).
+Association for Computing Machinery, New York, NY, USA, 33.
+[47] Bertrand Meyer. 1992. Applying “Design by Contract”. Computer 25, 10 (oct
+1992), 40–51. https://doi.org/10.1109/2.161279
+[48] Microsoft. 2021. ND-series Virtual Machines. https://docs.microsoft.com/en-
+us/azure/virtual-machines/nd-series.
+[49] Robin Milner, Mads Tofte, and David Macqueen. 1997. The Definition of Standard
+ML. MIT Press, Cambridge, MA, USA.
+[50] Takayuki Muranushi and Richard A. Eisenberg. 2014. Experience Report: Type-
+Checking Polymorphic Units for Astrophysics Research in Haskell. In Proceedings
+of the 2014 ACM SIGPLAN Symposium on Haskell (Gothenburg, Sweden) (Haskell
+’14). Association for Computing Machinery, New York, NY, USA, 31–38. https:
+//doi.org/10.1145/2633357.2633362
+[51] David L. Olson and Dursun Delen. 2008. Advanced Data Mining Techniques (1st
+ed.). Springer Publishing Company, Incorporated.
+[52] oneDNN. 2021. Understanding Memory Formats. https://oneapi-src.github.io/
+oneDNN/v2.5/dev_guide_understanding_memory_formats.html.
+[53] ONNX. 2017. Open Neural Network Exchange. https://onnx.ai/.
+[54] Stack Overflow. 2017. Negative dimension size caused by subtracting 3 from 1 for
+“Conv2D”. https://stackoverflow.com/questions/41651628/negative-dimension-
+size-caused-by-subtracting-3-from-1-for-conv2d.
+[55] Ran Pan. 2014. Tensor Transpose and Its Properties. CoRR abs/1411.1503 (2014).
+arXiv:1411.1503 http://arxiv.org/abs/1411.1503
+[56] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory
+Chanan, Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, Alban Des-
+maison, Andreas Kopf, Edward Yang, Zachary DeVito, Martin Raison, Alykhan
+Tejani, Sasank Chilamkurthy, Benoit Steiner, Lu Fang, Junjie Bai, and Soumith
+Chintala. 2019. PyTorch: An Imperative Style, High-Performance Deep Learning
+Library. In Advances in Neural Information Processing Systems 32, Vol. 32. Cur-
+ran Associates, Inc., 8024–8035. https://proceedings.neurips.cc/paper/2019/file/
+bdbca288fee7f92f2bfa9f7012727740-Paper.pdf
+[57] Benjamin C. Pierce. 2002. Types and Programming Languages (1st ed.). The MIT
+Press.
+[58] Leonardo Piñeyro, Alberto Pardo, and Marcos Viera. 2021. Structure verification
+of deep neural networks at compilation time. Journal of Computer Languages 67
+(2021), 101074. https://doi.org/10.1016/j.cola.2021.101074
+[59] PyTorch. 2019. Conv2d crashes with stride=0. https://github.com/pytorch/
+pytorch/issues/27598.
+[60] PyTorch. 2020. The topological sorting algorithm for the graph transforma-
+tion subsystem. https://github.com/pytorch/pytorch/blob/v1.5.1/caffe2/core/
+nomnigraph/include/nomnigraph/Graph/TopoSort.h#L26.
+[61] PyTorch. 2020. The torch.nn.Conv2d API. https://pytorch.org/docs/1.5.1/nn.
+html#conv2d.
+[62] PyTorch. 2021. Torchvision. https://github.com/pytorch/vision.
+[63] PyTorch. 2021. Translation with a Sequence to Sequence Network and Attention.
+https://pytorch.org/tutorials/intermediate/seq2seq_translation_tutorial.html.
+[64] Stuart Russell and Peter Norvig. 2009. Artificial Intelligence: A Modern Approach
+(3rd ed.). Prentice Hall Press, USA.
+[65] Brennan Saeta, Denys Shabalin, Marc Rasi, Brad Larson, Xihui Wu, Parker Schuh,
+Michelle Casbon, Daniel Zheng, Saleem Abdulrasool, Aleksandr Efremov, Dave
+Abrahams, Chris Lattner, and Richard Wei. 2021. Swift for TensorFlow: A portable,
+flexible platform for deep learning. In Proceedings of Machine Learning and Sys-
+tems, A. Smola, A. Dimakis, and I. Stoica (Eds.), Vol. 3. 240–254.
+[66] Sergio Guadarrama, Nathan Silberman. 2016. TensorFlow-Slim: A lightweight
+library for defining, training and evaluating complex models in TensorFlow.
+https://github.com/google-research/tf-slim.
+[67] Olha Shkaravska, Marko van Eekelen, and Ron van Kesteren. 2009. Polynomial
+Size Analysis of First-Order Shapely Functions. Logical Methods in Computer
+Science Volume 5, Issue 2 (May 2009). https://doi.org/10.2168/LMCS-5(2:10)2009
+[68] João P. Marques Silva and Karem A. Sakallah. 1997. GRASP—a New Search
+Algorithm for Satisfiability. In Proceedings of the 1996 IEEE/ACM InternationalConference on Computer-Aided Design (San Jose, California, USA) (ICCAD ’96).
+IEEE Computer Society, USA, 220–227.
+[69] Karen Simonyan and Andrew Zisserman. 2015. Very Deep Convolutional Net-
+works for Large-Scale Image Recognition. In 3rd International Conference on Learn-
+ing Representations, ICLR 2015, San Diego, CA, USA, May 7-9, 2015, Conference Track
+Proceedings, Yoshua Bengio and Yann LeCun (Eds.). http://arxiv.org/abs/1409.1556
+[70] Ilya Sutskever, Oriol Vinyals, and Quoc V. Le. 2014. Sequence to Sequence
+Learning with Neural Networks. In Proceedings of the 27th International Conference
+on Neural Information Processing Systems - Volume 2 (Montreal, Canada) (NIPS
+’14). MIT Press, Cambridge, MA, USA, 3104–3112.
+[71] C. Szegedy, Wei Liu, Yangqing Jia, P. Sermanet, S. Reed, D. Anguelov, D. Erhan,
+V. Vanhoucke, and A. Rabinovich. 2015. Going deeper with convolutions. In
+2015 IEEE Conference on Computer Vision and Pattern Recognition (CVPR). 1–9.
+https://doi.org/10.1109/CVPR.2015.7298594
+[72] TensorFlow. 2016. Large Strides for 1x1 Convolutions. https://github.com/
+tensorflow/tensorflow/issues/889.
+[73] TensorFlow. 2018. Primitive Neural Net (NN) Operations. https://github.com/
+tensorflow/docs/tree/r1.8/site/en/api_docs/python/tf/nn.
+[74] TensorFlow. 2019. The tf.layers.Conv2D API. https://github.com/tensorflow/
+docs/blob/r1.13/site/en/api_docs/python/tf/layers/Conv2D.md.
+[75] TensorFlow. 2019. The tf.nn.convolution API. https://github.com/tensorflow/
+docs/blob/r1.13/site/en/api_docs/python/tf/nn/convolution.md.
+[76] Takahisa Toda and Takehide Soh. 2016. Implementing Efficient All Solutions
+SAT Solvers. ACM J. Exp. Algorithmics 21, Article 1.12 (Nov. 2016), 44 pages.
+https://doi.org/10.1145/2975585
+[77] Ben Trevett. 2021. PyTorch Seq2Seq. https://github.com/bentrevett/pytorch-
+seq2seq.
+[78] Sahil Verma and Zhendong Su. 2020. ShapeFlow: Dynamic Shape Interpreter for
+TensorFlow. CoRR abs/2011.13452 (2020). arXiv:2011.13452 https://arxiv.org/abs/
+2011.13452
+[79] WALA. 2021. The T. J. Watson Libraries for Analysis. https://github.com/wala/
+WALA.
+[80] Wikipedia. 2021. Cross-correlation — Wikipedia, The Free Encyclopedia. http:
+//en.wikipedia.org/w/index.php?title=Cross-correlation&oldid=1031522391.
+[81] Hongwei Xi and Frank Pfenning. 1998. Eliminating Array Bound Checking
+through Dependent Types. In Proceedings of the ACM SIGPLAN 1998 Conference on
+Programming Language Design and Implementation (Montreal, Quebec, Canada)
+(PLDI ’98). Association for Computing Machinery, New York, NY, USA, 249–257.
+https://doi.org/10.1145/277650.277732
+[82] Hongkun Yu, Chen Chen, Xianzhi Du, Yeqing Li, Abdullah Rashwan, Le Hou,
+Pengchong Jin, Fan Yang, Frederick Liu, Jaeyoun Kim, and Jing Li. 2020. Tensor-
+Flow Model Garden. https://github.com/tensorflow/models.
+[83] Matei Zaharia, Reynold S. Xin, Patrick Wendell, Tathagata Das, Michael Armbrust,
+Ankur Dave, Xiangrui Meng, Josh Rosen, Shivaram Venkataraman, Michael J.
+Franklin, Ali Ghodsi, Joseph Gonzalez, Scott Shenker, and Ion Stoica. 2016. Apache
+Spark: A Unified Engine for Big Data Processing. Commun. ACM 59, 11 (Oct.
+2016), 56–65. https://doi.org/10.1145/2934664
+[84] Jian Zhang, Xu Wang, Hongyu Zhang, Hailong Sun, Kaixuan Wang, and Xudong
+Liu. 2019. A Novel Neural Source Code Representation Based on Abstract Syntax
+Tree. In Proceedings of the 41st International Conference on Software Engineering
+(Montreal, Quebec, Canada) (ICSE ’19). IEEE Press, 783–794. https://doi.org/10.
+1109/ICSE.2019.00086
+[85] Ru Zhang, Wencong Xiao, Hongyu Zhang, Yu Liu, Haoxiang Lin, and Mao Yang.
+2020. An Empirical Study on Program Failures of Deep Learning Jobs. In Pro-
+ceedings of the ACM/IEEE 42nd International Conference on Software Engineering
+(Seoul, South Korea) (ICSE ’20). Association for Computing Machinery, New York,
+NY, USA, 1159–1170. https://doi.org/10.1145/3377811.3380362
+[86] Tianyi Zhang, Cuiyun Gao, Lei Ma, Michael Lyu, and Miryung Kim. 2019. An Em-
+pirical Study of Common Challenges in Developing Deep Learning Applications.
+In2019 IEEE 30th International Symposium on Software Reliability Engineering
+(ISSRE). 104–115. https://doi.org/10.1109/ISSRE.2019.00020
+[87] Yuhao Zhang, Yifan Chen, Shing-Chi Cheung, Yingfei Xiong, and Lu Zhang. 2018.
+An Empirical Study on TensorFlow Program Bugs. In Proceedings of the 27th ACM
+SIGSOFT International Symposium on Software Testing and Analysis (Amsterdam,
+Netherlands) (ISSTA 2018). Association for Computing Machinery, New York, NY,
+USA, 129–140. https://doi.org/10.1145/3213846.3213866
+1855
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 08:34:15 UTC from IEEE Xplore.  Restrictions apply. 

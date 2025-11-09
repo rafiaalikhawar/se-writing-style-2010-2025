@@ -1,0 +1,1147 @@
+Scalable SMT -Based Veriﬁcation of GPU Kernel Functions∗
+Guodong Li
+School of Computing, University of Utah
+UT, USA
+ligd@cs.utah.eduGanesh Gopalakrishnan
+School of Computing, University of Utah
+UT, USA
+ganesh@cs.utah.edu
+ABSTRACT
+Interest in Graphical Processing Units (GPUs) is skyrocket-
+ing due to their potential to yield spectacular performance
+on many important computing applications. Unfortunately,
+writing such eﬃcient GPU kernels requires painstaking man-ual optimization eﬀort which is very error prone. We con-
+tribute the ﬁrst comprehensive symbolic veriﬁer for kernels
+written in CUDA C. Called the ‘Prover of User GPU pro-grams (PUG),’ our tool eﬃciently and automatically ana-
+lyzes real-world kernels using Satisﬁability Modulo Theo-
+ries (SMT) tools, detecting bugs such as data races, in-correctly synchronized barriers, bank conﬂicts, and wrong
+results. PUG’s innovative ideas include a novel approach
+to symbolically encode thread interleavings, exact analysisfor correct barrier placement, special methods for avoidinginterleaving generation, dividing up the analysis over bar-
+rier intervals, and handling loops through three approaches:
+loop normalization, overapproximation, and invariant ﬁnd-ing. PUG has analyzed over a hundred CUDA kernels from
+public distributions and in-house projects, ﬁnding bugs as
+well as subtle undocumented assumptions.
+Categories and Subject Descriptors: D.2.4 [Software
+Engineering]: Software/Program Veriﬁcation— Formal meth-
+ods
+General Terms: Reliability, Veriﬁcation
+Keywords: CUDA, GPU, Formal Veriﬁcation, Concur-
+rency, Satisﬁability Modulo Theories (Decision Procedures)
+1. INTRODUCTION
+There is an explosive growth of interest in Graphical Pro-
+cessing Units (GPU) for speeding up computations occur-
+ring at all application scales [10, 14]. GPUs are used iniPhones for video processing, and on desktop computers
+for extracting features from medical images. All future su-
+percomputers will employ GPUs. The main attraction of
+∗Supported in part by Microsoft, SRC TJ 1847.001, and
+NSF CCF 0935858.
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies arenot made or distributed for proﬁt or commercial advantage and that copies
+bear this notice and the full citation on the ﬁrst page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior speciﬁcpermission and/or a fee.FSE-18, November 7–11, 2010, Santa Fe, New Mexico, USA.
+Copyright 2010 ACM 978-1-60558-791-2/10/11 ...$10.00.GPUs is that when properly programmed , they can yield any-
+where from 20 to 100 times more performance compared to
+standard CPU based multi-cores. Unfortunately, obtaining
+this performance requires heroic acts of programming; toname a few: (i) one must keep all the ﬁne-grained GPU
+threads busy; (ii) one must ensure coalesced [14] data move-
+ments from the global memory (that is accessed commonly
+by CPUs and GPUs) to the shared memory (that is accessed
+commonly by the GPU threads); and (iii) one must mini-
+mize bank conﬂicts when the GPU threads step through the
+shared memory. Data races and incorrect barrier placementsare frequently introduced during CUDA programming. Few
+tools are available to verify CUDA programs. The emu-
+lator that comes with GPUs assumes concrete inputs andexecutes only a miniscule fraction of all possible schedules.
+Bugs often escape, either crashing or deadlocking the GPU
+hardware, often requiring a hardware reboot.
+GPU kernels are comprised of light-weight threads. Their
+Single Instruction Multiple Data (SIMD) organization bears
+little resemblance to thread programs written in C/Javawith their heterogeneous and heavy-weight threads, and use
+of synchronization primitives such as locks/monitors. This
+requires a fundamentally new approach for analyzing CUDAkernels. This paper’s main result is that while Satisﬁabil-ity Modulo Theories (SMT [22]) techniques are a natural
+choice for analyzing CUDA kernels, many innovations are
+essential before such analysis can scale. Eﬃcient techniquesfor encoding concurrent interleavings and analyzing barrier
+placement must be developed. One must try to exploit the
+“mostly deterministic” style of programming and avoiding
+interleaving generation. It is eﬃcient to divide up the anal-
+ysis over barrier intervals. Finally, techniques for eﬃciently
+handling loops (rather than simply unrolling them) must bedeveloped. We now begin with a few CUDA examples and
+elaborate our innovations.
+Illustration of CUDA. A CUDA kernel is launched as an
+1D or 2D gridofthread blocks . The total size of a 2D grid
+isgridDim.x ×gridDim.y . The coordinates of a (thread)
+block are /angbracketleftblockIdx.x ,blockIdx.y /angbracketright. The dimensions of
+each thread block are blockDim.x and blockDim.y (assum-
+ing 1D or 2D blocks in this paper). Each block contains
+blockDim.x ×blockDim.y threads, each with coordinates
+/angbracketleftthreadIdx.x ,threadIdx.y /angbracketright. These threads can share in-
+formation via shared memory , and synchronize via barri-
+ers(
+syncthreads()). Threads belonging to distinct blocks
+must use the much slower global memory to communicate.
+This paper focuses on shared memory races . Consider a sim-ple example of a CUDA kernel to add bto all the elements
+of a shared array aof size N:
+void __global__ kernel (int *a, int b) {
+int idx = blockIdx.x * blockDim.x + threadIdx.x;
+if (idx < N) a[idx] = a[idx] + b;}
+Basically, each thread accesses a diﬀerent array location
+and adds bto it in parallel; there are no data races .N o w
+imagine the programmer wanting to update each array lo-
+cation with badded to the previous array location. The
+programmer may not simply change the last line to a[idx]
+= a[idx-1] + b; because there will be data races between
+adjacent threads. The programmer may however change thecode to the following:
+void __global__ kernel1 (int *a, int b) {
+__shared__ int temp[N];
+int idx = blockIdx.x * blockDim.x + threadIdx.x;if (idx < N) temp[idx] = a[idx-1] + b;__syncthreads(); // A barrier
+if (idx < N) a[idx] = temp[idx];}
+What if the barrier is removed from this code? Obviously
+the accesses of a[idx]a n d a[idx−1] by diﬀerent threads
+may cause a race. This can be detected by examining the
+symbolic models of two threads as following, where privatevariables in a thread are superscripted by the thread id, bid
+andbdim are the short hands for blockIdx and blockDim
+respectively. Threads t
+1andt2are assumed to be in the
+same block. Formally, a race occurs if predicate t1.x/negationslash=t2.x∧
+idt1<N∧idt2<N∧idxt1−1=idxt2holds. As all variables
+have symbolic values, we can consult with a constraint solverto determine whether this predicate is satisﬁable. If so, thenthe solver would return a concrete counter example. If the
+barrier is present then we only need to check whether the
+writes to a[idx
+t1]a n d a[idxt2] conﬂict. Since t1.x/negationslash=t2.x
+implies idxt1/negationslash=idxt2fort1. x<b d i m . x andt2. x<b d i m . x ,
+these two writes will not result in a race.
+thread t1 thread t2
+idxt1=bid.x∗bdim.x +t1.x idxt2=bid.x∗bdim.x +t2.x
+if(idxt1<N )r e a d a[idxt1−1]if(idxt2<N )r e a d a[idxt2−1]
+if(idxt1<N ) write a[idxt1] if(idxt2<N ) write a[idxt2]
+As another example, the scalarProdGPU (Figure 1) kernel
+computes the scalar product of vNpairs of vectors with eN
+elements in each vector (both sequential and CUDA parallelversions are shown). This kernel coalesces global memory
+accesses, minimizes bank conﬂicts, avoids redundant barri-
+ers, and reduces serial penalties through tree summation.Without such hand-crafting steps, kernels such as this will
+perform poorly. In this paper, we present our tool PUG that
+helps detect bugs introduced during kernel design.
+Internal Architecture of PUG. P U Gt a k e sak e r n e lp r o -
+gram written in C (called Kernel C) as input. It ﬁrst uses the
+Rose Compiler [21] to parse the kernel and generates an im-
+mediate format, then produces an SMT expression accordingto the conﬁguration information supplied ( e.g.the proper-
+ties to be checked or the number of threads). We consider
+only two threads with symbolic identiﬁers (IDs) for race andsynchronization checking. Users must specify the number of
+threads for assertion (user-deﬁned property) checking. The
+PUG generated SMT expressions are processed by an SMTsolver (currently Yices [24]) for satisﬁability checking. Ifthe expression is satisﬁable, the solver will return a concrete
+counter-example; otherwise the kernel is deemed free of thebugs targeted by our analysis.
+Organization. We now list some of our novel contributions,
+each of which is later elaborated in its own section.
+•PUG employs a C front-end based on the LLNL Rose [21]
+framework (with customized extensions). It handles manyCUDA C features including: (i) arrays and records, (ii) loops,
+conditional statements and function calls, (iii) variable aliases
+due to pointer expressions, and (iv) lexical scopes. Manyfeatures such as heap allocation and recursive calls are not
+allowed in CUDA, simplifying our translation. §2
+•We contribute a novel approach to capture all possible
+interleavings between CUDA threads as compact SMT for-mulae. In practice, working with this SMT representation is
+far more eﬃcient than explicitly enumerating all schedules.
+§3
+•We propose a way to model the semantics of barriers ex-
+actly. We generate SMT formulae that help verify that de-
+spite the presence of branches and loops, all barriers are wellsynchronized. §4
+•While we have the ability to model all possible concurrent
+interleavings, it is preferable to avoid resorting to this ap-
+proach whenever possible . Our observation that enables this
+optimization is based on the fact that in many cases, the
+existence of races between a given pair of variables is pred-icated on the existence of conﬂicts on other variables. Theexistence of conﬂicts can be checked over just one canonical
+interleaving – say the one that simply runs one thread till it
+blocks and then switching over to another. This helps dra-matically improves the overall eﬃciency. We propose a way
+to further scale up this approach by analyzing one barrier
+interval (the portion before and after __syncthreads() )a t
+a time. This divide-and-conquer approach also helps boost
+eﬃciency. §5.
+•The translation of loops can become extremely involved
+– especially if the loops are nested and they employ non-
+linear strides. Our multi-pronged attack is as follows: (i) we
+normalize loops through program transformation into a unit-stride loop; (ii) we over-approximate loop computations; and(iii) we can automatically discover compensating invariants
+that compensate for non-linear loop strides frequently found
+in practice. §6.
+•For many kernels, an SMT tool may generate a false alarm
+(false bug report) when it cannot determine how the ker-
+nel formal parameters are constrained by the main program(caller). For example, PUG assures that the matrix multi-
+plication kernel in the CUDA Programming Guide [7] works
+only when the size of matrix B is greater or equal to theblock size. PUG is able to reveal such undocumented as-
+sumptions.
+•We have obtained very encouraging results using PUG on
+real examples. As one example of its multiple uses, withrespect to scalarProdGPU , we could obtain many valuable
+analysis results using PUG: (i) One may not remove thevoid scalarProdSeq // Sequential version
+(float *d_C, float *d_A, float *d_B, int vN, int eN) {
+1: for(int vec = 0; vec < vN; vec++){
+2: int vBase = eN * vec; int vEnd = vBase + eN;3: double sum = 0;
+4: for(int pos = vBase; pos < vEnd; pos++)
+5: sum += d_A[pos] * d_B[pos];
+6: d_C[vec] = (float)sum;
+7: }}
+// Parallel version: Nvidia CUDAZone site
+__global__ void scalarProdGPU (float *d_C, float *d_A,
+float *d_B, int vN, int eN) {
+1: __shared__ float acc[ACC_N];
+2:
+3: for(int vec = blockIdx.x; vec < vN; vec += gridDim.x) {
+4: int vBase = eN * vec; int vEnd = vBase + eN;
+5:6: for(int i = threadIdx.x; i < ACC_N; i += blockDim.x){
+7: float sum = 0;
+8: for(int pos = vBase + i; pos < vEnd; pos += ACC_N)
+9: sum += d_A[pos] * d_B[pos];
+10: acc[i] = sum;
+11: }
+12:13: for(int stride = ACC_N / 2; stride > 0; stride >>= 1) {
+14: __syncthreads();
+15: for(int i = threadIdx.x; i < stride; i += blockDim.x)
+16: acc[i] += acc[stride + i];
+17: }
+18:
+19: if(threadIdx.x == 0) d_C[vec] = acc[0];20: }}
+Figure 1: Scalar Product: Sequential and CUDA
+Parallel Versions
+barrier on line 14 (it will result in a data race), but this
+single barrier suﬃces to remove all races with respect to the
+variables dA,dB,dCandacc. (ii) It is formally guaran-
+teed that no bank conﬂicts (by diﬀerent threads) occur inthis example for all possible values of vN,eNandACC
+N;
+(iii) Analysis by PUG helped us conﬁrm the assumption that
+ACC Nmust be a power of two; (iv) We could establish the
+equivalence of this kernel to scalarProdSeq for small in-
+stances of the problem parameters.
+We have also encountered examples where some kernels
+have benign races; i.e., they are still functionally correct.
+PUG has caught some serious (but non-obvious) bugs in
+beginner examples. It has also handled many large examplesfrom the CUDA SDK site. §7 All these examples and PUG
+itself are freely downloadable [16].
+2. ENCODING SERIAL CONSTRUCTS
+prog ::=/angbracketleftvardecl|fundecl/angbracketright; program
+vardecl ::= [mdv]ty id v[=exp]v a r i a b l e
+fundecl ::=ty id f(/angbracketleftty id v/angbracketright,)=block function
+block ::={/angbracketleftstmt/angbracketright;} basic block
+stmt ::=ifexp block [elseblock] conditional
+|for(exp;exp;exp)block loop
+|block
+|vardecl
+|exp expression
+|idf(/angbracketleftexp/angbracketright,) function call
+ty int|ty∗|ty[]| type
+mdv shared |global modiﬁer
+Figure 2: Summary syntax of Kernel CThis section describes the encoding of serial constructs; it
+gives the formal semantics of a kernel assuming no concur-rency. Concurrency is handled in the next section.
+The main syntax of Kernel C is given in Figure 2, and are
+illustrated by the kernel examples given so far. The nota-
+tion/angbracketleftterm/angbracketright
+separator (used in fundecl,block, etc.) denotes a
+sequence of term’s separated by separator . Expression exp
+represents usual C expressions including assignments. Iden-
+tiﬁers idfandidvrepresent names of functions and variables
+respectively. Shared and global variables reside in the GPU
+and the CPU respectively. A variable declared without mod-
+iﬁer is local to each thread. We now present the encodingof sequential program structures.
+Basic Statements. Our encoding assigns SSA indexes to
+variables. Speciﬁcally, the following translation function Γ
+constructs a logical formula from single statements and ex-pressions, where nextand curreturn the next and the cur-
+rent SSA indices of a variable respectively, and v/unionmulti([i]/mapsto→x)
+denotes the update of array vby setting the element at ito
+x. We also give below a simple example of applying Γ.
+Γ(e
+1ope2).=Γ ( e1)opΓ(e2)
+Γ(v:=e).=vnext (v)=Γ (e)
+Γ(v[e1]: =e2).=vnext (v)=vcur(v)([Γ(e1)]/mapsto→Γ(e2))
+Γ(v).=vcur(v)
+int k = 0;
+int a[3];
+int i = a[1] + k;
+a[0] = i * k;
+i++;Γ→k1=0∧
+i1=a0[1] +k1∧
+a1=a0([0]/mapsto→i1∗k1)∧
+i2=i1+1
+Branches. The SSA indices of the variables updated in the
+two clauses of a conditional statement “ ifcb l k 1elseblk 2“
+should be synchronized so that subsequent statements have
+a consistent view of their values. The following example
+gives an illustration: i1=i0is added into the ﬁrst clause
+so that later on i0is invisible and only variable i1will be
+referred. Here notation itestands for “ if then else ”.
+ifi>0{
+j=i∗10;
+k=j−i;
+}
+else
+i=j+k;Γ→ite (i0>0,
+j1=i0∗10∧k1=j1−i0∧
+i1=i0,
+i1=j0+k0∧
+j1=j0∧k1=k0
+)
+Such synchronization is done at the join node by inserting
+the following formula into Γ( blk 1) (and similarly to Γ( blk 2)),
+where cur(blk, v) returns v’s last SSA index in blk.
+vj=vifori=cur(blk 1,v),j=cur(blk 2,v)
+such that i<j
+Variable Aliasing.
+Variables may be aliased due to the use of pointers or ref-
+erences. Typically, when the formal parameters of a func-tion are of pointer or reference types, the parameters are
+the aliases of the incoming actual arguments. When con-
+verting the programs, we map an alias to its correspondingvariable and use the variable rather than the alias. For the
+alias updated in diﬀerent paths, we add an iteexpression
+at the join. Note that most aliases in CUDA kernels occurat function entry.int a[3]; int *i = a;
+int j = i[1] + a[2];
+i[0]++;Γ→j1=a0[1] +a0[2]∧
+a1=a0([0]/mapsto→a0[0] + 1)
+However we do not model complicated pointer operations
+(e.g.pointer dereference) although it can be implemented
+by using a global array to represent the shared memory.
+Since typical CUDA programs exhibit very limited pointer
+arithmetic operations, PUG does not encounter this problemin practice.
+Scopes and Function Calls. Each basic block has its
+own scope. A variable should be distinguished from another
+one with the same name but in a diﬀerent scope. For this, avariable is prepended by its scope number:
+nvindicates that
+vis in scope n. The scope numbers of top level variables are
+skipped. When a function is inlined, its body constitutesa new scope. In the following example, the top level code
+consists of a “if”statement, whose left clause (a basic block)
+contains a call to f.N o t et h a t jis passed as a pointer.
+int f (int i, int* j) {
+i n tk=i-j ;
+return (i * k);
+}
+if (i>10){
+i n ti=2 ;
+int j = f(i, j);
+}Γ→¬(i
+0>10)∨
+1i1=2∧2i1=1i1∧
+2k1=2i1−1j1∧
+1j1=2i1∗2k1
+3. ENCODING CONCURRENCY
+A variable with modiﬁer shared is“shared”for all threads
+within a block. Private variables have no modiﬁers. We now
+illustrate the translation of shared variable updates.
+2-thread translation of shared updates.
+Suppose we have to translate a shared assignment v=
+1. Note that two threads are being allowed to concurrently
+perform this assignment. Our approach is to treat vas an
+array indexed by Schedule IDs (SID∈{0,1,2,...}). (If v
+were an array, we would simply add one more dimension to
+vindexed by SID.) An SID has the same root name as the
+variable, but has a subscript and a superscript. It is like atimestamp and combines two pieces of information: which
+thread is accessing it (superscript), and where in the code
+the access is occurring (subscript, forming the single staticassignment or SSA index [19]). With these, the translationofv= 1 is as follows:
+v=1Γ→ v[v
+t1
+1]=1 ∧v[vt2
+1]=1
+Here, the SIDs vt1
+1andvt2
+1range over {0,1}.T os a yt h a t
+t1accesses (writes) into vﬁrst, we can throw in the con-
+straint vt1
+1<vt2
+1. To say that either access order is possible,
+we do not throw in any constraint. Now, things get more
+interesting when we translate v=v+1 :
+v=v+1 ;Γ→v[vt1
+2]=v[vt1
+1]+1 ∧v[vt2
+2]=v[vt2
+1]+1
+∧(vt1
+2>vt1
+1)∧(vt2
+2>vt2
+1)∧
+v[vt1
+1]=v[vt1
+1−1]∧v[vt2
+1]=v[vt2
+1−1]
+and further vt1
+1,vt2
+1,vt1
+2,a n dvt2
+2should be pairwise distinct
+and must belong to the set {0,...,3}.First, let us look at the “pairwise distinct” requirement.
+This can be elegantly modeled by using an un-interpretedfunction f. More speciﬁcally, consider two variables land
+mthat range over v
+t1
+1,vt2
+1,vt1
+2,a n d vt2
+2. Then we can say
+f(l)/negationslash=f(m). Since fis a function, this forces l/negationslash=m.
+Now what about the rest of the constraints? It is clear
+thatv[vt1
+2]=v[vt1
+1]+1a n d v[vt2
+2]=v[vt2
+1]+1m o d e lh o w
+“assignment works.” It is also clear that vt1
+2>vt1
+1andvt2
+2>
+vt2
+1model that the L-value is updated only after the R-
+value is obtained. Now what about the R-value itself? This
+depends on “who wrote vlast.” This is precisely why we
+include v[vt1
+1]=v[vt1
+1−1] and v[vt2
+1]=v[vt2
+1−1]. It is
+interesting that this system, in one fell swoop, models all
+the six schedules possible.
+Example: Suppose vt1
+1=0 ,vt1
+2=3 ,vt2
+1=1 ,a n d vt2
+2=2 .
+Then we have expressed these constraints: v[3] =v[0]+1 ∧
+v[2] = v[ 1 ]+1 ∧v[1] = v[0]. In this example, we are
+modeling the following schedule that, overall, increments v
+by 1, and not 2: (i) v[1] = v[0] models that thread t2also
+“enjoys” the initial value of vin addition to t1(we take
+v[−1] to be the initial value of v,w h i c hi sw h a t t1gets);
+(ii)v[2] =v[1]+1 models that thread t2now does the update
+of this v; (iii) ﬁnally v[3] =v[0]+1 models that t1now takes
+the value it had read “long ago,” is incrementing that value,
+and depositing it into v.
+An Advanced Example Showing Barrier Encoding.
+We now illustrate advanced features of our encoding scheme
+through an example (details in [16]). In this kernel, kis al-
+located in the shared memory.
+__global__ kernel (unsigned int* k) {
+unsigned int s[2][3] = {{0,1,2},{3,4,5}};
+unsigned int i = threadIdx.x;
+unsigned int j = k[i] - i;if (j < 3)
+{ k[i] = s[j][0]; j = i + j; }
+else
+s[1][j && 0x11] = k[i] * j;
+__syncthreads();
+k[j] = s[1][2] + j;
+}
+TRANS (t)≡
+st
+1[0] = λi∈{0,1,2}.i∧st
+1[1] = λi∈{0,1,2}.i+3 )∧
+it
+1=t∧jt
+1=k[kt
+0][it
+1]−it
+1∧
+ite(jt
+1<3,k[kt
+1]=k[kt
+1−1]/unionmulti([it
+1]/mapsto→st
+1[jt
+1][0])∧jt
+2=it
+1+jt
+1
+∧st
+2=st
+1,
+st
+2=st
+1/unionmulti([1][jt
+1#0x11]/mapsto→k[kt
+2][it
+1]×jt
+1)∧
+jt
+2=jt
+1∧k[kt
+1]=k[kt
+1−1])
+k[bar 0]=k[bar 0−1]∧
+k[kt
+3]=k[kt
+3]/unionmulti([jt
+2]/mapsto→st
+2[1][2] + jt
+2)
+TRANS (t1,···,tn)≡V
+i∈[1,n]TRANS (ti)
+ORDER (t1,···,tn)≡
+(1)V
+i∈[1,n](kti
+0<{kti
+1,kti
+2}<b a r 0<kti
+3)
+(2) bar 0<l∧V
+i∈[1,n],j∈[0,3](kti
+j<l) where l=4n+1.
+(3) rank(bar 0)=0 ∧V
+i∈[1,n],j∈[0,3](rank(kti
+j)=4 i+j)
+•To capture the semantics of barriers, we assign them a
+single SID ( e.g.,bar0 in our example) and constrain them
+with respect to SIDs of allthreads.
+•Each thread thas a private copy of local variables like v.
+They are referred to by vt. Since its value is independent of
+the schedule, there is no SID associated with it.•We can now derive inequalities to model all these facts
+(the cases under ORDER are the numbers we refer to here):
+(1) the program order within each thread must be respected;(2) all the SIDs of all threads constitute a natural numberinterval [0 ,4n+1]where nis the number of threads; and (3)
+all the SIDs must be distinct.
+A valid schedule of the given example for two threads is
+depicted below (note that kis the only shared variable):
+kt1
+0=0∧kt1
+1=1∧kt2
+0=2∧kt2
+1=3∧kt2
+2=4∧
+kt1
+2=5∧bar 0=6∧kt2
+3=7∧kt1
+3=8
+Race Detection. In [16] we present an approach to detect
+races by encoding Access IDs into the formulas. It guaran-
+tees that all valid schedules are investigated, a race exhibit-
+ing in any particular schedule will not be missed. However
+it does not scale well [17]; thus we have replaced it with themethod described in §5, which needs to consider only one
+schedule as Feng and Leiserson [9] did for multi-threaded
+programs represented by series-parallel DAGs.
+4. CONDITIONAL BARRIERS AND CROSS-
+BRANCH CONFLICTS
+s1
+write k[i];
+bar;
+s3
+s4 ···?¬p1QQsp1
+?
++¬p2
+?p2s0
+s1;
+bar;s2;
+bar;
+s3;
+s4;  	p@@R¬p
+@@R  	
+(a) (b)
+Figure 3: Example CFGs.
+The presence of conditional statements makes it impera-
+tive that we have the precision of the SMT technology when
+we check whether all barriers are well-synchronized. It alsoinﬂuences the determination of whether races occur. Work
+such as [1] which rely purely on static analysis can gener-
+ate too many false alarms in codes where there are manyconditionals.
+To illustrate these ideas, consider the control-ﬂow graph
+(CFG) given in Figure 3(a). This diagram shows how state-ments s
+1through s4are situated in some example program
+(in (a) s2itself is shown expanded in terms of write k[i]
+followed by the barrier bar). At ﬁrst glance, this appears ill-
+synchronized: one thread may take the s1tos4path encoun-
+tering no barriers while another may take the path through
+p1encountering a barrier. Our SMT techniques can deter-
+mine whether these paths are feasible, and ﬂag an error if so.PUG’s approach to checking for well synchronized barriers
+is as follows: either (i) two branches must execute the same
+number of barriers; or (ii) all threads must make the samedecision on the condition.
+In Figure 3(a), if all threads make the same decision on
+condition p
+1,i.e.∀t1,t2:pt1
+1=pt2
+1, then all threads will
+execute the same branch, which is synchronization safe even
+if the two branches contain diﬀerent numbers of barriers. In
+Figure 3(b), both the left and the right branch contains onlyone barrier, thus they are considered well synchronized.Now assume that all barriers are well synchronized. We
+must now check for conﬂicting accesses that occur in pro-grams involving conditionals. If for instance the formula
+(it1=it2)∧pt1
+1∧pt2
+1is true in Figure 3(a), both threads
+can take the p1branch andconﬂict on the same klocation,
+causing a race.
+A more general analysis is captured by the CFG in Figure
+3(b). The conﬂict check includes the following expressions
+(here /negationslash∼denotes non-conﬂicting ). Also let us use p?sto de-
+note an expression sguarded by path condition p.N o w ,t h i s
+CFG may be regarded as consisting of two barrier intervals :
+the ﬁrst one containing s0,p?s1and¬p?s2, and the second
+one containing s4and¬p?s3. Conﬂict freedom requires the
+pairwise comparison of the elements in each barrier interval:
+pt2⇒st1
+0/negationslash∼st2
+1 ¬pt2⇒st1
+0/negationslash∼st2
+2
+pt1∧¬pt2⇒st1
+1/negationslash∼st2
+2¬pt2⇒st1
+4/negationslash∼st2
+3
+5. EXPLOITING SERIALIZABILITY AND
+BARRIER INTERV ALS
+CUDA programmers often intend to write deterministic
+programs whose ﬁnal results are independent of the concur-
+rent schedule. Thus it is natural to seek analysis methodsthat also try to avoid having to generate schedules. Our
+insights are explained with respect to a simple example:
+thread t
+1 thread t2
+write k[i]; read v;
+...; ...;
+write v;r e a d k[j];
+Let us ignore write v and read v for the moment. Sup-
+posekis the only shared variable. Now if both iandjare
+(control- and data-) dependent only on thread-local vari-
+ables, then their values are the same in all schedules. Inthat case, in order to check whether write k[i]a n dr e a d k[j]
+conﬂict, it suﬃces to examine only one arbitrary schedule
+that respects program order.
+Now suppose jdepends on a shared variable v.T h e n j’s
+value in thread t
+2may be diﬀerent in diﬀerent schedules.
+However in this case there exists a conﬂict on v.F u r t h e r -
+more, this conﬂict can be detected by executing v’s accesses
+according to one schedule (any schedule) that simply re-
+spects the program order. If we ﬁnd two accesses within the
+same barrier interval that conﬂict, we are done detectingthe conﬂict. This conﬂict does not go away under another
+schedule. For this reason we say that k’s conﬂict is reduced
+tov’s.
+Theorem (Serializability). Consider each pair of ac-
+cesses to shared variables where one access in the pair is
+a write. Suppose these access pairs can be shown to be non-
+conﬂicting. Then the entire code containing these accessesis race free and can be serialized.
+PUG implements such conﬂict checks and is able to elimi-
+nate generating concurrency schedules in our realistic exam-ples. We now show how the ideas in this theorem apply to
+programs that are decomposed in terms of barrier intervals.
+Barrier Intervals (BI) and Incremental Modeling.
+CUDA intra-block thread executions exhibit a regular pat-
+tern: {t1,···,tn}execute →barrier →{t1,···,tn}execute
+→· · · . Since an access before a barrier will never conﬂictwith an access after this barrier, we may focus on the ac-
+cesses between two consecutive barriers (so called a barrier
+interval orBI). If the accesses in a BI are non-conﬂicting, we
+build a transition constraint by serializing (sequentializing)
+them; then we move on to the next BI and hope to repeat
+this treatment. This approach also goes hand in hand withour SMT solver Yices’s [24] incremental SMT solving facil-
+ity that reuses existing conﬂict clauses in the context when
+checking new expressions. As an illustration we consider thefollowing program where shared variables are marked with a
+hat for readability .
+1:j
+t:=bit+t+1 ; 2: synthreads; 3 : e1=bkt[bit];
+4:bkt[jt]=e2;5 : synthreads; 6 : write bit
+Let us consider the case of two threads t1andt2.T h e
+ﬁrst BI consists of statement 1. Since there are no writes to
+shared variables, accesses to biatt1andt2are non-conﬂicting.
+Both of them can be set to i[0],i.e.their SIDs can both be
+forced to be 0. Using this approach, the transition relationup to statement 2 can be simpliﬁed and rewritten as follows
+(thejs are private variables):
+TRANS (t
+1,t2)2≡jt1
+1=i[0] +t1+1∧jt2
+1=i[0] +t2+1
+Now, the second BI consists of a read and a write to shared
+variable bk. We need to determine whether their addresses
+may overlap for diﬀerent threads. Given TRANS (t1,t2)2∧
+t1/negationslash=t2, expression jt
+1=i[0] is unsatisﬁable for t∈{t1,t2}.
+Therefore the read and write of bkdo not conﬂict. Also, we
+have jt1
+1=jt2
+1. Therefore even the writes to bkare non-
+conﬂicting. We can follow the approach used before and
+(re-)use the SIDs 0 and 1 for biandbjrespectively, and write
+the translation up to statement 4 as:
+TRANS (t1,t2)4≡
+TRANS (t1,t2)2∧V
+t∈{t1,t2}(Γ(et
+1)=k[0][jt
+1])
+∧k[1] =k[0]/unionmulti([jt1
+1]/mapsto→Γ(et1
+2))/unionmulti([jt2
+1]/mapsto→Γ(et2
+2))
+Things are ﬁne if we keep the barrier ( syncthreads) at
+statement 5. Let us remove it and see what happens. Then,
+the second BI includes statement write bit.N o w , w e d o n o t
+know what write bitwill write into bit. It is possible that
+expression jt
+1=bican be satisﬁed. The key observation is
+that the conﬂict between statements 3 and 4 is reducible to
+a conﬂict between statements 3 and 6.
+The key point here is that we can keep building constraints
+without considering interleavings (just by following a canon-ical interleaving). If there is any race at all in the program,we will reach a point where there will be one conﬂict some-
+where. Since we assume conﬂicts are rare, this optimistic
+approach has the ability to process many CUDA kernelssuccessfully without ﬁnding any conﬂicts (and hence races).
+In practice, instead of coalescing the SIDs among multi-
+ple threads, PUG builds the transitions in a thread modular
+manner: after constructing one single parameterized transi-
+tion TRANS(t) , it instantiates the SIDs with concrete values
+so as to serialize the concurrent execution of all threads.
+We give below the entire model of the example kernel in
+§3 fornthreads. There are two BIs each of which contains
+only one write. The serialization makes t
+ihappens before
+tjfori<j for each BI. Hence the SIDs of the writes int1,t2,...,t nin the ﬁrst BI are 1 ,2,...,n ; and those in the
+second BI are n+1,n+2,...,2n. Clearly this enforces that
+(1) within a BI, accesses in thread tihappen before those
+intjfori<j; and (2) in a thread, accesses in BI ihappen
+before those in BI jfori<j.
+TRANS (tx,n)≡
+st
+1[0] =λi∈{0,1,2}.i∧st
+1[1] =λi∈{0,1,2}.i+3 )∧
+it
+1=t∧jt
+1=k[x−1][it
+1]−it
+1∧
+ite(jt
+1<3,k[x]=k[x−1]/unionmulti([it
+1]/mapsto→st
+1[jt
+1][0])∧
+jt
+2=it
+1+jt
+1∧st
+2=st
+1,
+st
+2=st
+1/unionmulti([1][jt
+1#0x11]/mapsto→k[x−1][it
+1]×jt
+1)∧
+jt
+2=jt
+1∧k[x]=k[x−1])
+k[bar 0]=k[bar 0−1]∧
+k[n+x]=k[n+x−1]/unionmulti([jt
+2]/mapsto→st
+2[1][2] + jt
+2)
+TRANS (t1,···,tn)≡V
+x∈[1,n]TRANS (tx,n)
+6. LOOP ABSTRACTION
+While it is possible to unroll loops for precise checking,
+loop unrolling may not scale, especially with nested loops.Also, the loop bounds may involve symbolic values, mak-ing it impossible to perform loop unrolling. Consider the
+scalar product example shown in Figure 1. The outermost
+loop iterates through every pair of vectors. Each iterationﬁrst cycles through vectors with stride ACC_N , then performs
+tree-like reduction of the results. In practice, the grid size,
+the block size and the stride are large numbers, making itimpractical to unroll, particularly the nested loops. One so-
+lution is to downscale the problem size by reducing these
+sizes to small numbers while preserving the program’s be-haviors (this is tedious if done manually). Another solution
+– the focus of this section – is to perform loop abstraction
+to reduce or even eliminate loop unrolling.
+6.1 Loop Normalization
+A standard result in program analysis [2] is that if the
+stride part of a loop is a linear function of the loop index i
+(i.e.of format i=i±ewhere eis an expression), then we
+cannormalize such loops so they have a stride of one. For
+example, the loop header
+for (int i = lb; i ≤u b ;i+ =s t r i d e )
+can be normalized to
+f o r( i n ti=0 ;i ≤(ub - lb) / stride; i++),
+and each reference to iwithin the original loop is replaced
+byi∗stride +lb. After normalization, the precise value range
+of the loop index is [0,(ub−lb)/stride ]. When the stride is
+not a linear function on the loop index, we do not perform
+normalization to avoid making the range imprecise. Con-sider lines 13-17 of the example in Figure 1. Since the stride
+of the loop at line 13 is non-linear, we leave it alone. Since
+the stride of the loop at line 15 is linear, we change it. Thetransformation results in this code:
+for(int stride = ACC_N/2; stride > 0; stride >>= 1) {
+__syncthreads();
+for(int i’ = 0; i’ < (stride-threadIdx.x)/blockDim.x; i’++) {
+int i = i’ * blockDim.x + threadIdx.x;acc[i] += acc[stride + i];
+}}To determine whether this code is conﬂict-free (no race on
+accon line 16), we need to check, for threads t1andt2,t w o
+cases:•Whether
+(it1=it2). Luckily, this is false because iis
+initialized to threadIdx.x (diﬀerent for diﬀerent threads)
+and stays diﬀerent.•Or, whether
+(it1=stridet2+it2). This is also false because
+it1<s t r i d et2holds.
+The logical formula for conﬂict checking incorporates all
+this knowledge and also that stride ∈(0,A CC N/2] and
+i∈[0,(stride −threadIdx.x )/blockDim.x ); it also emerges
+unsatisﬁable:
+V
+t∈{t1,t2}0
+@stridet>0∧stridet≤ACC N/2∧
+i/primet≥0∧i/prime<(stridet−t)/blockDim.x
+∧it=i/primet∗blockDim.x +t1
+A
+∧(t1/negationslash=t2)∧(it1=it2∨it1=stridet2+it2)
+Similar analysis can also be applied to the loop at lines 6-11.
+6.2 Automatic Reﬁnement
+In addition to the loop index, we need to handle the vari-
+ables in the loop body. Consider the following example, the
+constraints generated for j,l,nandkdepend on whether
+they are loop carrying.
+int m = 0; int k = a;
+for(int i = lb; i < ub; i++){i n tj=i*2 ;i n tl=j+i ;
+i n tn=m-l ;k=j*k ;. . .}
+Av a r i a b l ei s non loop-carrying if (1) it is the loop index
+variable, or (2) it is not updated in the loop, or (3) any of
+its updates (if there is any) involves only non loop-carryingvariables. We simplify our analysis by generating constraints
+only for non loop-carrying variables, and over-approximate
+loop-carrying variables to have range
+(−∞,+∞).I n t h i s
+example, i, j, m, n are non loop-carrying while kis loop-
+carrying. The formula i∈[lb, ub )∧j=i∗2∧l=j+i∧n=
+m−iaccurately speciﬁes the value ranges of i,j,landn,
+andk(because it is loop-carrying) is over-approximated by
+leaving it unconstrained.
+Sometimes over-approximating the range of a loop-carrying
+variable may lead to false alarms. If jbelow is uncon-
+strained, then a false race will be reported on s[threadIdx ∗
+n+j].
+int j = 1; int n = blockDim.x;
+for(int i = n; i > 0; i >>= 1)
+{ s[threadIdx *n+j ]= ...; j=j*2 ;}
+To overcome this, PUG incorporates simple rules for syn-
+tactically deriving common invariants safely, and automati-
+cally adds them to the constraints. For the above example,PUG derives an invariant i∗j=n, which follows from the
+relation between ∗2 and right shift ( /greatermuch1). This implies
+j<n and threadIdx ∗n+jare diﬀerent in diﬀerent threads.
+PUG derives invariants for similar simple patterns involving+a n d −,∗and/, and so on, but only for the variables used
+in the addresses of shared variables.
+As another example, invariant j=v+i∗kcan be derived
+for the following loop since jcan be normalized to have the
+same stride as loop index idoes.
+int j = v;
+for (int i = 0; i < ub; i++)
+{ ...; j += k;}6.3 Inter-Iteration Race Checking
+Within a loop, accesses to shared variables may conﬂict
+with themselves in previous iterations, thus causing inter-
+iteration conﬂicts. For example, in the following loop,
+for(int i = lb; i < ub; i++)
+{ __syncthreads(); acc[i+1+tid] += acc[i]; }
+access acc[i+1+ tid]may not conﬂict with acc[i+1+ tid]
+and acc[i]in the same iteration. However, if the barrier is
+removed then acc[i+1+ tid]may conﬂict with acc[(i−1) +
+1+( tid+1 ) ],i.e.the access by a neighboring thread in the
+previous iteration.PUG considers two cases:
+•The loop body is not barriered. Diﬀerent threads may
+be in diﬀerent iterations, i.e.i’s values in diﬀerent
+threads may be regarded to be unrelated. If the barrier
+is removed in the above example, the constraint for
+conﬂict checks is as follows, which is clearly satisﬁablefort
+1/negationslash=t2.
+it1∈[lb,ub]∧it2∈[lb,ub]∧
+(it1+1+ t1=it2∨it1+1+ t1=it2+1+ t2)
+•The loop body is barriered ( e.g.ends with a barrier).
+If the body satisﬁes the synchronization correctness re-quirement described in §4, then all threads will always
+be in the same iteration. In other words, loop index
+variable ishould have the same value at all threads
+(i.e.i
+t1=it2)( w es a y iissingle valued ); and the
+following constraint is unsatisﬁable for t1/negationslash=t2.
+i∈[lb,ub]∧(i+1+ t1=i∨i+1+ t1=i+1+ t2)
+Even after iis set to single valued, we may still need to
+consider two consecutive iterations. For the following
+code, PUG considers the possibility that accesses in s2at iteration iconﬂict with those in s1 at iteration i+1.
+for(int i = lb; i < ub; i++)
+{ s1; __syncthreads(); s2; }
+In the scalar product example, the loop in lines 6-11 belongs
+to the ﬁrst case, while the loop in lines 13-17 belongs to thesecond case. If the barrier at line 14 in the second loop
+is removed, then accesses on acc[i]a n d acc[stride +i]m a y
+conﬂict when stride
+t1/negationslash=stridet2.
+7. IMPLEMENTATION AND EXPERIMEN-
+TAL RESULTS
+As described earlier, PUG is based on the Rose frame-
+work for C program analysis. The user may input a ﬁle con-
+taining multiple kernels together with the main (CPU side)
+program. The kernel to be analyzed is syntactically ﬂagged,and this kernel alone will be analyzed. Within the kernel of
+interest, the user may place assert assertions anywhere in
+the code, which will be checked during analysis.
+Overall Orchestration of PUG. Given an annotated pro-
+gram, PUG works in a push-button fashion and is totally
+syntax driven (similar to a precise type checker, more de-tails in [16]). It ﬁrst parses the program and triggers rulesfor each syntactic category, building constraints in an in-
+termediate format. For instance, for handling loops, it ﬁrstchecks if whether the loop body contains barriers. It thenperforms loop normalization and loop reﬁnement, and ana-
+lyzes the loop body which may contain multiple BIs. For a
+BI, PUG ﬁrst checks whether there is a race (conﬂict), if sothen report the bug and terminates. Otherwise it serializes
+all the accesses to shared variables and moves to the next
+BI.
+Expressions in the intermediate language (IL) are con-
+verted to Yices’ expressions for satisﬁability checking. Yices’
+expressions are based on bit vectors (bounded integers). Wefound that the correctness of most CUDA kernels relied onthe assumption that no overﬂows will occur in arithmetic op-
+erations. To model this, the user has the ability to request
+(through the “+O” ﬂag) whether non-overﬂow constraintsmust be incorporated (for unsigned bit vectors). Setting
+the +O ﬂag causes PUG to generate and incorporate these
+additional constraints for + and ∗:
+IL Expr. Yices Expr. Constraint
+e
+1+e2e1+e2 e1<2n−1∧e2<2n−1
+e1∗e2e1∗e2 e1<2n/2∧e2<2n/2
+e1/e2 qe 2∗q+r=e1∧r<e 2
+e1%e2re 2∗q+r=e1∧r<e 2
+In addition, since Yices does not provide the “div” and
+“mod” operator directly, we implement them using multi-
+plication and addition. Some optimizations are performed
+when e1ore2are constants. For example, 2m∗e2ande1/2m
+are converted to e2/lessmuchmande1/greatermuchmrespectively ( /greatermuchis a
+shift operator).
+The user may further use two more types of annotationswithin the kernel of interest:
+•Anassume that deﬁnes the problem conﬁguration parame-
+ters and input constraints ( e.g., whether a matrix is assumed
+to be square, what the input data constraints are). We cap-ture this assume class as if it were a ﬂag, “+C”.
+•In some examples, the user has to help PUG out by pro-
+viding simple loop invariants or simple predicates on sharedvariables. These are assumed to be true (for now; future
+work will try to semi-automate their formal veriﬁcation).
+These are shown as the “+R” ﬂag. We do not include thesyntactic invariants automatically generated by PUG into
++R (these are guaranteed to be correct invariants).
+We performed experiments using PUG on a machine with a
+single CPU (Intel Pentium-4 3.60 GHz processor with only 1
+GB of memory). Our table of results in Table 1 shows which
+examples required these ﬂags for veriﬁcation to succeed, andnot fail through false alarms. All the examples in this tableare widely cited kernels from the CUDA SDK, and naturally
+PUG found them all to be correct. “Pass” in this table as-
+serts that (i) All barriers were found to be well synchronized ,
+and (ii) No races were found . When a benchmark program
+(e.g.Reduction ) contains multiple kernels, we invoke them
+one by one – but in a single run – and report the total timeof this run.
+PUG has checked many more CUDA SDK kernels than
+shown in Figure 1. While the computation of a large ap-plication is usually broken into multiple kernels, we have
+successfully checked some very large kernels ( e.g., Eigenval-
+ues, at 2,200 LOC). The translation time into IL and to theYices constraints is negligible, and not counted in.Kernels loc +O +C +R B.C. Time(pass)
+Bitonic Sort 65 LO 2.2
+MatrixMult 102 * * HI <1
+Histogram64 136 LO 2.9
+Sobel 130 * HI 5.6
+Reduction 315 * HI 3.4
+Scan 255 * * * LO 3.5
+Scan Large 237 * * LO 5.7
+Nbody 206 * HI 7.4
+Bisect Large 1,400 * * HI 44
+Radix Sort 1,150 * * * LO 39
+Eigenvalues 2,200 * * * HI 68
+Table 1: Experimental results of checking some SDK
+kernel programs for synchronization errors, races
+and bank conﬂicts.
+PUG is able to check most programs smoothly. The radix
+sort kernel is the most diﬃcult one to analyze since the ad-
+dresses of a few shared variable accesses cannot be resolvedlocally, i.e.they are control-dependent on the shared arrays
+which may be updated by multiple threads. This makes
+the checking diﬃcult. In our present attack, we added +Cconstraints indicating the the shared arrays are (partially)sorted to overcome this limitation.
+Bank Conﬂict Checking. A fascinating direction to evolve
+PUG is in giving designers feedback on performance met-rics. Thanks to our use of SMT, we can use the infrastruc-
+ture for race checking in order to check for bank conﬂicts
+also. Speciﬁcally, access k[i]a n d k[j] incurs a race when
+i=j, and incurs a bank conﬂict when i%16 = j%16. Col-
+umn“B.C.”indicates how serious the bank conﬂict is, which
+is measured by the percentage of the barrier intervals (BI)
+containing bank conﬂicts : HI (High) and LO (Low) denote
+≥50% and <50% respectively. Since only two threads are
+considered and the loops are not unrolled, these results are
+quite preliminary; yet, the promise is clear. We plan to givemore accurate measurement in the future work.
+Road-Testing PUG. We took 57 assignment submissions
+from a recently completed graduate GPU class taught in ourdepartment. The “Defects” column in the table below
+Defects Race Refinement
+benign fatal over #kernel over #loop
+13 (23%) 3 2 17.5% 10.5%
+indicates how many kernels were found to be not well pa-
+rameterized – i.e., work only in certain conﬁgurations (e.g.
+the grids and blocks must have speciﬁc sizes). We had tomanually ﬁnd this out by guessing and trying diﬀerent +Csettings. This is a promising way to reverse-engineer un-
+stated assumptions and provide feedback to a programmer
+to improve their kernel.
+There were three benign races and two fatal races in these
+(presumably tested) codes. These fatal races can be at-
+tributed to missing barriers in the loop body or incorrectindexing at the boundary between two thread data spaces.
+While PUG always does its set of automatic loop reﬁne-
+ments, we were curious as to how many of these cases couldhave passed through without them. When we turned oﬀ the
+automatic loop invariants, we found that only 17.5% of the
+kernels (measured in terms of loops, only 10.5% of the totalnumber of loops) would have failed (by giving false alarms).Thus it appears that for small to medium kernels repre-
+sented by a class, about 90% of the kernels can be veriﬁedeven without loop reﬁnements.
+Assertion Checking (Functional Correctness). Users
+can specify the properties to be checked using our assume
+andguarantee directives. If a precondition assume (P)a n d
+a postcondition guarantee (Q) are speciﬁed, formula P∧¬Q
+is added into the constraint. For example, we can specify
+the correctness of the bitonic sort kernel
+__global__ bitonic (int vals[]) {
+...
+guarantee(i < j =⇒vals[i] ≤vals[j]);
+}
+Functional correctness check requires accurate models of
+the programs. PUG translates the program into a bounded
+one by unrolling the loops dynamically in the incrementalmodeling phase. The number of threads must be speciﬁedexplicitly. Since CUDA programs are highly symmetric, we
+only need to consider a few threads.
+The following table shows the SMT solving time in sec-
+onds. To speed up the checking we turn oﬀ the overﬂow
+detection, assign small values to the loop bounds, and use
+smaller bitvectors. Here ndenotes the number of threads;
+T.O denotes Time Out ( >5 minutes). Correctness is proven
+for bug-free programs, and bugged programs are obtained by
+disabling some required constraints or specifying false asser-tions. Correctness check takes much longer time since the
+solver needs to prove unsatisﬁability ( i.e.absence of bugs)
+for all cases. In general, the degree of loop unrolling neededis proportional to the number of threads n, making the solv-
+ing time blow up on n.
+Kernels n=2 n=4 n=8
+Corr. Bug Corr. Bug Corr. Bug
+simple reduct. <1 <1 2.8 <1 T.O 4.42
+matrix transp. <1 <1 1.9 <1 28 6.5
+bitonic sort <1 <1 3.7 <1 T.O 255
+scalar product <1 <1 6.9 2 T.O 137
+This checker identiﬁes several “bugs” in these programs:
+(i) the“bitonic sort”is incorrect when the number of threads
+is not the power of 2; (ii) the “scalar product” is incorrectwhen ACC
+Nis not the power of 2; and (iii) the “matrix
+tranpose” is incorrect when the sizes of two input matrixes
+are smaller than the block size.
+As the property checker does not scale well with respect
+to the number of threads, it is intended to be used as a unit
+tester/veriﬁer for functional correctness.
+Performance Improvement. PUG utilizes Yices’s incre-
+mental SMT solving technique to avoid evaluating an ex-
+pression multiple times. This technique is primarily used to
+manage the built transitions. For example, when the solveris called for evaluating eover transitions Eprovided that
+path condition Cholds, we ﬁrst assert Eand push the con-
+text containing Einto Yices’ context stack, then assert C
+andeto evaluate the entire expression. After that, when we
+want to evaluate e
+1onEandC1, we pop the context stack
+so as to restore the context containing the existing clausesforE, then we assert C
+1ande1. This enables us to avoid
+evaluating Eagain.
+We also apply a simple slicing algorithm to exclude useless
+transitions from the transition stack. A use-def analysis isperformed to identify the variables which will be used by the
+addresses of shared variables. We do not build transitionsfor the assignments involving other variables. For instance,in the scalar product example of Figure 1, no transitions
+corresponding to the assignments on line 9 and line 16 will
+be added into the transition stack.
+Some Limitations of PUG. Present day SMT solvers pro-
+vide limited support for real numbers. PUG cannot prove
+the functional correctness of many CUDA applications thatoperate on ﬂoat or double numbers. Fortunately, this doesn’t
+limit PUG’s conﬂict checking power because the addresses
+of shared variables involves only unsigned integers.
+PUG may report false alarms if it fails to derive loop in-
+variants for complicated program patterns. In this case, the
+user is required to provide suﬃcient invariants.
+PUG cannot handle kernels containing complicated pointer
+arithmetic operations. In addition, PUG requires manual
+transformation of the source programs to Kernel C format
+(e.g.by converting “while” loops to “for” loops and elimi-
+nating advanced C++ features).
+Other Programs. Although focusing on CUDA kernels,
+PUG can be easily extended to other domains such as lockbased multi-threaded programs. It is particularly suitablefor checking such programs over relaxed memory models:
+we just need to loosen the constraint on the accesses orders
+w.r.t the memory model. The main challenge, however, isto model involved APIs and system calls. One solution is
+to build light-weight models or abstract interpretations for
+t h e s eA P I sa sw ed i df o rM P I2 . 0[ 1 8 ] .
+8. CONCLUDING REMARKS
+Other Related Work. Traditional testing methods are in-
+eﬀective at locating CUDA bugs because they assume con-crete input values as well as a ﬁxed numbers of threads.
+They cannot generate all possible schedules – an exponen-
+tially growing number even for short programs. They haveno mechanisms to focus on relevant schedules that trigger
+bugs. Interleaving reduction methods such as [12] are inap-
+plicable to CUDA. Many past eﬀorts have focused on multi-threaded programs synchronizing using locks and semaphores
+[11]. These methods are inapplicable for kernels.
+Symbolic techniques for program analysis go back to works
+such as [5] and more recently [6]. Recent exact symbolic
+concurrent C program analysis techniques ( e.g.,[ 1 5 ] )h a v e
+not been shown to be eﬀective for vector computations foundin CUDA kernels. In PUG, we do not worry about modeling
+recursive functions or heap allocated structures – something
+considered in tools such as [15]. Our work is tailored forCUDA which is very widely used; it will easily apply toemerging standards ( e.g.,O p e n C L[ 2 0 ] ) .
+Only two CUDA-speciﬁc checkers have been reported on
+the past. An instrumentation based technique is reported [3]to ﬁnd races and shared memory bank conﬂicts. This is an
+ad-hoc testing approach, where the program is instrumented
+with checking code, and only those interleavings occurringin a platform-speciﬁc manner are considered. A determin-
+ism ( i.e.no races) checking tool [23] constructs constraints
+from an automaton without considering the communication(e.g.value passing) among threads. This tool makes many
+assumptions on the input programs to facilitate noninterfer-
+ence checking, which include: (i) the source program can-not contain loops, conditional barriers, functions calls andpointers; (ii) all variables must already in SSA format, etc.
+In contrast, PUG works on source programs directly anddoes not make these restrictions. PUG is also able to modelcommunicating programs. Our static race detection is sim-
+ilar to the non-interference checking in [23]; our method is
+capable of handling more general cases.
+SPMD programs are prone to incorrect synchronization
+patterns, especially when barriers are within conditional state-
+ments. Aiken and Gay [1] proposed a type system to checkglobal synchronization errors. They check whether program
+branches make the same decision and execute the same num-
+ber of barriers by recording the single-valued variables thathave the same values among all threads. They may produce
+false alarms by rejecting correct programs. PUG is able to
+check such global synchronization errors as well. As PUG re-lies on SMT solving to compare the values of expressions, itproduces more precise results on determining whether dif-
+ferent threads make the same decision, thus giving more
+accurate reports on synchronization errors.
+We have shown many innovative uses of PUG including
+providing performance estimates relating to bank conﬂicts.
+Related work on symbolic techniques for performance eval-uation [13] is of interest here.
+Summary of PUG, and Future Work. We presented
+the ﬁrst realistic analyzer for GPU kernels called PUG. PUGtakes an annotated CUDA C program and analyzes a kernelﬂagged to be of interest in it (this single kernel may itself
+be thousands of lines long). The user speciﬁes the number
+of threads (usually two) for which the kernel is to be ana-lyzed. There is really no way to tell whether two threads are
+suﬃcient for either race checking or for assertion checking.
+This can easily be shown to be an undecidable problem as aspecial instance of the undecidability of parameterized veri-
+ﬁcation problem [4]. We are interested in exploring whether
+ﬁnite cut-oﬀ results can be obtained ( e.g., [8]). Abstrac-
+tion/reﬁnement methods may be another approach.
+PUG can be supported by any of the highly developed
+SMT solvers available today. Even given the phenomenaladvances in the SMT technology, a straightforward (na ¨ıve)
+approach of unrolling all loops and solving will not work.
+PUG employs a number of innovative approaches for reduc-
+ing the analysis complexity.
+We have already documented a number of limitations of
+PUG. One additional limitation that needs to be overcome
+pertains to the calling context of CUDA kernels. The callingcontext may most likely determine the assume clauses that a
+user has to provide through the “+C” ﬂag. Any method for
+obtaining some of these constraints automatically can helpimprove the degree of automation. Loop invariant discov-
+ery methods that determine the +R annotations will also
+enhance the usability of PUG.
+9. REFERENCES
+[1]Aiken, A., and Gay, D. Barrier inference. In
+Symposium on the Principles of ProgrammingLanguages (POPL) (1998).
+[2]Allen, R., and Kennedy, K. Optimizing Compilers
+for Modern Architectures: A Dependence-based
+Approach . Morgan Kaufmann, 2001.
+[3]Boyer, M., Skadron, K., and Weimer, W.
+Automated dynamic analysis of CUDA programs. InThird Workshop on Software Tools for MultiCore
+Systems (2008).
+[4]Clarke, E. M., Grumberg, O., and Peled, D. A.
+Model Checking . MIT Press, 2000.
+[5]Cobleigh, J. M., Clarke, L. A., and Osterweil,
+L. J. Flavers: A ﬁnite state veriﬁcation technique for
+software systems. IBM Systems Journal 41 , 1 (2002).
+[6]Csallner, C., Tillmann, N., and Smaragdakis,
+Y.DySy: Dynamic symbolic execution for invariant
+inference. In International Conference on Software
+Engineering (ICSE) (2008), pp. 281–290.
+[7] Cuda programming guide version 1.1.
+http://developer.download.nvidia.com/compute/cuda/1_1/NVIDIA_CUDA_Programming_Guide_1.1.pdf .
+[8]Emerson, E. A., and Kahlon, V. Reducing model
+checking of the many to the few. In International
+Conference on Automated Deduction (CADE) (2000),
+pp. 236–254.
+[9]Feng, M., and Leiserson, C. E. Eﬃcient detection
+of determinacy races in cilk programs. In Parallel
+Algorithms and Architectures (SPAA) (1997).
+[10] Fermi. http:
+//www.nvidia.com/object/fermiarchitecture.html .
+[11]Flanagan, C., and Freund, S. N. Type-based race
+detection for Java. In Programming Language Design
+and Implementation (PLDI) (2000).
+[12]Flanagan, C., and Godefroid, P. Dynamic
+partial-order reduction for model checking software. InSymposium on the Principles of Programming
+Languages (POPL) (2005), pp. 110–121.
+[13]Gulwani, S. Speed: Symbolic complexity bound
+analysis. In Computer Aided Veriﬁcation (CAV)
+(2009), pp. 51–62.
+[14]K i r k ,D .B . ,a n dm e iW .H w u ,W . Programming
+Massively Parallel Processors . Morgan Kauﬀman,
+2010.
+[15]Lahiri, S. K., Qadeer, S., and Rakamaric, Z.
+Static and precise detection of concurrency errors in
+systems code using SMT solvers. In Computer Aided
+Veriﬁcation (CAV) (2009), pp. 509–524.
+[16]Li, G., and Gopalakrishnan, G. Technical Report
+and PUG Tool Download:
+http://www.cs.utah.edu/fv/PUG .
+[17]Li, G., Gopalakrishnan, G., Kirby, R. M., and
+Quinlan, D. A symbolic veriﬁer for CUDA programs.
+In
+PPoPP, Poster Session (2010), pp. 357–358.
+[18]Li, G., Palmer, R., DeLisi, M., Gopalakrishnan,
+G., and Kirby, R. M. Formal speciﬁcation of MPI
+2.0: Case study in specifying a practical concurrent
+programming API. Sci. Comp. Prog. 75 (2010).
+[19]Nielson, F., Nielson, H. R., and Hankin, C.
+Principles of Program Analysis . Springer-Verlag, 1999.
+[20] OpenCL. http://www.khronos.org/opencl .
+[21] The ROSE compiler. http://www.rosecompiler.org/ .
+[22] Satisﬁability Modulo Theories Competition
+(SMT-COMP). http://www.smtcomp.org/2009 .
+[23]Tripakis, S., Stergiou, C., and Lublinerman, R.
+Checking non-interference in SPMD programs. In 2nd
+USENIX Workshop on Hot Topics in Parallelism
+(HotPar) (2010).
+[24] Yices: An SMT solver. http://yices.csl.sri.com .

@@ -1,0 +1,1243 @@
+UBITect: APrecise and Scalable Methodto Detect
+Use-b
+efore-InitializationBugsinLinuxKernel
+YizhuoZhai
+yzhai003@ucr.edu
+UC,Riverside
+USAYu Hao
+yhao016@ucr.edu
+UC,Riverside
+USAHang Zhang
+hang@cs.ucr.edu
+UC,Riverside
+USA
+Daimeng Wang
+dwang030@ucr.edu
+UC,Riverside
+USAChengyuSong
+csong@cs.ucr.edu
+UC,Riverside
+USAZhiyun Qian
+zhiyunq@cs.ucr.edu
+UC,Riverside
+USA
+Mohsen Lesani
+lesani@cs.ucr.edu
+UC,Riverside
+USASrikanth V.Krishnamurthy
+krish@cs.ucr.edu
+UC,Riverside
+USAPaul Yu
+paul.l.yu.civ@mail.mil
+U.S. ArmyResearchLaboratory
+USA
+ABSTRACT
+Use-before-Initialization (UBI) bugs in the Linux kernel have se-
+rioussecurityimpacts,suchasinformationleakageandprivilege
+escalation. Developers are adopting forced initialization to cope
+with UBI bugs, but this approach can still lead to undefined behav-
+iors (e.g., NULLpointer dereference). Asit is hardto infer correct
+initializationvalues,webelievethatthebestwaytomitigateUBI
+bugs is detection and manual patching. Precise detection of UBI
+bugsrequirespath-sensitiveanalysis.Thedetectorneedstotrack
+anassociatedvariable’sinitializationstatusalongallthepossible
+program execution paths to its uses. However, such exhaustive
+analysis prevents the detection from scaling to the whole Linux
+kernel. This paper presents UbiTect, a UBI bug finding tool which
+combines flow-sensitive type qualifier analysis and symbolic ex-
+ecution to perform precise and scalable UBI bug detection. The
+scalable qualifier analysis guides symbolic execution to analyze
+variablesthatarelikelytocauseUBIbugs. UbiTect alsodoesnot
+require manualeffort forannotations and hence, it can be directly
+applied to the kernel without any source code or intermediate rep-
+resentation(IR)change.OntheLinuxkernelversion4.14, UbiTect
+reported 190 bugs, among which 78 bugs were deemed by us as
+true positives and52 were confirmedbyLinux maintainers.
+CCS CONCEPTS
+·Security and privacy →Operating systems security ;Sys-
+temssecurity.
+ESEC/FSE ’20, November 8ś13, 2020, Virtual Event, USA
+© 2020 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-7043-1/20/11.
+https://doi.org/10.1145/3368089.3409686KEYWORDS
+Use-before-Initialization, bug detection, type qualifier, symbolic
+execution
+ACMReference Format:
+Yizhuo Zhai,YuHao,Hang Zhang, Daimeng Wang,Chengyu Song,Zhiyun
+Qian,MohsenLesani,SrikanthV.Krishnamurthy,andPaulYu.2020.UBI-
+Tect:APreciseandScalableMethodtoDetectUse-before-InitializationBugs
+in Linux Kernel. In Proceedings of the 28th ACM Joint European Software
+Engineering Conference and Symposium on the Foundations of Software Engi-
+neering(ESEC/FSE’20),November8ś13,2020,VirtualEvent,USA. ACM,New
+York, NY, USA, 12pages.https://doi.org/10.1145/3368089.3409686
+1 INTRODUCTION
+Linux kernels provide a secure foundation upon which services
+for user applications can be built. However, security vulnerabil-
+ities existing inside kernel code violate the security guarantees
+thatitintendstoprovide.Amongsuchvulnerabilities,use-before-
+initialization (UBI) is an emerging threat. A recent report from a
+Microsoft security team shows that the number of patched UBI
+bugsissimilartothenumberofpatcheduse-after-freebugs[ 20].
+UBI bugs open up significant security threats against the operating
+system: they could enable attackers to take control over the entire
+system[2,7,16,33], leaksensitive information[ 15,19], and can be
+exploitedusing automatedmeans [16].
+Bothstaticanalysisanddynamicanalysishavebeenappliedto
+detect UBI bugs. Modern compilers provide the -Wuninitialized
+optiontofacilitatethedetectionofUBIbugsatcompiletime.Unfor-
+tunately,duetoitslimitedanalysisscope(i.e., intra-procedural),this
+cannot detect UBI bugs that involve multiple functions. In practice,
+manyUBIbugsdooccurinter-procedurally.Forexample,objects
+can be allocated in one function, initialized in another function,
+and used in a third function. Static symbolic execution like that
+in Clang static analyzer (CSA) [ 26], can perform more accurate
+analysis, but due to the path explosion, its ability to perform inter-
+moduleholisticprogramanalysisislimited.Dynamicanalysisused
+in MemorySanitizer[ 25]andkmemcheck[ 27]canalso detectUBI
+221This work is licensed under a Creative Commons Attribution International 4.0 License. 
+ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA Y. Zhai, Y. Hao, H.Zhang,D. Wang,C.Song,Z.Qian, M. Lesani, S.V. Krishnamurthy, P. Yu
+bugs, but their limited code coverage means that they will miss
+manybugs.
+Zeroing the allocated object is a popular mitigation strategy for
+UBIbugs.Forexample,PaX’s STACKLEAK plugin[22]forcestheini-
+tialization of kernel stacks during context switches between the
+kernel and user space. UniSan [ 15] forces the initialization of mem-
+ory objects that may be uninitialized and may leave the kernel
+space (e.g.,copy-to-user ). SafeInit [ 19] does so for all stack and
+heap variables. However, we point out that forced initialization can
+only be used to mitigate information leaks, but not other types of
+UBI bugs. The reason is that, the value 0used for initialization may
+violate a program’s semantics and lead to undefined behaviors. For
+instance, initializing a pointer to NULLis sufficient towards prevent-
+inginformationleaks,butdereferencinga NULL-pointerresultsin
+a different type of vulnerability viz., CWE-476 [ 3] (which is not
+desirable in OS kernels). For normal data, a few patches we submit-
+ted were also rejected due to incorrect initializationvalues. Based
+on this observation, we conclude that a better way to mitigate UBI
+bugs is to warn developers and let them decide upon the correct
+initializationvalues.
+There are two particular challenges for reporting UBI bugs to
+developers.First,theLinuxkernelhasabout27.8millionlinesof
+codeandso, theanalysismustbe scalable. Second, mostUBIbugs
+arepath-sensitive , meaning that they can only be triggered if there
+is a feasible path between the allocation site and the use site, along
+whichtheinvolvedvariablewillnotbeinitialized.Becauseofthese,
+UBI bugs are uniquely challenging to comprehensively discover
+and require inter-procedural path-sensitive analysis. We are not
+aware ofany such analysisscalingto the wholekernel.
+Flow-sensitive static analysis and symbolic execution are two
+state-of-artsolutionsthatcanhelptowardsdiscoveringUBI bugs.
+Our evaluations show that the former method scales well but gen-
+erates too many warnings to inspect manually. Moreover, there
+are lots of false positives in those warnings. Symbolic execution
+reports fewer false positives but suffers from pathexplosion.
+Inthiswork,weseektoaddresstheaforementionedtwochal-
+lenges,anddesignatoolsuitableforreportingUBIbugsformanual
+inspection and fixing. To this end, we have developed UbiTect,
+a tool that combines flow-sensitive type qualifier inference and
+symbolicexecutiontofindUBIbugsintheLinuxkernel.Inthefirst
+stage,UbiTect uses a soundy [ 17] flow-sensitive, field-sensitive
+andcontext-sensitiveinter-proceduralanalysistofindpotentialUBI
+bugs.Foreachpotentialbug,thisstepalsogeneratesaguidancefor
+path exploration, so as to avoid paths that will never reach the use
+site or paths that will initialize the involved variable. In the second
+stage,UbiTect uses under-constrained symbolic execution [ 23] to
+find a feasible path according to the guidance. If a path is found,
+UbiTect will report the bug together with the corresponding path
+to make the manual inspection andfixeasier.
+Weperformathoroughevaluationof UbiTect onLinuxv4.14un-
+derallyesconfig ,whichincludes16,163fileswith616,893functions.
+UbiTect reported 190 bugs, among which 78 bugs were deemed
+by usas truepositives,yielding a falsepositive rate of59%.Among
+truepositives,wefoundthatthecorrespondingcodeof9bugshave
+been removed from the mainline kernel due to feature updates and
+11bugswerealreadyfixedinthemainline.Wesubmittedpatches
+fortheremaining58bugsand37wereconfirmedandappliedby1/* file: drivers/crypto/mv_cesa.c
+2* uninteresting code lines are omitted
+3*/
+4typedef void(*crypto_completion_t)(
+5structcrypto_async_request *req,interr);
+6
+7structcrypto_async_request {
+8crypto_completion_t complete;
+9};
+10
+11staticintqueue_manag (void*data)
+12{
+13/* backlog is defined without initialization */
+14structcrypto_async_request *backlog;
+15if(cpg->eng_st==ENGINE_IDLE)
+16 backlog =crypto_get_backlog( &cpg->queue);
+17if(backlog)
+18 /* uninitialized pointer dereferenced! */
+19 backlog->complete(backlog, -EINPROGRESS);
+20return0;
+21}
+Figure 1: A UBI bug in the Linux kernel. Variable backlogis
+not initialized if (cpg->eng_st != EN’INE_IDLE) . It allows arbi-
+trary code execution once an attacker exploits the bug to
+controlthevalue left on the kernelstack.
+kernelmaintainers.Inaddition,basedonthesebugs,weapplysome
+intuitive heuristics and uncover 15 more bugs, thereby confirming
+52 bugsintotal. Details are providedin section 6.
+Contributions Inthispaper,ourcontributionsareasfollows:
+•Design.Wedesign UbiTect,whichcombinesscalabletypequal-
+ifier inference with symbolic execution to perform scalable and
+precisedetectionofUse-before-InitializationbugsintheLinux
+kernel.
+•Implementation. We implement UbiTect on the LLVM 7.0.0
+compiler toolchain and KLEE with 13,446 LoC. The tool is open
+sourced[ 5].
+•Results. UbiTect found78bugsinthev4.14Linuxkernel,where
+11 were already fixed and 37 were confirmed by Linux maintain-
+ers.
+2 USE-BEFORE-INITIALIZATION BUGS
+In thissection,we highlightthe severityof UBI bugsandthe chal-
+lengesindetection.
+2.1 From UBIto ArbitraryCodeExecution
+The firstexample isa bug thatwas found inthe queue_manag func-
+tion(simplifiedin Figure1)andpatchedinrevision 1a92b2b.The
+rootcauseforthisbugisthatthepointer backlog(line14)isonly
+initialized(line16) when (cpg->eng_st == ENGINE_IDLE) .
+Although this case is simple, it highlights the severity of the se-
+curityimpactofUBIbugs.Thevariable backlogbelongstothetype
+structure crypto_async_request , which contains a function pointer
+complete (line8).When backlogisleftuninitialized,itcouldpointto
+an arbitrary memory location depending on what value was stored
+222UBITect: A PreciseandScalableMethodto DetectUse-before-Initialization Bugsin LinuxKernel ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA
+atthataddress( &backlog)before,and backlog->complete couldalso
+point to arbitrary code. Since backlogis allocated on the kernel
+stack, by utilizing stack spray [ 16], an attacker can control backlog
+andthus,thefunctionpointer ( backlog->complete ).Consequently,
+whenthisfunctionisinvokedatline19,theattackercanachieve
+arbitrary code execution.
+In addition to control-flow hijacking attacks, an attacker can
+also launch arbitrary reads and writes by overlapping attacker-
+controlleddatawithuninitializedpointers( e.g.,CVE-2010-2963[ 7]).
+Moreover,ifacriticaldecisionvariable( e.g.,authenticated )isunini-
+tialized,anattackercanbypasssecuritychecksandinduceother
+unexpected control flows. A subsequent research effort has shown
+thatsuchattacksarepracticalandcanbeconstructedinanauto-
+matedmanner [ 16].
+2.2 Challenges in Detecting UBIBugs
+The key challenge in detecting UBI bugs is the need for high-
+precision analysis (to reduce false positives), which can conflict
+withour goalofscaling upthe analysis to the entire Linux kernel.
+Figure2depictsagoodexample:function vmw_translate_mob_ptr
+takes three input arguments and an output argument *vmw_bo_p ,
+which is supposed to be initialized at line 16. Under normal cir-
+cumstances ( i.e.,the lookup succeeds), *vmw_bo_p will be initialized.
+However, when the callee enters an error related return path (line
+15),*vmw_bo_p isleft unchanged.
+NeedforInter-proceduralAnalysis. Aconservativeintra-procedural
+analysis can require that all the variables must be initialized at all
+levels (e.g.,both the pointer and the data the pointer points to),
+when passed to a callee. However, since the callee may not ac-
+cess all input arguments ( e.g.,when an error is returned at line
+15), thisrequirement is too restrictive and will generate too many
+false positives. Therefore, an inter-procedural analysis is necessary.
+Moreover,since *vmw_bo_p isleft unchangeduponan errorreturn,
+whether the actual argument is uninitialized or initialized depends
+onthecallingcontext( i.e.,whetherthecallerhasalreadyinitialized
+it).Hence,acontext-sensitiveinter-proceduralanalysisisprefer-
+able.Similarly,sincethecalleemaynotaccessallthefieldsofan
+argument ( e.g.,sw_context ), performing a field-sensitive analysis is
+preferable.
+Needs for Path-Sensitive Analysis. Another interesting part of
+thisexampleisthatthelocalvariable( vmw_bo)isnotinitializedat
+first(line10),andmaynotbeinitializedifthecalltothefunction
+vmw_user_dmabuf_lookup fails (line12). However,since
+vmw_translate_mob_ptr() checksthereturnvaluetodetecttheerror
+(line 14-15), the uninitialized value will not reach a use (line 16).
+Thus, in essence, having a data-flow between where the variable is
+uninitialized and used, is a necessary condition for UBI bugs but
+is not sufficient ( i.e.,, the corresponding execution path must be
+feasible).Unfortunately,nopath-sensitiveanalysis( e.g.,dynamic
+analysis)canscaletocoverallthepathsinthekernel.Asapractical
+compromise, UbiTect uses under-constrained symbolicexecution
+to verifythe feasibilityofapotentialbuggy path.1/* file: drivers/gpu/drm/vmwgfx/vmwgfx_execbuf.c
+2* uninteresting code lines are omitted
+3*/
+4staticintvmw_translate_mob_ptr (
+5 structvmw_private *dev_priv,
+6 structvmw_sw_context *sw_context,
+7 SVGAMobId *id,
+8 structvmw_dma_buffer **vmw_bo_p)
+9{
+10structvmw_dma_buffer *vmw_bo;// = NULL;
+11uint32_t handle= *id;
+12intret=vmw_user_dmabuf_lookup(
+13 sw_context ->fp->tfile, handle, &vmw_bo);
+14if(unlikely(ret != 0))
+15 return-EINVAL;
+16*vmw_bo_p =vmw_bo;
+17return0;
+18}
+Figure 2: An inter-procedural UBI bug in the Linux kernel.
+Argument vmw_bo_p may remain uninitialized during error
+return.
+Figure3:Theworkflowof UbiTect ,"QI":QualifierInference,
+"QR":qualifier requirements,"QU": qualifier updates
+3 OVERVIEW
+Inthissection,weshowhow UbiTect combinestypequalifierinfer-
+enceandsymbolicexecutiontodetectUBIbugs. Figure3illustrates
+theworkflowof UbiTect andwewillexplaineachcomponentin
+the following content. The design of the type inference will be
+presentedmore formally in subsection 4.2 .
+3.1 Pre-processing
+Tomaketheanalysiseasier, UbiTect firstcompilesLinuxsource
+code to its LLVM Intermediate representation (IR). To improve the
+scalability of the type inference, UbiTect adopts the bottom-up
+style inter-procedural analysis. To support the bottom-up style
+analysis, the second step is to build the call graph of the whole
+code base so as to (1) resolve indirect call targets, (2) build the
+dependency tree between caller and callee(s), and (3) find potential
+recursive chains.
+223ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA Y. Zhai, Y. Hao, H.Zhang,D. Wang,C.Song,Z.Qian, M. Lesani, S.V. Krishnamurthy, P. Yu
+3.2 TypeQualifierInference
+Type qualifiers have been used in previous works to detect secu-
+ritybugs.Forexample,JohnsonandWagner[ 13]introducedtwo
+qualifiers kernelanduserto trackthe provenance ofpointers ( i.e.,
+whether their values are controlled by user space) and find unsafe
+dereferences of user-supplied pointers. In this work, we adopt the
+flow-sensitive type qualifier inference [ 9]to detectUBIbugs.
+From a high level, we introduce two new qualifiers: initand
+uninit,whereinit⪯uninit(i.e.,initisasubtypeof uninit);andde-
+fines the subtype relations between qualified types ( e.g.,init int⪯
+uninit int ). Besides the trivial check that an expression of uninit
+cannotbeassignedtoalocationof init,UbiTect addsadditional
+checks/assertions to detectuse ofinitializedvariables:
+•Onlyexpressionsof inittype can be dereferenced;and
+•Only expressions of inittype can be used in conditional
+branches.
+UbiTect onlyconsidersthosetwoassertionsthatcaptureUBI
+bugswithsecurityimplicationshereandignoreothertypesofuses
+ofsuchvariables.Forexample,addingtwouninitializedvariables
+reflectsan uninitializedusage,but isnot security-critical.
+SincetheIRgeneratedbythecompilerdoesnotcontainanyqual-
+ifier,UbiTect performsautomated inference toassignaqualifierfor
+every variable at every program point within a function, including
+its argument(s) and return value(s). If UbiTect can successfully
+infer all the qualifiers, then the analyzed function is free of UBI
+bugs.OtherwisewefindpotentialUBIbug(s)andthecorresponding
+guidance will be generated andpassed to UbiTect’s symbolicexe-
+cutionengine.We will firstexplain how UbiTect infersqualifiers
+within a function and generates function summaries; then we will
+describe howinter-proceduralqualifier inference works.
+Intra-proceduralQualifierInference. Theintra-proceduralqual-
+ifier inference is done as follows. (1) UbiTect assigns each expres-
+sion(LLVMvalue)withasymbolictype κ.(2)Alongdifferenttypes
+of expressions, UbiTect generates subtyping constraints accord-
+ingtorulesin subsection4.2 .(3)Whenencounteringthesecurity
+critical operations listed above, UbiTect enforces that the corre-
+sponding expression has the concrete qualifier init. (4)UbiTect
+resolvesthesymbolictypesintoconcretequalifiedtypesbysolving
+the constraints.
+Takeaa_splitn_fqname inFigure 4 as an example. At the en-
+try of the function (line 6), ns_nameandns_lenare assigned with
+two symbolic types κ1const char κ 2∗κ3∗andκ4size_t κ5∗.
+Because ns_name(%2) andns_len(%3) in basic block (BB) %7are
+dereferenced as pointers, the qualifier of the pointer should be
+init.UbiTect can then resolve their qualified types at least to be
+uninit const char uninit ∗init∗(initialized pointer to uninitial-
+izedpointer to uninitializedconstant char) and uninit size _t init∗
+(initializedpointer to uninitializedinteger).
+FunctionSummariesGenerations. Afterintra-proceduralquali-
+fierinference, UbiTect generatesfunctionsummaries(FS)forevery
+function. Each function summary includes (1) qualifier require-
+ments (QR)over theinputarguments for thetarget functionto be
+invoked without triggering UBI bugs, (2) qualifier updates (QU) for
+inandoutparameters,and(3) qualifier ofthe return value.
+Here, we continue using aa_splitn_fqname as an example and
+focus on how we generate QR and QU for the input argumentsns_nameandns_len. Let us assume that the actual argument types
+areκ1const char κ 2∗init∗andκ4size_t init∗, whereκiis sym-
+bolic(i.e.,eitherinitoruninit).Byassigningtheconstantinteger
+to*ns_name (line 10) and *ns_len(line 11), their qualified types
+will be updated to κ1const char init ∗init∗andinit size_t init∗.
+However, when the control flow merges at basic block %8before re-
+turning,becausethesetwovariablesarenotwritten-tointheother
+branch (when name == NULL ), the updates to the qualifier when
+aa_splitn_fqname returnswill be decidedby the least-upperbound
+ofκ2andinit(i.e.,κ2∨init), as well as κ4andinit.
+Toenablecontext-sensitiveinter-proceduralanalysis,wekeep
+κ2andκ4assymbolicasłupdatestotheparametersžinthefunction
+summary, and calculate the actual updates according to the calling
+context.
+Inter-proceduralQualifier Inference. After we derive the sum-
+mary of aa_splitn_fqname ,we can proceedto analyze
+aa_fqlookupn_profile . The arguments &ns_name (%4) and&ns_len
+(%5)pointtomemoryobjectsallocatedonthestackandthus,the
+qualifiedtypesare uninit char uninit ∗init∗anduninit size _t init∗.
+Their qualified types are compatible with the QR generated above.
+After invocation, according to the QU, their types remain the same
+because when κ2=uninit,uninit∨init=uninit.
+When processing the ifstatement on line 22, UbiTect enforces
+that the expression used as the branch condition has a qualifier
+init. However, in aa_fqlookupn_profile , thissubtypingconstraint
+cannot be satisfied because the qualified type of ns_name(%7) is
+uninit char uninit ∗. Due to this conflict, the inference module out-
+putsapotentialUBIbugonline22(BB %3)ofaa_fqlookupn_profile .
+Guidance for Symbolic Execution. Tomitigatethepathexplo-
+sionproblem, UbiTect generatesaguidanceforthesymbolicexecu-
+tion engine (SE). The guidance includes an avoidlist and a mustlist
+of basic blocks. A basic block is inserted into the avoidlist when (1)
+the involved variable is initialized or (2) the basic blocks can never
+leadtotheusesite.Abasicblockisinsertedintothemustlistwhen
+(1) the involved variable becomes uninitialized or (2) the unini-
+tializedvariable isused.For the UBIbugdetectedabove, UbiTect
+passes SE a avoidlist containing %7where the variable is initialized
+andamustlistcontaining %3where UBIhappens.
+3.3 Symbolic Execution
+Aftergettingtheguidance, UbiTect usesunderconstrainedsym-
+bolicexecutiontosearchforafeasiblepath( i.e.,whosesymbolic
+pathconstraintscanbesatisfied)fromtheallocationsite( i.e.,the
+entryof aa_fqlookupn_profile )totheproblematicusesite %3,while
+avoiding %7.Ifafeasiblepathisfound( e.g.,BB%3,%4,%8,%3 ),UbiTect
+outputs areport for manual inspection, togetherwiththe path.
+4UBITECT DESIGN
+This section describes the design details of UbiTect, including
+points-to and aliasing analysis, the formalization of the type infer-
+ence,andthe symbolic executionengine.
+4.1 Points-to andAliasingAnalysis
+Asaprecursortoflow-sensitivequalifierinference[ 9],UbiTect per-
+formsaflow-sensitiveandfield-sensitiveintra-proceduralpoints-to
+224UBITect: A PreciseandScalableMethodto DetectUse-before-Initialization Bugsin LinuxKernel ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA
+1/* file: security/apparmor/policy.c
+2* uninteresting code lines are omitted
+3*/
+4constchar*aa_splitn_fqname (
+5 constchar*fqname, size_tn,
+6 constchar**ns_name, size_t*ns_len) {
+7constchar*name=skipn_spaces(fqname, n);
+8if(!name)
+9 returnNULL;//*ns_name is not initialized
+10*ns_name =NULL;
+11*ns_len= 0;
+12/* populate *ns_name */
+13returnname;
+14}
+15
+16intaa_fqlookupn_profile (structaa_label *base,
+17 constchar*fqname, size_tn) {
+18constchar*name,*ns_name;
+19size_tns_len;
+20name=aa_splitn_fqname(fqname, n,
+21 &ns_name, &ns_len);
+22if(ns_name) { // UBI!
+23 //ns = aa_lookupn_ns(labels_ns(base),
+24 //ns_name, ns_len);
+25}
+26return0;
+27}
+Figure4:Aninter-proceduralUBIbugintheapparmormod-
+ule andcorresponding LLVM IR with control-flow graph.analysis;specifically,towardsthisitappliesstandarddata-flowanal-
+ysis.Foreachstatement,apoints-tomapismaintainedandupdated
+accordingtothecontrol-flow.Thisallows UbiTect tohavediffer-
+ent points-to sets for the same pointer at different program points
+(i.e.,flow-sensitive).
+Because type casting is common in the Linux kernel, the points-
+tomaptracksallvariablesand(field-extended)objectsregardlessof
+whethertheirtypesarepointersornot.Thisallows UbiTect tohan-
+dle (i) casting between pointers and integers and (ii) integer-based
+pointerarithmetic. UbiTect alsohandlestwotypesofcastingsthat
+areespeciallytroublesomeforpoints-toanalysis: container_of and
+casting from a voidpointer. When handling such cases, UbiTect
+dynamically extends the allocated object size ( i.e.,number of fields
+in astructtype), if the destination type contains more fields than
+the original object. Since such castings usually happen on function
+arguments,thisprocedureenablesmoreprecisefunctionsummaries
+whichwillbe explainedin subsection 4.3 .
+4.2 QualifierInference
+Our qualifier inference component is an extension of the flow-
+sensitive analysis by Foster et al.[9], and the inference rules for
+basic expressionsare the same.In addition, we consider pair types
+which model the fields inside a C struct type and present their
+correspondingtypeinferencerules.Providingseparatequalifiers
+for elements of pairs ( i.e.,structfields) is important as structis
+usedextensivelyintheLinuxkernel.Moreimportantly,pointersto
+structareoftenpassedbetweenkernelfunctions,andwhethera
+fieldof a structisor isnotinitializedis independentofthestates
+ofthe otherfields inthe struct.
+Given a program in LLVM IR, we present a type qualifier in-
+ference system to infer a qualifier (either initoruninit) for each
+registervariable( i.e.,LLVMexpression)andeachfieldthatbelongs
+to an allocated memory object. We perform the inference function-
+by-functioninabottom-upfashion.Ifwecansuccessfullyinferthe
+qualifiers, then the analyzed function is correct; otherwise we find
+potentialUBIbug(s).
+Whileweneitherelaboratenorcontributetothesophisticated
+theorybehindtypequalifiershere,wetrytokeepthenarrativeself-
+contained bydescribing the notationsand conceptsappliedin the
+referencerules.Interestedreaderscanreferto[ 9]forfurtherdetails.
+We retain the standard qualifier notation from Foster et al.[9], and
+onlypresent thetype inferencerules for pair expressions;thefull
+set of inference rules is available to the interested reader in the
+supplementary material[ 4].
+The subtyping relation between the two qualifiers is straightfor-
+ward:init⪯uninit(i.e.,initisasubtypeof uninit),meaningthata
+variable of init tcould be valid wherever uninit tis expected, but
+not vice versa. Defining the subtyping relations for qualified types,
+andinparticularqualifiedreferencetypes,issubtle.Considering
+the primitive type int,its subtyping relation of qualified intis:
+Q⪯Q′
+Qint⪯Q′int
+Thismeansthatifqualifier Q⪯Q′,thenQintisasubtypeof Q′int,
+For instance, initintis a subtype of uninitint. When it comes to
+references,theruleismorecomplicated.Thefollowingruledefines
+the subtyping relation between qualifiedreferences.
+225ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA Y. Zhai, Y. Hao, H.Zhang,D. Wang,C.Song,Z.Qian, M. Lesani, S.V. Krishnamurthy, P. Yu
+Q⪯Q′
+Qref(τ) ⪯Q′ref(τ)
+Specifically,itrequiresthatthetypeofthe( τ)towhichtherefer-
+ences point,be thesame.
+4.2.1 Syntax. Our qualifier inference is performed on LLVM IR
+after the alias analysis. For simplicity of the discussion, we use the
+followingabstractsyntaxfollowingtheoneusedinFoster etal.[9],
+instead ofthe full LLVMIR syntax.
+e:=x|n|λLx:t.e|e1e2|
+|refρe|!e|e1:=e2
+| ⟨e1,e2⟩ |fst(e) |snd(e)
+|fst(e1):=e2|snd(e1):=e2|
+|assert(e,Q) |check(e,Q)
+t:=α|int|ref(ρ) |t→Lt′| ⟨t1,t2⟩
+L:={ρ,..,ρ}
+Anexpression ecanbeavariable x,aconstantinteger n,afunction
+λLx:t.ewith argument xof typet, effect set Land body e. The
+effect set, L, is the set of abstract locations ρthat the function
+accesses,which iscalculated aspartof ouraliasanalysis. Atype t
+iseitheratypevariable α,anintegertype int,areference ref(ρ)(to
+the abstractlocation ρ), a function type t→Lt′(that isdecorated
+with its effects L) or a pair type ⟨t1,t2⟩. The expression e1e2is the
+applicationoffunction e1toargument e2.Thereferencecreation
+expression refρe(decorated with the abstract location ρ) allocates
+memory to store the value e. The expression ! edereferences the
+reference e. The expression e1:=e2assigns the value of e2to
+the location e1points to. The expression ⟨e1,e2⟩is the pair of e1
+ande2.Theexpressions fst(e)andsnd(e)arethefirstandsecond
+elements of the pair e, respectively. The expressions fst(e1):=e2
+andsnd(e1):=e2assign thevalueof e2tothe first and the second
+elements ofthe location e1pointsto,respectively.
+Note that, following the style of Foster et al.[9], we use explicit
+qualifiers to both annotate and check the initialization status of
+expressions.Theexpression assert(e,Q)annotatestheexpression e
+withthequalifier Q,whichisusedto manually annotatetypes( e.g.,
+thefromargumentof copy_to_user ).Theexpression check(e,Q)re-
+quiresthetop-levelqualifierof etobeatmost Q.Weautomatically
+insert the check(e,init)expressions bya simple program transfor-
+mation before every security critical use to enforce the safety of
+theoperations.Specifically,weconsiderapointerdereference(! e)
+to be security critical; a similar connotation applies when eis used
+as the predicate ofaconditional branch.
+4.2.2 QualifiedTypesandTypeStores. Giventhesubtypingrela-
+tions,we nowdefinethe qualifiedtypes.
+τ:=Q σ
+Q:=κ|init|uninit
+σ:=int|ref(ρ) | (C,τ) → (C′,τ′) | ⟨τ1,τ2⟩
+C:=ϵ|Assign(C,ρ:τ) |...
+η:=0|1|ω
+Thequalifiedtypes τcanhavequalifiersatdifferentlevels. Qcan
+beaqualifiervariable κoraconstantqualifier initoruninit.The
+flow-sensitiveanalysisassociatesagroundstore Ctoeachprogram
+point that is a vector that associates abstract locations to qualified
+types.Thus,functiontypesarenowextendedto (C,τ) → (C′,τ′)Int⪯
+Q⪯Q′
+Q int⪯Q′intRef⪯
+Q⪯Q′
+Qref(ρ) ⪯Q′ref(ρ)
+Fun⪯
+Q⪯Q′τ2⪯τ1τ′
+1⪯τ′
+2C2⪯C1C′
+1⪯C′
+2
+Q(C1,τ1) →L(C′
+1,τ′
+1) ⪯Q′(C2,τ2) →L(C′
+2,τ′
+2)
+Store⪯
+τi⪯τ′
+iηi⪯η′
+ii=1..n
+{ρη1
+1:τ1, ...,ρηn
+n:τ1} ⪯ {ρη′
+1
+1:τ′
+1, ...,ρη′n
+1:τ′
+n}
+Pair⪯
+Q⪯Q′τ1⪯τ′
+1τ1⪯τ′
+2
+Q⟨τ1,τ2⟩ ⪯Q′⟨τ′
+1,τ′
+2⟩
+Figure 5:Store subtyping.
+whereCis the store that the function is invoked in and C′is the
+store when the function returns.
+Totrackwhenstrong/weakupdatesshouldbeperformed,each
+locationinastore Calsohasanassociatedlinearity ηthatcantake
+three values: 0 forunallocated locations, 1 forlinear locations( i.e.,
+only point-to a single abstract location and thus, admits strong
+updates), and ωfor non-linear locations ( i.e.,can point-to multiple
+different abstract locations and thus, only admits weak updates).
+An abstract location is linearif the type systemfinds that itcorre-
+sponds to a single concrete location in every execution. An update
+that changes the qualifier of a location is called a strong update;
+otherwise, it is called a weak update. Strong updates can be ap-
+plied to only linear locations. The three linearities form a lattice
+0<1<ω.Additiononlinearitiesisasfollows:0 +x=x,1+1=ω,
+andω+x=ω. The type inference system tracks the linearity of
+locations to allowstrongupdatesfor only the linearlocations.
+Since a store Cmaps from each abstract location ρito a type τi
+and a linearity ηi,we write C(ρ)asthe type of ρinCandClin(ρ)
+as the linearity of ρinC. Store variables are denoted as ϵ. We
+usethefollowingstoreconstructortorepresentthestoreafteran
+assignment expressionas afunction of the store before it.
+Assign(C,ρ′:τ)(ρ)=
+ 
+τ′whereτ⪯τ′ifρ=ρ′∧Clin(ρ)/nequalω
+τ⊔C(ρ) ifρ=ρ′∧Clin(ρ)=ω
+C(ρ) otherwise
+Assign(C,ρ′:τ)lin(ρ)=Clin(ρ)
+Assign(C,ρ:τ)overrides Cby mapping ρto a type τ′such that
+τ⪯τ′.(τ′canbeanysuper-typeof τ.)Thecondition τ⪯τ′allows
+assigningasubtype τofresultingtype τ′toρ.Ifρislinearthenits
+type inAssign(C,ρ:τ)isτ′; otherwise its type is conservatively
+the least-upper bound of τandits previous type C(ρ).
+Thetypeinferencesystemgeneratessubtypingconstraintsbe-
+tween stores. We define store subtyping in Figure 5. Constraints
+between stores yield constraints between linearities and types,
+whichinturnyieldconstraintsbetweenqualifiersandlinearities.
+The ruleInt⪯requires a corresponding subtyping relation for the
+qualifiers of the type int. The rule Ref⪯requires the same subtyp-
+ing relation between qualifiers and further, the equality of the two
+locations. The rule Fun⪯requires the subtyping relation between
+thetop-levelqualifiers,andcontra-variancefortheargumentand
+inputstoreandco-varianceforthereturnvalueandoutputstore.
+The rule Store⪯requires both subtyping and stronger linearity
+226UBITect: A PreciseandScalableMethodto DetectUse-before-Initialization Bugsin LinuxKernel ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA
+for corresponding locations. The rule Pair⪯requires subtyping be-
+tweenthetop-levelqualifiers,andalsosubtypingforcorresponding
+elements ofthe twopair type.
+4.2.3 TypeInferenceSystem. Atypeinferencesystemconsistsa
+set of rules which define the preconditions for each expression
+(with the analyzed function) to be executed safely without UBI.
+Suchpreconditionswillimposesubtypingconstraintsbetweeneach
+expression. Anchoredby the (automatically inserted) check(e,init)
+and(manuallyinserted) assert(e,init)expressions,wecaninferthe
+qualifiers of the remaining expressions. Again, if the constraints
+are satisfiable, the analyzed function is free from UBI bugs and the
+inferencecansucceed;otherwisetheremayexistUBIbug(s)and
+the conflicting constraint(s) willreveal the reason.
+Because the main difference between our system and the one in
+Fosteret al.[9], is field-sensitivity, we only present the rules for
+the pair expressions in this Section ( Figure 6). The complete set of
+rules are in the supplementary material [ 4]. The judgments are of
+theform Γ,C⊢e:τ,C′thatisreadas:inthetypeenvironment Γ
+andstore C,evaluating eyieldsaresultoftype τandanewstore
+C′.
+The rule Pairtype-checks the expressions e1ande2in order
+and results in an initialized pair type. The rule Fstchecks that the
+expression eis of a pair type and types fst(e)as the first element
+ofthepairtype.Thequalifier Qofthepairtypeisunconstrained;
+qualifiers are only checked by the checkexpressions discussed
+above. The rule FstAssign checks that the expression e1is of a
+referencetype ref(ρ),thepost-store C′′(afterchecking e1ande2)
+mapsthereference ρtoasupertypeofapairtype κ⟨α1,α2⟩,andthe
+typeτ1ofe2isasubtypeof α1.Theresultingstoreremaps ρtoanew
+pairtypewherethefirstelementisthetypeof τ1andthesecond
+element is unchanged. We elide the rules for sndthat are similar
+to the rules for fst. The constraints generated by the new rules
+Pair,FstandFstAssign are type and store subtypingconstraints
+that were also generated by the basic rules. Further, by the rule
+Pair⪯,subtypingconstraintsbetweenpairtypesaredecomposed
+intosubtypingconstraintsbetweenqualifierandsimplertypesthat
+are inductively decomposed into constraints between qualifiers
+and linearities. Thus, the added inference rules do not increase the
+complexityofthe generatedconstraints.
+4.3 Inter-Procedural Analysis
+Givena function Finthe callgraph,afterapplying thetypeinfer-
+encetoeachcalleefunctionseparately,thesummariesgenerated
+for all of these are used in the analysis of the caller function F.
+Thefunctionsummaryisrepresentedas(1)thequalifierrequire-
+ments for the input arguments (of the function), (2) the qualifier of
+returnedvalue,and(3)theupdatestoinandoutarguments.There-
+quirementsspecifytheweakestqualifiersfortheformalarguments
+thatarenecessaryforthefunctiontobeinvokedsafelywithouttrig-
+geringany UBI bug. This means thatif the actual arguments have
+weaker qualifiers, UBI bug(s) may occur. The updates record the
+qualifiersofoutputs,whichintheClanguage,areoutputpointer
+arguments. To support context-sensitive inter-procedural analysis,
+the updates and return value are polymorphic, i.e.,based on the
+qualifiers of the actual arguments from the callers, the qualifiers of
+the outputs maychange.As shown in subsection 4.2 , a qualified function could be repre-
+sentedintheformatof Q(C,τ) →L(C′,τ′)whereQisthequalifier
+of the function object itself, Cmaps locations ρto their types τ
+before the function is called, τisthe parameter type, C′maps lo-
+cationsρto their (possibly) updated types τafter the function is
+called,τ′isthereturntype,and Listhesetoflocationsaccessedby
+thefunction.Theconceptisfurtherexemplifiedbythefollowing
+example:
+init([ρ/maps⊔o→uninitint,ρ′/maps⊔o→initint],ref(ρ))
+→{ρ,ρ′}
+([ρ/maps⊔o→initint,ρ′/maps⊔o→initint],initint)
+It represents an (initialized) function that starts with a pre-store
+whereρis uninitialized and ρ′is initialized. The input is the refer-
+enceforρ,andthefunctionaccessesboth ρandρ′.Thefunction
+initializes ρand leaves ρ′initialized.This function is summarized
+asfollowsśnoinitialization requirements foritsparameterandone
+update:updateparameter ρto initialized.
+4.3.1 CalculatingandUsing Summaries. Requirementsoverinput
+arguments can be directly fetched from the inference result. While
+updates are a little complicated, they are calculated as follows. For
+any pointer argument, UbiTect maintains a copy of the alias set
+of its abstract location at both the entry and exit of the function. If
+the alias set changes, then the corresponding argument is updated
+during the execution, and the output qualifier is the least-upper
+bound of the qualifiers of all variables from the alias set at the exit
+of the function. If the points-to set still contains the initial value
+fromthealiassetattheentryofthefunction,thenitsqualifieris
+kept as symbolic, so as to support polymorphism. For a concrete
+example,pleaserefer to section 3.
+The qualifier of the return value is handled similarly: if it de-
+pendsonthequalifieroftheinputvalue(s), UbiTect keepsthemas
+symbolicsothatthereturnvaluecanhavetheappropriatequalifier
+basedonthe callingcontext.
+Usingfunctionsummaries,theimplementationofcontext-sensitive
+inter-proceduralanalysisisstraightforward.
+•Inference constraints : Each actual argument must be a subtype of
+the corresponding formal argument ( i.e.,requirements). Adding
+thisconstraintallowsusto(1)checkifthecalleecanbesafely
+invoked(ifnot,typeinferenceoverthecurrentfunctionwillfail).
+and(2)automaticallypropagatetherequirementsfromthecallee
+tothecaller,incasethecallerpassesitsargument(s)tothecallee.
+•Applyupdates :Aftertheinvocationofafunction,thequalifiers
+of values inside the points-to set of pointer type argument(s) are
+updated according to the updates. Further, the qualifier of the
+valueusedtoreceivethereturnvalueisthesameasthequalifier
+ofthe return value.
+•Indirect calls : For indirect calls, the actual arguments have to
+satisfytherequirementsofallpossiblecalltargets,andtheup-
+datesareconservativelycalculatedastheleast-upperboundof
+allupdates.
+4.3.2 SpecialCases. Therearesomenuancesthatareassociated
+withsummary-basedinter-proceduralanalysis;here,wedescribe
+twothat we belive are important.
+227ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA Y. Zhai, Y. Hao, H.Zhang,D. Wang,C.Song,Z.Qian, M. Lesani, S.V. Krishnamurthy, P. Yu
+Pair
+Γ,C⊢e1:τ1,C′Γ,C′⊢e2:τ2,C′′κfresh
+Γ,C⊢ ⟨e1,e2⟩:init⟨τ1,τ2⟩,C′′Fst
+Γ,C⊢e:Q⟨τ1,τ2⟩,C′
+Γ,C⊢fst(e):τ1,C′
+FstAssign
+Γ,C⊢e1:Qref(ρ),C′Γ,C′⊢e2:τ1,C′′κ⟨α1,α2⟩ ⪯C′′(ρ)τ1⪯α1κ,α1,α2fresh
+Γ,C⊢fst(e1):=e2:τ1,Assign(C′′,ρ:⟨τ1,snd(C′′(ρ))⟩)
+Figure 6:Type inferencerulesforthepair expressions ( C struct fields).
+Heap Objects. Because our points-to analysis is intra-procedural,
+it cannot track aliases created or removed outside the current func-
+tion. More importantly, the concurrent nature of the kernel also
+makes it hard to precisely reason about the qualifier for heap data.
+For example, thread Astores an initialized data to heap address
+addrh; however, when Atries to load from the same address, the
+data may no longer be initialized because a concurrent thread B
+could have written an uninitialized data to the same address. To
+handle this, we (1) track the provenance of memory objects; any
+object thatisnot allocatedinthecurrentscope isconservatively
+consideredtobeaheapobject( i.e.,globallyvisible);and(2)enforce
+a conservative rule for writing to heap objects: the variable has
+tobefullyinitialized( i.e.,withqualifier init);ifthevariableisof
+pointertype,wealsorequirethatthedataitpointstoareinitialized.
+By doing so, we can safely assume all data loaded from heap are
+also initialized but false positives are introduced because of this
+strategy.
+Recursion. After building the call graph, we observed recursions
+among functions calls. Fixed point analysis is adopted to handle
+such recursions. Specifically, a function in the circular dependency
+graph is randomly picked to start the qualifier analysis. For callees
+whosesummariesarenotavailable,thesubtypingconstraintsare
+temporarilyignored.Asaresult,animprecisesummaryoftheas-
+sociated function is constructed by the first-time analysis. Then
+UbiTect movesontoanalyze itscallers using thisimprecise sum-
+mary. Following the dependency circle, the function is analyzed
+again.Becausethistimethesummariesofitscalleeswillbeavail-
+able, despite being imprecise, a new summary would be generated.
+Thisprocessisrepeateduntiltherearenochangestothesummaries.
+4.4 Symbolic Execution
+Up to this point, the type qualifier inference reported all the sus-
+picious UBI locations. Next, UbiTect uses under-constrained sym-
+bolic executionto find true positives.
+For each potential bug output by the static analysis module,
+the symbolicexecution(SE)modulefirstlinksall thebitcode files
+relatedtothebug.Itthenstartssearchingforafeasiblepathfromthe
+beginning of the function where the involved variable is allocated.
+Duringtheexploration,theSEmodulewillprunepathsthatinclude
+anybasicblockintheavoidlistorpathsthatdonotincludeallbasic
+blocks in the mustlist. In this way, type qualifier inference reduces
+the searching spacefor SE andmakesitmore scalable.
+Since a partial path (the portion between uninitialization and
+use)isexploredinsteadofafullexecutionpathfromentrytothe
+kernel(e.g.,systemcall)totheuse,somefalsepositivescouldstill
+pass the filter. Similarly, false positives caused by an imprecise callTable 1:LoCfordifferentanalysis of UbiTect .
+Analysis Lineof Code
+Call Graph 708
+Points-To 1,652
+Alias 375
+Qualifier Inference 4,460
+UtilityFunctions 3,412
+Symbolic Execution 2,839
+Total 13, 446
+graph (i.e.,indirect call targets) will not be filtered. However, we
+ensure that notrue positives are wrongly excluded.
+Finally,despitetheuseofunder-constrainedsymbolicexecution
+and guided path exploration, due to path explosion and complex
+pathconstraints, the tool may still takea longtimeand/or a large
+amount of memory to verify a warning. To handle the large vol-
+umeofwarningsfromthestaticanalysis,weranktheremaining
+warnings by łthe time taken to find a feasible path between the
+uninitialization siteand the use sitež. Our observations are (1) bug
+reportswithafeasiblepatharemucheasierfordeveloperstoverify
+and (2) the less complex the path is, the sooner symbolic execution
+willfind it.
+5 IMPLEMENTATION
+UbiTect isbuiltupontheLLVMcompilerinfrastructure.Weadopt
+thewholekernelanalysisinfrastructurefromKINT[ 29]andmodify
+ittomatchthebottom-upanalysis.Points-toanalysisisbasedonthe
+structure analysis code from [ 1] while under-constrained symbolic
+executionstandsonKLEE[ 6].Overall,13,446LoCareadded,the
+distributionsofwhichare shownin Table1.
+We manually summarize 26 functions from three major cate-
+gories.(thereasonsfordoingsoareprovidedwithinthediscussion
+pertainingto eachcategory):
+•LLVMintrinsicsandassemblyfunctions :Wedonothaveaccess
+to intrinsicfunctions like memsetandmemcpyor functionsimple-
+mentedinpureassembly;thus,inthesecaseswecannotconstruct
+summariesthroughautomaticinference.
+•Heap allocation functions : For reasons discussed earlier, we man-
+ually summarize typical kernel heap allocation functions, in-
+cludingthe kmallocseriesandthe kmem_cache_alloc series.Since
+these functions accept flag GFP_ZERO, which will initialize the
+allocated memory, we set the initial qualifier for the allocated
+object according to this flag. Because our points-to analysis is
+field-sensitive (instead of byte-sensitive) andthe allocation size
+tothesefunctionsareinbytes,todeterminethetypeofallocated
+object, we willfollow thedef-use chain ofthereturnedaddress
+228UBITect: A PreciseandScalableMethodto DetectUse-before-Initialization Bugsin LinuxKernel ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA
+Table 2: Evaluation I: UBI bugs patched since 2013. All of
+theuninitializedvariablesarelocatedonstack. UbiTect can
+successfullydetectallofthem.
+Commit or CVE No Type UbiTect
+bde6f9d intra-procedural Yes
+1a92b2b intra-procedural Yes
+8134233 inter-procedural Yes
+c94a3d4 inter-procedural Yes
+da5efff inter-procedural Yes
+CVE2010-2963 inter-procedural Yes
+7814657 inter-procedural Yes
+6fd4b15 inter-procedural Yes
+andcheckfora bitcastoperation.Ifwecannotfindone,wetreat
+the objectas havingasinglefield ( i.e.,void type).
+•Security related functions: As mentioned in section 2, we can use
+qualifiers toexplicitlyexpresssecuritypolicies wewant to en-
+force. For example, copy_to_user() copies the kernel data to the
+userspace.Toavoidinformationleakagebecauseofuninitialized
+data, we manually create a summary for this function, requiring
+the sourceobjectto be fully initialized.
+6 EVALUATION
+Ourexperimentsaresystematicallyperformedwiththeobjective
+ofansweringthe following researchquestions:
+•RQ1:CanUbiTect detectpreviously knownbugs?
+•RQ2:CanUbiTect detectnewbugs?
+•RQ3:Comparedwith UbiTect,howdootheropensourcedstatic
+analyzers perform for findingUBIbugsinthe Linux kernel?
+Experimental Setup. To answer these three questions, we first
+gatheredeightpreviouslypatchedLinuxkernelUBIbugsstudied
+in[16]andvalidateourtool.Then,weapply UbiTect tothex86_64
+Linux kernel, version 4.14, with allyesconfig . It was tested on
+machineswithIntel(R)Xeon(R)E5-2695v4processorsand256GB
+RAM. The operating systemisthe 64 bit Ubuntu16.04 LTS.
+Data Availability. Linux kernel is an open sourced project. We
+will also open source UbiTect for aiding the reproducibility of the
+experimental results.
+6.1 Detecting Known UBIBugs
+ToanswerRQ1,weevaluate UbiTect intermsoffindingeightprevi-
+ouslypatchedLinuxkernelUBIbugsstudiedin[ 16].Table2shows
+theresultsi.e., UbiTect candetectallofthem.Twoofthesebugs
+can be detected by intra-procedural analysis but the rest require
+inter-proceduralanalysis.
+6.2 Detecting NewUBIBugs
+It tookUbiTect about a week to fully analyze the entire Linux
+kernelwith616,893functions.Specifically,ittook7and205days
+of CPU time for qualifier inference and symbolic execution (SE),
+respectively. After qualifier inference, for each function, generated
+warningswereimmediatelyfedintoSE,whichranonmorethan
+30 CPU cores, on average (and was complete in a week of real
+time). The qualifier inference component generated 147,643 poten-
+tial uninitialized use of stack variables. Each warning representsa unique use of an uninitialized variable, meaning that repeated
+accesses to the same uninitialized variable in different statements
+andaccessestodifferentfieldsofthesameobject areconsideredas
+different warnings. Since our modeling of heap variables is very
+conservative and the number of warnings for stack variables is
+already large enough, we exclude the warnings relating to writing
+uninitializedvaluesto heapvariables.
+UbiTect’s under-constrained symbolic execution (SE) compo-
+nentsfiltered4,150warningsasfalsepositivesbecauseitwasunable
+to find a feasible path based on the guidance. 1,190 cases could not
+be handled by our SE component due to a mixture of 32-bit and
+64-bitpointers.Wethenmanuallyinspected190bugswhereourSE
+componentcanfindafeasiblepathwithin2minutes.6ofthe190
+bugsareduetotheuseofuninitializedfunctionpointers,125are
+duetouseofuninitializeddatapointers,and59arerelatedtouse
+of uninitialized data (that affect control flow). Our manual analysis
+confirmed78ofthemastruepositives,yieldingafalsepositiverate
+of59%.Weinterpretareportedbugasafalsepositiveifthepath
+returned by SE is infeasible, or the variable is actually initialized
+alongthe path.
+To confirm our manual inspection results with kernel main-
+tainers, we tried to create patches for the 78 true positive cases.
+During this process, we found that the buggy code of 9 cases have
+been removed in the mainline due to feature updates and 11 are
+alreadyfixed in themainline. We also found that many bugs were
+relatedtomissingchecksoverthereturnvalue[ 14]ofthefunction
+regmap_read() . Further (manual) checks over the remaining callers
+ledtoanadditional60bugs.Wesubmittedpatchesforalltheun-
+fixed118 casesto Linux developers. 52 bugs have been confirmed,
+35caseswerecategorizedasłwillnothappeninreality,žandthe
+remaining 31 are still in process (we are awaiting feedback). The
+detailed list of the confirmed bugs is shown in Table 3. We point
+out here that among the 52 bugs, 37 of them were reported auto-
+matically while 15 are identified from the additional manual check.
+In fact, if we extend the time and memory limitations for symbolic
+execution,weexpectthatthesecasescanbereportedautomatically
+as well.
+For112warningswedeemedasfalsepositives,wealsoanalyzed
+the root causes.The major ones include (1) Incomplete black and
+whitelist (39 cases): when the path crosses multiple functions. (2)
+Imprecise indirect call resolution (26 cases): the indirect call target is
+infeasible.(3) LLVMoptimization(16cases): whereinLLVMconverts
+astructwithtwo u32types,directlytoa u64type;thisoptimization
+makescertainfunctionsummariesinaccurate.(4) Thelimitations
+ofunder-constrainedsymbolicexecution: wetreatinputarguments
+as unconstrained symbolic values; however, in reality, such uncon-
+strained inputs are impossible according to the program logic ( e.g.,
+constraintsincurredoutsidethescopeofthesymbolicexecution).
+and(5)Assemblycode (10 cases) .
+6.3 SensitivityandPrecision
+Weshowcasehowdifferentsensitivitylevelsaffect UbiTect’squal-
+ifierinference.First,weuseasimplesyntaxanalysisasthebaseline,
+where we check for stack variables that are notinitialized immedi-
+atelyaftertheirdeclaration.Thisbaselineflagged1,373,174abstract
+locations (expanded to be field-sensitive) out of 2,179,399 as not
+229ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA Y. Zhai, Y. Hao, H.Zhang,D. Wang,C.Song,Z.Qian, M. Lesani, S.V. Krishnamurthy, P. Yu
+Table 3: Evaluation II: New bugs detected by UbiTect . The
+Line No. column gives the place where uninitialized uses
+happens. The last column: A-Patch Applied; C-Confirmed
+by developers
+No. Sub-System Module Variable LineNo. Patch
+1 iommu/amd iommu.c unmap_size 1523 A
+2 asoc/rt565 rt5651.c ret 1759 A
+3 asoc/rt274 rt274.c buf 364 A
+4 asoc/rt275 rt274.c val 1133 A
+5 net/stmmac dwmac-sun8i.c val 646 A
+6 clk/gemini clk-gemini.c val 320 C
+7 iio/adc meson_saradc.c regval 286 C
+8 iio/adc meson_saradc.c regval 313 C
+9 iio/adc meson_saradc.c val 454 C
+10 iio/adc meson_saradc.c regval 631 C
+11 iio/adc meson_saradc.c regval 789 C
+12 regulator pfuze100-regulator.c val 635 A
+13 drm/bridge sii902x.c status 122 C
+14 iio/trigger stm32-timer-trigger.c ccer 136 C
+15 iio/trigger stm32-timer-trigger.c cr1 140 C
+16 iio/trigger stm32-timer-trigger.c ccer 168 C
+17 iio/trigger stm32-timer-trigger.c cr1 173 C
+18 iio/trigger stm32-timer-trigger.c cr1 222 C
+19 iio/trigger stm32-timer-trigger.c psc 224 C
+20 iio/trigger stm32-timer-trigger.c arr 225 C
+21 iio/trigger stm32-timer-trigger.c dat 411 C
+22 iio/trigger stm32-timer-trigger.c dat 454 C
+23 media atmel-isc.c isc_intsr 1255 C
+24 media atmel-isc.c isc_intmask 1255 C
+25 mfd fsl-imx25-tsadc.c status 40 C
+26 mfd ti_am335x_tscadc.c reg 58 C
+27 net/ethernet hns_mdio.c reg_value 165 A
+28 clk/axi-clkgen clk-axi-clkgen.c d 314 C
+29 power/supply max17042_battery.c read_value 485 C
+30 power/supply max17042_battery.c vfSoc 667 C
+31 power/supply max17042_battery.c vfSoc 682 C
+32 pwm pwm-stm32-lp.c val 163 C
+33 pwm pwm-stm32-lp.c prd 163 C
+34 power/supply max17042_battery.c full_cap0 681 C
+35 power/supply max17042_battery.c val 1082 C
+36 power/supply rt5033_battery.c val 33 C
+37 iio/adc bcm_iproc_adc.c intr_status 161 C
+38 iio/adc bcm_iproc_adc.c intr_mask 162 C
+39 iio/adc bcm_iproc_adc.c intr_status 187 C
+40 iio/adc bcm_iproc_adc.c ch_intr_status 194 C
+41 iio/adc bcm_iproc_adc.c channel_status 201 C
+42 iio/adc bcm_iproc_adc.c val_check 299 C
+43 pwm pwm-stm32.c psc 100 C
+44 pwm pwm-stm32.c arr 100 C
+45 pwm pwm-stm32.c ccer 295 C
+46 pwm pwm-stm32.c ccer 312 C
+47 regulator ltc3589.c irqstat 419 C
+48 regulator max8907-regulator.c val 303 A
+49 media pvrusb2-hdw.c qctrl.flags 793 A
+50 x86/hpet hpet.c msg.f2 503 C
+51 staging/ddk750 ddk750_chip.c pll.OD 58 C
+52 power/supply max17042_battery.c val 837 C
+beinginitializedwhendeclared.Ifweaddflow-sensitiveanalysis
+(but without inter-procedural analysis), the number of warnings
+was10,267,357.
+Thisnumberishigherthanthebaselineinlinewithwhatone
+might expect, because this is on the basis of uses ( i.e.,different
+uses will be considered as different warnings) instead of decla-
+rations. If we add inter-procedural analysis but without context-
+sensitivity, the number of warnings was 242,934. After adding
+context-sensitivitytotheanalysis, UbiTect’sstaticanalysiscom-
+ponentreported147,644warnings.Again,becauseeachwarning
+fromstatic analysisisbased ona uniqueuse,thereduction rateis
+actually higher than90%.
+6.4 Comparisonwith otherStatic Analyzers
+ToanswerRQ3,wecompare UbiTect withtwoopensourcedtools
+which are able to detect UBI bugs. We first compare the perfor-
+manceof UbiTect withthatofcppcheck[ 18].BothUbiTect andcppcheck need the access to the source code and do not need man-
+ualannotations.While UbiTect’sstaticanalysisisinter-procedural
+andreportsthewarningsattheusesite,cppcheck’sanalysisisonly
+intra-proceduralandreportsthewarningwhentheuninitialized
+variable is read. We ran the cppcheck on the whole Linux ker-
+nel, version 4.14. It reported 191 UBI bugs, from which 164 bugs
+werewithinouranalysisscope( i.e.,codeenabledby allyesconfig ).
+Among the overlapped 164 bugs, only 2 are true positives ( i.e.,a
+muchhigherfalsepositiverateof98%).Fromthese2truepositives,
+UbiTect catches only one via its static analysis component; the
+other is missed by UbiTect because the use site is not explicitly
+markedbyus.Specifically,theuninitializedvalueisleakedthrough
+the network layer but we only explicitly marked copy_to_user()
+to detect potential leaks. 29 false positives are shared between
+UbiTect’s static analysis and cppcheck. The remaining 131 false
+positiveswerecorrectlyfilteredby UbiTect’sinter-procedurestatic
+analysis.
+Oppositetothecppcheck’slightweightandimpreciseanalysis,
+the Clang Static Analyzer (CSA) is another open source tool which
+applies the expensive and precise symbolic execution to catch UBI
+bugs. As with any symbolic execution, it is hard to scale to large
+programs due to the path explosion problem. Therefore, CSA only
+performsinter-proceduralanalysiswithinamodule.Unfortunately,
+evenwithoutinter-modulewholeprogramanalysis,itisdifficultto
+scale CSA to all the source code files in Linux kernel. Alternatively,
+we ran CSA over the 78 files in which our true positives were
+located. CSA took about 1.5 hours (96m 8.171s) to finish (had it
+performedinter-moduleanalysis,thetimeislikelytoblowupmuch
+more).Becauseouranalysiswasperformedover16,163filesintotal,
+at this speed, CSA will run for ≈13 days to finish analyzing the
+entirekernel.Withinthe78files,CSAreportedonly22uninitialized
+variables. 3 were false positives that were filtered by UbiTect. 2
+were not reported by UbiTect due to complex assembly which are
+hardtoverify.For theremaining17true positives,12were within
+the78bugs UbiTect reportedin subsection6.2 ,whiletheremaining
+5 can be verified by UbiTect’s SE component with longer times
+(more than 2 minutes). The majority of the true positives found
+byUbiTect were not found by CSA; the main reason is that these
+bugsfundamentallyrequire analysisacrossmultiple modules.
+InUbiTect, we take the best of both qualifier inference and
+symbolic execution. We apply the expensive and precise symbolic
+execution only selectively under the guidance of qualifier infer-
+ence,e.g.,to go across the boundary of modules (files) and to focus
+on a subset of all the program paths. This allowed us to discover
+morevulnerabilitiesthanpuresymbolicexecution( i.e.,morescal-
+able)withbetteraccuracythanpurestaticanalysis( i.e.,lessfalse
+positives).
+6.5 Threatsto Validity
+Therearethreemajorthreatstothevalidityofourevaluation.First,
+although the theoretical foundation of type inference is sound,
+compromisesmadeduringthedesigncouldaffectthesoundnessof
+our analysis results and hence, our static analysis component may
+miss some bugs. Such compromises include imprecise modeling of
+assembly code, undefined behaviors ( e.g.,out-of-bound memory
+access), and data structure padding. The second threat is potential
+230UBITect: A PreciseandScalableMethodto DetectUse-before-Initialization Bugsin LinuxKernel ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA
+bugs in our prototype implementation. We have used previously
+known UBI bugs to test our prototype, but the test set is small
+and thus, could not cover all corner cases. Finally, classifying bugs
+reportedby UbiTect wasdonebytheauthors.AswearenotLinux
+kernel maintainers, we could have made mistakes on whether a
+reportedbugisatruepositiveorfalsepositive.Wetriedtomitigate
+thisthreatbyreportingthebugsthatwebelieveweretruepositives
+tothekernelmaintainers,butwedidnothearbackforallthecases.
+7 RELATED WORK
+Mitigating UBI Bugs. Automated mitigation of UBI bugs is pio-
+neered by PaX’s STACKLEAK plugins [22], which forces the initializa-
+tionofkernelstacksduringcontextswitchesbetweenthekernel
+and user space; STRUCTLEAK optimizes STACKLEAK by only initializ-
+ingobjectsthatmaybeexposedtouserspace.Tworecentrelated
+works are SafeInit [ 19] and UniSan [ 15]. SafeInit [ 19] is a compiler
+extension that initializes all allocated memory to zero. However,
+thisblindinitializationstrategyisoftenundesiredandcanmaskthe
+real bug. According to our interaction with kernel developers, it is
+actuallybelievedthatinmanycasestherightapproachistoleavea
+variable uninitialized when it is first created. The reasoning is that
+therealinitialvaluewillbecomputeddynamicallylateranyway;
+assigning zero or some arbitrary value is not only unnecessary
+butcanalsomaskarealbugwherethedesired(correct)initializa-
+tionprocedurefailsandthevariablegetsusedsubsequently.The
+correct way to fix such bugs is to make sure that the use-before-
+initializationpath is eliminated ( e.g.,by properly checking for the
+absenceofinitializationandreturning).UniSan[ 15]detectsandze-
+rosuninitializeddatathatcanleakfromthekernelspace.So,itonly
+eliminatesinformationleakageresultingfromuninitializedreads.
+This work attempts to detect all use-before-initialization bugs. For
+instance,anuninitializedfunctionpointer maybe dereferencedin
+thekerneltocausearbitrarycodeexecutionasdiscussedearlier.At
+this stage, UBI bugs still need to be patched manually case by case,
+andwebelievethattheidentificationofsuchbugswith UbiTect is
+anecessary firststep.
+StaticDetectionofKernelBugs. Withtheincreasingpopularity
+of LLVM, many LLVM-based static analysis tools have been devel-
+opedtofindbugsintheLinuxkernelsource.KINT[ 29]puttogether
+anumberofstaticanalysistechniquessuchastaintandrangeanal-
+ysistodiscoverintegeroverflowvulnerabilitiesintheLinuxkernel.
+Juxta [21] detects semantic bugs in Linux file systems by finding
+deviant behaviors in different file system implementations [ 8]. Dr.
+Checker [ 17] is a static taint analysis engine that can be used to
+find taint-style vulnerabilities in the Linux kernel. K-Miner [ 10]
+performscontext-sensitivevalue-flowanalysistoidentifymemory-
+corruptionvulnerabilities.Deadline[ 30]andCheck-it-Again[ 28]
+detecta specialtype oftime-of-check-to-time-of-use(TOCTTOU)
+bugsduetolackofre-checks.CRIX[ 14]detectsmissingsecurity
+checks in the Linux kernel. PeX [ 32] detects missing permission
+checks.Toourknowledge,noanalysishasattemptedtodiscover
+the increasing number ofUBIbugs.
+TypeQualifiers. Typequalifiershavebeenshowntobeapowerful
+waytorepresentinvariantsinprograms.Atypequalifierisgeneral
+andexpressiveenoughtoconductavarietyofsecurityanalysisand
+bugfindingtasks,includingthepopulartaintanalysis[ 12].Someexamples of applying type systems for bug finding include finding
+user/kernel pointer bugs [ 13], format string vulnerabilities [ 24],
+integer-overflow-to-buffer-overflow [ 31], null pointer deference
+bugs[11], lock/unlockbugsandfile descriptor bugs[ 9].
+8 CONCLUSIONS
+Inthispaper,wetargettheprincipleddetectionoftheunderrated
+yet dangerous use-before-initialization (UBI) bugs in the Linux
+kernel. These bugs pose a security threat not only because they
+canleadtounpredictablebehaviorsbutalsobecausetheyareex-
+ploitabletogainrootprivileges.Wedesignandimplement UbiTect,
+aframeworkthatcombinesflow-,field-,andcontext-sensitivetype
+qualifier inference with symbolic execution to identify UBI bugs
+withlowfalsepositiverates.Akeycharacteristicthatdistinguishes
+UbiTect fromothereffortsisthatittakesthebestofthetwometh-
+ods and performs scalable inter-procedural analysis to catch the
+uninitializeduseofvariablesacrossfunctions.Weapply UbiTect to
+the Linux 4.14 kernel and 138 new bugs are unearthed from which
+52 ofthemare confirmedbyLinux maintainers.
+ACKNOWLEDGMENTS
+We would like to thank the anonymous reviewers for their insight-
+ful comments that helped improve the quality of the paper. We
+thankManuSridharan for hisuseful comments, and WeitengChen
+for hisassistance. This research was partially sponsored by the U.S.
+ArmyCombatCapabilitiesDevelopmentCommandArmyResearch
+LaboratoryandwasaccomplishedunderCooperativeAgreement
+Number W911NF-13-2-0045 (ARL Cyber Security CRA). The views
+andconclusionscontainedinthisdocumentarethoseoftheauthors
+andshouldnotbeinterpretedasrepresentingtheofficialpolicies,ei-
+therexpressedorimplied,oftheCombatCapabilitiesDevelopment
+CommandArmyResearchLaboratoryortheU.S.Government.The
+U.S. Government is authorized to reproduce and distribute reprints
+for Government purposes notwithstanding any copyright notation
+hereon.ItwasalsopartiallysupportedbyNSFawardCNS-1718997
+andONR undergrant N00014-17-1-2893.
+REFERENCES
+[1] 2014. Andersen’s inclusion-based pointer analysis re-implementationin LLVM.
+https://github.com/grievejia/andersen/graphs/contributors .
+[2]2018. CVE-2018-6981. https://cve.mitre.org/cgi-bin/cvename.cgi?name=CVE-
+2018-6981 .
+[3]2020. CWE-476: NULL Pointer Dereference. https://cwe.mitre.org/data/
+definitions/476.html .
+[4]2020. Qualifier Type Inference. https://github.com/seclab-ucr/UBITect/blob/
+master/QualifierTypeInference.pdf .
+[5] 2020. UBITect. https://github.com/seclab-ucr/UBITect
+[6]CristianCadar,DanielDunbar,DawsonREngler,etal .2008.KLEE:Unassistedand
+Automatic Generation ofHigh-Coverage Tests for Complex Systems Programs.
+InUSENIX Symposium on Operating Systems Design and Implementation (OSDI) .
+[7]K. Cook. 2011. Kernel Exploitation Via Uninitialized Stack. https:
+//www.defcon.org/images/defcon-19/dc-19-presentations/Cook/DEFCON-19-
+Cook-Kernel-Exploitation.pdf. .
+[8]Dawson Engler, David YuChen, SethHallem, Andy Chou, and Benjamin Chelf.
+2001. Bugsasdeviantbehavior:Ageneralapproachtoinferringerrorsinsystems
+code.ACMSIGOPSOperatingSystemsReview 35,5,57ś72.
+[9]Jeffrey S Foster, Tachio Terauchi, and Alex Aiken. 2002. Flow-sensitive type
+qualifiers. Vol. 37. ACM. https://doi.org/10.1145/512529.512531
+[10]DavidGens,SimonSchmitt,LucasDavi,andAhmad-RezaSadeghi.2018.K-Miner:
+Uncovering Memory Corruption in Linux. In Annual Network and Distributed
+SystemSecuritySymposium(NDSS) .https://doi.org/10.14722/ndss.2018.23326
+231ESEC/FSE ’20, November8–13,2020,VirtualEvent, USA Y. Zhai, Y. Hao, H.Zhang,D. Wang,C.Song,Z.Qian, M. Lesani, S.V. Krishnamurthy, P. Yu
+[11]DavidHovemeyer,JaimeSpacco,andWilliamPugh.2005. Evaluatingandtuning
+a static analysis to find null pointer bugs. In ACM SIGSOFT Software Engineering
+Notes, Vol. 31.ACM,13ś19. https://doi.org/10.1145/1108768.1108798
+[12]Wei Huang, Yao Dong, and Ana Milanova. 2014. Type-Based Taint Analysis
+for Java Web Applications. In IEEE/ACM International Conference on Automated
+SoftwareEngineering (ASE) .https://doi.org/10.1007/978-3-642-54804-8_10
+[13]RobJohnsonandDavidWagner.2004. FindingUser/KernelPointerBugswith
+Type Inference. In USENIX Security Symposium (Security) , Vol. 2.https://dl.acm.
+org/doi/10.5555/1251375.1251384
+[14]KangjieLu, Aditya Pakki, and Qiushi Wu.2019. DetectingMissing-CheckBugs
+via Semantic-and Context-Aware Criticalness and Constraints Inferences. In
+USENIXSecuritySymposium(Security) .
+[15]KangjieLu,ChengyuSong,TaesooKim,andWenkeLee.2016. UniSan:Proactive
+kernelmemoryinitializationtoeliminatedataleakages.In ACMConferenceon
+Computer and Communications Security (CCS) .https://doi.org/10.1145/2976749.
+2978366
+[16]KangjieLu,Marie-ThereseWalter,DavidPfaff,StefanNürnberger,WenkeLee,
+and Michael Backes. 2017. Unleashing use-before-initialization vulnerabilities in
+theLinuxkernelusingtargetedstackspraying.In AnnualNetworkandDistributed
+SystemSecuritySymposium(NDSS) .
+[17]Aravind Machiry, Chad Spensky, Jake Corina, Nick Stephens, Christopher
+Kruegel, and Giovanni Vigna. 2017. DR. CHECKER: A Soundy Analysis for
+Linux KernelDrivers.In USENIXSecuritySymposium(Security) .
+[18]Daniel Marjamäki. 2019. Cppcheck: a tool for static c/c++ code analysis. http:
+//cppcheck.sourceforge.net/ .
+[19]Alyssa Milburn, Herbert Bos, and Cristiano Giuffrida. 2017. SafeInit: Com-
+prehensive and Practical Mitigation of Uninitialized Read Vulnerabilities. In
+Annual Network and Distributed System Security Symposium (NDSS) .https:
+//doi.org/10.14722/ndss.2017.23183
+[20]Matt Miller. 2019. Trends, Challenges, and Strategic Shifts in the Software
+Vulnerability Mitigation Landscape. In BlueHat IL .
+[21]Changwoo Min, Sanidhya Kashyap, Byoungyoung Lee, Chengyu Song, and Tae-
+soo Kim. 2015. Cross-checking semantic correctness: The case of finding file
+systembugs.In Proceedingsofthe25thSymposiumonOperatingSystemsPrinciples .
+361ś377. https://doi.org/10.1145/2815400.2815422[22]PaX Team. 2013. PaX - gcc plugins galore. https://pax.grsecurity.net/docs/
+PaXTeam-H2HC13-PaX-gcc-plugins.pdf .
+[23]DavidARamosandDawsonREngler.2015. Under-ConstrainedSymbolicEx-
+ecution: Correctness Checking for Real Code. In USENIX Security Symposium
+(Security) .
+[24]UmeshShankar,KunalTalwar,JeffreySFoster,andDavidWagner.2001.Detecting
+format string vulnerabilities with type qualifiers. In USENIX Security Symposium
+(Security) .
+[25]Evgeniy Stepanov and Konstantin Serebryany. 2015. MemorySanitizer: fast
+detectorofuninitializedmemoryuseinC++.In InternationalSymposiumonCode
+Generation and Optimization (CGO) .https://doi.org/10.1109/CGO.2015.7054186
+[26]The Clang Team. 2019. Clang Static Analyzer. https://clang-analyzer.llvm.org/ .
+[27]VegardNossum.2015. GettingStartedWithkmemcheck. https://www.kernel.
+org/doc/Documentation/kmemcheck.txt .
+[28]WenwenWang,KangjieLu,andPen-ChungYew.2018. Checkitagain:Detecting
+lacking-recheck bugs in os kernels. In Proceedings of the 2018 ACM SIGSAC
+ConferenceonComputerandCommunicationsSecurity .1899ś1913. https://doi.
+org/10.1145/3243734.3243844
+[29]XiWang,HaogangChen,ZhihaoJia,NickolaiZeldovich,andM.FransKaashoek.
+2012. Improving Integer Security for Systems with KINT. In USENIX Symposium
+onOperatingSystemsDesignand Implementation(OSDI) .
+[30]MengXu,ChenxiongQian,KangjieLu,MichaelBackes,andTaesooKim.2018.
+Precise and scalable detection of double-fetch bugs in OS kernels. In Proceedings
+ofthe2018ACMSIGSACConferenceonComputerandCommunicationsSecurity .
+https://doi.org/10.1109/SP.2018.00017
+[31]Chao Zhang, Tielei Wang, Tao Wei, Yu Chen, and Wei Zou. 2010. IntPatch:
+Automaticallyfixinteger-overflow-to-buffer-overflowvulnerabilityatcompile-
+time. InEuropean SymposiumonResearch inComputer Security(ESORICS) .
+[32]Tong Zhang, Wenbo Shen, Dongyoon Lee, Changhee Jung, Ahmed M Azab, and
+RuowenWang.2019. PeX:APermissionCheckAnalysisFrameworkforLinux
+Kernel.In USENIXSecuritySymposium(Security) .
+[33]HanqingZhao,YanyuZhang,KunYang,andTaesooKim.2019. BreakingTurtles
+All the Way Down: An Exploitation Chain to Break out of VMware ESXi. In
+USENIXWorkshop onOffensiveTechnologies(WOOT) .
+232

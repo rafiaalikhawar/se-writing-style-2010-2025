@@ -1,0 +1,1264 @@
+Prober: Practically Defending Overflows with Page Protection
+Hongyu Liu∗†
+liu2978@purdue.edu
+Purdue University
+USARuiqin Tian∗
+rtian@email.wm.edu
+William & Mary
+USA
+Bin Ren
+bren@cs.wm.edu
+William & Mary
+USATongping Liu†
+tongping@umass.edu
+University of Massachusetts Amherst
+USA
+ABSTRACT
+Heap-based overflows are still not completely solved even after
+decades of research. This paper proposes Prober, a novel systemaiming to detect and prevent heap overflows in the productionenvironment. Prober leverages a key observation based on theanalysis of dozens of real bugs: all heap overflows are related toarrays. Based on this observation, Prober only focuses on array-
+relatedheapobjects,insteadofallheapobjects.Proberutilizesstatic
+analysis to label all susceptible call-stacks during the compilation,
+andthenemploysthepageprotectiontodetectanyinvalidaccesses
+during the runtime. In addition to this, Prober integrates multiple
+existing methodstogether toensure theefficiency of itsdetection.
+Overall,Proberintroducesalmostnegligibleperformanceoverhead,
+with 1.5% on average. Prober not only stops possible attacks on
+time,but alsoreports thefaultyinstructions thatcould guidebug
+fixes.Proberisreadyfordeploymentduetoitseffectivenessand
+low overhead.
+CCS CONCEPTS
+•Softwareanditsengineering →Automatedstaticanalysis ;
+Software testing and debugging.
+KEYWORDS
+Buffer overflow, Program analysis, Page protection
+ACM Reference Format:
+Hongyu Liu,Ruiqin Tian,Bin Ren,and TongpingLiu. 2020.Prober: Practi-
+callyDefendingOverflowswithPageProtection.In 35thIEEE/ACMInterna-
+tionalConferenceonAutomatedSoftwareEngineering(ASE’20),September
+21–25,2020,VirtualEvent,Australia. ACM,NewYork,NY,USA,13pages.
+https://doi.org/10.1145/3324884.3416533
+∗Both authors contributed equally to this work.
+†This work was initiated and partially conducted while Hongyu Liu and Tongping
+Liu were at the University of Texas at San Antonio.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+onthe firstpage.Copyrights forcomponentsof thisworkowned byothersthan the
+author(s)mustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,or
+republish,topostonserversortoredistributetolists,requirespriorspecificpermission
+and/or a fee. Request permissions from permissions@acm.org.
+ASE ’20, September 21–25, 2020, Virtual Event, Australia
+© 2020 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-6768-4/20/09...$15.00
+https://doi.org/10.1145/3324884.34165331 INTRODUCTION
+C/C++ applications are prone to memory errors, such as buffer
+overflows (including over-reads/over-writes). Buffer overflows will
+notonlycauseaprogramtocrash,butalsocanbeexploitedtoissue
+securityattacksorcauseinformationleakage[ 44].Sinceitisnot
+able to expunge all buffer overflows during development phases,
+highly depending on program inputs, significant research has been
+focused on detecting and preventing buffer overflows dynamically.
+Among them, stack-based overflows can be detected with very low
+overhead (less than 6.5%) via the shadow stack technique [ 44]. But
+heap-basedoverflowsarestillnotsolvedyet,sincetheywerestill
+ranked as Top 2 vulnerabilities (as shown in Table 1).
+Table 1: Top five vulnerabilities reported in 2018 [10].
+Vulnerabilities DoSCode Execution Overflow XSS Gain Information
+16555 1852 3035 2492 2004 1426
+Dynamic detection tools can be further divided into multiple
+types. The most common approach is to check the overflow before
+everymemoryaccess,whichcouldstoptheoverflowimmediatelyif
+amemoryaccessisfoundtoaccessredzonesthatarenotsupposed
+to be read or written. Existing work, such as Valgrind [ 30], Dr.
+Memory [ 5], and AddressSanitizer [ 40], employs this approach,
+but withstatic or dynamicinstrumentation method, anddifferent
+organization of red zones. However, even the state-of-the-art of
+this type, e.g. AddressSanitizer, still imposes over 40% performanceoverhead,inadditiontoitssignificantmemoryoverhead.Therefore,
+this type of approach is only applicable for development phases,
+but not for the production environment.
+Efficientapproachesexist,suchasCruiser[ 48],DoubleTake[ 26],
+HeapTherapy [ 49], or iReplayer [ 24]. They detect buffer overflows
+after the effect, typically by checking the evidence of corrupted
+canaries. Althoughtheyimpose very low overhead,generally less
+than 5%, they cannot detect read-based overflows because reads
+do not leave any evidence behind. Also, they cannot stop security
+attackstimely,sincethedetectionmayoccurafterexploits.Sampler
+also imposes littleoverhead by only checking sampled references
+via hardware performance counters [ 43]. However, Sampler can-
+notdetectalloverflowswithinoneexecutionduetoitssampling
+property,andsharesthesameissuethatmayonlydetectoverflows
+after exploits.
+We propose a novel system, called Prober, to overcome these
+issues. Prober has the following goals. First, Prober aims for in-production systems, which should impose low performance and
+11162020 35th IEEE/ACM International Conference on Automated Software Engineering (ASE)
+memoryoverhead.Second,Probershoulddetectbothread-based
+and write-based overflows. Third, Prober will stop overflows im-
+mediately, eliminating any possibility of memory exploits. Last but
+not least, Prober is able to report detailed information to assist bug
+fixes, e.g., allocation sites and faulty instructions.
+To achieve these goals, Prober is based on a key observation
+thatseparatesitfromallexistingwork: overflowingobjectsaretypi-
+cally related to arrays. This observation is based on our analysis on
+dozensofbugscollectedbyexistingwork[ 47](asfurtherdiscussed
+in Section 2.1). We further confirmed that this observation holds
+foralloverflowsreportedinarandomly-selectedperiodintheCVE
+database. This observation is also aligned with the intuition: foran object not related to an array, there is no need of operating it
+with error-prone operations, such as pointer arithmetic instruc-
+tions,stringAPIs,orloopoperations,thuswithalowpossibilityof
+overflows.
+Thiskeyobservationidentifiesthetypeofobjectsthatmayhave
+bufferoverflows,calledas array-relatedobjects orsusceptibleobjects.
+Both terms will be utilized interchangeably in the remainder of
+thispaper.Totakeadvantageofthisobservation, Proberproposes
+to separate array-related objects from normal objects, by placing
+themintoaseparatespace.ThenProberemploysthepageprotec-
+tion to detect overflows, an idea that was initially proposed by
+ElectricFence[ 37]butcanbeseamlesslyintegratedwiththiskey
+observation that reduces the scope of detection. Prober allocatesarray-related objects from a heap that every object is separated
+fromeachotherbyprotectedpages.Morespecifically,Proberplaceseveryarray-relatedobjectattheendofcorrespondingpages,while
+thenextpagewillbesettobenon-readableandnon-writable(or
+protected). Therefore, any overflowing reference (either read or
+write)ontheprotectedpagewilltriggeraviolation.Byintercepting
+suchviolations,Proberwillimmediatelystoptheexecutionandany
+subsequent exploits, and report the faulty instructions precisely.Comparing to the mechanisms of using explicit checks [
+30,40],
+page protection checks buffer overflows without actually checking
+every access, thus imposing no additional checking overhead other
+thantheinitialprotectionoverhead.Proberisabletotrackallin-
+validaccessesintheprotectedpage,causedbyeithercontinuous
+or non-continuous overflows, which could potentially detect more
+issues than existing work using one word [ 24,26,43,48,49]o r
+multiple words [40] as the canary.
+However, the key challenge is to correctly identify all array-
+related heap objects. On the one hand, missing array-related ob-jects will lead to no detection/protection of overflows caused bythem, reducing the safety guarantee. On the other hand, if some
+unnecessary objects were included, it may impose some overhead
+unnecessarily. To this end, Prober proposes a hybrid approach
+to identifyarray-related objects. Someobjects can beidentified as
+array-related (or not) statically by analyzing the source code as
+describedinSection3.1,whiletheremainingoneswillbeidentifiedinahybridway:Prober’sstaticcomponent(Prober-Static)identifies
+the basic type of such allocations (easier to do), instruments the
+size ofsuch allocationswith thecompiler,and itsruntime system
+(Prober-Dynamic)isresponsiblefordeterminingwhetheritisan
+array-relatedobjectbytherealallocationsize.Thatis,ifthesize
+ofanallocationismultipletimesofthebasictype,thenthisallo-
+cation site is identified as susceptible allocation site. Consequently,all future allocations from such sites will be allocated from the
+protectedheapsothatalloverflowingreferencescanbedetected
+and prevented immediately.
+Initsimplementation,Prober-StaticreliesontheLLVMcompiler
+to perform the analysis and instrumentation at the Intermediate
+Representation (IR) level. Prober proposes to identify array-related
+allocationsbasedontheallocationfunction,thedefinitionofthe
+sizeparameter, and the operations of the corresponding object.
+Afterthat,Prober-Staticfurtherlabelsarray-relatedallocationsites
+with simple instrumentation, so that Prober-Dynamic will place
+thecorrespondingobjectsintheprotectedheap.Forobjectsthat
+cannotbeidentifiedasarray-relatedonesstatically,Prober-Static
+simply labels the unit size so that Prober-Dynamic can determine
+its type dynamically. Overall, Prober is over-estimated so that it
+will not miss any array-related allocations.
+Prober-Dynamic intercepts all memory allocations and dealloca-
+tionssothatitcandeterminearray-relatedallocationsandmanagearray-relatedallocationscorrespondingly.Prober’skeyobservationrestrictsitsprotectionscopetoasmallportionofobjects,insteadofmonitoringallheapobjects,whichisonemajorreasonwhyProberrunsmuchmoreefficientlythanElectricFence[
+37].Further,Prober
+also implements carefully to reduce the overhead as follows: (1) It
+employsper-threadheapstocacheavailable/freedobjectslocallyinordertoreducethecontentionamongdifferentthreads,anideabor-rowedfromHoard[
+3];(2)Itemploysaninformation-computablede-
+sign to reduce the checking overhead upon deallocations; (3) Freed
+objects are organized by the size of power-of-two pages in order
+to encourage the re-utilization of objects, without coalescence and
+splitting, which is different from Electric Fence [37].
+Wehaveperformedextensiveexperimentstoevaluatetheper-
+formanceoverhead,memoryoverhead,andeffectiveness.Basedon
+the evaluation of 18 applications, Prober imposes only 1.5% perfor-
+manceoverheadonaverageandaround25.9%memoryoverhead,
+making it applicable for in-production systems. To ensure that
+Prober does not miss any necessary instrumentation, we have con-
+firmedthatProberinstrumentscorrectlyforallknownoverflows
+collected by existing work [ 47]. Also, we further confirmed that
+Probercorrectlydetectsandprevents10knownoverflowswithin
+real applications. Prober is ready for in-production systems due to
+its low overhead, timely prevention, and effectiveness.
+Overall, this paper makes the following contributions.
+•It makes a novel key observation that only array-related objects
+are prone to overflows based on our analysis of massive bugs.
+We further empirically confirm that this observation holds for
+randomly-chosen real bugs in the CWE database.
+•Itproposesahybridmechanismthatensurestoidentifyallarray-
+related allocations. Such a mechanism is based on the allocation
+function,thedefinitionof sizeparameterandtheoperationson
+thecorrespondingobject,orthecombinationoftheunitsizeand
+the requested size.
+•It designs and implements a new allocator to manage the pro-
+tected heap efficiently, by borrowing multiple mechanisms origi-
+nated from different memory allocators.
+•Thepaperperformsextensiveevaluationontheperformanceand
+effectiveness of Prober, showing that Prober has the potential to
+be actually employed in the deployment environment.
+1117Table 2: Analysis on 48 heap overflows collected by [47].
+Type Overflow Reason Num(#)
+Sub-structure
+overflowsPointer arithmetic 0
+Loop operation 4
+System call 0
+String APImemcpy 2
+strncpy 3
+strcpy 1
+Whole-structureOverflowsPointer arithmetic 3
+Loop operation 20
+System call 2
+String APImemcpy 6
+strncpy 1
+strncmp 1
+memset 3
+sprintf 1
+memmove 1
+The remainder of this paper is organized as follows. Section 2
+firstdescribesthekeyobservation,thebasicideaofProber,andthen
+describes the attack model of Prober. The detailed implementation
+is further described in Section 3, and the evaluation is presented in
+Section4.Afterthat,wediscussProber’sweaknessesinSection5.In
+the end, Section 6 discusses related work, and Section 7 concludes.
+2 OVERVIEW
+Thissectionfirstanalyzesoverflowbugscollectedbyanexisting
+study [47], and derives our key observation : overflowing objects
+areallrelatedtoarrays.Basedonthiskeyobservation,itfurther
+discusses the basic design and key challenges of Prober.
+2.1 Observations on Heap Overflows
+Onerecentworkstudies100“randomlyselectedbugswithinthe
+buffer overflow category from the CVE website” [ 47]. Based on
+their description, the study is objective due to random selection,
+representingtherealsituationofbufferoverflows.Therefore,our
+analysiswasbasedonthesebugstoavoidanybias.Basedonour
+analysis,these100overflowbugsinclude48heapoverflows,and
+52stackorglobalbufferoverflows.Thissectionfocuseson48heap
+overflows,asshowninTable2.Wehavethefollowingobservations.
+Thefirstobservationisthatalloftheheapoverflowsareinvolved
+witharrays,eithersub-structureorwhole-structureoverflows.Here,
+awhole-structure overflow is an overflow that its allocation is an
+arrayofstructuresorbasicunits(e.g.,characters,integers,orwords).
+Asub-structureoverflow isthattheobject(orallocation)itselfisnot
+an array, but the corresponding structure includes one or multiple
+arrays internally. It is intuitive that array-related objects are prone
+to overflows. If an allocation is just a structure, every field can
+bemanipulatedwithamemberaccessoperator(e.g.,“ ->”or“ .”),
+whichshouldnotcausetheoverflow.Ontheotherhand,ifanobject
+isrelatedtoanarray,thenitisverylikelytoemployerror-prone
+operations, such as pointer arithmetic instructions, string APIs, or
+loop operations.
+The second observation is that whole-structure overflows are
+much more common than sub-structure overflows, consisting of
+around 79.2% of these bugs (with 38 bugs in total).The third observation is that overflow bugs can be caused by
+multiple operations, such as pointer arithmetic instructions, string
+APIs, loop operations, or system calls, as further shown in Table 2.
+Morespecifically,24outof48overflowsarerelatedtoloopsdur-
+ingtheiterations,and19overflowsarerelatedtostringAPIs.For
+instance, the memcpyfunction copies more memory than it should.
+Thesetwocategoriesactuallyconsistofmorethan89.5%ofthese
+bugs.Inadditiontothesetwocategories,threeoverflowsarerelated
+to pointer arithmetic, and two overflows occur when the readsys-
+tem call does not check the boundary of the buffer. Thus, overflow
+occurs if programs utilize the pointers to access the entry of an
+array, but without correctly checking its size.
+Table3:Heapoverflowsbetween11/01/2018and02/15/2019.
+Type Overflow Reason Num(#)
+Sub-structure
+overflowsLoop operation 4
+String API sprintf 1
+Whole-structureOverflowsPointer arithmetic 5
+Loop operation 15
+System call 1
+String APImemcpy 4
+strncat 1
+strncpy 1
+memset 2
+snprintf 1
+memmove 2
+ConfirmingKeyObservation: Inordertofurtherconfirmour
+key observation, we further examined 65 heap overflow bugs re-
+ported in the National Vulnerability Database, with the published
+datebetween11/01/2018to02/15/2019.Sinceonly37bugsoutof
+65bugshaveadetaileddescriptionorhavethesourcecodeinfor-
+mation, we focused on these 37 bugs. Based on our analysis, all of
+these37bugsarearray-related,wherewhole-structureoverflows
+are still the most common types of overflows, with the percentage
+of 86.4% and a total of 32 bugs.
+2.2 Basic Idea of Prober
+ 
+
+
+
+	
+"
+
+" 
+
+
+	!
+	
+Figure 1: Overview of Prober.
+Based on the key observation, Prober focuses only on array-
+relatedwhole-structureoverflows,wherearound80%reportedheap
+1118overflows to belong to. Since array-related objects are only a small
+percentageofallheapobjects,thedetectionoverheadcanbedra-
+matically reduced as further evaluated in Section 4 when using the
+page-protection mechanism. Prober does not handle sub-structure
+overflows in this paper, which will be the future work.
+ThedesignofProberisillustratedasFigure1.Basically,Proberin-
+cludestwocomponents,Prober-StaticandProber-Dynamic.Prober-
+Staticisastaticcompile-timebasedtoolthatidentifiesandlabels
+susceptible memory allocation sites, while Prober-Dynamic per-
+formsoverflowdetection/preventionanddeterminessomearray-
+related allocations on top of the static instrumentation.
+2.2.1 Prober-Static. Prober-Static performs analysis and instru-
+mentation at the Intermediate Representation (IR) level because of
+multiple benefits. First, LLVM IR offers multiple built-in functions
+thatcanfacilitatetheanalysisandinstrumentation.Forexample,
+define-use anduse-define chains that track the definition and us-
+age of memory allocation, can help determine an array-related
+allocation.Second, theanalysisandinstrumentation algorithmon
+LLVM IR is more robust, because many complicated cases (e.g.,
+various macros) at the source code are simplified or merged at the
+IR level. Third, instrumenting at IR level provides the flexibility
+of registering the new code transformation pass in an appropriate
+positionofthecompilationchain,thusavoidingthepossibleside-
+effectstothesubsequentanalysisandcodeoptimizations(e.g.,loop
+optimizations) that are crucial to the code performance. Prober-
+StaticanalyzestheIRtodeterminearray-relatedallocations,and
+marks susceptible allocation sites via the explicit instrumentation.
+Currently, Prober-Static is registered as a Link Time Optimization
+(LTO)passsothatitcanhandledefinitionsandusageslocatedin
+multiple C/C++ files.
+ResearchChallenges: TheaimofProber-Staticistodesignaro-
+bust compile-time analysis, which further includes two challenges.
+First,howtoidentifymemoryallocations,giventhatmemoryal-
+locationshavevariousforms,e.g.,wrapperfunctions,orfunction
+pointers? Second, how to identify array-related memory alloca-
+tions? Basically, Prober designs a hybrid mechanism to ensure
+correctnessandcompleteness.Ifanallocationsitecanbeidentified
+statically, as described in Section 3.1, then it will be labeled explic-
+itly. Otherwise, Prober-Static labels the size of its basic unit, and
+thenreliesonitsdynamiccomponenttodeterminearray-related
+allocations.
+2.2.2 Prober-Dynamic. Prober-Dynamic is a dynamic library that
+applicationsshouldbelinkedwith.Itinterceptsallheapallocations
+and deallocations via its “Alloc/Free Monitor” module, and handles
+theallocationanddetectionforarray-relatedobjects.Forobjects
+allocatedfromarray-relatedallocationsites,ifProber-staticcould
+identify them statically, Prober-Dynamic allocates these objects
+fromaseparateheapviaits“ProtectedHeapManagement”module.
+Basically,thesesusceptibleobjectswillbeseparatedbyprotected
+pages.Inparticular,theywillbeplacedtotheendofcorrespond-
+ing pages, with the next page as protected pages. Therefore, any
+overflowwillbeforcedtolandonprotectedpages,triggeringthe
+protection violation consequently. Prober-Dynamic has anothercomponent—“Exception Handler”–to deal with protection viola-
+tions.Insidetheexceptionhandler,Proberpreciselypinpointsthefaulty instruction that causes the overflow by simply analyzingits calling context of exception. Then Prober stops the execution
+immediately, preventing any further exploits of overflows. Prober
+can be configured to detect out-of-one-page overflows easily. Note
+that Prober cannot detect overflows that do not access protected
+pages. This indicates that Prober cannot detect less-than-one-word
+overflows. However, this is not a real issue, since most heap alloca-
+tors will return a word-aligned address. Less-than-one-word heap
+overflowspracticallywillnotcauseanyissue.Probercannotdetect
+underflows landing on the same page as the starting address of
+special objects, but will tolerate them instead.
+Another task of Prober-Dynamic is to identify array-related
+objects,whentheycannotbeidentifiedstatically.Itutilizesasimple
+mechanismto determinethisdynamically: whethertherequested
+allocation is multiple times of its basic structure. If that is the
+case, Prober-Dynamic will treat the allocation site as array-related
+objects, and follows the above description.
+Research Challenges: Page-based protection guarantees that it
+generatesnofalsepositives,sincememoryreferencesonthepro-
+tected pages are guaranteed to be real overflows. However, thechallenge is to design a system that could manage protected ob-jects efficiently, since a naive method as Electric Fence imposestoo much overhead to be employed in the deployment environ-ment. Section 3.2.2 presents multiple mechanisms to reduce the
+contention and possible cache misses.
+2.3 Attack Model
+Probertargetstodetectbothread-basedandwrite-basedheapbuffer
+overflows, and then stop any possible exploits immediately, based
+on explicit instrumentation. It utilizes the page-based protection
+to detect invalid accesses, which is available on any hardware that
+supports the virtual memory mechanism. Prober does not relyonaspecificOperatingSystem,whichwillbeageneralsolution,although the current prototype is only implemented on top of
+Linux.Proberdoesnotrelyonanyrandomizationmechanismin
+user space or kernel space. Prober could still work effectively, even
+if the hacker knows the source code of the application and Prober.
+3 DESIGN AND IMPLEMENTATION
+Thissectiondescribesthedetaileddesignandimplementationof
+Prober that consists of two components, static instrumentation
+(Section 3.1) and runtime system (Section 3.2).
+3.1 Compiler Analysis and Instrumentation
+Prober-Staticperformsitsstaticanalysisandinstrumentationon
+LLVM IR to identify all susceptible allocations, and relies on dy-namic confirmation to confirm those ones that cannot be deter-
+minedstatically.Overall,ourhybridapproachguaranteesa100%
+coverageforarray-relatedallocations,whichisover-estimatedin
+reality.Prober-StaticisimplementedasoneLinkTimeOptimization
+(LTO)passbecauseoftwomajorconsiderations.First,thealloca-
+tion function may be located inside a wrapper function, but this
+wrapperfunctionisinvokedinanotherCfile,soaninter-module
+analysis (provided by LTO) is required. Second, placing instrumen-
+tationatlink-timecaneffectivelyavoidcomplicatingorinterfering
+performance-critical compile-time analysis and optimizations (e.g.,
+1119varied loop optimizations). Prober-Static determines array-related
+allocations in three steps, as further described in Section 3.1.1.
+3.1.1 Identify Susceptible Allocations. Prober-Staticanalyzessus-
+ceptible (or array-related) allocations in the following steps.
+Step-I: Identify memory allocation functions: Based on our
+knowledge,memoryallocationsareinvokedbyseveralAPIsandop-
+eratorsinC/C++,suchas new,malloc(),calloc(),realloc(),valloc,
+posix_memaliдn (), andmemaliдn (). But there are multiple situa-
+tions as described in the following.
+Basic Case: Some memory allocation invocations can be directly
+recognized according to the name in LLVM IR. For example, the
+new[]keywordistranslatedto _ZnaminLLVMIR.Similarly,various
+macrodefinitionscanalsoberecognizeddirectlyinIRlevel,because
+they have already been replaced by the preprocessor before being
+converted to IR.
+Special Cases: Prober-Static also handles two more sophisticated
+but common cases. First, memory allocation is invoked inside a
+wrapper.For thiscase,Prober-Static recursivelytreatsall functions
+in its calling stack as wrappers of memory allocation functions.
+Second,memoryallocationisdefinedasafunctionpointer.Fortu-
+nately, LLVM translates function pointer calls to indirect calls in
+itsIR,andthefunctioninvocationisspecifiedbyaloadinstruction.Listing1showsasimpleexample.Thedefinitionof
+malloc_ptr re-
+quiresanadditionalchecktodeterminewhetherline2isamemory
+allocation.
+Listing 1: Memory alloc is defined and called as a fun ptr.
+1 %4 = load i8∗ (i64)∗, i8∗ (i64)∗∗@malloc_ptr, align 8
+2 %5 = tail call i8∗ %4(i64 %0)
+Step-II: Identify array-related allocations: Prober-Static fur-
+theridentifiesarray-relatedallocationsbythenameoffunctions,
+the definition of allocation size, and the operations of the corre-
+sponding object. Table 4 lists multiple examples that cover 36 bugs
+analyzedinSection2.1.Thedetailsoftheseexamplesarediscussed
+as follows.
+Type Ican be identified by the name of memory allocation
+functions. For example, new[]is known as an operator to allocate
+an array, and callocallocates an array with multiple objects with
+the same size. 5 out of 36 cases belong to this simple type.
+Type II, III,and IV can be identified by the definition of size
+parameter. If its sizeparameter is defined (or manipulated) by
+multiplication ,addition , and strlenoperations, then the cor-
+responding allocation is array-related. We can easily understand
+thisbycheckingitscontradiction.Ifanallocationisjustforasinglestructure, a
+sizeofoperation will be used to compute the sizepa-
+rameter, without these operations. Prober-Static employs LLVM’s
+built-in def-useanduse-defchainstoassisttheanalysisonthe
+definition of sizeparameter. 24 out of 36 cases can be analyzed
+using this method.
+Type Vcan be identified by the operation on corresponding
+objects.Asweknow,someAPIs,suchas read,fread,pread,readv,
+read multiple bytes from the network or a file to the local buffer.
+Therefore,wheneveroneobjectappearsasthedestinationbufferof
+thesesystemcalls,itshouldbetracked.Basedonouranalysis,2outTable 4: Examples of susceptible allocations.
+TypeExample Explanation Count
+I. . .=(int*) new[5];
+. . .=(int*) calloc(5,sizeof(int));Memory allocation
+calls new[]orcalloc.5
+IIsize = num * sizeof(struct S);
+. . .=(struct S*) malloc(size);sizeis defined by a
+multiply operation.13
+IIIsize = size1 + size2;
+. . .=(struct S*) malloc(size);sizeis defined by a
+addoperation.10
+IVsize = strlen(buffer);. . .=(int*) malloc(size); sizeisareturnvalue
+ofstrlen().1
+Vbuffer = malloc(size);read(buffer, 0, size); Object is operated by
+array-related syscalls.2
+VI. . .=(int*) malloc(const_value); sizeis a constant. 3
+VIIsize = (i>0?sizeof(int):1 0*
+sizeof(int));. . .=(int*) malloc(size);sizeisfromabranch
+that is potentially
+array-related.2
+SUM 36
+of 36 cases belong to this type. Similarly, the analysis also requires
+the support of LLVM’s built-in def-use anduse-def analysis.
+Type VI requires further analysis, when the sizeparameter of
+anallocationisaconstantinteger.Formostcases,ifthe sizepa-
+rameter is a constant, the corresponding allocation is an array. But
+there are some exceptions when analyzing in IR level. For instance,
+if a statement is like this, (structS∗)malloc(sizeof(structS)), the
+sizeparameter is also interpreted as a constant integer in IR level.
+Butthisisnotanarray.Toavoidthemisidentification,Prober-Static
+further confirms whether the sizeis equal to the size of the corre-
+spondingdatatype.AlthoughLLVMhassomebuilt-infunctionsto
+get the size of the object type, it requires some additional analysis
+to determine the object type. The challenge is to determine this
+whenanallocationreturnsavoidtypepointer.Prober-Staticadopts
+adef-useoruse-defanalysistofindthedefinitionortheusage
+of the return value to figure out the object type.
+Type VII is more complicated, since the object can be an ar-
+ray in some branches. More specifically, LLVM-IR represents these
+branches with a PHINode instruction. Prober-Static tracks all in-
+coming values of this PHINode instruction. If at least one valuebelongs to
+Type II, III, or IV , this allocation is treated as array-
+related conservatively.
+After the above analysis, Prober-Static will determine most allo-
+cationsarray-relatedornot andselectivelyprotectthearraysand
+ignore the ones that are not array-related.
+Step-III: Identify the object type (and unit size) for mem-
+ory allocations non-determined: If a statement cannot be de-
+termined array-related or not in Step-II, Prober-Static labels the al-
+locatedobjecttype(andthustheunitsize)sothatthisallocationcan
+bedetermineddynamicallybyProber-Dynamic.Prober-Dynamic
+collectsthesizeofanallocationsizeanddividesitbytheunitsize1.
+If thisresult isgreater thanone, Prober-Dynamicwill protectthismemory allocation.
+Prober-StaticmainlyemploysLLVM’sbuilt-in def-usechainsto
+findanobject’stypeinitsusagesite.Prober-Staticalsoreliesonthe
+metadata in LLVM IR to find the type information. Listing 2 and 3
+showtwoexamplesoffindingtheobjecttypewith def-use chains
+1A memory allocation might be used in more than one data types
+1120
+
+
+
+
+
+'!!$($#$%&($#'
+!!$($#+&%%&'
+)#($#%$#(&'	!!#+$&!!$
+
+#,")!
+
+#,
+
+
+
+#,'(&!#
+'#&&,','!!,)'
+	$#'(#(*!)
+((,%
+	$"&$"&#$ #'(&)($#
+
+
+ 
+
+
+
+	
+
+		
+
+
+
+)'#
+((
+
+,#"
+ #
+Figure 2: Identify susceptible allocations.
+and metadata, respectively. Listing 2 illustrates that an explicit
+casting operation reveals the object type.
+Listing 2: Identify the object type with a casting
+1 %1 = call noalias i8∗ @malloc(i64 70) #4
+2 %2 = bitcast i8∗ %1 to %struct.s∗
+Sometimes,itisdifficulttofindanyobvioususageforamemory
+allocation, then the metadata information showed in Listing 3 also
+helps to find its object type.
+Listing 3: Identify the object type with metadata
+1 %21 = tail call i32 @mbuffer_create(%struct.mbuffer_t∗ nonnull %20,
+/arrowhookleft→i64 %19) #7, !dbg !1409
+2 !22 = !DIBasicType(name: "int", size: 32, encoding: DW_ATE_signed)
+3 !1393 = !DILocalVariable(name: "r", scope: !1387, file: !137, line: 312,
+/arrowhookleft→type: !22)
+ItisworthnoticingthatProber-Staticsetsthetypesizeas“1”by
+default,soevenitcannotdeterminetheobjecttypestaticallyvia
+theaboveanalysis,theallocationsitewillbeprotectedeffectively
+duringtheruntime.Thatis,Proberalwaysensuresover-protection.
+Put them together: Figure 2 summarizes Prober-Static’s imple-
+mentation. In Step-I, it checks each LLVM IR instruction according
+toonebasiccaseandtwospecialcasestoidentifyallinvocationsof
+allocationfunctions,allocationfunctionwrappers,andallocation
+functionpointers.InStep-II,onlytheseallocationinvocationsare
+further identifiedbased on the following order. First,it checks the
+functionnameandoperator.Second,itcheckstheallocationsize
+withuse-def,datatype,andPHINodeinstructioninformation.Fi-
+nally,itcheckswhethertheoperationsofthecorrespondingobjects
+isrelatedtosomespecialsystemcalls.Ifanallocationmeetsanyof
+these cases, then it is array-related. For them, Prober-Static label it
+explicitly as shown in Section 3.1.2. Otherwise, Prober-Static finds
+the object type (and type size) with either def-use chains or meta-
+data in LLVM IR, and instruments the size of the allocation before
+the allocation so that Prober-Dynamic will confirm it dynamically.Inreal-worldapplications,pointersandaliasvariablesmaycom-
+plicate this analysis in two aspects. First, an alias pointer pointsto the protected allocation. However, this will not cause any is-sue, since Prober detects any access on the protected pages, nomatter whether they are accessed via an alias or not. Second, anallocation function contains pointers or alias variables as its size
+parameter.Prober-StaticreliesonLLVM’spointerandaliasanalysis
+functions to associate these pointers or alias variables to the actual
+size variable and then performs further analysis. The evaluation in
+Section 4 demonstrates that Prober-Static can successfully identify
+and instrument array-related allocations for 46 bugs.
+Listing 4: A LLVM-IR instrumentation example with new.
+1 @specialMalloc = external thread_local global i8, align 1
+2 define dso_local i32 @main() #0 {
+3 store volatilei8−1, i8∗ @specialMalloc, align 1
+4 %6 = call i8∗ @_Znam(i64 20) #2
+5 ret i32 0
+6}
+Listing5:EquivalentCinstrumentationofthe newexample.
+1extern__thread volatile bool specialMalloc;
+2intmain(){
+3 specialMalloc = −1;
+4int∗b=new int[5];
+5return0;
+6}
+3.1.2 LLVM-IR Instrumentation. After a susceptible allocation site
+has been identified, a thread-local variable, e.g., specialMalloc, will
+beinsertedtomarkthissiteasasusceptibleallocation.Here,thespecialMalloc variableisanintegervariable,withthevalueof“0”
+bydefault.Thisvariableissetto“-1”beforetheallocationsiteiftheallocationisarray-relatedallocation.Forinstance,the
+newexample
+ofType IinTable4isinstrumentedasListing4,whereListing5
+showsitsequivalentCcodeforclarification.Ifamemoryallocation
+1121isnon-determinablestatically, specialMalloc willbesetasthesize
+oftheobjecttype.Prober’sruntimewilldetermineifitshouldbe
+protected.
+3.2 Runtime System
+AsdescribedinSection2,theruntimesysteminterceptsallmemory
+allocationsanddeallocationssothatallsusceptibleobjectscanbe
+protected correspondingly. Therefore, the runtime system includes
+multiplecomponents,suchasmalloc/freemonitor(Section3.2.1),
+protected heap management (Section 3.2.2), and exception handler
+(Section 3.2.3), as further shown in Figure 1.
+3.2.1 Malloc/Free Monitor. Prober intercepts all memory alloca-
+tions and deallocations with the preloading mechanism. Prober
+determines whether an object should be allocated from the pro-tected heap upon memory allocations, and whether to return an
+object to the protected heap upon deallocations.
+Proberreliesonthestaticinstrumentationtodetermineanarray-
+related object. As described in Section 3.1.1, a thread-local variable
+(specialMalloc ) will be labeled by the Prober-Static: If an object
+is identified as not-array related statically, with the value 0, theobject will be allocated from the default allocator; If the valueis
+−1, indicating an array-related object, then the object will be
+allocatedfromtheprotectedheap;Otherwise,thisvariableisthebasicunitsizeofanobject.Proberfurthercollectstheactualsize
+for the allocation. When the allocation size is multiple times of
+the basic structure, then Prober decided that the current allocation
+is an array-related object. After that, the object will be allocatedfrom the protected heap. Note that when there is an extensive
+number of array-related allocations, Prober allows users to disable
+the protection on some allocation sites explicitly via a blacklist file.
+Inparticular,Prober-StaticgeneratesauniqueIDforeachallocation
+site,thenuserscanspecifytheIDsofallocationsitesthatshould
+be excluded for the protection.
+For each deallocation, Prober should determine whether this
+objectiscomingfromtheprotectedheap.Proberutilizestheaddress
+of the deallocation to determine it, where the address must be
+located in a special range. For such objects, Prober returns them to
+the protected heap as described in Section 3.2.2. Otherwise, objects
+will be passed to the default allocator.
+3.2.2 Management of Protected Heap. Proberdesignsitsownheap
+tomanagearray-relatedobjectsinordertoreducetheperformance
+overhead. Similar to existing allocators [ 3,16,31], Prober manages
+small and large objects separately. The idea behind this is that
+largeobjectsaretypicallymuchless,andthentheydonothavea
+big chance of being re-utilized. Objects larger than 31 pages aretreated as large objects, which are allocated from or returned to
+the OS directly by invoking mmapandmunmpsystem calls. In order
+to determine whether an object is a protected big object, Prober
+maintainsahashtabletotrackaddressesofsusceptiblelargeobjects,andconfirmsitbycheckingthehashtable.Theprotectedbigobject
+will be returned to the OS with the munmapsystem call.
+Objectslessthan31pageswillbetreatedassmallobjects,which
+are managed differently from big objects. Prober overcomes multi-
+ple design issues of Electric Fence. First, Electric Fence introduces
+high contention for multi-threaded applications with one global ar-ray to hold all freed objects. For instance, every freed object can bestoredintoaglobalarrayonlyafterholdingthegloballock,prevent-
+ing concurrent allocations and deallocations from multiple threads.
+Second, it uses the best-fit allocation policy. For each allocation, it
+searches the whole array to find the best-matched buffer, which is
+unnecessarilyslow.Ifitfailstofindone,iteitherdividesabigger
+objectintotwoparts,ormapsanewonefromtheOSdirectly.Third,
+it supports the coalescence and splitting of objects, which invokes
+unnecessary mprotect systemcallstochangetheattributesofpro-
+tection.Instead,ProbertakestheoppositeapproachesofElectric
+Fence to improve the performance.
+Fixed Size Class: The size of each object is kept the same dur-
+ing the whole execution. Therefore, there is no need to invoke
+mprotect to change the protection attribute. It is intuitive to main-
+tain 31 classes, starting from 1-page to 31-page, but this method
+does not encourage memory utilization. Instead, Prober maintains
+only five size classes, including 1-page, 3-pages, 7-pages, 15-pages,
+and31-pages.Allofthesesizeclassesareonepagelessthanpower-
+of-two pages, since one page is reserved for the protected page.Given this design, Prober could quickly compute the bag index
+usingsimplebit-shifts operations,whichisintegrated withitsnext
+information-computable design.
+Information-ComputableDesign: Uponeverydeallocation,Prober
+checks the size of each object in order to return it to the freelist be-longingtothecorrespondingsizeclass.Onenaivedesignistomain-
+tain the size of each object into a hash table, which may invoke ex-
+tensivesearchingandcomparingoperations.Instead,Proberadopts
+the “information-computable design” of existing work [ 41,42], as
+shown in Figure 3. It takes advantage of the vast virtual addressspace of 64-bits machines. Prober maps a large chunk of virtual
+memoryfromtheunderlyingoperatingsystemsatfirst,andthen
+dividesitintomultipleregions(calledas“bags”)withthesamesize.
+Eachbagonlyholdsobjectswiththesamesizeclass.Thisdesign
+enablesthequickcomputationofthebagindex(thusthesizeofa
+givenobject)bytheaddress,whichcanbecomputedbydividing
+the offset with the size of each bag.
+Per-Thread Heap: In order to reduce lock contention of multi-
+threaded applications, Prober adopts the per-thread heap idea ofHoard [
+3]: allocations and deallocations of different threads will
+occuronlyintheirownper-threadheaps,withouttheacquisition
+of a global lock. Only when freed objects of a per-thread heap are
+larger than a predefined threshold, then these freed objects willbe returned to the global buffer and then be shared by all otherthreads. In order to quickly locate the index of a thread, Prober
+intercepts the creation of threads in order to assign a thread index
+foreverythread,whichwillbestoredinitsThreadLocalStorage
+(TLS). Therefore, upon each allocation and deallocation, Prober
+could quickly locate its per-thread heap using its thread index, and
+then direct it to its per-thread heap.
+Pre-allocatedFreeArray: Proberutilizesapre-allocatedcircular
+arraytotrackavailable/freedobjects.Twocontinuousdeallocations
+willbestorednexttoeachother(exceptthelastoneinthearray).For
+allocationsfromtheFreeArray,ProberutilizestheLast-In-First-Out
+(LIFO)algorithm,sincethemost-recently-freedobjecthavealarger
+chance of being in the cache, which improves the cache efficiency.
+Comparing to the normal freelist that each entry will be getting
+1122from anew allocation, thearray-based designimproves thecache
+efficiency, since multiple continuous allocations and deallocations
+can be satisfied from objects stored in the same cache line. Its pre-
+allocated array further avoids the overhead of allocations of free
+lists.
+Overall,Probermanagesmemoryasfollows.Uponeachmem-
+ory allocation, Prober determines the size class by rounding the
+allocation size up to its next size class. After that, the FreeArrayof its specific size class will be checked first. If a freed object isavailable, the request will be satisfied with the FreeArray. When
+thereisnofreedobjects,Proberfetchesmultipleobjectstogether
+from the never-allocated ones to the FreeArray, and then allocates
+one from it. During each deallocation, Prober first checks whether
+thedeallocationisallocatedfromtheprotectedheapornot.Ifan
+objectisnotfromtheprotectedheap,Proberinvokesthedefault
+allocator to deal with that. Otherwise, the current freed object will
+beaddedintotheper-threadFreeArraywiththecorrespondingsize
+class. Note that the allocator only saves the starting address of the
+freed block to the FreeArray. If the FreeArray is full, half of thefreed objects will be donated to the global buffer. That is, Prober
+only involves with lock operations when there are no freed objects
+intheper-threadFreeArray,orwhentheper-threadFreeArrayis
+full. Therefore, Prober’s design minimizes the lock contention.
+
+##
+ 
+ 
+
+   
+##
+
+	"
+!
+	"##
+!
+	"##
+##
+Figure 3: Basic idea of heap design.
+3.2.3 Exception Handler. Sincebothoverflowsandprogramfail-
+ures could trigger segmentation faults, Prober should determine
+whetherafaultiscausedbyanoverflowornot,andonlyreportthe
+faultyinstructiontousersforheapoverflows.Toachievethistarget,
+Prober registers its segmentation fault handler in order to capture
+everySIGSEGV signal.Insidethesignalhandler,Proberfirstchecks
+whether the current object is one of the protected objects, either
+the small or the big one. If the access does not belong to the pro-tected object, the exception will be passed to the default handler
+of applications. Otherwise, the current fault is an overflow. Prober
+reportsthefaultyinstructiondifferently,dependingonwhetherthe
+binary includes the symbol information. If the symbol information
+is included, Prober reports the detailed line number information
+withthe addr2line command.Otherwise,Proberonlyreportsbi-
+nary addresses of the corresponding call stacks. For each overflow,
+Proberalsoreportsthecallstackofitscorrespondingmemoryal-
+locationsite,wheretheinformationwillbestoredintheshadow
+memory for small objects and in the hash table for big objects.4 EXPERIMENTAL EVALUATION
+We performed the experiments on a two-socket quiescent machine,
+where each socket is an Intel(R) Xeon(R) Gold 6138 processor with
+20 cores. It has 200GB main memory, and 32KB L1, 1024 KB L2 and
+28160KBL3cache.TheexperimentswereperformedonUbuntu
+18.04,installedwithLinux-4.15.0kernel.Allapplicationswerecom-
+piledwithLLVM-8.0,byaddingananalysis/instrumentationpass
+of Prober-Static.
+4.1 Effectiveness
+Theeffectivenessevaluationincludestwoparts,38bugsincluded
+intheexistingstudy[ 47]andotheroverflowbugsincludedinother
+existing work, such as Bugbench [ 28], CVE database, or HeapTher-
+apy [49].
+4.1.1 38 Bugs from the Existing Study. For 38 bugs listed in the
+existingstudy,weconfirmthatProbercorrectlyinstrumented36
+bugs outof them.The remainingtwo bugscannot be instrumented
+due to the invocation of external standard library calls (e.g., lib-
+stdc++), which are not analyzed (shared by instrumentation-based
+approaches). Therefore, Prober’s evaluation presents high confi-dence on the actual overhead, since it could instrument all bugs
+correctly.
+Notethatwedidnotrunthesebuggyapplicationsdirectly,dueto
+the following reasons. First, these bugs may not include erroneous
+inputsthatarerequiredtoexercisethem.Second,manyofthemare
+not compatible with modern libraries, which requires a significant
+amountofmanualeffortsfor thecompilation.Therefore,weonly
+verify whether the corresponding bugs have been instrumented
+correctly.
+4.1.2 Other Real-world Bugs. Weperformedtheeffectivenesseval-
+uation on the other real-world 10 bugs that are not listed in the
+existingstudy[ 47].Theseapplicationsandtheirspecificbugtrig-
+ger inputs are obtained from Bugbench [ 28] , CVE database, or
+HeapTherapy [ 49]. Among these 10 vulnerable applications, the
+heartbleedandlibtiff-4.0.7vulnerabilitiesarecausedbybufferover-
+reads, while others are caused by buffer over-writes. The details
+of these applications are shown in Table 5, where all of these bugs
+can be detected by AddressSanitizer. Table 5 also listed the number
+of allocation sites that can be identified statically (“Static” column)
+and dynamically (“Dynamic”). Overall, Prober detects all known
+overflows without false positives. Upon detection, Prober stops the
+executionimmediately(beforethecrashes),andreportsthetypeofanoverflow(over-readorover-write),thecallpathoftriggeringthe
+overflow,andtheallocationsiteofthecorrespondingbuffer.The
+evaluationconfirmsthatProberisabletodetectrealheapoverflows
+with its proposed instrumentation and runtime system.
+4.1.3 Case Study. Figure4showsthebugreportfortheheartbleed
+vulnerability. Prober identifies that this bug is a buffer over-read
+problem.Thebugreportalsoincludesthecallstackofthefaulty
+instruction(wheretheoverflowoccurs),andthecallstackofthis
+object’s allocation site.
+Accordingtothebugreport,theoverflowoccursinthe memcpy()
+function, which is invoked by the tls1_process_heartbeat function
+atline2586of ./ssl/t1_lib.c file.Bycheckingthesourcecode,
+thecorrespondingstatementis memcpy(bp,pl,payload).According
+1123Table 5: Statically and dynamically identified callsites in
+buggy applications
+Application ReferenceStatic
+(#)Dynamic
+(#)
+bc-1.06 BugBench [28] 43 5
+gzip-1.2.4 BugBench [28] 3 1
+Heartbleed CVE-2014-0160 [13] 9314 3941
+LibHX-3.4 CVE-2010-2947 [6] 23 15
+Libtiff-4.0.1 CVE-2013-4243 [7] 406 75
+Libtiff-4.0.7 CVE-2016-10269 [9] 421 104
+Memcached-1.4.25 CVE-2016-8706 [45] 80 19
+openjpeg-1.3 CVE-2012-3535 [39] 756 201
+polymorph-0.4.0 BugBench [28] 1 0
+squid-2.3 BugBench [28] 83 175
+A buffer over−read problem is detected at:
+../glibc/../multiarch/memcpy−avx−unaligned.S:237
+../x86_64−linux−gnu/bits/string3.h:53
+../openssl−OpenSSL_1_0_1f/ssl/t1_lib.c:2586
+../openssl−OpenSSL_1_0_1f/ssl/s3_pkt.c:1092
+../openssl−OpenSSL_1_0_1f/ssl/s3_both.c:457
+...
+../nginx−1.3.9/src/event/ngx_event.c:247
+../nginx−1.3.9/src/os/unix/ngx_process_cycle.c:807
+...
+This object is allocated at:
+../openssl−OpenSSL_1_0_1f/ssl/s3_both.c:770
+../openssl−OpenSSL_1_0_1f/ssl/s3_pkt.c:949
+../openssl−OpenSSL_1_0_1f/ssl/s3_both.c:457
+Figure 4: Bug report for the Heartbleed Problem.
+totheattributeofthisproblem–abufferover-readproblem,itiseasy
+to know that the over-read issue is related to the source of memcpy,
+that is, either plorpayload. Sinceplis the starting address of a
+normalheapobjectthatisallocatedatline770of ./ssl/s3_both.c
+file, then the failure must be caused by payload. By examining the
+sourcecode,wecouldeasilyfindoutthat payloadiscomputedfrom
+the length of the data that the server receives from the network.
+Therefore,viathebugreport,programmerscaneasilyreasonthe
+root cause of overflow, and fix the problem correspondingly.
+4.2 Performance Overhead
+To evaluate the performance overhead, Prober is evaluated on a
+popularbenchmarksuite–PARSEC[ 4],andmultiplewidely-utilized
+real applications, suchas sqlite, memcached, aget, pbzip2,and pfs-
+can,with18multithreadedapplicationsintotal.ForPARSECbench-
+marks,weusedthenativeinputsand40threads.Forapplications
+thatcanonlyusepower-of-2threads,e.g.,facesim,thentheywill
+use 32 threads [4].
+We compare Prober with Prober-All, Electric Fence [ 37] ,and
+AddressSanitizer [ 40]. Prober-All protects all heap objects through
+thepageprotectiondespitetheyarearray-relatedornot.Electric
+Fencealsoutilizesthepageprotectiontoprotectallheapobjects,
+which is very similar to Prober-All, but with different implementa-
+tion.AddressSanitizerisaninstrumentation-basedapproachthatchecks every memory access, representing one important tech-nique that is widely employed in development phases. For both
+AddressSanitizerandProber,wedidnotinstrumentanyexternal
+andstandardlibrariesthatarerequiredbytheseapplications,which
+could impose more overhead if they are included. For the fair com-
+parison, we disable the checks of global and stack overflows for
+AddressSanitizer.
+Figure 5 shows the normalized runtime of these four systems,
+which are normalized to the runtime of the default Linux libraries.
+Overall, the average overhead of Prober, Prober-All, Electric Fence,
+and AddressSanitizer are 1.5%, 2 .4×,>7×, 42.9%, respectively. The
+largest overhead of Prober is only 9.3% for ferret.
+ForbothAddressSanitizerandElectricFence, freqmine iscrashed
+due to an unknown problem in our evaluation environment. aget
+iscrashedwithElectricFenceaswell.ForElectricfence,fiveapplica-tions,including
+canneal,dedup,facesim,raytrace andswaptions ,
+cannot finish the execution within 1 hour (marked as “T”). ForProber, dedup runs over 2
+×slower initially, if all identified call-
+sites are protected. Based on our analysis, one callsite has over50% of allocations, which is excluded manually (as described in
+Section 3.2.1).
+Multiple reasons contribute to the big performance difference
+of these systems. AddressSanitizer’s performance overhead mainly
+comesfromitscheckingoverheadforeverymemoryaccess,which
+also explains its little overhead for IO-bound applications, such as
+agetorpfscan.ComparingtoAddressSanitizer,Proberdoesnot
+checkonaccesses,withitspageprotectionmechanism.Compar-
+ing to Prober-All and Electric Fence, Prober only protects array-
+related objects, instead of all heap objects. Therefore, the overhead
+ofProber-AllandElectricFenceismuchhigherthanthatofProber.ElectricFenceimposesthehighestoverheadduetoitsimplementa-
+tion issues as discussed in Section 3.2.2.
+Comparing to Electric Fence, Prober-All (and Prober) is more
+efficient due to multiple reasons. First, Electric Fence utilizes the
+globallocktoprotectallallocationsanddeallocations,whichunfor-
+tunatelyserializesallallocationsanddeallocations.Second,Elec-
+tric Fence may coalesce continuous objects upon deallocations,and split a larger object to smaller ones upon allocations. Third,
+ElectricFencecannotquicklylocatethemetadatainformation.In-
+stead,ProberandProber-Alldesignsper-threadheap,pre-allocatedfreeArray, and information-computable design as further discussed
+in Section 3.2.2.
+We further collected the characteristics of these applications
+dynamically,asshowninTable6.Inthistable,the“ Total Objects ”
+column shows the total number of allocations for each application,
+including allocations from the application and all libraries. The
+“Protected Objects ” column shows the number of allocations
+thatareprotectedintotal.Here,“ Static”and“ Dynamic”represent
+whether such objects can be identified statically or dynamically
+(requiringthedeterminationofitsruntime).Amongtheseprotected
+objects, “Live” column shows the maximum number of objects
+thatareprotectedatthesametime.The“ Unprotected Objects ”
+columnindicatesthenumberofheapobjectsthatarenotprotected
+by Prober. We have the following observations.
+First, most applications have a larger portion of objects that
+arenotarray-related,suchas canneal,raytrace ,and vips.This
+112400.511.522.5Normalized Runtime
+Prober Prober-All Electric Fence ASan3.9 4.8 T 6.2T T 16.8 5.6 T T 38.9 5.0 7.0 3.1 13.9
+Figure 5: Performance overhead of Prober, Prober-All, Electric Fence and AddressSanitizer, where they are all normalized to
+theruntimeofthedefaultLinuxlibraries.Applicationswiththebarmarkedas“T”(indicatingthetimeout)cannotfinishtheexecution in one hour.
+Table 6: Characteristics of applications.
+Application Total ObjectsProtected Objects Unprotected
+Objects Static Dynamic Live
+blackscholes 208 5 0 5 203
+bodytrack 452,084 2,349 070 449,735
+canneal 21,141,661 0 0 021,141,661
+dedup 1,887,373 734336,747 140,630 1,549,892
+facesim 4,908,999 2,302,579 432440,944 2,605,988
+ferret 549,109 380,546 3,49681,736 165,067
+fluidanimate 230,105 24 024 230,081
+freqmine 8,699 7,555 0944 1,144
+raytrace 20,000,619 12 11220,000,606
+streamcluster 9,241 8,854 615 381
+swaptions 48,001,995 48,001,796 01,826 199
+vips 1,430,261 01,312 1,312 1,428,949
+x264 37,332 4637,121 2,355 165
+aget 319 38 029 281
+memcached 848 276 33309 539
+pbzip2 23,851 0 0 0 23,851
+pfscan 238 3 1 3 234
+sqlite 2,889,043 2,888,868 05,826 175
+indicatesthatourkeyinsightiseffectiveinreducingthescopeof
+protection.
+Second,inProber,thenumberofobjectsthatareprotectedatthe
+sametime(in“ Live”column)willaffecttheperformanceoverhead,
+but not the number of protected objects, since freed objects arere-used in Prober. The overhead of each protected object comesfrom two aspects. First, it comes from the
+mprotect system call
+to insert the protected page. After that, page protection imposes
+no additional overheadfor checking the overflow. Second, alarge
+number of protected objects (in different pages) may increase page
+faults.Thisexplainswhy dedup,ferret,and sqliteimposehigher
+performanceoverheadthanothers.However, facesimimposesa
+low overhead, although with the largest number of live objects.
+Thisisduetothefactthat facesimrunsmuchlongerthanother
+applications,wheretheaveragednumberofprotectionisstillsmall.
+In addition to that, facesim has found to have serious memory
+leaks[20],indicatingthatthenumberofliveobjectsissmallerthan
+thatinTable6.Thisindicatesthat facesimmaynotincreasethe
+number of page faults.Third,Table6explainsthatsomeapplicationsrequirealongexe-
+cution with Prober-All, Electric Fence, such as canneal,raytrace ,
+andswaptions , since there are a large number of objects inside.
+Prober avoids this issue by protecting only array-related objects,instead of all objects. Table 6 also explains why Prober-All andElectric Fence performs well in
+blackscholes ,streamcluster ,
+memcached ,pbzip2, and pfscan, since only a few allocations exist
+in these applications. Prober’s unique observation and its efficient
+heap design (as discussed in Section 3.2.2) make it efficient enough
+for the deployment environment, but without compromising its
+effectiveness.
+4.3 Memory Overhead
+We also evaluated the memory overhead of Prober using the same
+applicationsthatareusedintheperformanceevaluation.Tocollect
+memoryconsumptionofserverapplications,suchas memcached ,
+ascriptisdesignedtoperiodicallycollectthe /proc/PID/status
+file.Thenthemaximumvalueofthe VmHWMfieldisutilizedasthe
+maximum memory consumption. For other applications, memory
+consumptioniscollectedfromtheoutputofthe timeutility,where
+themaxresident fieldreportsthemaximummemoryconsumption
+of an application [2].
+Therealmemorydataisomittedduetospacelimitations.Intotal,
+Prober utilizes 25.9% more memory when compared to the default
+library. In contrast, Electric Fence utilizes around 3 .9×memory,
+and AddressSanitizer’s memory overhead is around 69.7%. That is,
+ProberutilizessignificantlylessmemorythanElectricFenceand
+AddressSanitizer. Wealso observedthat applicationswitha small
+footprinthaveahighermemoryoverhead,comingfromthestoring
+ofthreadinformation,heapinformation,andothermetadatathat
+are not proportional to their memory usage.
+5 LIMITATIONS
+Prober focuses on array-related heap overflows, representing over
+86% of heap overflows based on our observations (Section 2). It
+cannotdetectarray-relatedinternal-structureoverflows,whichis
+itsbiggestlimitation.However,thereisnofundamentalreasonwhy
+1125this cannot be done. It is possible to arrange the fields of the struc-
+ture so that array(s) can be placed at the end of the corresponding
+structure. Adding the support for internal-structure overflows will
+be our future work.
+Prober can only detect overflows landing on the protection
+page(s).Probercanbeconfiguredtochangethepagesforthepro-
+tection if necessary. In theory, it is able to detect more errors than
+existingapproacheswithredzones,suchasAddressSanitizer[ 40].
+Itcurrentlycannotdetectheapunderflows.However,heapunder-
+flowscannotdoanyharm,sincetheycanonlylandonthenon-used
+area.
+Prober only detects overflows when the source code is analyzed
+andinstrumentedbyProber-Static.Thislimitationisalsoshared
+by all instrumentation-based tools, e.g., EffectiveSan [ 11]o rA d -
+dressSanitizer [ 40]. When an overflowing object is allocated in a
+library that is not instrumented, Prober cannot detect it. However,
+different from existing work that detects overflows by checking
+memory accesses, Prober can detect overflows caused by APIs of a
+non-instrumented library. This is a significant difference.
+6 RELATED WORK
+Weclassifyexistingtoolsofdetectingheapbufferoverflowbased
+on the type of approaches.
+Static Detection: Many tools utilize static analysis to detect
+buffer overflow bugs [ 14,22,23,27]. They only analyze software
+source code in order to reason which statements could potentially
+cause buffer overflows. However, some variables (e.g., indirect
+branches) could not be determined without the execution. Thus,
+theymaygeneratemanyfalsepositivesorfalsenegatives,which
+requires further manual efforts to confirm the reported bugs. In
+contrast, Prober never generates any false positives.
+Dynamicdetection: Severaltoolsplaceaninaccessiblemem-
+ory page around every heap object [ 32,33,37,49], which is similar
+to Prober. Memory accesses to the protected pages will generate a
+SIGSEGV signal.However,theseexistingworksufferfromaprohib-
+itively high performance overhead by protecting all pages or even
+probabilistically.AlthoughProberemploysthesamemechanism
+todetectheapbufferoverflow,itnarrows downheapobjectsthat
+canpotentiallyresultinbufferoverflows,whichdrasticallyreduces
+its performance overhead. Also, Prober designs its runtime system
+carefully to reduce its overhead.
+Static instrumentation-assisted detection: Numerous tools
+analyze source codeto identify necessary instrumentation,which
+favors sanity checksat runtime [ 1,8,12,15,17,21,29,36,38,40].
+Theyinstrumentallmemoryaccessesatcompilationphases,and
+checkthevalidityofaccessesatruntime.AddressSantizer[ 40]is
+thestate-of-artofthistypeofapproaches,whichfurtheremploys
+thestaticanalysistopruneoutcertainunnecessarychecks.How-
+ever, AddressSanitizer still imposes non-negligible performance
+overhead, as further evaluated in Section 4.2. Different from these
+tools, Proberdoes notcheck everymemory access,but relyingon
+thepageprotectiontodetectoverflowswithoutcheckingoverhead,
+if there is no overflow.
+Dynamic instrumentation-assisted detection: A lot of dy-
+namicanalysistoolsdetectmemoryerrorsbasedonthecheckingof memory accesses during runtime, such as Valgrind’s Memcheck
+tool[30],Dr.Memory[ 5],Purify[ 18],IntelInspector[ 19],andSun
+Discover [ 35]. Due to the expensive instrumentation and inspec-
+tion,theytypicallyimposetoohigh-performanceoverheadtobe
+employed in the production environment.
+Hardware-assisted detection: Afewtoolsrelyonnewhard-
+ware to detect buffer overflows. Intel MPX tries to reduce the over-
+head of pointer checks by embedding checks into a new hard-
+ware[34].BOGOreliesonIntelMPXtoprovidebothspatialand
+temporal safety [ 50]. However, the overhead of validating every
+memoryaccessistoohightobeadoptedinpractice.Sampling-based
+techniques, such as CSOD [ 25] and Sampler [ 43], utilize hardware
+watchpointsorPerformanceMonitorUnit(PMU)hardwaretomon-
+itor a few heap objects at one time or validate a subset of memory
+accesses. Although they impose low runtime overhead similarly
+as Prober, they cannot guarantee the same effectiveness as Prober,
+especially when there are a lot of heap objects. CHERI requiresthe cooperation of architecture, compiler, and operating system
+togethertoenforcememorysafety[ 46],whichinevitablyincreases
+developers’ effort. Prober, which is a dynamically linked library,
+imposeslittlemanualeffort,withoutchangingtheunderlyingOS
+and requiring new hardware.
+Postmortemdetection: Someevidence-basedtoolsdetectbuffer
+over-writes by appending canaries after each heap object and
+checks if canaries are corrupted at memory deallocations or epoch
+ends[24,26,48,49].Sincereadoperationsdonotleaveevidence,
+they cannot detect read-based buffer overflow, while Prober can
+detectbothbufferover-readsandbufferover-writes.Also,evidence-
+basedapproachescannotbeappliedinthesecurityenvironment,
+since the attacks may already be issued successfully before per-
+forming the detection.
+7 CONCLUSION
+This paper presents a novel system to defend heap overflows. It is
+based on a key observation that is obtained from the analysis of
+48real overflowbugs: overflowingobjectsaretypicallyinvolved
+witharrays.Basedonthisobservation,Probertakesatwo-phase
+approachtodetectheapoverflows:itsstaticcomponentidentifies
+all possible array-related allocations before the compilation, and
+theninstrumentsthecodecorrespondingly;Itsdynamiccomponentfurtherinterceptstheallocations,andredirectstheallocationsfrom
+susceptible allocation sites to the protected heap in order to detect
+theoverflowswiththepageprotectionmechanism.Overall,Prober
+onlyimposesaround1.5%performanceoverheadonaverage,but
+without compromising its effectiveness. The low overhead and the
+high effectiveness makes Prober an always-on approach for the
+production environment.
+8 ACKNOWLEDGEMENTS
+Wewouldliketothankallanonymousreviewersfortheirconstruc-
+tive suggestions and feedback. This paper is partially supported by
+theNationalScienceFoundationunderAwardCCF-2024253,UMass
+Amherst startup package, and William & Mary startup package.
+1126REFERENCES
+[1]PeriklisAkritidis, ManuelCosta,Miguel Castro,andSteven Hand.2009. Baggy
+bounds checking: an efficient and backwards-compatible defense against out-of-
+boundserrors.In Proceedingsofthe18thconferenceonUSENIXsecuritysymposium
+(Montreal,Canada) (SSYM’09).USENIXAssociation,Berkeley,CA,USA,51–66.
+http://dl.acm.org/citation.cfm?id=1855768.1855772
+[2]Andries Brouwer. 2015. time - time a simple command or give resource usage.
+Linux Comunity.
+[3]Emery D. Berger, Kathryn S. McKinley, Robert D. Blumofe, and Paul R. Wil-
+son. 2000. Hoard: A Scalable Memory Allocator for Multithreaded Applica-
+tions.InProceedingsoftheInternationalConferenceonArchitecturalSupportfor
+Programming Languages and Operating Systems (ASPLOS-IX). Association for
+ComputingMachinery,NewYork,NY,UnitedStates,Cambridge,MA,117–128.
+citeseer.ist.psu.edu/berger00hoard.html
+[4]Christian Bienia, Sanjeev Kumar, Jaswinder Pal Singh, and Kai Li. 2008. The
+PARSECBenchmarkSuite:CharacterizationandArchitecturalImplications.In
+Proceedings of the 17th International Conference on Parallel Architectures and
+CompilationTechniques.AssociationforComputingMachinery,NewYork,NY,
+United States, 1–10.
+[5]DerekBrueningandQinZhao.2011.PracticalmemorycheckingwithDr.Memory.
+InProceedings of the 9th Annual IEEE/ACM International Symposium on Code
+Generation and Optimization (CGO ’11). IEEE Computer Society, Washington,
+DC, USA, 213–223. http://dl.acm.org/citation.cfm?id=2190025.2190067
+[6]Bugzilla. 2010. "libHX: buffer overrun in HX_split()".
+https://bugzilla.redhat.com/show_bug.cgi?id=625866.
+[7]Bugzilla. 2013. "libtiff (gif2tiff): possible heapbased buffer overflow in readgifim-
+age()". http://bugzilla.maptools.org/show_bug.cgi?id=2451.
+[8]ZheChen,JunqiYan,ShuanglongKan,JuQian,andJinglingXue.2019. Detecting
+Memory Errors at Runtime with Source-level Instrumentation. In Proceedings of
+the 28th ACM SIGSOFT International Symposium on Software Testing and Analysis
+(Beijing,China) (ISSTA2019).ACM,NewYork,NY,USA,341–351. https://doi.
+org/10.1145/3293882.3330581
+[9]The MITRE Corporation. 2016. CVE-2016-10269. https://cve.mitre.org/cgi-
+bin/cvename.cgi?name=CVE-2016-10269.
+[10]CVEdetails. 2019. Vulnerabilities By Type.
+https://www.cvedetails.com/vulnerabilities-by-types.php.
+[11]Gregory J. Duck and Roland H. C. Yap. 2018. EffectiveSan: Type and MemoryError Detection Using Dynamically Typed C/C++. In Proceedings of the 39th
+ACMSIGPLANConferenceonProgrammingLanguageDesignandImplementation
+(Philadelphia, PA, USA) (PLDI 2018). ACM, New York, NY, USA, 181–195. https:
+//doi.org/10.1145/3192366.3192388
+[12]Gregory J. Duck and Roland H. C. Yap. 2018. EffectiveSan: Type and MemoryError Detection Using Dynamically Typed C/C++. In Proceedings of the 39th
+ACMSIGPLANConferenceonProgrammingLanguageDesignandImplementation
+(Philadelphia, PA, USA) (PLDI 2018). ACM, New York, NY, USA, 181–195. https:
+//doi.org/10.1145/3192366.3192388
+[13]Exploit. 2014. "Openssl heartbeat poc with starttls support".
+https://gist.github.com/takeshixx/10107280.
+[14] Micro Focus. 2019. Fortify Static Code Analyzer. https://www.ndm.net/sast/hp-
+fortify. last visited: 02/08/2019.
+[15] Frank Ch. Eigler. 2003. Mudflap: pointer use checking for C/C++. Red Hat Inc.
+[16]SanjayGhemawatandPaulMenage.2005. TCMalloc:Thread-CachingMalloc.
+http://goog-perftools.sourceforge.net/doc/tcmalloc.html.
+[17]Niranjan Hasabnis, Ashish Misra, and R. Sekar. 2012. Light-weight bounds
+checking.In ProceedingsoftheTenthInternationalSymposiumonCodeGeneration
+and Optimization (San Jose, California) (CGO ’12). ACM, New York, NY, USA,
+135–144. https://doi.org/10.1145/2259016.2259034
+[18]Reed Hastings and Bob Joyce. 1992. Purify: Fast detection of memory leaksand access errors. In In Proc. of the Winter 1992 USENIX Conference. USENIX
+Association, Berkeley, Califonia, USA, 125–138.
+[19]IntelCorporation.2012. IntelInspectorXE2013. http://software.intel.com/en-
+us/intel-inspector-xe.
+[20]Changhee Jung, Sangho Lee, Easwaran Raman, and Santosh Pande. 2014. Au-tomated Memory Leak Detection for Production Use. In Proceedings of the
+36th InternationalConference on Software Engineering (Hyderabad, India) (ICSE
+2014).AssociationforComputingMachinery,NewYork,NY,USA,825âĂŞ836.
+https://doi.org/10.1145/2568225.2568311
+[21]TaddeusKroes,KoenKoning,ErikvanderKouwe,HerbertBos,andCristiano
+Giuffrida. 2018. Delta Pointers: Buffer Overflow Checks Without the Checks. In
+ProceedingsoftheThirteenthEuroSysConference (Porto,Portugal) (EuroSys’18).
+ACM, New York, NY, USA, Article 22, 14 pages. https://doi.org/10.1145/3190508.
+3190553
+[22]David Larochelle and David Evans. 2001. Statically Detecting Likely Buffer
+OverflowVulnerabilities.In Proceedingsofthe10thConferenceonUSENIXSecurity
+Symposium - Volume 10 (Washington, D.C.) (SSYM’01). USENIX Association,
+Berkeley, CA, USA, Article 14, 177âĂŞ190 pages. http://dl.acm.org/citation.cfm?
+id=1251327.1251341[23]Wei Le and Mary Lou Soffa. 2008. Marple: A Demand-driven Path-sensitive
+Buffer Overflow Detector. In Proceedings of the 16th ACM SIGSOFT International
+SymposiumonFoundations ofSoftwareEngineering (Atlanta,Georgia) (SIGSOFT
+’08/FSE-16).ACM,NewYork,NY,USA,272–282. https://doi.org/10.1145/1453101.
+1453137
+[24]Hongyu Liu, Sam Silvestro, Wei Wang, Chen Tian, and Tongping Liu. 2018.
+iReplayer:In-situandIdenticalRecord-and-replayforMultithreadedApplications.
+InProceedingsofthe39thACMSIGPLANConferenceonProgrammingLanguage
+DesignandImplementation (Philadelphia,PA,USA) (PLDI2018).ACM,NewYork,
+NY, USA, 344–358. https://doi.org/10.1145/3192366.3192380
+[25]Hongyu Liu, Sam Silvestro, Xiaoyin Wang, Lide Duan, and Tongping Liu.
+2019. CSOD:Context-SensitiveOverflowDetection.In Proceedingsofthe2019
+IEEE/ACM International Symposium on Code Generation and Optimization (Wash-
+ington, DC, USA) (CGO 2019). IEEE Press, 50âĂŞ60.
+[26]Tongping Liu, Charlie Curtsinger, and Emery D. Berger. 2016. DoubleTake: Fast
+andPreciseErrorDetectionviaEvidence-basedDynamicAnalysis.In Proceedings
+ofthe38thInternationalConferenceonSoftwareEngineering (Austin,Texas) (ICSE
+’16).ACM,NewYork,NY,USA,911–922. https://doi.org/10.1145/2884781.2884784
+[27]Checkmarx Ltd. 2019. Checkmarx. https://www.checkmarx.com. last visited:
+02/08/2019.
+[28]ShanLu,ZhenminLi,FengQin,LinTan,PinZhou,andYuanyuanZhou.2005.
+Bugbench: Benchmarks for evaluating bug detection tools. In In Workshop on the
+Evaluation of Software Defect Detection Tools. Chicago, IL, USA.
+[29]GeorgeC.NeculaNecula,McPeakScott,andWeimerWestley.2002.CCured:Type-
+Safe Retrofitting of Legacy Code. In Proceedings of the Principles of Programming
+Languages. Association for Computing Machinery, New York, NY, United States,
+128–139.
+[30]Nicholas Nethercote and Julian Seward. 2007. Valgrind: a framework for heavy-
+weight dynamic binary instrumentation. In Proceedings of the 2007 ACM SIG-
+PLAN conference on Programming language design and implementation (San
+Diego, California, USA) (PLDI ’07). ACM, New York, NY, USA, 89–100. https:
+//doi.org/10.1145/1250734.1250746
+[31]Gene Novark and Emery D. Berger. 2010. DieHarder: securing the heap. In
+Proceedingsofthe17thACMconferenceonComputerandcommunicationssecurity
+(Chicago, Illinois, USA) (CCS ’10). ACM, New York, NY, USA, 573–584. https:
+//doi.org/10.1145/1866307.1866371
+[32]Gene Novark, Emery D. Berger, and Benjamin G. Zorn. 2007. Exterminator:automatically correcting memory errors with high probability. In Proceedings
+of the 2007 ACM SIGPLAN Conference on Programming Language Design and
+Implementation (PLDI 2007) (San Diego, California, USA). ACM Press, New York,
+NY, USA, 1–11. https://doi.org/10.1145/1250734.1250736
+[33]Gene Novark, Emery D. Berger, and Benjamin G. Zorn. 2009. Efficiently and
+precisely locating memoryleaks and bloat. In Proceedings of the2009 ACM SIG-
+PLAN conference on Programming language design and implementation (PLDI
+2009)(Dublin,Ireland).ACM,NewYork,NY,USA,397–407. https://doi.org/10.
+1145/1542476.1542521
+[34]OleksiiOleksenko,DmitriiKuvaiskii,PramodBhatotia,PascalFelber,andChristof
+Fetzer. 2018. Intel MPX Explained: A Cross-layer Analysis of the Intel MPX
+SystemStack. Proc.ACMMeas.Anal.Comput.Syst. 2,2,Article28(June2018),
+30 pages. https://doi.org/10.1145/3224423
+[35]Oracle Corporation. 2011. Sun Memory Error Discovery Tool (Discover).
+http://docs.oracle.com/cd/E18659_01/html/821-1784/gentextid-302.html.
+[36] parasoft Company. 2013. C and C++ Memory Debugging.
+[37]BrucePerens.2005. ElectricFence. https://linux.softpedia.com/get/Programming/
+Debuggers/Electric-Fence-3305.shtml.
+[38]OlatunjiRuwaseandMonicaS.Lam.2004. APracticalDynamicBufferOverflow
+Detector. In In Proceedings of the 11th Annual Network and Distributed System
+Security Symposium. The Internet Society, San Diego, California, USA, 159–169.
+[39]Kurt Seifried. 2012. "CVE Request: Heap-based buffer overflow in openjpeg".
+https://seclists.org/oss-sec/2012/q3/300.
+[40]Konstantin Serebryany, Derek Bruening, Alexander Potapenko, and Dmitry
+Vyukov. 2012. AddressSanitizer: a fast address sanity checker. In Proceed-
+ings of the 2012 USENIX conference on Annual Technical Conference (Boston,
+MA)(USENIX ATC’12). USENIX Association, Berkeley, CA, USA, 28–28. http:
+//dl.acm.org/citation.cfm?id=2342821.2342849
+[41]Sam Silvestro, Hongyu Liu, Corey Crosser, Zhiqiang Lin, and Tongping Liu.
+2017. FreeGuard:AFasterSecureHeapAllocator.In Proceedingsofthe2017ACM
+SIGSAC Conference on Computer and Communications Security (Dallas, Texas,
+USA)(CCS ’17). ACM, New York, NY, USA, 2389–2403. https://doi.org/10.1145/
+3133956.3133957
+[42]Sam Silvestro, Hongyu Liu, Tianyi Liu, Zhiqiang Lin, and Tongping Liu. 2018.Guarder: A Tunable Secure Allocator. In 27th USENIX Security Symposium
+(USENIX Security 18). USENIX Association, Baltimore, MD, 117–133. https:
+//www.usenix.org/conference/usenixsecurity18/presentation/silvestro
+[43]Sam Silvestro, Hongyu Liu, Tong Zhang, Changhee Jung, Dongyoon Lee, and
+Tongping Liu. 2018. Sampler: PMU-Based Sampling to Detect Memory Errors
+1127Latent in Production Software. In 2018 51st Annual IEEE/ACM International Sym-
+posium on Microarchitecture (MICRO). IEEE, 231–244.
+[44]LaszloSzekeres,MathiasPayer,TaoWei,andDawnSong.2013. SoK:EternalWar
+inMemory.In Proceedingsofthe2013IEEESymposiumonSecurityandPrivacy
+(SP ’13). IEEE Computer Society, USA, 48–62. https://doi.org/10.1109/SP.2013.13
+[45]Talos. 2016. "Memcached Server SASL Autentication Remote Code Execution
+Vulnerability". https://www.talosintelligence.com/reports/TALOS-2016-0221/.
+[46]R. N. M. Watson, J. Woodruff, P. G. Neumann, S. W. Moore, J. Anderson, D.
+Chisnall,N.Dave,B.Davis,K.Gudka,B.Laurie,S.J.Murdoch,R.Norton,M.Roe,
+S.Son,andM.Vadera.2015. CHERI:AHybridCapability-SystemArchitecture
+forScalableSoftwareCompartmentalization.In 2015IEEESymposiumonSecurity
+and Privacy. 20–37. https://doi.org/10.1109/SP.2015.9
+[47]T. Ye, L. Zhang,L. Wang, and X. Li. 2016. An Empirical Study on Detecting and
+Fixing BufferOverflow Bugs.In 2016 IEEEInternational Conferenceon Software
+Testing, Verification and Validation (ICST). 91–101. https://doi.org/10.1109/ICST.
+2016.21[48]Qiang Zeng, Dinghao Wu, and Peng Liu.2011. Cruiser: concurrent heap buffer
+overflowmonitoringusinglock-freedatastructures.In Proceedingsofthe32nd
+ACMSIGPLANconference onProgramminglanguagedesignandimplementation
+(SanJose,California,USA) (PLDI’11).ACM,NewYork,NY,USA,367–377. https:
+//doi.org/10.1145/1993498.1993541
+[49] Qiang Zeng, Mingyi Zhao,and Peng Liu.2015. HeapTherapy:An Efficient End-
+to-End SolutionAgainst HeapBuffer Overflows.In Proceedings ofthe 201545th
+AnnualIEEE/IFIPInternationalConferenceonDependableSystemsandNetworks
+(DSN ’15). IEEE Computer Society, Washington, DC, USA, 485–496. https://doi.
+org/10.1109/DSN.2015.54
+[50]Tong Zhang, Dongyoon Lee, and Changhee Jung. 2019. BOGO: Buy Spatial
+MemorySafety,GetTemporalMemorySafety(Almost)Free.In Proceedingsofthe
+Twenty-FourthInternationalConferenceonArchitecturalSupportforProgramming
+LanguagesandOperatingSystems (Providence,RI,USA) (ASPLOS’19).ACM,New
+York, NY, USA, 631–644. https://doi.org/10.1145/3297858.3304017
+1128

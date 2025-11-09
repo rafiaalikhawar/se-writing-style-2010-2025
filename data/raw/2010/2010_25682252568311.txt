@@ -1,0 +1,1318 @@
+Automated Memory Leak Detection for Production Use
+Changhee Jung Sangho Lee Easwaran Raman Santosh Pande
+Virginia Tech, USA Georgia Tech, USA Google Inc., USA Georgia Tech, USA
+chjung@cs.vt.edu slee431@cc.gatech.edu eraman@google.com santosh@cc.gatech.edu
+ABSTRACT
+This paper presents Sniper, an automated memory leak detection
+tool for C/C++ production software. To track the staleness of allo-
+cated memory (which is a clue to potential leaks) with little overhead
+(mostly<3%), Sniper leverages instruction sampling using perfor-
+mance monitoring units available in commodity processors. It also
+ofﬂoads the time- and space-consuming analyses, and works on the
+original software without modifying the underlying memory alloca-
+tor; it neither perturbs the application execution nor increases the
+heap size. The Sniper can even deal with multithreaded applications
+with very low overhead. In particular, it performs a statistical anal-
+ysis, which views memory leaks as anomalies, for automated and
+systematic leak determination. Consequently, it accurately detected
+real-world memory leaks with no false positive, and achieved an
+F-measure of 81% on average for 17 benchmarks stress-tested with
+various memory leaks.
+Categories and Subject Descriptors
+D.2.4 [ Software Engineering ]: Software/Program Veriﬁcation—
+Reliability, Statistical methods ; D.2.5 [ Software Engineering ]: Test-
+ing and Debugging— Debugging aids, Monitors, Tracing ; D.3.4
+[Programming Languages ]: Processors— Memory management,
+Run-time environments
+General Terms
+Language, Measurements, Performance, Reliability
+Keywords
+Sniper, Memory leak detection, Anomaly detection, Performance
+monitoring unit
+1. INTRODUCTION
+Memory management bugs are a common source of persistent
+errors in real-world code. Memory leaks are particularly notorious,
+since their symptoms and causes are insidious and hard-to-track [35,
+19]. Leaks occur when allocated objects are not freed, even if they
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for proﬁt or commercial advantage and that copies
+bear this notice and the full citation on the ﬁrst page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc
+permission and/or a fee.
+ICSE ’14, May 31 - June 7, 2014, Hyderabad, India
+Copyright 14 ACM 978-1-4503-2756-5/14/05 ...$15.00.are never accessed again. Since they remain allocated consuming
+the heap memory, they gradually affect the quality-of-service (QoS)
+of the entire system. That is, they impact not only the leaking
+application, but also all the others, due to the limited amount of
+available system memory [13]. Even worse, piled leaks eventually
+crash the applications by exhausting system resources.
+Memory leaks can also result in software security/reliability prob-
+lems [15]. For example, many CVE entries this year including
+CVE-2013-0152/0217/1129 have detailed the problems [14], and
+malicious exploits have been designed based on memory leaks to
+launch denial-of-service (DoS) attacks [43].
+In the manycore era, leaks are more common than ever in multi-
+threaded software. When heap-allocated objects escape their thread,
+it is hard to determine when and which thread should deallocate
+them. Due to the difﬁculties of reasoning about the liveness of the
+shared objects, programmers often end up leaving the objects allo-
+cated in the memory thereby producing leaks. Despite undergoing
+extensive in-house testing, leaks often exist in deployed software
+and show up in customer usage [9, 7]. In fact, they are common
+causes of bug reports for production software [33, 2], e.g., over 40
+leaks in a Firefox web browser were reported in the ﬁrst quarter of
+2014. That is mainly because memory leaks are very input- and
+environment-sensitive [9, 7]. To effectively detect such memory
+leaks, tools have to be usable in production environment to observe
+the real execution characteristics of an application, which leads to
+leaks.
+Unfortunately, existing tools [19, 35, 30, 13, 12, 37, 9] can-
+not be used in production environment. First, their high overhead
+jeopardizes the QoS demand, e.g., <5% latency and throughput
+degradation for datacenter applications [28]. While state-of-the-art
+tools leverage sampling techniques to track accesses to heap ob-
+jects [12, 37], the resulting overhead is still unacceptable, e.g., 9.72x
+slowdown and more than 70% dynamic memory increase for heap-
+bound applications. Note that such memory-consuming approaches
+including [37, 39] are prohibited for production use. Apart from
+that, it just makes no sense to spend more memory for less memory
+leak.
+More importantly, existing tools are neither automated nor sys-
+tematic. Their leak determination relies on a manually-set threshold.
+That is, user intervention is required for each program, and even
+worse such a high cost will have to be paid anew on environmental
+change, e.g., program-input (workload) change. It is unrealistic to
+ask users to set a new threshold for each environmental change. The
+lack of a methodology for determining threshold forces users to seek
+a proper threshold for each application. In reality, they often end
+up blindly applying a ﬁxed threshold to those applications that have
+different characteristics. As a result, existing tools can falsely blamePermission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior speciﬁc permission and/or a
+fee. Request permissions from Permissions@acm.org.
+ICSE’14 , May 31 – June 7, 2014, Hyderabad, India
+Copyright 2014 ACM 978-1-4503-2756-5/14/05...$15.00
+http://dx.doi.org/10.1145/2568225.2568311
+825
+non-leaking objects or miss real leaks. Thus, the tools are inherently
+vulnerable to false positives and negatives.
+Given all this, there is a compelling need for a practical memory
+leak detection tool usable in production software. With that in mind,
+this paper presents the design and implementation of Sniper to auto-
+matically detect memory leaks in C/C++ production applications. It
+leverages instruction sampling using performance monitoring units
+(PMU) in processors to track accesses to heap objects without signif-
+icant overhead. It also ofﬂoads most of time- and space-consuming
+work, e.g., tracking heap organization and searching for the heap ob-
+ject accessed by a sampled instruction. To achieve this, Sniper uses
+a trace-driven approach based on the combination of a lightweight
+heap trace generation and an ofﬂine trace simulation.
+During program execution, Sniper records full traces of mal-
+loc/free as well as sampled PMU traces. The ofﬂine simulator then
+analyzes those traces and calculates the staleness of heap objects,
+which is a clue to potential memory leaks. That is, the simulator
+replays the program’s heap-related activities, thereby catching ev-
+ery leak that occurred during the program execution. In this way,
+Sniper rarely increases the execution time and the memory space at
+runtime. The takeaway is that the same mechanism is applicable to
+multithreaded program with no synchronization overhead.
+In particular, Sniper’s leak identiﬁcation is very accurate. Rather
+than relying on ad hoc efforts which require user intervention, Sniper
+provides a systematic and accurate methodology to identify leaks.
+The main idea is to view memory leaks as anomalies. Sniper’s
+anomaly detection is not only fully automated but also application-
+tailored. Such a statistical analysis makes Sniper robust against false
+positives/negatives across applications. For example, even though
+thestaleness of innocent objects might be over-estimated due to the
+sampling, they are very unlikely to be falsely blamed.
+Finally, Sniper neither requires recompilation nor perturbs the
+application execution with instruction instrumentation or memory
+allocator modiﬁcation. Along with the low overheads, that makes
+Sniper work transparently to the application. In case QoS require-
+ment becomes more stringent, it is possible to dynamically turn off
+Sniper taking away all the overheads.
+Overall, Sniper is usable in production environment, and there-
+fore can observe real execution characteristics that actually cause
+memory leaks. The following are the contributions of this work:
+The ﬁrst automated and systematic methodology for accurate
+leak identiﬁcation based on an anomaly detection. The most
+important issue is to automatically determine the staleness
+threshold, which is an open problem. Our leak identiﬁcation,
+which is tailored not just for each application but for each
+allocation site as well, effectively deals with the problem.
+A new trace-driven methodology to track how an application
+interacts with the heap; it not only ofﬂoads heavy work to the
+simulator, but also enables the statistical analysis of leaks.
+To the best of our knowledge, Sniper is the ﬁrst to effectively
+detect leaks for multithreaded software.
+No heap size increase and very little time overhead.
+2. BACKGROUND AND MOTIV ATION
+This section introduces basic concepts and terminologies used in
+state-of-the-art leak detection tools [47, 6, 42, 26, 7, 29, 13, 9, 46, 48,
+49, 49, 27], and shows their limitations as well as the requirements
+for production use.
+Target Memory Leaks: Memory leaks are of two kinds: (1)
+unreachable memory, i.e., program cannot access it, and (2) dead
+memory, i.e., it is reachable, but the program will never use it again,
+thus it is not live. The unreachable leaks can be effectively addressed
+Figure 1: Threshold effect: Tideal is in between l2andi1
+by garbage collection [5], static analysis [20, 45, 11, 26, 49], or
+model checking [51, 50]. However, the dead leaks are much trickier,
+since it is in general undecidable to determine if certain memory
+will not be accessed in the remainder of the program execution. This
+difﬁculty leads to the advent of those memory leak detection tools
+based on dynamic analysis techniques [39, 8, 47, 6, 7, 13, 9, 46, 48,
+27] including Sniper1. The focus of this paper is to detect the dead
+leaks even though Sniper can deal with both types of leaks.
+Staleness-Based Leak Detection: Chilimbi and Hauswirth for-
+mulated the problem of memory leak detection based on ‘how stale
+heap objects are’ in their pioneering work called SWAT [12]. They
+deﬁne the staleness of an object as how long it remains unac-
+cessed since the last access time . SWAT reports those heap ob-
+jects whose staleness is greater than the length of timeout. That
+is, if an object has not been accessed for a long time, it is likely
+to be a leak. At time treport , an objectois identiﬁed as a leak
+iftreport tlast _access (o)> threshold staleness . To track the
+last access with low overhead, existing tools leverage a sampling
+technique.
+Depending on the threshold, they can end up reporting inno-
+cent objects as leaks (false positives) and miss real leaks (false
+negatives). Figure 1 shows the importance of accurate threshold
+determination. In the ﬁgure, circles on a time arrow represent
+the last access of heap objects whose staleness appears below the
+arrow.Tncorresponds to each threshold while lnandinto leak-
+ing and innocent objects, respectively. Here, T1missesl2since
+thestaleness (l2)is less than the threshold staleness (T1), thus a
+smaller threshold is desirable. Alternatively, T2correctly identi-
+ﬁesl2as a leak, but falsely blames i1since the staleness (i1)be-
+comes greater than the threshold staleness (T2). The ideal thresh-
+old (Tideal ) exists between tlast _access (argminx2Lstaleness (x))
+andtlast _access (argmaxy2Istaleness (y))whereLandIare the
+sets of leaking and innocent objects, respectively.
+However, it is practically impossible to determine Tideal, since
+such a determination already requires perfect knowledge of what
+object is a leak. Note that the ideal threshold exists if and only if
+min
+x2Lstaleness (x)>max
+y2Istaleness (y) (1)
+That is, if the inequality 1 above does not hold, then
+@threshold s:t:jfFalsePositiveg[fFalseNegativegj= 0
+meaning that there is no threshold to achieve perfect accuracy. In
+reality, since existing tools leverage a sampling technique thereby
+over/under-estimating the staleness , the inequality 1 is likely to fail,
+i.e., they suffer from false positives/negatives.
+Note that the ideal staleness threshold is different across applica-
+tions. That is, the leak determination should be application-speciﬁc.
+1The dynamic analysis techniques, including Sniper, are inherently
+notcomplete due to their input-centric nature.826In particular, this work shows that even if the inequality 1 does not
+hold in the ﬁrst place, Sniper can still achieve good results with the
+help of its context-sensitive leak detection (see Section 3.4.2).
+Requirements for Production Use: Since memory leaks are
+very input- and environment-sensitive [9, 7], production use is es-
+sential to observe real execution characteristics that actually cause
+the leaks. There are several requirements for production use that the
+Sniper must meet.
+First, Sniper must not cause signiﬁcant overhead that jeopar-
+dizes the QoS requirements of the production service. For exam-
+ple, it should not increase heap size, thus memory-consuming ap-
+proaches [37, 39] are prohibitive. Second, due to the difﬁculty of the
+manual threshold determination and the need to reset it on environ-
+mental change, Sniper must provide an automated and systematic
+methodology for leak determination. Third, it has to be precise;
+it should not blame an application for the falsely-reported leaks
+while real leaks must be detected. Lastly, Sniper should be able to
+effectively deal with multithreaded software. Otherwise, it would
+be considerably less useful.
+Unfortunately, existing tools do not meet any of above require-
+ments, thus not usable for production use. In light of this, Sniper
+takes into account the requirements in its design.
+3. SNIPER APPROACH DETAILS
+The ﬁrst goal is to provide a lightweight memory leak detection
+tool usable in production environment. To achieve this, we identiﬁed
+the key sources of runtime and space overheads in staleness based
+leak detectors. (1) the instruction instrumentation to track accesses
+to heap objects causes high runtime overhead. (2) most of the
+space overhead comes from tag (meta) data that abstracts the heap
+objects; for each heap object, tools need to maintain the staleness ,
+the allocation site, the dynamic program point that accessed the
+object, and the heap organization information, e.g., the address
+range of the object. (3) updating the staleness of the heap objects
+causes both space and time overheads. In particular, for every
+sampled load, the tools need to determine if the instruction accesses
+a heap object. This requires searching the tag directory, which is a
+memory-intensive data structure, for the heap object whose range
+embraces the target address of the load instruction.
+Sniper addresses each source of the overheads effectively. To re-
+move the heavyweight instrumentation completely, Sniper exploits
+instruction sampling using hardware performance monitoring units
+(PMU) available in commodity processors. To reduce the space
+overhead due to the tag data, Sniper buffers the full trace of mal-
+loc/free and ﬂushes each buffer into ﬁles when it is full. Similarly,
+Sniper maintains another buffer to keep information about PMU
+samples. Thus, the additional memory consumption is bound to the
+size of the buffers.
+Sniper also ofﬂoads time- and space-consuming work of the stal-
+eness update to its trace simulator. Using the malloc/free/PMU
+traces generated at runtime as an input, the simulator performs the
+expensive staleness update ofﬂine. That way the memory-hungry
+tag directory and the space needed for the staleness are no longer
+necessary at runtime. Instead, it is during the ofﬂine simulation that
+a tag directory is constructed and searched for the staleness update.
+In this manner, Sniper minimizes both time and space overheads
+during program execution by ofﬂoading much of the work.
+The more important goal of Sniper is to provide an automated
+and systematic methodology for precise leak determination. Again,
+the lack of the methodology leads to blindly applying a ﬁxed thresh-
+old to all the applications which may differ signiﬁcantly in their
+behaviors. To this end, Sniper leverages a couple of observations;
+(1) one-size-ﬁt-all threshold does not exist even within the same
+Figure 2: The Sniper Organization.
+application, i.e., multiple thresholds should be carefully determined
+according to application characteristics. (2) separating objects based
+on program context where they are created, and then performing
+leak detection on the separated sets can improve the accuracy, i.e.,
+the inequality 1 is more likely to hold. In short, the leak determina-
+tion methodology should be tailored for each allocation-site as well
+as each application.
+With that in mind, Sniper leverages a statistical analysis on the
+trace information, as well as detailed results of the trace simulation.
+In particular, this work reformulates the problem of memory leak
+detection as that of anomaly detection. Thus Sniper views memory
+leaks as anomalies. The reason for this is that the staleness of a
+leaking object should be extremely higher than that of considerably
+more normal objects in the entire application or even in the same
+allocation site. The end result is that Sniper can automatically
+determine the staleness threshold in an application-speciﬁc manner.
+Figure 2 shows a high-level view of Sniper. First, an application
+binary is fed into Sniper’s launcher. It prepares a ptrace hook so
+that a ptrace monitor observes every PMU transaction from the
+core the application is running on. That way Sniper can collect the
+instruction samples without perturbing the application execution.
+Then, the launcher preloads Sniper’s wrapper (.so) to hijack heap
+interfaces, e.g., malloc/free, and then it forks and executes the ap-
+plication. At runtime, the wrapper generates traces of the functions
+to track how the heap organization evolves. They are buffered and
+later recorded in ﬁles. PMU traces are recorded in a similar manner.
+Once the application completes its execution, all the traces are
+fed into a trace simulator. To extract program context information,
+it consults the binary analyzer. During the simulation, it tracks
+the interaction between the application and the heap organization
+as well as the accesses to the heap-allocated objects. That is, the
+simulator replays the application’s execution in terms of its heap
+usage, and updates the staleness of the allocated objects.
+At the end of the simulation, Sniper ﬁnally reports leaks detected
+with its anomaly detection to Bugzilla. In particular, Sniper’s report
+is rich with details about each object including the program context
+(malloc/free sites2) and various simulation results such as memory
+2Sniper records the return address of malloc and free at runtime.
+Later the ofﬂine trace simulator calculates the their actual site ad-
+dress from the return address by analyzing the application binary.827access/growth analysis. While prior work reports just the last access
+site of only leaking objects, i.e., a single instruction address, Sniper
+provides a snapshot of different instruction accesses to the objects
+whether or not they are a leak. Thus, Sniper can help developers
+to ﬁx leaks while debugging. For example, using the techniques
+found in [10], one can construct a dynamic slice to track down the
+offending memory allocation and ﬁnd the program ﬂow from that
+allocation site until the point of last use.
+3.1 Memory Access Tracking with PMU
+The key to detect leaks is the staleness of allocated objects in that
+if they have not been accessed for a long time, they are likely to be
+leaks. By its deﬁnition, i.e., the elapsed time from the last access,
+thestaleness calculation requires tracking the memory access to
+the objects. For efﬁcient leak detection, it is important to collect
+the last access with a low overhead. With that in mind, Sniper
+obtains the memory access proﬁle through the PMU without incur-
+ring a signiﬁcant overhead. This section brieﬂy presents Sniper’s
+hardware/software internals and the related issues.
+An instruction sampling is a hardware mechanism that offers a
+good insight into program behaviors with a very low overhead. The
+PMU on modern processors has a special mode called event-based
+sampling [21, 17]. For a given event, this mode can conﬁgure the
+corresponding performance counter to raise an interrupt on overﬂow
+of its value, i.e., sampling period; when an interrupt occurs, the
+instruction that causes the overﬂow can be queried. As an extension
+to that, Intel’s PEBS (Precise Event Based Sampling) [21] not only
+provides precise location of the event in the instruction space, but
+also provides a way to access the register contents of the instruction
+that causes the event. Likewise, AMD’s IBS (Instruction Based
+Sampling) supports reading the virtual address in the target register
+of the retired load/store instruction together with its address.
+Similar sampling support is available on other microarchitectures
+such as Intel Pentium4/Itanium, IBM POWER5, Sun UltraSparc,
+etc.
+Sniper samples memory accesses, i.e., load(store) events, to
+capture both the instruction and data addresses in the target register
+through the PMU based instruction sampling. Such information
+about each sample along with its timestamp is recorded in the trace
+ﬁles. Later, the trace simulator determines whether the sampled
+instructions access a heap object. That is, if there exists a heap
+object that embraces the data address of the executed instruction, the
+simulator updates the staleness of the object based on its timestamp.
+Currently, Sniper supports process- and thread-aware sampling
+with the help of Perfmon2 kernel interface [40] and ptrace system
+calls. Sniper intercepts process/thread creation requests through
+the ptrace hook, and creates a PMU context for each thread; the
+context contains appropriate PMU conﬁgurations including event
+types and sampling periods. Sniper then attaches the PMU context
+to the corresponding thread to be created.
+On a context switch, the kernel reconﬁgures the PMU according
+to the attached PMU context, and enables the sampling of memory
+accesses. With this support, Sniper can monitor and save thread-
+level information thereby effectively dealing with multithreaded
+applications. During program execution, Sniper monitors the appli-
+cation’s PMU transactions, i.e., memory access samples, and fetches
+the samples through the Perfmon2 kernel interface.
+It is important to note that Sniper does not interrupt the target
+application execution at all. Thus, Sniper keeps track of the heap
+accesses without perturbing the original application execution. In
+particular, to prevent a majority of samples from falling into a
+synchronized pattern in some loops, Sniper leverages the sampling
+period randomization, i.e., adding a small randomized factor to the
+period.3.2 Lightweight Heap Trace Generation
+To track the staleness of the heap objects, Sniper has to be aware
+of the heap organization in terms of its allocation and deallocation
+during program execution. For this purpose, it is necessary to
+record full traces of malloc/free and the related program context
+information. Even if the trace simulator takes over much of the
+heavy work such as tracking heap organization, Sniper still needs to
+minimize the overhead of the trace generation.
+Unfortunately, the trace occupies a large amount of memory
+in order to store the tag data of each heap object. For example,
+the tag data includes its allocation/deallocation/last-access sites,
+heap organization information such as the range information of an
+allocated object and freed address, and so on3. To tackle the space
+overhead, Sniper buffers the tag data trace and ﬂushes the buffer
+into a ﬁle when it is full. In this way, the memory consumption of
+the trace generation is bound to the buffer size.
+Especially for a multithreaded application, Sniper should take
+care of contention to the buffer and the ﬁle from multiple threads.
+Of course, Sniper should guarantee that multiple threads write their
+trace correctly. One way to do that is relying on locking mecha-
+nism on the buffer and the ﬁle. However, this causes unacceptable
+performance degradation of the application due to the high syn-
+chronization overhead as the number of threads increases. Instead
+of using the locking mechanism, Sniper allocates both a buffer
+and a ﬁle into each thread, thus they become thread-private. This
+makes the buffer accesses lock-free as well as allows Sniper to use
+fwrite_unlocked for lockless ﬁle writing.
+In particular, it is important for the trace simulator to have a
+synchronized view of traces from multiple threads. To achieve
+this, Sniper associates each of malloc/free/PMU traces with the
+timestamp when it is generated.
+3.3 Ofﬂine Trace Simulation
+Sniper ofﬂoads the time- and space- consuming work of the stal-
+eness update for heap objects, which requires tracking heap orga-
+nization and searching for the heap object accessed by a sampled
+instruction. To achieve this, Sniper leverages the lightweight heap
+trace generation and its ofﬂine trace simulator that takes over the
+heavy work. In particular, the simulator builds the tag directory
+based on recorded traces and performs expensive tag searches to
+calculate the staleness ofﬂine.
+Once the traces of malloc/free/PMU(memory access) are recorded
+at the end of program execution, all the trace ﬁles are fed into the
+simulator. An application binary is also fed into the simulator for
+its binary analyzer to extract an actual allocation site address; the
+instruction address of call to malloc/new is calculated based on the
+return address in the stack trace. the same thing is with deallocation
+and last-access sites.
+Then, the simulator ﬁrst merges the traces in the ﬁles and sorts
+them by the timestamp of each trace using MapReduce [16]. This
+gives the simulator a time-synchronized view of all the traces. While
+the simulator is running, it decodes each trace in turn and performs
+appropriate actions according to the decoded results.
+To keep track of the heap organization, Sniper models each heap
+object with the start and end addresses of the object in the tag, and
+maintains a tag directory to manage the tags. When the simula-
+tor processes a malloc (free) trace, the corresponding tag is cre-
+ated/inserted (removed) in the directory. For a memory access trace,
+the simulator determines if the address of the access corresponds to
+one of the heap objects. This involves a search for the corresponding
+3The space for the staleness is not necessary at runtime because it
+is calculated ofﬂine by the trace simulator.828tag whose range (the start of the tagged object its end address)
+embraces the queried address in the tag directory4. If the search
+succeeds, i.e., the address of the memory access belongs to a heap
+object, the staleness of the resulting tag for the object is calculated
+and recorded by the simulator. Since it tracks the heap organization,
+each access is correctly attributed to the corresponding heap object.
+In summary, the trace simulator replays the program execution in
+terms of the heap usage, updating the staleness of the allocated
+objects.
+3.4 Automated and Systematic Leak Detection
+Once the trace simulation ﬁnishes, Sniper is ready to report leak-
+ing objects based on the staleness . An important issue is how to
+determine the threshold staleness . It is very important to precisely
+determine the threshold, since it directly impacts the number of false
+positives and negatives.
+To the best of our knowledge, no prior work deals with this issue,
+thus users are left to determine the accurate threshold on their own.
+Unfortunately, it is indeed difﬁcult, costly, and error-prone for users
+to set the threshold correctly. Upon any change, such a high cost
+of threshold determination will have to be paid anew. In particular,
+the threshold should be different across applications, and there is no
+one-size-ﬁt-all solution even in the same application.
+With that in mind, this work leverages a statistical anomaly detec-
+tion, i.e., Sniper views leaks as anomalies. This is based on a couple
+of observations; (1) the staleness of a leaking object is very high
+compared to normal objects allocated in the same site, which is the
+basic philosophy of staleness -based leak detection. (2) the number
+of leaking objects is a lot smaller than that of normal objects. This is
+because production software should undergo a number of extensive
+testing procedures from its creation to the release. In fact, large soft-
+ware companies such as Microsoft and IBM have already adopted
+the test-driven application development approach [34]. Without
+passing various test cases, developers cannot submit even a sin-
+gle line of change to the code repository. That way naive leaks in
+applications are likely to be detected before its production release.
+3.4.1 Anomaly Detection with Adjusted Boxplots
+Sniper transforms the problem of leak detection into that of
+anomaly detection for univariate data sets which are comprised of
+thestaleness of objects. The issue here is that most of the anomaly
+detection techniques assume an underlying distribution, e.g., boxplot
+approach works best for normal distribution as other approaches
+favor it [44].
+However, the leak detection problem does not follow normal
+distribution. Recall that leaking objects are very few compared
+to normal objects, and the stalenesses of leaking objects is very
+high compared to that of normal objects. Thus, the distribution of
+stalenesses data tends to be right-skewed, i.e. having a long tail in
+the positive direction, which can paralyze the anomaly detection
+capability of the boxplot approach.
+That leads to a different approach, i.e., Sniper leverages adjusted
+boxplots [44] for the anomaly detection. In contrast to the original
+boxplot approach that classiﬁes all points outside the interval of
+[Q1 1:5IQR ;Q3+ 1:5IQR ], whereQ1andQ3are 1st and 3rd
+quartiles respectively and IQR isQ3 Q1, aspotential anomalies,
+theadjusted boxplot shifts the interval with the consideration of
+how the underlying distribution of the data set is skewed. For the
+systematic leak determination, Sniper sets the threshold staleness
+as the upper bound of the adjusted boxplot deﬁned as;
+4We implement the directory using a modiﬁed RedBlack tree whose
+asymptotic complexities remain the same, i.e., O(logN) time [23].
+This fast range search is essential for accelerating simulation.Threshold =
+Q3+ 3:0e3MCIQR MC0
+Q3+ 3:0e4MCIQR MC < 0
+where medcouple (MC), i.e., a robust measure of the skewness of
+an underlying distribution, is deﬁned as;
+MC = med
+xiQ2xjh(xi;xj)
+whereQ2is the sample median and for all xi6=xj. That is, MCis
+the median of the kernel function ( h) results, where his given by;
+h(xi;xj) =(xj Q2) (Q2 xi)
+xj xi
+More details of adjusted boxplots can be found in [44].
+3.4.2 The Granularity of the Anomaly Detection
+This section describes leak determination schemes that differ in
+the scope of the anomaly detection.
+Local Detection: Sniper can apply the anomaly detection for
+each allocation site, which is called local detection. This scheme
+has potential to achieve higher accuracy, since it performs allocation-
+site-speciﬁc (context-sensitive) leak detection. Even when the in-
+equality 1 does not hold for entire objects, the scheme can still detect
+leaks with no false positive/negative. That is, by narrowing down
+the scope of leak detection to those objects created in the same site,
+the inequality 1 is likely to hold.
+However, the local scheme can be misleading depending on the
+state of an allocation site. This might occur for a couple of reasons:
+(1) insufﬁcient amount of sample data; if some site has a few objects,
+e.g.,<10 objects, in which case no statistical method works. (2)
+similarity of sample data; even with the abundant amount of sample
+data, stalenesses of the objects could have not much difference, in
+which case even humans cannot detect any anomaly. For example,
+it would be the case where every object created in one site is all
+leaking, or no object is leaking.
+Global Detection: To deal with the problems, Sniper can per-
+form the anomaly detection for entire objects within the applica-
+tion, which is called global detection. Note that the global scheme
+still performs the application-tailored leak detection but not in the
+allocation-site-speciﬁc way. When the local scheme fails to de-
+tect leaks due to its high threshold ( local _threshold staleness ), the
+global scheme would be a good alternative. As an example, when
+those objects created in the same allocation site are all leaking,
+the global scheme is still able to detect them because its thresh-
+old (global _threshold staleness ) is likely to be smaller than their
+stalenesses.
+Then the question is how to make a correct decision to pick the
+right detection scheme for each case. By doing that, Sniper can take
+advantage of the synergy between the local/global schemes thereby
+achieving higher accuracy. On the contrary, an incorrect decision
+translates to false positives/negatives. With that in mind, this work
+designs Sniper’s hybrid detection scheme.
+Hybrid Detection: Sniper performs the local detection for each
+site in the ﬁrst place. The idea is that Sniper respects the leak report
+of the allocation-site-speciﬁc detection scheme. For only those
+allocation sites that report no anomaly (leak), does Sniper consult
+the global detection scheme. For the local and global schemes to
+generate a different result, the staleness spectrum of the objects in
+the site has to be overlapped with the interval of the two thresholds
+of both the schemes. That is, the candidate sites for the hybrid
+detection is deﬁned as
+candidate _sites =fsitejsite2S;global _threshold staleness<
+max
+o2sitestaleness (o)<local _threshold staleness (site)g
+(2)829whereSis a set of allocation sites in an application.
+For each candidate site, the hybrid scheme simply uses the global
+scheme assuming that the site’s objects are leaking. The intuition
+behind the heuristic is two-fold; (1) it follows the philosophy of the
+original staleness -based leak detection [12], i.e., highly-stale objects
+are likely leaking. (2) Sniper must not miss leaks; otherwise, it loses
+its worth as a leak detection tool.
+However, the heuristic might end up with false positives in case
+the assumption is wrong. Note that this is rather a limitation of
+staleness -based leak detection, i.e., it is possible to incorrectly blame
+the objects that are highly stale but that do not actually leak. As an
+example, even if GUI objects might not be accessed for a long time
+after their creation, they should not be reported as leaks [47].
+To avoid such unnecessary false positives, Sniper focuses on users’
+expectation for a leak detection tool. In general, users are interested
+in the critical leak that impacts overall memory consumption. That
+is, they would not care about a leak which rarely affects memory
+consumption, even though it is highly stale .
+In light of this, Sniper selectively applies the heuristic according
+to how much stale objects contribute to total memory consumption,
+i.e., the hybrid scheme switches to the global scheme only for the
+following sites;
+hybrid _sites =fsitejsite2candidate _sites;
+X
+obj2sitesize(obj)> X
+obj2allocated _setsize(obj)g(3)
+where allocated_set is a set of the objects that have been allocated
+but not yet freed at time treport . That is, if it turns out that the stale
+objects detected by the global scheme do not contribute signiﬁcantly,
+the hybrid scheme remains at the local scheme. Note that is a
+conﬁgurable parameter which takes into account the application’s
+QoS requirement. This work sets the value of to 0.001 in the
+experiments.
+3.5 False Positives due to Sampling
+Since Sniper leverages instruction sampling to update the stale-
+ness of the accessed heap object, it could miss some memory access.
+Such an uncaught access to heap objects causes Sniper to overesti-
+mate their staleness . In a sense, Sniper might falsely report them as
+leaks, thus causing false positives.
+It is important to note that for frequently accessed objects, the
+sampling does not have a signiﬁcant impact on the false positives.
+The reason is that often times leaks become manifest after long-
+running execution. That is, it is practically impossible to generate
+false positives from frequently accessed objects for that long time.
+The real possibility of false positives due to the sampling comes
+from those objects that are sporadically accessed. For example, if
+the last access to the objects with a long life time is not sampled,
+Sniper ends up overestimating the staleness thereby falsely reporting
+them as leaks.
+In particular, Sniper turns out to be accurate even when the sam-
+pling frequency is low (see Section 4.4). That is because even if
+staleness gets overestimated due to the low sampling rate, Sniper’s
+anomaly detection adapts itself to the underlying sample distribution.
+That is, Sniper adjusts the threshold appropriately according to the
+resulting staleness distribution. Thus, Sniper can effectively prevent
+unsampled objects from being falsely blamed as leaks.
+3.6 Discussion
+Trace Size/Simulation Time: Without any optimization, the
+largest trace ﬁle we evaluated was 7 GB, and its simulation took
+20 minutes including the time spent sorting the trace with MapRe-
+duce [16]. Table 1 summarizes both the trace size and the simulation
+Figure 3: Typical datacenter-like production environment
+Table 1: The trace size and the simulation time
+Benchmark Trace Size Simulation Time
+omnetpp 6832.5 MB 18.5 Min
+dealII 3585.4 MB 9.3 Min
+xalancbmk 3118.4 MB 8.6 Min
+time of those applications whose trace simulation takes more than 5
+minutes. For other SPEC2006 applications, the trace size is mostly
+less than 512 MB while the trace simulation takes a few minutes.
+One possible optimization to reduce the trace size (simulation
+time) can be achieved by periodically processing partial trace ﬁles
+during program execution. Once simulation outputs are generated,
+most of the trace ﬁles can be deleted. Those malloc traces having
+the corresponding free traces can be deleted too. However, for
+incremental staleness update, any information necessary to track
+the heap organization should be maintained. For efﬁciency, the
+partial trace ﬁles can be transmitted to other available machines in a
+pipelined way for the remote simulation.
+Note that many production applications have already collected
+various traces for a monitoring purpose. Thus, dedicated analysis
+machines often exist in datacenters to process the log and trace data
+of production machines. Sniper can thus leverage such machines
+to enable the remote simulation. Figure 3 shows the datacenter
+environment. In particular, both production and analysis machines
+share a distributed ﬁle system (e.g., Quantcast File System [38],
+Hadoop Distributed File System [41]) which is connected to a sep-
+arate gigabit network. Thus, writing a trace ﬁle rarely affects the
+QoS of the application which is serviced using another network,
+e.g., Internet; the production machines are equipped with two NICs
+for each separate network to keep the overhead minimal.
+Limitation with Virtualization: The target of Sniper is pro-
+duction software running on non-virtualized systems where high-
+performance is critical. In fact, many commercial applications run
+on a non-virtualized cluster node in the datacenter for performance
+reasons [31, 32]. Since the proposed PMU-based technique does not
+assume a virtual machine (VM), Sniper is not directly applicable to
+VMs in its current form.
+However, this is not a fundamental obstacle for Sniper to be used
+on virtualized systems. In the VM environment, PMU is shared
+among processes on different VMs as well as on the same VM.
+Therefore, PMU virtualization is a key to avoid mixing memory
+access samples of different processes. Recently, operating system
+researchers have come up with a framework for the PMU virtual-
+ization [36]. Currently, KVM (Kernel-based Virtual Machine) has
+already supported Intel’s architectural PMU [3]. Thus, we expect
+that the support for other features of PMU to be available soon.
+4. EV ALUATION
+To demonstrate the effectiveness of Sniper, we implemented it
+in C++ as a shared library on a Linux operating system. To access
+PMU, we leverage Perfmon2 kernel interface [18]. This section ﬁrst
+analyzes the execution time overhead of Sniper for both single- and830  0  0.2  0.4  0.6  0.8  1  1.2  1.4  1.6
+cfrac
+espresso
+gs
+roboop
+geo_mean
+soplex
+povray
+gobmk
+sjeng
+mcf
+hmmer
+gcc
+sphinx3
+h264ref
+bzip2
+milc
+lbm
+xalancbmk
+omnetpp
+perlbench
+libquantum
+gromacs
+astar
+dealII
+namd
+geo_meanNormalized execution timeBaseline
+SniperFigure 4: Execution time overhead of serial benchmarks
+multi-threaded benchmark suites with their largest input available. It
+turns out that Sniper’s memory space overhead is negligible (<1%)
+for those benchmarks. Note that there is no increase in application’s
+heap size. The only source of the overhead is the small ﬁxed-
+size trace buffers. Then, it analyzes the accuracy of Sniper using
+synthetic memory leak injection, and presents a sensitivity analysis
+to sampling period.
+Finally, it describes a case study of using Sniper to detect real-
+world memory leaks in several open-source applications vulnerable
+to malicious denial-of-service attacks. All experiments were per-
+formed on a Linux machine with two Intel Nehalem-based quad-core
+Xeon processors (i.e., 8 cores total in two sockets) with 32GB of
+memory. In particular, trace ﬁles are written to a distributed ﬁle sys-
+tem. Except for the sensitivity analysis, Sniper runs with a sampling
+period of 100 (see Section 3.1).
+4.1 Runtime Overhead of Serial Benchmarks
+Figure 4 summarizes the execution time overhead incurred by
+Sniper in serial applications including both SPEC2006 and allocation-
+intensive benchmarks. In the ﬁgure, the dark bars correspond to
+a baseline execution time without Sniper, while light bars to the
+execution time with Sniper enabled, which is normalized to the
+baseline time.
+For most of the SPEC2006 applications, Sniper’s overhead is neg-
+ligible (<1–3%) except for xalancbmk (4%), perlbench (5%), and
+omnetpp (6%). Note that prior work [37] omitted the applications
+butxalancbmk in its evaluation, e.g., it failed to execute omnetpp
+due to its overhead. For xalancbmk , the prior work causes huge
+overhead (almost 10x slowdown), while Sniper’s overhead is only
+4%. Overall, the execution time overhead incurred by Sniper is 3%
+on average for the SPEC2006 applications.
+We also measure the overhead for several allocation-intensive
+applications, since they were used in the most recent work [37].
+For these applications, Sniper causes relatively signiﬁcant overhead
+(3%–59%) despite its lightweight heap trace generation. However,
+such overhead is adequate in that the applications spend a con-
+siderable amount of the entire execution time for memory alloca-
+tion/deallocation. In fact, prior work [37] causes much more over-
+head (50%–100%) for the same applications. On average, Sniper’s
+execution time overhead is 31% for the allocation-intensive applica-
+tions.
+Sniper can lead to performance degradation for three reasons.
+First, those applications are allocation- and deallocation-intensive.
+Thus, Sniper perturbs the application execution for a moment in
+order to store the meta data which is necessary to leave malloc
+(free) trace for each malloc (free) invocation. Second, they create
+many small heap objects, thus the meta data can become much
+larger than the the original size of the objects. As a result, the
+applications can cause more trafﬁc to caches and TLBs. Finally,
+such many allocations/deallocation requests quickly make the trace
+buffers full. Thus, the ﬁle write operation to ﬂush the buffers also
+occurs relatively frequently.4.2 Runtime Overhead of Parallel Benchmarks
+To evaluate the execution time overhead for parallel applications,
+we chose PARSEC benchmark suite whose applications are heav-
+ily multithreaded and written in C/C++ [4]. Since the PARSEC
+applications run in parallel on multiple cores, this section focuses
+on Sniper’s inﬂuence on the scalability of the original applications.
+Figure 5 represents how Sniper affects the scalability of the mul-
+tithreaded applications as the number of threads increases. The
+solid line corresponds to a speedup of a baseline execution without
+Sniper, while the dashed line to a speedup of the execution with
+Sniper enabled. Overall, Sniper does not hurt the scalability of the
+applications. The main reason for this is that Sniper lets multiple
+threads have thread-private buffers and ﬁle pointers to dump the
+buffers for efﬁcient trace collection. In this way, Sniper cannot only
+reduce contention to the buffers, but also can exploit lockless ﬁle
+operations. On average, when the number of threads used is 1, 2, 4,
+and 8, Sniper’s execution time overhead is 3.3%, 3.8%, 4.3%, and
+4.8%, respectively.
+4.3 Accuracy Analysis with Leak Injection
+To evaluate the leak detection accuracy of Sniper, there is a need
+of a good set of applications containing various memory leaks. with
+which the detection accuracy is measured and compared. However,
+there is no such standard applications to the best of our knowledge.
+This work therefore creates leak benchmarks stress-tested with the
+synthetic leak injection. We inject two types of leaks, i.e, dynamic
+and static leaks, into C/C++ SPEC2006 applications5. In real-world
+applications, memory leaks often times manifest only in certain
+program contexts (e.g., speciﬁc procedure calling sequence or ma-
+licious user input patterns). To model this kind of memory leaks
+(called dynamic leaks ), we ﬁrst run the original SPEC2006 appli-
+cations with Sniper to collect the free traces, and then randomly
+remove 10% of deallocations from the traces.
+On the other hand, leaks sometimes occur irrespective of the
+contexts (called static leaks ), e.g., every object created in a single
+allocation site is leaking. Even if such leaks are relatively rare in
+deployed software due to extensive in-house testing, they become a
+serious problem whenever they occur. That is because every created
+object gets lost and never reaches any deallocation site, thereby
+leading to memory bloat. To model this scenario, we ﬁrst pick the
+allocation site which is responsible for closest to 10% of the entire
+allocations, and then remove deallocations of the objects created
+from the site.
+As metrics to evaluate the leak detection accuracy, we use pre-
+cision, recall, F-measure that are commonly used to measure the
+quality of classiﬁers in the information retrieval community. Intu-
+itively, high precision leads to less false positives (falsely blamed
+leaks) while high recall to less false negative (undetected leaks), and
+the F-measure is the harmonic mean of precision and recall which
+focuses on the balance between the other two metrics.
+We test the ad hoc approach (i.e., using manual threshold ) used
+in prior tools, and compare its accuracy to that of Sniper approach
+which automatically selects the threshold using anomaly detection.
+Recall that due the lack of the systematic methodology, prior tools
+end up using a ﬁxed threshold across applications. To model the
+ad hoc approach by selecting the appropriate threshold, we ﬁrst try
+20 candidates forming arithmetic series among which the smallest
+value results in no false negative while the largest in no false positive.
+Then, we select a value with the best F-measure as the threshold.
+5The experiment omits mcf,sjeng ,lbmsince these applications
+allocate very few objects, i.e., their results tend to be misleading.8311 2 4 812345Speedup
+Number of CoresBaseline
+Sniper(a)blackscholes
+1 2 4 812345Speedup
+Number of CoresBaseline
+Sniper (b)bodytrack
+1 2 4 8123Speedup
+Number of CoresBaseline
+Sniper (c)canneal
+1 2 4 81Speedup
+Number of CoresBaseline
+Sniper (d)dedup
+1 2 4 81234Speedup
+Number of CoresBaseline
+Sniper (e)facesim
+1 2 4 812345Speedup
+Number of CoresBaseline
+Sniper (f)fluidanimate
+1 2 4 812345678910Speedup
+Number of CoresBaseline
+Sniper
+(g)freqmine
+1 2 4 81Speedup
+Number of CoresBaseline
+Sniper (h)raytrace
+1 2 4 812345Speedup
+Number of CoresBaseline
+Sniper (i)streamcluster
+1 2 4 81234567Speedup
+Number of CoresBaseline
+Sniper (j)swaptions
+1 2 4 81234567Speedup
+Number of CoresBaseline
+Sniper (k)vips
+1 2 4 81234567Speedup
+Number of CoresBaseline
+Sniper (l)x264
+Figure 5: Scalability of PARSEC parallel benchmark applications with and without Sniper
+  0  0.2  0.4  0.6  0.8  1
+perlbench
+bzip2
+gcc
+milc
+gromacs
+namd
+gobmk
+dealII
+soplex
+povray
+hmmer
+libquantum
+h264ref
+omnetpp
+astar
+sphinx3
+xalancbmk
+geo_meanPrecisionAd−hocSniper−Hybrid
+Ideal−Hybrid
+  0  0.2  0.4  0.6  0.8  1
+perlbench
+bzip2
+gcc
+milc
+gromacs
+namd
+gobmk
+dealII
+soplex
+povray
+hmmer
+libquantum
+h264ref
+omnetpp
+astar
+sphinx3
+xalancbmk
+geo_meanRecallAd−hocSniper−Hybrid
+Ideal−Hybrid
+Figure 6: Precision/recall of different leak detection ap-
+proaches. Sniper is shown in the second bar, i.e., Sniper-Hybrid
+Thus, the real ad hoc approach may perform worse than what we
+model here.
+In particular, to quantify and verify the effectiveness of Sniper’s
+heuristic for the hybrid anomaly detection (see Section 3.4.2), we
+implement an ideal hybrid approach based on oracle information.
+That is, the ideal approach (called Ideal Hybrid ) always selects the
+best between the global and local leak detection schemes.
+Figure 6 compares precision/recall of different leak detection
+approaches; (1) Ad-Hoc : the manual approach of prior work, (2)
+Sniper-Hybrid : Sniper’s leak identiﬁcation based on the hybrid
+anomaly detection, (3) Ideal-Hybrid : the ideal version of Sniper
+based on the oracle information. For most applications, Hybrid
+outperforms Ad-Hoc . This is due to Sniper’s application-tailored
+leak identiﬁcation strategy. Sniper-Hybrid works comparably in
+namd ,omnetpp ,sphinx3 . and it is less accurate than Ad-Hoc only in
+gromacs . Inperlbench ,bzip2 ,gccandgobmk ,Ad-Hoc does not work
+at all, and the results translates to its low average of precision/recall.
+On the contrary, Sniper-Hybrid can ﬁt itself into each problem
+instance by examining underlying staleness distributions and never
+has a case where it fails to detect all the presence of leaks.
+Ingromacs andastar ,Sniper-Hybrid fails to detect static leaks ,
+which are supposed to be caught by the global anomaly detection
+scheme (see Section 3.4.2), thus resulting in low recall. However, it
+  0  0.1  0.2  0.3  0.4  0.5  0.6  0.7  0.8  0.9  1
+libquantum h264ref astar perlbenchF−measureGlobal
+Local
+Sniper−Hybrid
+Ideal−HybridFigure 7: The impact of the hybrid anomaly detection. Sniper’s
+F-measure is shown in the third bar, i.e., Sniper-Hybrid
+turns out that the global detection could not detect the static leaks
+either. The reason for this is that in gromacs , 31% of allocations
+end up with leaks due to the leak injection. Because of such a large
+number, the leaks do not look like anomalies to the global detection,
+i.e., it cannot distinguish leaks from innocent objects. Similarly,
+astar hasstatic leaks too, thus Sniper-Hybrid suffers from the same
+problem. As an exception, it achieves low precision and recall in
+namd . That is because the stalenesses of innocent objects and leaks
+innamd are so severely overlapped that it cannot accurately separate
+leaks even with its allocation-site speciﬁc local detection scheme.
+Note that Sniper-Hybrid is near-optimal for most applications, i.e.,
+it is as accurate as Ideal-Hybrid ; it turns out that most of the time,
+Sniper’s heuristic for the hybrid anomaly detection correctly selects
+the best between the local and global detection schemes. There
+are four exceptions ( namd ,soplex ,sphinx3 ,xalancbmk ) for which
+Sniper-Hybrid is either too conservative or too aggressive. For namd ,
+Sniper-Hybrid is too conservative due to the severe overlap in the
+application while it is too aggressive for the rest of them. Overall,
+Sniper-Hybrid is very accurate; its precision and recall are 0.88 and
+0.75, respectively, and the resulting F-measure is 0.80.
+One reason for the high accuracy of Sniper-Hybrid is that its
+heuristic for the hybrid anomaly detection successfully selects the
+best between the local and global detection schemes. Figure 7
+shows the F-measure of each scheme, and highlights how Sniper-
+Hybrid behaves when either the local detection scheme ( Local ) or the
+global scheme ( Global ) works better than the other. In libquantum
+andh264ref ,Global outperforms Local . That is because these
+applications have relatively many static leaks for which Local is
+destined to fail. Here, even the local detection reports no anomaly,
+Sniper-Hybrid detects the leaks by correctly switching to the global
+detection.832Figure 8: Stalenesses spectrum of objects in perlbench
+●● ● ●● ● ●
+100 150 200 250 300 350 4000.50.60.70.80.91.0
+Sampling periodsPrecision● Sniper−Ideal
+Sniper−Hybrid
+Figure 9: Impact of sampling period change on false positives
+On the other hand, Local outperforms Global forastar andperl-
+bench . In particular, they have relatively many dynamic leaks which
+are supposed to be caught by the local anomaly detection scheme
+(Section 3.4.2). As a result, the applications show considerable
+overlap in the stalenesses ofdynamic leaks and innocent objects,
+which prevents the global scheme from detecting the leaks. That
+is why Global achieves the low accuracy for the applications. In
+contrast, the local detection scheme can solve this problem with the
+help of its allocation-site-based partitioning of objects.
+Figure 8 displays four 1-D scatter plots shown in a log scale ,
+demonstrating the beneﬁt of such partitioning. Each point in the
+plot represents staleness of an object. Leaks are plotted in the upper
+part of the plot while innocent objects are plotted in the lower part.
+As shown in Figure 8(a), before partitioning, there is huge overlap
+between stalenesses of leaks and innocent objects. Thus, it is very
+difﬁcult for Global to recognize the leaks as anomalies.
+However, when the objects are partitioned according to their
+allocation sites, the degree of overlap within each partition reduces
+considerably. Thus, those objects of each partition become much
+more amenable to the anomaly detection. To support this, the rest
+of 1-D scatter plots in Figure 8, i.e., (b), (c), and (d) show three
+different allocation sites after partitioning. Here, Sniper-Hybrid
+makes a correct decision, i.e., adopting the local anomaly detection
+scheme.
+Overall, Sniper-Hybrid is comparable to Ideal-Hybrid and thus
+performs better than both the local and global detection schemes.
+Comparing the impact of the local scheme only and the global
+scheme only, it is clear that they have a constructive effect in Sniper-
+Hybrid which is the combination of Global andLocal . That is,
+Sniper-Hybrid achieves better accuracy than either scheme can.
+Apart from that, the fact that Sniper-Hybrid achieves the optimal
+accuracy of Ideal-Hybrid supports that Sniper’s hybrid leak identiﬁ-
+cation is accurate and effective.
+4.4 Sensitivity to Sampling Frequency
+Since Sniper leverages the instruction sampling, an unsampled
+access to heap objects causes their staleness to be overestimated
+thus possibly leading to false positives. Sniper should be robust
+against such false positives to be useful in production environment
+that might force the sampling period to be adjusted for the QoS
+requirements.
+Figure 9 shows the average precision of Sniper on sampling period
+changes. Here, the average precision is the geometric mean of theprecisions of C/C++ SPEC2006 applications. Overall, the precision
+change of Sniper is not signiﬁcant across different sampling periods.
+For example, when the period is 400, i.e., Sniper observes a single
+access out of 400 memory accesses seen by the PMU, the resulting
+precision ( Sniper-Hybrid ) is still high; 0.872.
+This is because even if the staleness overestimation due to the
+coarse sampling is inevitable, Sniper’s anomaly based leak identiﬁ-
+cation adapts itself to the resulting sample distribution of staleness .
+In other words, the automatic anomaly detection adjusts the thresh-
+oldappropriately to determine leaks. In particular, Sniper-Hybrid is
+comparable to Ideal-Hybrid across the sampling periods.
+4.5 Case Study of Real-World Memory Leaks
+Squid is a web caching proxy [2] server. It caches frequently-
+requested web pages and delivers the contents from its local cache
+upon request from many users (clients), thereby improving the
+response time and the network bandwidth. Squid has a memory
+leak which could potentially be used by malicious attackers to crash
+the program or cause some system failure, i.e., denial-of-service.
+The root-cause of the problem is that invalid HTTP requests with an
+empty URL trigger a control path in which the memory allocated
+to serve the request will not be deallocated. To reproduce the leak,
+we ran Squid for several hours, requesting many valid web site
+addresses along with the problematic URL at a constant rate.
+It turns out that Sniper successfully detected the memory leak
+with no false positive. In addition, Sniper found that based on its
+simulation outputs, every non-leaking object created for valid HTTP
+requests has the same free site. It was also found that all the objects
+including leaks have the same allocation site. By simply checking
+the object counts and the free site, the user can further recognize that
+most of the objects are not leaked—e.g., 95%—and freed in a single
+location. Then, it would be a natural reaction for the user to attempt
+to deallocate the remaining 5% leaking objects in the same location
+where ‘all the non-leaking objects’ (95% of the entire objects) are
+deallocated. This is the exact solution to the leak problem of Squid.
+Packet-o-matic is a multithreaded network packet analyzer. It
+performs network forensics [1], thus reading network packets and
+logging various information about the network connections. It has
+a memory leak due to incorrect thread termination. When the ap-
+plication reads an input ﬁle ( pcap capture ﬁle) which generates the
+network trafﬁc, a new thread is created to process the ﬁle. The prob-
+lem is that even if each thread is supposed to joinat its termination,
+(i.e., speciﬁed as joinable in the pthread_create ), there is a case
+where it does not execute pthread_join .
+According to Sniper, the leaking objects are all allocated in the
+same function, i.e., pthread_create . That is, they are a sort of thread-
+local resources, which should be returned to the system at the end
+of the thread execution; such unredeemed objects accumulate as the
+application reads more input ﬁles. Here, Sniper’s information of
+the last_access to the objects can help the user ﬁnd the appropriate
+location to put pthread_join . In fact, the exact joining point was
+in the end of the pthread worker function. In order to give users
+the context information such as the allocation site, the pthread li-
+brary was statically compiled in this experiment. The alternative
+is to instrument the dynamic loader (ld.so) so that it can leave the
+information on where the pthread library is loaded in memory [25].
+In particular, Sniper generated no false positive for this application.
+USIMM is an open source architecture simulator for memory
+scheduling [22]. It had severe a memory leak causing the simulator
+to eventually crash with an out-of-memory error when the simulation
+input was large. The root-cause of the leak is that memory requests
+already serviced are not deallocated even if they do not exist in
+the service queue any longer. Since there are billions of memory833requests being scheduled in the queue, the simulation can eventually
+eat up all the available memory in the system.
+Sniper turns out to be very accurate with no false positive, in
+detecting the memory leak in USIMM. Note that in this case, the
+last-touch site information helps to ﬁgure out the cause of the leak.
+Sniper successfully reported the site where the memory requests
+are serviced. For developers with a full understanding of how the
+simulator schedules the requests with the queue, the site information
+motivates them to investigate the function of clearing the queue
+where free is supposed to exist to ﬁx the leak.
+5. RELATED WORK
+Path-Biased Sampling: Chilimbi and Hauswirth [12] were the
+ﬁrst who proposed the staleness based leak detection in their pio-
+neering system called SWAT. The staleness update relies on code
+instrumentation. To reduce the overhead, SWAT uses path-biased
+sampling in tracking heap accesses. It samples each program path
+at a different rate; the sampling rate is in inverse proportion to the
+execution frequency. That way SWAT can reduce the overhead,
+since instructions on a hot path rarely get sampled. However, the
+sampling can result in overestimating the staleness of the objects in
+hot paths, thus leading to false positives. Thus, the effort to reduce
+the runtime overhead may end up undermining the quality of the
+leaks detection.
+Uniform Sampling versus Path-Biased Sampling: One might
+wonder which sampling is better. The path-biased sampling was
+invented to reduce overheads at the expense of hot-path’s precision.
+Thus, only if the cold-path hypothesis holds, the path-biased sam-
+pling is more precise than uniform sampling. However, there is
+doubt about the generality of the hypothesis. As [37] pointed out,
+it does not hold for many cases, e.g., data structures suffering from
+memory bloat [24], where the path-biased sampling generates many
+false positives.
+Even if the hypothesis holds, Sniper is still robust against false
+positives. That is, Sniper’s anomaly detection effectively prevents
+unsampled objects from being falsely reported as a leak. More
+importantly, the path-biased sampling is intrusive and memory con-
+suming; thus it cannot be used in production environment. It does
+not make sense to spend much more memory to detect a memory
+leak in production environment.
+Page Protection Based Sampling: Novark et al. present Hound
+that removes the heavyweight instrumentation for the staleness
+updates using a page-level sampling [37]. The basic idea is to
+employ a memory protection mechanism of an OS kernel to detect
+the accesses of the objects. Hound periodically protects every page
+and updates the last access time of all objects on the same page to
+theprotection time. Once a page fault occurs, Hound catches the
+signal and unprotects it for a performance reason; here, Hound does
+not update the last access time of all objects on that page until it gets
+protected again. That is, actual staleness updates are always delayed
+to the protection time. The resulting staleness is underestimated,
+thus posing a risk of false negatives.
+Another cause of false negatives is that Hound works at the gran-
+ularity of a page; it is possible that a page contains both live and
+dead objects, and a single access to a live object can cause a reset to
+the staleness of dead objects in that page. To mitigate that, Hound
+changes the underlying memory allocator to perform an age-based
+segregation of the objects, which can end up degrading the perfor-
+mance of the memory allocator. Nevertheless, the page-level false
+sharing can still occur depending on memory allocation patterns.
+Sniper versus SWAT/Hound: There are key differences be-
+tween SWAT/Hound and Sniper. First, Sniper is fully automated
+whereas others are not. Second, Sniper does not perturb the originalapplication execution. In contrast, SWAT inserts instrumentation
+code but also changes the original control ﬂow for the path-biased
+sampling. Hound changes the original memory allocator, which
+is not acceptable in production runs due to the resulting alloca-
+tion/deallocation speed and heap size increase. Besides, some appli-
+cations are tightly coupled with the original memory allocator; thus
+they may simply fail to run with a new allocator.
+Third, Sniper does not require any recompilation, while SWAT re-
+lies on binary translation. Fourth, Sniper is more robust against false
+positives/negatives due to its application-tailored anomaly detection,
+and its sampling operates at a much ﬁner granularity compared
+to Hound’s page-level sampling. In particular, even if those ob-
+jects infrequently accessed are not sampled, i.e., their staleness is
+over-estimated, Sniper is not likely to falsely report them as mem-
+ory leaks with the help of its anomaly detection. On the contrary,
+SWAT/Hound are vulnerable to false positives/negatives due to their
+ad hoc , manual determination of the staleness threshold.
+Fifth, Sniper is detachable from an application for mission-critical
+situations. That way all the overheads due to Sniper can be dynami-
+cally managed to meet the QoS requirement of the application. On
+the contrary, the code transformed by SWAT permanently resides
+as a part of the application. Meanwhile, the internal and external
+fragmentation caused by Hound’s memory allocator continuously
+affects the application performance. Finally, Sniper has much lower
+time and space overheads compared to SWAT/Hound. Their over-
+heads particularly get worse for multithreaded applications; that is
+why they can deal with only sequential applications. In contrast,
+Sniper supports multithreaded applications with very low overhead.
+6. CONCLUSION
+Memory leak detection in production environment is a critical
+step toward the QoS enforcement and the reliability enhancement.
+This work presents Sniper, an automated memory leak detection tool
+for production use. Its runtime overhead is negligible (mostly <3%)
+and never increases the application’s heap size. Sniper is also appli-
+cable to multithreaded applications without hurting the scalability.
+Thus, Sniper can be practically used in production environment and
+observe real execution characteristics in production runs, thereby
+effectively detecting memory leaks which are inherently input- and
+environment-sensitive.
+To the best of our knowledge, Sniper is the ﬁrst to provide a
+systematic methodology for accurate leak identiﬁcation. Sniper au-
+tomatically determines the staleness threshold based on an anomaly
+detection. As a result, the leak identiﬁcation is tailored not just for
+each application but for each allocation site as well, thus Sniper
+achieved an F-measure of 81% on average for 17 benchmarks stress-
+tested with various memory leaks. We believe that our statistical
+methodology improves the accuracy of other leak detection ap-
+proaches that leverage different sampling techniques. In particular,
+Sniper is transparent unlike prior tools; it does not change applica-
+tion behaviors by modifying the executable or replacing the original
+memory allocator. The evaluation demonstrates that Sniper is highly
+accurate in detecting critical memory leaks in real-world software.
+7. ACKNOWLEDGMENTS
+The authors would like to thank Kaushik Ravichandran, Sangmi
+Lee, and Moonkyung Ryu who helped edit initial versions of this
+draft as well as the anonymous referees who provided excellent
+feedback to help shape this work. This work was supported by
+the National Science Foundation under grants CNS-1320752 and
+CCF-1018544.8348. REFERENCES
+[1] packet-o-matic. http://www.packet-o-matic.org/.
+[2]Squid: Optimising web delivery. http://www.squid-cache.org/.
+[3] Red hat enterprise linux 6. Technical report, Red Hat, 2012.
+[4] C. Bienia, S. Kumar, J. P. Singh, and K. Li. The PARSEC
+Benchmark Suite: Characterization and Architectural
+Implications. In Proc. of the 17th PACT , Oct. 2008.
+[5] H. J. Boehm. Space efﬁcient conservative garbage collection.
+SIGPLAN Not. , 39:490–501, April 2004.
+[6] M. Bond and K. McKinley. Tolerating memory leaks. In
+Proceedings of the 23rd ACM SIGPLAN OOPSLA . ACM,
+2008.
+[7]M. D. Bond and K. McKinley. Leak pruning. In Proceeding of
+the 14th ASPLOS , pages 277–288. ACM, 2009.
+[8] M. D. Bond and K. S. McKinley. Bell: bit-encoding online
+memory leak detection. In Proc. of the 12th ASPLOS , New
+York, USA, 2006.
+[9]D. Bruening and Q. Zhao. Practical memory checking with dr.
+memory. In Proc. of the 9th CGO , 2011.
+[10] D. Chen, N. Vachharajani, R. Hundt, X. Li, S. Eranian,
+W. Chen, and W. Zheng. Taming hardware event samples for
+precise and versatile feedback directed optimizations.
+Computers, IEEE Transactions on .
+[11] S. Cherem, L. Princehouse, and R. Rugina. Practical memory
+leak detection using guarded value-ﬂow analysis. In Proc. of
+28th PLDI’07 .
+[12] T. M. Chilimbi and M. Hauswirth. Low-overhead memory
+leak detection using adaptive statistical proﬁling. In Proc. of
+11th ASPLOS’04 .
+[13] J. Clause and A. Orso. Leakpoint: pinpointing the causes of
+memory leaks. In Proc. of the 32nd ICSE , New York, NY ,
+USA, 2010.
+[14] CVE Details. Common Vulnerabilities and Exposures (CVE),
+2013. http://www.cvedetails.com.
+[15] CWE Details. Common Weakness Enumeration (CWE), 2013.
+http://cwe.mitre.org/data/deﬁnitions/401.html.
+[16] J. Dean and S. Ghemawat. Mapreduce: simpliﬁed data
+processing on large clusters. In Proc. of 5th USENIX OSDI ,
+2004.
+[17] P. J. Drongowski. Instruction-based sampling: A new
+performance analysis technique for amd family 10h
+processors, 2007.
+[18] S. Eranian. Perfmon2: a Standard Performance Monitoring
+Interface .
+[19] R. Hastings and B. Joyce. Purify: Fast detection of memory
+leaks and access errors. In Proc. of the 1992 USENIX Winter
+Conference .
+[20] D. L. Heine and M. S. Lam. A practical ﬂow- and
+context-sensitive c/c++ memory leak detector. In Proc. of the
+23rd PLDI , 2003.
+[21] Intel Corporation. Intel RMicroarchitecture Codename
+Nehalem Performance Monitoring Unit Programming Guide ,
+2010.
+[22] Journal of Instruction Level Parallelism. 3rd workshop on
+computer architecture competitions: Memory scheduling
+championship, 2012.
+[23] C. Jung and N. Clark. Ddt: design and evaluation of a
+dynamic program analysis for optimizing data structure usage.
+InProceedings of the 42nd Annual IEEE/ACM International
+Symposium on Microarchitecture , MICRO 42nd, 2009.[24] C. Jung, S. Rus, B. P. Railing, N. Clark, and S. Pande. Brainy:
+effective selection of data structures. In Proceedings of the
+32nd ACM SIGPLAN conference on Programming language
+design and implementation , PLDI ’11, pages 86–97, New
+York, NY , USA, 2011. ACM.
+[25] C. Jung, D.-K. Woo, K. Kim, and S.-S. Lim. Performance
+characterization of prelinking and preloading for embedded
+systems. In Proc. of the 7th ACM & IEEE EMSOFT , New
+York, NY , USA, 2007.
+[26] Y . Jung and K. Yi. Practical memory leak detector based on
+parameterized procedural summaries. In Proc. of the 7th
+ISMM , 2008.
+[27] S. Lee, C. Jung, and S. Pande. Detecting memory leaks
+through introspective dynamic behavior modelling using
+machine learning. In Proceedings of the 36th International
+Conference on Software Engineering , 2014.
+[28] J. Mars, L. Tang, R. Hundt, K. Skadron, and M. L. Soffa.
+Bubble-up: Increasing utilization in modern warehouse scale
+computers via sensible co-locations. In MICRO ’11:
+Proceedings of The 44th Annual IEEE/ACM International
+Symposium on Microarchitecture , New York, NY , USA, 2011.
+ACM.
+[29] E. K. Maxwell, G. Back, and N. Ramakrishnan. Diagnosing
+memory leaks using graph mining on heap dumps. In
+Proceedings of the 16th ACM SIGKDD International
+Conference on Knowledge Discovery and Data Mining , KDD
+’10, pages 115–124, 2010.
+[30] B. Meredith. Omega: An instant leak detector tool for
+Valgrind, 2008.
+http://www.brainmurders.eclipse.co.uk/omega.html.
+[31] Michael Procopio. Cloud computing does not require
+virtualization, 2011. http://www.enterprisecioforum.com.
+[32] Microsoft SharePoint Foundation. Hyper-V Performance
+Tests, 2010.
+http://technet.microsoft.com/en-us/library/gg454734.aspx.
+[33] Mozilla.org. Mozilla Bugzilla, 2014.
+https://bugzilla.mozilla.org.
+[34] N. Nagappan, E. M. Maximilien, T. Bhat, and L. Williams.
+Realizing quality improvement through test driven
+development: results and experiences of four industrial teams.
+Empirical Softw. Eng. , 2008.
+[35] N. Nethercote and J. Seward. Valgrind: A framework for
+heavyweight dynamic binary instrumentation. In Proc. of the
+28th PLDI , 2007.
+[36] R. Nikolaev and G. Back. Perfctr-xen: a framework for
+performance counter virtualization. In Proc. of the 7th ACM
+SIGPLAN/SIGOPS international conference on Virtual
+execution environments , VEE ’11, 2011.
+[37] G. Novark, E. D. Berger, and B. G. Zorn. Efﬁciently and
+precisely locating memory leaks and bloat. In Proc. of the
+30th PLDI , 2009.
+[38] M. Ovsiannikov, S. Rus, D. Reeves, P. Sutter, S. Rao, and
+J. Kelly. A the quantcast ﬁle system. PVLDB ,
+6(11):1092–1101, 2013.
+[39] F. Qin, S. Lu, and Y . Zhou. Safemem: Exploiting ecc-memory
+for detecting memory leaks and memory corruption during
+production runs. In Proc. of the 11th HPCA , 2005.
+[40] S. Eranian. Perfmon2: a ﬂexible performance monitoring
+interface for linux. In In Ottawa Linux Symposium (OLS) ,
+2006.835[41] K. Shvachko, H. Kuang, S. Radia, and R. Chansler. The
+hadoop distributed ﬁle system. In Proceedings of the 2010
+IEEE 26th Symposium on Mass Storage Systems and
+Technologies (MSST) , MSST ’10, pages 1–10, 2010.
+[42] J. Sundararaman and G. Back. Hdpv: Interactive, faithful,
+in-vivo runtime state visualization for c/c++ and java. In
+Proceedings of the 4th ACM Symposium on Software
+Visualization , SoftVis ’08, pages 47–56, 2008.
+[43] J. Whittaker. How to Break Software Security . Addision
+Wesley.
+[44] R. Wilcox. Introduction to Robust Estimation and Hypothesis
+Testing . Elsevier Science & Technology, 2012.
+[45] Y . Xie and A. Aiken. Context- and path-sensitive memory
+leak detection. In Proc. of FSE . ACM Press, 2005.
+[46] G. Xu, M. D. Bond, F. Qin, and A. Rountev. Leakchaser:
+helping programmers narrow down causes of memory leaks.
+InProc. of the 32nd PLDI , 2011.[47] G. Xu and A. Rountev. Precise memory leak detection for java
+software using container proﬁling. In Proc. of ICSE , 2008.
+[48] G. Xu and A. Rountev. Precise memory leak detection for java
+software using container proﬁling. ACM Trans. Softw. Eng.
+Methodol. , 22(3):17:1–17:28, July 2013.
+[49] D. Yan, G. Xu, S. Yang, and A. Rountev. LeakChecker:
+Practical static memory leak detection for managed languages.
+InInternational Symposium on Code Generation and
+Optimization , 2014.
+[50] J. Yang, P. Twohey, and D. Engler. Using model checking to
+ﬁnd serious ﬁle system errors. In In Proc. OSDI 2004 , pages
+273–288, 2004.
+[51] J. Yang, P. Twohey, D. Engler, and M. Musuvathi. Using
+model checking to ﬁnd serious ﬁle system errors. ACM Trans.
+Comput. Syst. , 24(4):393–423, Nov. 2006.836

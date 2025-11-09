@@ -1,0 +1,953 @@
+Understanding and Overcoming Parallelism
+Bottlenecks in ForkJoin Applications
+Gustavo Pinto1Anthony Canino2Fernando Castor3Guoqing Xu4Y u David Liu2
+UFPA, Brazil1SUNY Binghamton, USA2UFPE, Brazil3UC Irvine, USA4
+Abstract —F ORK JOIN framework is a widely used parallel
+programming framework upon which both core concurrency
+libraries and real-world applications are built. Beneath its simple
+and user-friendly APIs, F ORK JOIN is a sophisticated managed
+parallel runtime unfamiliar to many application programmers:
+the framework core is a work-stealing scheduler, handles ﬁne-
+grained tasks, and sustains the pressure from automatic memory
+management. F ORK JOIN poses a unique gap in the compute stack
+between high-level software engineering and low-level system
+optimization. Understanding and bridging this gap is crucial for
+the future of parallelism support in JVM-supported applications.
+This paper describes a comprehensive study on parallelism
+bottlenecks in F ORK JOIN applications, with a unique focus
+on how they interact with underlying system-level features,such as work stealing and memory management. We identify 6bottlenecks, and found that refactoring them can signiﬁcantly
+improve performance and energy efﬁciency. Our ﬁeld study
+includes an in-depth analysis of A
+KKA — a real-world actor
+framework — and 30 additional open-source F ORK JOIN projects.
+We sent our patches to the developers of 15 projects, and 7 outof the 9 projects that replied to our patches have accepted them.
+I. I NTRODUCTION
+Modern Java applications predominately run on parallel ar-
+chitectures, whose performance and energy efﬁciency critically
+depend on efﬁcient thread management. F ORK JOIN [1] is an
+inﬂuential parallel framework at the core of Java concurrency
+design. It not only provides thread management to numer-ous real-world applications, but also serves as the bedrockfor higher-level Java concurrent libraries [2]. The impact of
+F
+ORK JOIN also goes beyond Java applications per se,a s
+several new programming languages [3], [4], [5] continueto operate on Java Virtual Machines (JVMs) and rely on
+F
+ORK JOIN for thread management. F ORK JOIN is known for
+its intuitive programming interface, particularly suitable forprogramming task-parallel and data-parallel jobs that have adivide-and-conquer nature.
+F
+ORK JOIN employs a work-stealing runtime [1]. While
+work stealing provides many beneﬁts in resource utilization
+and scalability, efﬁcient stealing dictates careful coordinationacross the layers of applications, runtime systems, and theOS. System-level performance and energy optimizations forC-based work-stealing programs are not new [6], [7], [8],[9], but combining work stealing with a Java-like managedruntime and, more importantly, reorienting it to applicationprogramming comes with a distinct set of unique challenges:
+•Thread Management : work stealing by nature is “de-
+centralized coordination,” where threads coordinate onsystem utilization but thread management decisions aremade by individual threads. This is in contrast withexisting approaches either lacking coordination (e.g. ,J a v a
+Thread objects) or requiring centralized management
+(e.g. , thread pooling).
+•Synchronization Management : work stealing presents
+unique features in managing synchronization and thread
+states. Unfortunately, they conﬂict with traditional ap-proaches such as locks (e.g. , synchronized methods)
+and explicit thread state management (e.g. , sleep) [10],
+leading to erratic performance surprising to applicationprogrammers. This problem is exacerbated by the largelegacy code base of Java applications and libraries.
+•Data Management : the Java runtime primarily allocates
+objects in the heap, and deallocation is managed by
+garbage collection. This is in sharp contrast with C-basedwork-stealing frameworks [11], where data are routinelyrepresented as arrays of primitive data types. As a result,the allocation and distribution of data among workerthreads plays a pivotal role in application performance.
+Do these challenges introduce bottlenecks in modern paral-
+lel applications running on F
+ORK JOIN? How severe are these
+bottlenecks in terms of performance and energy efﬁciency? Is
+there generalizable wisdom that can be shared with F ORK JOIN
+programmers to avoid the bottlenecks?
+This Paper We present the ﬁrst empirical study to bridge the
+gap between modern software engineering and work-stealing
+systems in the context of F ORK JOIN. It aims at providing
+a better understanding—as well as raising the awareness—ofthe subtleties and common performance pitfalls in F
+ORK JOIN
+programming through a comprehensive study of character-istics and behaviors of real-world F
+ORK JOIN applications.
+We identify potential bottlenecks against parallelism in theseapplications, illustrate their impact on system performanceand energy, and demonstrate how such bottlenecks can beovercome through refactoring.
+Our study follows a unique cross-layer approach: it is
+application-driven and system-aware. On the one hand, we
+are more interested in how real-world applications built on
+F
+ORK JOIN behave—and how their performance can be im-
+proved through application-level programming—rather thanan “under-the-hood” system-level optimization. On the otherhand, we are aimed at ﬁnding the root causes of the bottleneckson the systems stack, such as how each bottleneck maypotentially hamper the desired behavior of the work stealingscheduler, garbage collector, and underlying hardware. Thiscross-layer approach advances software engineering by provid-
+978-1-5386-2684-9/17/$31.00 c/circlecopyrt2017 IEEEASE 2017, Urbana-Champaign, IL, USA
+T echnical Research765
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. TABLE I
+PLACING FORK JOIN IN CONTEXT .
+work stealing ﬁne-grained dynamic garbage unstructured programmable
+parallelism allocation collection synchronization thread states
+Fortran no no no no yes uncommon
+Pthread no no uncommon no prevalent prevalent
+OpenMP no no uncommon no uncommon uncommon
+MPI yes yes uncommon no uncommon uncommon
+Cilk yes yes uncommon no uncommon uncommon
+Java threads no no prevalent yes prevalent prevalent
+X10 yes yes prevalent yes uncommon uncommon
+Haskell yes yes prevalent yes uncommon uncommon
+FORK JOIN yes yes prevalent yes prevalent prevalent
+ing guidelines for performance improvement and illuminating
+why programming patterns and performance are intimately
+linked. The approach also advances system research by ﬁllinga void of assessing work stealing through an empirical andapplication-oriented route, taking advantage of the fact that
+F
+ORK JOIN is the ﬁrst work stealing framework with a large
+application developer base.
+We take a two-pronged approach for our empirical study.
+First, we conduct a depth-oriented study on A KKA [12], a
+sophisticated middleware F ORK JOIN-based framework. We
+identify a bottleneck at the junction of A KKA ’s messaging
+engine and F ORK JOIN, and demonstrate an average speedup
+of 3.1× and up to a 13.1× , and an average energy savings of
+31.6% up to 80.2% through an in-depth refactoring of A KKA ’s
+core messaging engine. Second, we conduct a breadth-oriented
+study through investigating 30 real-world F ORK JOIN projects
+from GitHub, with a total of 791K LOC. We summarize
+our ﬁndings as a taxonomy of 6 bottlenecks and present across-layer analysis on the root causes of these bottlenecks.By removing these bottlenecks, the optimized applicationscan produce an average of 26% of performance improvementand 23% of energy savings. Our optimization patches wereconﬁrmed by the majority of application developers we com-municated with.
+This paper makes the following contributions:
+•We present a comprehensive application-driven system-
+aware empirical study on performance and energy efﬁ-ciency of F
+ORK JOIN applications.
+•We identify 6 bottlenecks latent in F ORK JOIN applica-
+tions, analyze their root causes, and provide programming
+patterns for mitigating them.
+•We develop FJD ETECTOR , a bottleneck detection and
+refactoring tool that can perform interactive source-code-level optimizations of some F
+ORK JOIN applications.
+The source code of the tool we have developed, as well as
+all raw data, can be found online.1
+II. B ACKGROUND
+We now provide a brief background on the work stealing
+algorithm, its implementation in F ORK JOIN, and applications
+built on F ORK JOIN.
+1https://github.com/gustavopinto/fjdetectorWork Stealing Work stealing was popularized by the Cilk
+language [11], a C-like language designed for parallel pro-
+gramming. In the work-stealing runtime, each CPU core ismanaged by a worker, which is often directly mapped to an
+OS thread. The computational unit executed by each workeris called a task, during whose execution may fork additional
+tasks. These tasks are placed on a decentralized per-worker
+queue. When a worker completes a task, it picks up one more
+from its queue. When the queue is empty, the worker steals a
+task from the queue of another worker. In this case we call the
+stealing worker a thief while the worker whose item was stolen
+is called a victim. Ultimately, workers are joined to compute
+a result.
+Observe that the logical parallel processing unit, a task,
+is different from the physical parallel unit, a worker. In
+practice, the number of workers (physical threads) is staticallydetermined—often the same as the number of CPU cores—whereas the number of tasks (logical processing unit) farexceeds the number of workers. Work stealing, therefore, isan instance of ﬁne-grained parallelism.
+The F
+ORK JOIN Framework FORK JOIN is Java’s parallel
+programming framework with a unique set of features. Table Iplaces F
+ORK JOIN in the context of commonly used frame-
+works and languages.
+At its core, F ORK JOIN is a concrete implementation of
+work stealing. The ForkJoinPool class is the entry point
+of the F ORK JOIN framework, where the programmer can
+specify the number of workers. Tasks are modeled as sub-classes of the ForkJoinTask class: RecursiveTask and
+RecursiveAction. The two differ in that only the former
+can return the result of a computation. Upon execution, aForkJoinTask instance may in turn fork additional tasks—
+called child tasks—via the fork method. Invoking the join
+method introduces synchronization between the enclosing taskand its children. The framework also provides additional util-ity methods. For example, method invokeAll is syntactic
+sugar for a fork immediately followed by a join. Method
+isDone inspects whether a task has completed.
+F
+ORK JOIN Applications As F ORK JOIN runs on the JVM,
+its inﬂuence extends beyond applications written in Java.A growing number of object-oriented languages—such asScala—are translated to Java (bytecode) and operate on the
+766
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. JVM. Such programming languages also take advantage of
+FORK JOIN for thread management. As our main interest is
+ondynamic behavior of F ORK JOIN—performance and energy
+efﬁciency in particular—we view applications written in these
+languages also as F ORK JOIN applications.
+One example is A KKA , an actor framework written in Scala
+but built on Java’s F ORK JOIN. Scala’s programming interface
+for F ORK JOIN is identical to the interface described above,
+with the exception of language-speciﬁc grammatical differ-
+ences. Conceptually, actors are a message-passing frameworkwhere each actor serves as a logical processing unit thatcommunicates with each other. No two actors share memory,leading to beneﬁts such as race condition freedom by design.
+A
+KKA has been deployed by companies such as Groupon,
+eBay, and Amazon.
+III. M ETHODOLOGY
+Benchmarks Table II shows the applications within the scope
+of this study. The ﬁrst row provides the information for A KKA .
+We selected this application because: (1) A KKA is among
+the largest open-source projects built on top of F ORK JOIN;
+(2) A KKA has been extensively deployed in the real world;
+(3) A KKA is a middleware framework rather than an “end-
+user” application. Its performance improvement may lead tosigniﬁcant impact on a large number of end-user applications.
+For the breadth-oriented study we searched Github for the
+key word “ForkJoin” and selected a set of 30 open-sourceprojects, covering a wide range of application domains fromsupervisor management to raytracing. Our selection criteriaare: (1) they should not be tutorials; (2) they should be recent,but not currently under rapid changes. For example, we didnot select any projects whose ﬁrst commit and last commit areboth within 6 months; (3) they must be able to compile andrun. For each project, we investigate its source code lookingfor possible bottlenecks. If the project has tests, we executedthe tests that perform F
+ORK JOIN computations; otherwise, we
+wrote the tests. We discarded projects where we were unableto ﬁnd any bottleneck.
+Experiments We ran each selected application in a machine
+with a 2× 8-core (32-core when hyper-threading is enabled) In-
+tel(R) Xeon(R) E5-2670 CPU (2.60GHz) and 64GB of DDR3
+1600 memory, running Debian 6 (kernel 3.0.0-1-amd64) andOracle HotSpot 64-Bit Server VM (build 25.5-b02, mixedmode, JDK version 1.8.0
+05-b13). The machine has three
+cache levels (L1, L2 and L3), whose sizes are 64KB percore (128KB total), 256KB per core (512KB total), and 3MB(smart cache), respectively. All experiments were performedin the OS-exclusive mode without any other loads runningsimultaneously.
+The default settings of both the OS and the JVM were
+used. In particular, (1) the power management of Linux is thedefault ondemand governor, which dynamically adjusts CPU
+core frequencies based on system workloads. (2) For the JVM,the parallel garbage collector is used and just-in-time (JIT)compilation is enabled. The initial heap size and maximumheap size were set to be 1GB and 16GB respectively. Hyper-threading is enabled and the Turbo Boost feature is disabled.TABLE II
+ASAMPLE OF PROJECTS USED IN THIS STUDY .LOCS ENCOMPASS ONLY
+NON -BLANK AND NON -COMMENTED LINES OF CODE COMPUTED USING
+THE CLOC PROGRAM .
+Projects # LoC # Commits # Bottlenecks
+Akka 326,341 20,759 1
+itemupdown 4,925 2 2
+jAcer 4,476 35 2
+educational 1,323 7 2
+scalatuts 253 5 2
+knn 3,099 27 2
+doms-transformers 3,714 254 2
+ForkAndJoinUtility 127 12 2
+Solitaire 1,527 39 2
+mywiki 1,920 17 2
+MagicSquares 664 153 2
+ejisto 12,330 274 2, 3
+exhibitor 15,314 701 2, 3, 4
+cq4j 5,815 23 2, 3
+netflixoss 231,361 1 2, 3
+javaOneBR-2012 518 4 2, 3
+jadira 46,095 630 3
+ecco 5,849 119 3
+conflate 934 9 3
+bazzar-base 7,766 15 3, 4
+DocumentIndexing 1,127 1 4
+CSSTProto 10,721 17 4
+Fibonacci 79 2 5
+Mandelbrot 1,442 30 5
+Solitaire 1,527 39 5
+Matrices 2,356 15 5
+LockedBasedGrid 1,390 1 5
+Basic-Blocks 4,821 41 5
+warp 15,287 338 6
+j7cc 5,110 76 6
+lowlatency 3,018 18 6
+For all applications other than A KKA , we ran each bench-
+mark 10 times; this is implemented by a top-level 10-iterationloop over each benchmark. The reported data is the averageof the last 3 runs to warm up the JIT optimizations [13]. Forour A
+KKA study, we ran each benchmark 27 times, discarding
+the ﬁrst 7 runs. Message passing frameworks such as actors
+are known to have a higher degree of nondeterminism. Weobserved higher variation in our experiments and choose torepresent results with a larger sample of data.
+Energy consumption was measured using jRAPL [14], a
+framework that contains a set of APIs for proﬁling Java pro-
+grams running on CPUs with Running Average Power Limit(RAPL) [15] support. Our energy consumption data includeCPU core, CPU uncore, and DRAM energy consumption.
+IV . A S
+TUDY ON AKKA
+In this section we conduct a depth-oriented study on poten-
+tial parallelism bottlenecks latent in F ORK JOIN applications,
+with a focus on A KKA .
+An Overview of AKKA (Messaging) Core AKKA ’s internal
+messaging structure is detailed in Listing 1. Messages are en-capsulated by an Envelope that bundles an abstract message
+with its sending actor. Messages are sent between actors byforwarding the message to the Dispatcher. Messages sent
+to an actor are queued up in the actor’s Mailbox, which is an
+instance of a ForkJoinTask. Once scheduled, a Mailbox
+task will process allmessages held in its queue, one at a time
+767
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. case class Envelope(message: Any, sender: Actor)
+class Mailbox(queue: Queue[Envelope])
+extends ForkJoinTask {
+var receiver: Actor = _
+def setActor(a: Actor) = receiver = a
+def hasMessages: Boolean = { ... }
+def isScheduled: Boolean = { ... }
+def setScheduled() = { ... }
+def setNotScheduled() = { ... }
+def run: Boolean = { processMailbox() }
+def processMailbox(): Unit = {
+val next = queue.next()
+if(next != null){
+receiver.invoke(next)
+processMailbox()
+}
+setNotScheduled()
+}}
+class Dispatcher {
+val pool: ExecutorService
+def dispatch(receiver: Actor, msg: Envelope) = {
+val mbox = receiver.mbox
+mbox.enqueue(msg)
+if(!mbox.isScheduled) {
+mbox.setScheduled()
+pool.execute(mbox)
+}
+}}
+class Actor(mbox: Mailbox, dispatcher: Dispatcher) {
+def sendMessage(msg: Envelope): Unit = {
+// ...
+dispatcher.dispatch(this, msg)
+}}
+Listing 1. The Core A KKA Messaging Logic (Classes Mailbox,
+Dispatcher, and Actor have additional unrelated methods not
+shown)
+in the same order that the messages were received. A message
+is processed when the message handler deﬁned in the actor hasbeen executed. Note that a Mailbox, once scheduled, may
+represent a long-running task. Furthermore, a Mailbox han-
+dles synchronization via status bits and compare-and-swap, ab-
+stractly represented with isScheduled, setScheduled,
+andsetNotScheduled. Overall, an A
+KKA runtime may
+consist of a large number of actors, and F ORK JOIN provides
+ﬁne-grained parallelism for message processing of different
+actors, as illustrated by the Mailbox class.
+Bottleneck: Centralized Pooling FORK JOIN as a work-
+stealing runtime in essence features decentralized thread man-
+agement: decisions on task creation, execution, and migra-tion are managed by individual worker threads and there isno centralized control. For backward compatibility purposes,
+F
+ORK JOIN in addition supports centralized pooling : main-
+taining a centralized task pool where all newly created tasks
+should be submitted, and from which all F ORK JOIN workers
+steal2. Centralized pooling, however, goes against the spirit of
+work stealing, which may lead to performance penalties.
+AKKA handles Mailbox tasks through centralized pooling.
+This can be seen in the dispatch method in Listing 1, where
+the mailbox is submitted through execute to the centralized
+pool. Indeed, the Mailbox abstraction is a natural design
+choice considering A KKA needs to maintain the semantic
+guarantee that messages are processed one at a time in the
+2For backward compatibility reasons, the conceptually centralized pool is
+implemented as the union of all F ORK JOIN worker thread queues.class Envelope(message: Any, sender: Actor)
+extends ForkJoinTask {
+var receiver: Actor = _
+def setActor(a: Actor) = receiver = a
+def run(): Unit = {
+receiver.invoke(message)
+receiver.mbox.setNotRunning()
+}
+}
+class Mailbox(queue: Queue[Envelope])
+extends ForkJoinTask {
+var receiver: Actor = _
+def setActor(a: Actor) = receiver = a
+/*hasMessages, isScheduled, setScheduled,
+setNotScheduled same as Listing 1 */
+def isRunning: Boolean = { ... }
+def setRunning() = { ... }
+def setNotRunning() = { ... }
+def run: Boolean = {
+if(!isRunning) { processMailbox() }
+else { run() }
+}
+/*processMailbox same as Listing 1 */
+}
+class Dispatcher { /*Same as Listing 1 */}
+class Actor(mbox: Mailbox, dispatcher: Dispatcher) {
+def sendMessage(msg: Envelope): Unit = {
+msg.setActor(this)
+if(!mbox.hasMessages && mbox.notRunning) {
+mbox.setRunning()
+msg.fork()
+}else {
+dispatcher.dispatch(this, msg)
+}
+}}
+Listing 2. Refactored A KKA Messaging Logic
+well-preserved order. The sacriﬁce to be made is that a task
+cannot be forked for every message sent, de facto foregoing
+the decentralized nature of F ORK JOIN design. This may lead
+to performance penalties, especially when an actor does not
+continuously receive a backlog of messages, i.e, incoming
+messages do not need to be queued.
+Centralized pooling is unfriendly to ForkJoin for several
+reasons. First, there is greater synchronization overhead associ-
+ated with scanning the centralized pool. Second, the processingof individual tasks must go through centralized scheduling,often delayed compared with the decentralized design.
+Overcoming the Bottleneck We illustrate a modiﬁed version
+of A
+KKA that takes advantage of fork in Listing 2. Our intu-
+ition is that when the Mailbox is empty we can immediately
+fork the message handling as a task at message-send time.
+We transformed the Envelope class into a ForkJoinTask,
+which upon run, will invoke the handler of the message
+receiver. To determine whether the mailbox is empty we
+introduce a ﬂag isRunning which will be atomically ac-
+cessed. When the Mailbox is not empty the program defaults
+to A KKA ’s one-at-a-time message processing. Algorithmically,
+this refactoring may improve performance of A KKA programs
+because it removes the handling of the ﬁrst actor message from
+the critical path of actor message handling. The synchroniza-tion introduced by isRunning is per mailbox, decentralized
+in nature.
+In our implementation we further enable a light-weight
+tracking on how often Mailbox is empty when a message
+768
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. TABLE III
+DETAILED PERFORMANCE STA TISTICS :A KKA WITH 32 F ORK JOIN WORKER THREADS
+Runtime (ms) Energy (J)
+benchmark original σ custom σ speedup original σ custom σ savings
+max-throughput 2057.6 621.41 1978.5 394.13 1.04x 397.93 119.98 388.15 81.89 2.46%
+single-ping 11716.6 739.74 8694.45 1568.18 1.35x 1921.59 289.79 1737.14 277.48 9.6%
+ping-throughput 2507.4 107.89 701.3 69.13 3.58x 526.67 24.19 195.67 15.19 62.85%
+single-producer 4078.7 1331.51 5257.45 2651.6 0.78x 512.38 157.05 580.63 249.51 -13.32%
+multi-producer 7236.95 993.1 7907.25 1557.71 0.92x 732.65 174.19 846.34 283.68 -15.52%
+middle-man 3827.4 151.74 1752.9 185.51 2.18x 807.48 31.31 437.72 38.06 45.79%
+mediator 4505.05 376.8 679.7 70.38 6.63x 912.59 78.22 194.78 14.65 78.66%
+1248
+4 8 16 32
+ForkJoin Worker ThreadsSpeedup (x)
+-20020406080
+4 8 16 32
+ForkJoin Worker ThreadsEnergy Saved (%)
+Micromax-throughput
+single-pingping-throughputsingle-producermulti-producermiddle-manmediator
+Fig. 1. Speedup (Y -Axis in Logarithmic Scale) and Energy Saving of
+Refactored A KKA Implementation
+is sent to it. The A KKA runtime adaptively switches to the
+default when the likelihood is small.
+TABLE IV
+AKKA BENCHMARK CONFIGURA TIONS
+actors messages per actor
+max-throughput 8+8 1,500,000
+single-ping 2 300,000,000
+ping-throughput 20,000 1000
+single-producer 1 600,000,000
+multi-producer 1+8 600,000,000
+middle-man 30,000 2000
+mediator 30,000 1000
+Performance Impact We have modiﬁed A KKA 2.5 — com-
+piled and run with Scala 2.11 — to incorporate these changes.We have evaluated these changes within A KKA with 7 micro
+benchmarks provided by the actors benchmarking suite,
+with minor changes to include our performance measure-
+ments [16]. ping-throughput creates several pairs of
+actors that ping messages. single-ping is an instance of
+this general pattern where only one pair of actors with a largenumber of messages are created. Additionally, we created twovariations of ping-throughput: middle-man, where
+two pinging actors compete to send messages to a third,
+“middle man” actor; and mediator, where a ping messages
+must ﬁrst pass through a third actor. single-producer
+taxes a single actor by sending a large number of messages
+without waiting. multi-producer spawns 8 application
+threads that all send messages without waiting to a singleactor. max-throughput spawns 8 application threads that
+each send messages without waiting to their own actor. Thenumber of actors and messages per actor for each benchmarkare detailed in Table IV.
+As shown in Figure 1, eliminating the centralized pooling
+bottleneck results in a remarkable improvement in perfor-
+mance and energy efﬁciency. We observe an average of 3.1×speedup and 31.6% energy savings in a wide spectrum of set-tings. Among them, ping-throughput, single-ping,
+andmediator, reacted to our refactoring with overwhelm-
+ingly positive results. These three benchmarks capture the
+scenario when an actor or some actors are able to processmessages without them queueing up, and represent the casewhere our experiments conﬁrm that fork leads to per-
+formance beneﬁts. For ping-throughput, the observed
+speedup ranges from 3.6× to 13.1× , and the energy savings
+range from 62.9% to 79.4%. In contrast, max-throughput,
+single-producer, and multi-producer, capture the
+scenario where an actor will receive messages faster than it canprocess them, and represent the case where our experimentsindeed show a mild slowdown. We will discuss these detailsshortly. The most intriguing case is perhaps middle-man,a
+hybrid case where some running actors are observed to have
+a backup of messages. Encouragingly, middle-man has a
+stable 1.93× to 2.31× speedup and 43.4% to 52.2% energy
+savings.
+A
+KKA as a middleware framework may be subjected to
+diverse workloads. Refactoring at the level of the core service
+of A KKA cannot — nor should it be expected to — beneﬁt all
+workloads. In our experiments we ﬁnd our new implementa-tion of A
+KKA is effective in the presence of heavy workloads
+769
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. in terms of the number of actors, the number of messages, and
+the number of workers. The workload it does not handle wellis the case when the throughput rate of an actor’s messagehandler is far below the rate of its message reception. Ourcurrent sampling algorithm partially addresses this issue, buta more reﬁned workload characterization is likely needed foran industrial-strength A
+KKA re-implementation. We highlight
+the 32-thread conﬁguration in Table III. Observe that in thecase that we do not perform well, the slowdown remains withinthe deviation.
+V. A T
+AXONOMY OF FORK JOIN PARALLELISM
+BOTTLENECKS
+Centralized pooling is an important bottleneck we have
+discovered for F ORK JOIN applications, but not the only one.
+In this section, we summarize additional bottlenecks we have
+found in our study. From now on, centralized pooling is alsocalled Bottleneck 1.
+Bottleneck 2: Copy on Fork For data-intensive applications, a
+performance-sensitive dimension of design is data distribution,i.e., how data are spread through parallel execution units. Individe-and-conquer frameworks — including F
+ORK JOIN —
+the general strategy is to represent the data as an indexiblestructure, e.g., a (potentially multidimensional) array, which
+in turn can be partitioned into slices and fed to individual
+parallel execution units.
+This simple process may pose challenges to a F
+ORKJOIN
+programmer. In particular, data in Java are often represented as
+objects, and arrays are dynamically allocated. The combinationeffect of aliasing and shared-memory programming impliesthat data distribution “by reference” at forking time mayintroduce race conditions.
+As a conservative approach, many F
+ORK JOIN programmers
+choose to copy data at the forking time. Observe the followingusage of the copyOfRange in Figure 2.
+import static Arrays. *;
+class Task extends RecursiveAction {
+public Task (User[] u) { ... }
+protected void compute() {
+if(u.length < N) { local(u); }
+else {
+int split = u.length / 2;
+User[] u1 = copyOfRange(u, 0, split);
+User[] u2 = copyOfRange(u, split, u.length);
+invokeAll(new Task(u1), new Task(u2));
+}}}
+Fig. 2. Example of copying data over sub-tasks
+Beyond the obvious consequences such as memory
+bloat [17], excessive copying turns out to be uniquely un-friendly to F
+ORK JOIN, for a number of reasons. (1) As a
+ﬁne-grained parallelism framework, most tasks are completedwithin milliseconds. Copying upon fork implies the dominat-ing growth of short-lived objects, creating a severe burdenfor garbage collection. (2) The cascaded division common in
+F
+ORK JOIN applications means that data are copied at every
+level of recursion, potentially leading to an O(log n) growth inmemory. In contrast, copying for ﬂat data partitioning can onlylead to a constant growth in memory. (3) Unlike copying with
+0 2 04 06 0
+ThreadsEnergy (J)MagicSquares
+1 2 4 8 16 32Copied
+Shared
+02468 1 0
+ThreadsTime (sec)MagicSquares
+1 2 4 8 16 32
+Fig. 4. A comparison on energy and performance with varying numbers of
+threads before and after copies are removed in MagicSquares.
+ﬂat data partitioning where all allocations are done once and
+for all, a strategy somewhat friendly for the memory allocatordue to batching, copying with cascaded data partitioning leadsto frequent yet intermittent allocation requests, hamperingperformance.
+Among the 30 programs we have studied, we found 18
+occurrences of this bottleneck, in 15 F
+ORK JOIN programs.
+Fixing the bottleneck requires simple modiﬁcation of the
+source code that shares the input data structure and letssubtasks work on distinct regions of the data structure. Fig-ure 3 shows the energy gains from ﬁxing this bottleneck.
+0 5 10 15 20
+Fig. 3. Energy savings (%)
+when removing the Copy on F ork
+bottleneck. From left to right,projects are itemupdown,
+jAcer, educational,
+scalatuts, knn, netflixoss,
+doms-transformers,ForkAndJoinUtility,exhibitor, Solitaire,
+javaOneBR-2012, mywiki,
+ejisto, cq4j, and
+MagicSquaresClearly, the energy
+consumption is reduced in allthe refactored programs. Theaverage reduction in energyconsumption is 12.63%. Theexecution time decreasesproportionally. Interestingly,9 out of the 15 analyzedprojects cross the 10% barrierof energy savings. However,5 of the analyzed projectshave energy savings of lessthan 5%. For the projectsabove 5%, the minimumenergy saving was 8.23%(foritemupdown), and the
+maximum was 23.51% (for
+MagicSquares). After inspecting these projects, we haveobserved that the amount of energy savings is related tothe width of forking. That is, the more the program createsredundant copies of the data structure, the more effective ourrefactoring is.
+Figure 4 shows the comparison results before and af-
+ter eliminating copies for MagiSquares, a computational
+benchmark for computing the magic square puzzle
+3. The data-
+parallel computation is based on the number of permutationsavailable, which represents all possible rows, columns, anddiagonals. Each parallel task attempts to construct a matrixwhose ﬁrst row is the permutation and whose ﬁrst columnis another permutation that begins with the same entry andcontains no other duplicate entries. The algorithm attemptsto ﬁnd sum permutations to ﬁll in the remaining rows andcolumns. When sharing the data structure, we saved theprogram from creating 128 additional data structures (withinteger data type), leading to a 23.51% energy saving, whenrunning with 32 threads.
+3http://mathworld.wolfram.com/MagicSquare.html
+770
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. Enabled by jRAPL, we also report our results on the
+hardware component-level for DRAM, CPU, and Uncore re-
+spectively. We observed that roughly the same amount of CPUenergy was consumed before and after removing the copies(i.e., 8.32 Joules and 6.67 Joules, respectively). However, thedifference is more obvious when the energy consumptions ofDRAM and Uncore are compared. Due to the excessive objectcreation, DRAM and Uncore of the original version consume1.39× and 1.43× more energy than the optimized version.
+Since Copy on F ork creates large volumes of small, shortly-
+lived data structure objects, it is interesting to understand how
+different GC algorithms may impact our results, we conductedexperiments over 5 GC options in Hotspot: (a) SerialGC:
+the stop-the-world serial collector, (b) ParallelGC: the par-
+allel collector, (c) ParallelOldGC: the parallel collector with
+data compression, (d) ConcMarkSweepGC: concurrent mark
+sweep collector, and (e) G1GC: the garbage-ﬁrst collector.
+Figure 5 shows the results for MagicSquare. For almost all
+algorithms, the ﬁx can speed up GC by 20%–40%.
+Copy
+ReferenceEnergy Consumption (J)
+0 2 04 06 08 0
+abcdeCopyReferenceTime (sec)
+02468 1 2
+abcde
+Fig. 5. A Comparison of GC costs (MagicSquares, 32 threads; GC
+algorithms are: a: SerialGC, b: ParallelGC, c: ParallelOldGC, d: Par-
+allelNewGC, e:G1GC).
+Bottleneck 3: Copy on Join The counterpart of Copy on F ork
+isCopy on Join: after having joined on its subtasks, a task must
+usually combine the results of the subtasks into a result for the
+larger problem. Consider the program in Figure 6, extractedfrom the cq4j benchmark.
+protected List<T> compute() {
+int size = dataSource.size();
+if(size < FORK_SIZE) {
+return computeDirectly();
+}else {
+List<T> result = new ArrayList<T>();
+int mid = size / 2;
+RecursiveFilteringTask<T> first = new
+RecursiveFilteringTask<T>(filter, dataSource.
+subList(0, mid));
+first.fork();
+RecursiveFilteringTask<T> second = new
+RecursiveFilteringTask<T>(filter, dataSource.
+subList(mid, size));
+second.fork();
+result.addAll(first.join());
+result.addAll(second.join());
+return result;
+}
+}
+Fig. 6. Example of joining data with sub-tasks.
+As one reader might observe, this particular code snip-
+pet suffer from the same bottleneck previously explained
+(creating sublists of the current data structure). However,this benchmark also presents a different bottleneck. At theend of the execution, an expensive operation addAll is
+invoked to copy merge collections. Copy on Join has many
+negative consequences similarly to Copy on F ork, with oneadditional unique drawback: since joining in a work stealing
+system is implemented by barriers, Copy on Join increases
+the wait time at barriers, particularly unfriendly for energy
+consumption. Note that this is an established fact [18], [19],
+[9], [13]: barrier wait at the low level is either implementedas spin locks or context switch, both of which can leadto energy waste without contributing to program progress.
+048 1 2
+Fig. 7. Energy savings (%)
+after removing the Copy on
+Join bottleneck. From left
+to right, projects are: cq4j,
+ejisto, javaOneBr-2012,
+exhibitor, conflate.We have found 5 occurrences of
+this bottleneck in the 30 pro-grams studied. A ﬁx of this bot-tleneck is similar to that of Copy
+on F ork : a shared data struc-
+ture can be passed into subtasks
+to carry results. After applyingthese changes in 5 programs, wehave achieved overall 3% – 13%energy savings. The results areshown in Figure 7.
+Bottleneck 4: Scattered Data We next investigate the impact
+of data locality on performance and energy consumption. An
+important pattern we found is that the execution of a taskfollows the sequence of ababababc , where aperforms memory
+copies for a subtask, bforks the subtask, and cdoes the
+computation of the current task. Figure 8 shows a code snippet
+of this case, extracted from benchmark CSSTProto.
+protected R compute() {
+if(len == 1) {
+RecursiveTask<R> task = createTask(from);
+return task.invoke();
+}else {
+ForkJoinTask<R>[] tasks = new ForkJoinTask[len];
+for (int i = 0; i < len; i++) {
+ForkJoinTask<R> task = createTask(from+i);
+task.fork();
+tasks[i] = task;
+}
+R result = tasks[0].join();
+tasks[0] = null;
+for (int i = 1; i < len; i++) {
+R next = tasks[i].join();
+tasks[i] = null;
+result = merge(result, next);
+}return result; }
+Fig. 8. Example of scattered data.
+This pattern has impact on energy consumption and perfor-
+mance for several reasons. First, the copy operation has thepotential of polluting caches, increasing the chance of memoryround-trips. Second, the number of context switches might alsoincrease, due to the sparse task creations. A possible solutionto this problem is to create a list of tasks and, during the for
+loop, add each new task object to the list. After the execution
+of the for loop, one might call the invokeAll method,
+which is responsible for forking and joining all tasks in the list.With this ﬁx, we have observed an energy saving of 9.82% forCSSTProto. Regarding cache behavior, we observed that theoriginal implementation had a 34.24% cache misses, whereasthe ﬁx reduced it to 31.98%. We also observed a reductionon context switches, from 24,550 to 23,193. Yet, the numberof branch misses is also reduced: from 1.82% of all branches
+771
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. to 1.14%4, which we believe is due to the boilerplate code
+used our initial example; invokeAll eliminates the ﬁrst for
+loop, then reducing the overall number of branches and, as a
+consequence, the number of branch misses.
+Bottleneck 5: Exacting Intra-Task Synchronization As locks
+play a central role in Java shared-memory programming and
+metadata representation, unstructured synchronization ( i.e.,
+object locks) is pervasive in Java applications. Synchroniza-
+tion occurs via invoking synchronized methods or code
+blocks, or using popular concurrent library classes such asCountDownLatch. Improving performance and energy efﬁ-ciency for systems where unstructured synchronization is theonly mechanism to achieve concurrency safety — such asPthreads or the Java Thread library— is a well understood
+topic.
+Mixing unstructured synchronization in a structured parallel
+system such as work stealing leads to additional subtle inter-
+actions between the application runtime and the OS. Whenunstructured synchronization happens in the middle of the
+task execution, it effectively stalls stealing from that worker.Unfortunately, the stalled worker cannot forgo the current taskand select another task from its deque — even if there aremany other task items in it — because tasks on the deque ina work stealing system carry inherent logical dependencies,analogous to stack frames. At best, the worker itself can becontext-switched by the OS. Observe however, even thoughthere may be thousands of tasks in the work-stealing runtime,
+the number of workers — the JVM representation of OS
+threads — is few, typically smaller than the number of CPUcores. In other words, OS-level context switch may at best helpother applications in a time-sharing environment, but will not
+contribute to improving the performance or energy efﬁciency
+of the application itself.
+The most principled solution to avoid the bottleneck is to
+eradicate unstructured synchronization from Java. There is
+encouraging progress in recent Java development to supportasynchronous abstractions, such as futures [20]. However,it may take time before Java practitioners fully embracethese features [10]. In this study, we investigate into legacyprograms, attempting to understand how unstructured syn-chronization is used in the real world. Overall, we found 7occurrences of this bottleneck. Surprisingly, we found in asigniﬁcant number of projects, an easier solution exists: manysynchronizations are simply to implement exact computations,
+which can be safely relaxed [21] without creating any impact
+on correctness [22].
+We illustrate this bottleneck with benchmark
+Mandelbrot. A mandelbrot is a mathematical set ofpoints whose boundary is a distinctive two-dimensionalfractal shape. Each parallel task works on a set of points, andthesynchronized block is then used when a task needs to
+render the fractal image. This is done by calling the setRGB
+method, available on the BufferedImage class, as showed
+in Figure 9-(a).
+4We used the perf linux tool to calculate cache misses, context switches,
+and branch misses.if(!isBenchmarking && mb.isLiveRendering) {
+synchronized (mb.lock) {
+mb.renderImage.setRGB(j, i, color.getRGB());
+}
+mb.repaint();
+}
+(a)0 100 300 500
+ThreadsEnergy (J)Mandelbrot
+1 2 4 8 16 32Synchronized
+Unsynchronized
+0 1 02 03 04 0
+ThreadsTime (sec)Mandelbrot
+1 2 4 8 16 32
+(b)
+Fig. 9. Example of an hidden over-synchronization (a) and a compari-
+son of energy and performance, with and without synchronization (b), on
+Mandelbrot
+Figure 9-(b) shows the results for this benchmark, In this
+benchmark, a task has a range of values of which it should
+work on. For our input data (width: 1000, height: 10000), thebenchmark creates a total of 2,048 tasks. As we can see, thereis a great difference between the synchronized version and theunsynchronized one. On average, the unsynchronized versionconsumes 42% less energy then its counterpart (38% faster).
+After inspecting the implementation, we observed that the
+method setRGB is already synchronized, so there is no
+need to use another synchronization construct to wrap up thissingle method call. In fact, we could not ﬁnd any visibledifference between the images generated by executions withand without the synchronization. We sent the modiﬁed sourcecode as a patch to its developer, who then acknowledged theover-synchronization and accepted our patch.
+5.
+Bottleneck 6: Sleepy Workers A more extreme case — but
+along the same line of Intra-Task Synchronization — is the
+use of Thread.sleep during task execution. Just as the
+previous bottleneck, the invocation of this thread management
+primitive stalls stealing, and explicitly requests OS contextswitches. From a logical perspective, the intention of theprogrammer may be to put the task to sleep, but unfortunately,
+the work stealing runtime will place the worker to sleep. As
+described earlier, the worker cannot forgo the sleep-inducing
+task and pick up other tasks from its deque; neither can the idleCPU core help other workers of the same application. What isworse is that unless the OS has other applications running, anidle core under the widely used on-demand governor wouldput the core in a low-power state, which later needs a longtime to wake up. In a work stealing runtime where competitiveperformance is of its ﬁrst priority, user-level sleeping is oftenmore detrimental than beneﬁcial. We found 3 occurrences ofthis bottleneck.
+TheCTask benchmark presents the worst scenario of this
+bottleneck. During the sequential execution, this benchmarkputs every current task to sleep for a second. Figure 10 showsthis impact on both performance and energy consumption.
+5https://github.com/catree/SimpleMandelbrotDemo/pull/1
+772
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. 0 20 60 100
+ThreadsEnergy (J)CTask
+1 2 4 8 16 32Sleep
+No Sleep
+0 5 10 15
+ThreadsTime (sec)CTask
+1 2 4 8 16 32
+Fig. 10. A comparison on energy and Performance, with and without thread
+sleeping, for varying numbers of threads in ctask.
+The sleep construct creates signiﬁcant penalties in both
+performance and energy consumption. The execution without
+sleep can be 13,495.26× more energy efﬁcient than the
+execution with (and 1,917× reduction in running time). After
+inspecting the source code, we observed that the developerused sleep to force the program to wait for a result fromanother computation. However, this sleep is unnecessary, sincethe computation on which the sleep is waiting is a synchronous
+operation.
+VI. D
+ETECTING REFACTORING OPPORTUNITIES
+Some bottlenecks can be detected and refactored automat-
+ically. As a proof of concept, we have built a tool named
+FJD ETECTOR capable of automatically detecting and refac-
+toring copy-related bottlenecks as explained in Bottleneck 2.
+A.FJD ETECTOR
+FJD ETECTOR works as a plugin for Eclipse IDE. It per-
+forms source code analysis on F ORK JOIN programs, focusing
+on programs with divide-and-conquer data parallelism. We
+check if the F ORK JOIN computation is operated on a data
+structure, such as array orArrayList. Since most of
+theArrayList methods provide accesses over arrays, our
+approach handles them in a similar way. F ORK JOIN computa-
+tions are usually described in terms of inner-classes, where the
+data is passed through the inner-class constructor. Hence, foreach parameter of the constructor, we inspect (a) if it is a datastructure, (b) if it is splitted and copied inside the compute
+method, and (c) if the variables containing the copy results are
+passed into new instances of the Task class.
+We identify potential divide-and-conquer programs through
+pattern matching F
+ORK JOIN’scompute method body.
+Speciﬁcally, we are looking for a branching statement that fallsinto one of three patterns.(1) sequential computation in the if
+block and parallel computation in the else block; (2) parallel
+computation in the if block and sequential computation in
+theelse block; and (3) sequential computation in the if
+block plus a return at the end of the block, and the parallel
+computation in the remainder of the method. FJD
+ETECTOR
+is not able to work with F ORK JOIN classes structured in a
+different manner.
+Once a bottleneck is conﬁrmed by the developer, FJD ETEC -
+TOR performs a set of transformations on the F ORK JOIN code.
+Our transformations remove copies by computing indices foreach subtask and letting them work on distinct regions of thesame (shared) data structure.TABLE V
+THE BENCHMARKS SELECTED .C OLUMNS Add AND Del INDICA TE THE
+NUMBER OF ADDITIONS AND DELETIONS APPLIED BY FJD ETECTOR .
+“REP?”MEANS “REPLIED ?”AND “ACC?”MEANS “ACCEPTED ?”. T HE
+SYMBOLS /check,×AND — MEAN ,RESPECTIVELY ,“ACCEPTED ”, “ NOT
+ACCEPTED ”,AND ‘NO RESPONSE ”.
+Projects Add Del Rep? Acc? Savings
+itemupdown 13 7 —— 8.23%
+jAcer 14 8 /check/check 4.21%
+educational 13 17 —— 18.51%
+scalatuts 12 6 /check/check 12.41%
+knn 20 8 /check/check 21.3%
+netflixoss 17 13 — × 2.18%
+doms-transformers 20 9 /check — 3.82%
+ForkAndJoinUtility 13 6 /check/check 21.17%
+exhibitor 21 15 /check — 1.23%
+Solitaire 14 5 —— 14.12%
+javaOneBR-2012 13 4 /check/check 22.21%
+mywiki 17 18 —— 16.12%
+ejisto 18 9 /check/check 3.2%
+cq4j 14 7 —— 11.23%
+MagicSquares 12 11 /check — 23.51%
+B.FJD ETECTOR Results
+We have applied FJD ETECTOR to 15 of the benchmarks
+listed in §III. The benchmarks were selected due to the
+presence of Bottleneck 2 (§V). Table V lists the selected
+benchmarks. We assess FJD ETECTOR in terms of the follow-
+ing evaluation questions:
+•EQ1. Is our approach useful ?
+•EQ2. How intrusive is FJD ETECTOR ?
+Results of EQ1 To answer EQ1, we have sent modiﬁed
+versions of the benchmarks to their developers as patches. If
+these matches are useful, they will eventually be merged intothe benchmarks. To assess the intrusiveness of FJD
+ETECTOR ,
+we measured the number of lines of code that FJD ETECTOR
+adds to and removes from the benchmarks in order to refactorthem. A large number of modiﬁcations makes the code harderto understand and modify for its developers.
+With FJD
+ETECTOR , 18 instances of refactorings were per-
+formed over 15 projects. We sent these modiﬁed versions
+as patches to the owners of the corresponding repositoriesvia the pull request feature of Github. On Table V, columns“Replied?” and “Accepted?” ﬂag the projects that have repliedand accepted our patch. 9 projects have replied showing anintention to accept our patch. One project is no longer activelymaintained (doms-transformers). For the remaining 8
+projects that replied, 7 of them have already accepted andmerged our patches.
+Benchmark netflixoss was the only project that closed
+our pull request with no response. This particular projectseems to be a fork from another existing project (it has 231,361lines of Java code performed by a single developer in asingle commit), and does not seem to be maintained anymore.The owners of the remaining 7 projects did not provide anycomments for our patches.
+Results of EQ2 To answer EQ2, we measured the number of
+new statements that were added to and the number existing
+statements that were deleted from the benchmarks. A large
+773
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. number of modiﬁcations can produce code that is hard to
+understand and modify. So, a refactoring that results in a smallnumber of modiﬁcations is desirable.
+Overall, our approach has added 231 statements and re-
+moved 143 ones to the 15 benchmarks. Considering that
+one of them has 4 instances of Bottleneck 2, the meannumber of modiﬁcations for each transformation was 12.8additions and 7.9 deletions. Thus, our approach is not veryintrusive. Most of the additions are due to the addition of anew constructor, which means that preexisting code, e.g., thecompute method, is the target of only a few modiﬁcations.
+The refactoring of the parallel code added an average 5.3 newstatements. Deletions have different explanations. For instance,most of the deletions on project exhibitor are due rewriting
+the parallel computation (10 out of the 15 deletions). Initially,this project used a more verbose approach, iterating throughthe data structure, creating and forking each new parallel task,and joining them at the end. We simpliﬁed this computationby just using the invokeAll method, as shown Figure 11.
+protected List<ServerStatus> compute() {
+for (List<ServerSpec> subList : Lists.partition(
+specs, size / 2)) {
+Task task = new Task(exhibitor, subList);
+task.fork(); tasks.add(task);
+}
+for (Task task : tasks) {
+statuses.addAll(task.join());
+}}
+⇓
+protected List<ServerStatus> compute() {
+// ...
+int split = (from + to)/2;
+invokeAll(
+new Task(exhibitor, specs, from, split),
+new Task(exhibitor, specs, from + split, to)
+);
+// ...
+}
+Fig. 11. FJD ETECTOR Refactor Example.
+VII. R ELA TED WORK
+Parallel programming is a well-established topic. In the
+last decade, efforts have been made on introducing novelprogramming models [23], [24], as well as performance [25],[26], programmer effort, satisfaction and error-proneness [27],[28] and even energy consumption [13], [29] evaluations.
+There exists a considerable number of studies about the
+characteristics of bugs in modern software systems, includingconcurrency bugs [30], performance bugs [31], and, morerecently, bugs in the cloud [32], [33]. Closely related to thiswork are empirical studies focusing on uses and misuses ofconcurrent libraries have been conducted [34], [35], [36]. Forinstance, the java.util.concurrent package, in which
+the F
+ORK JOIN framework resides, is the focus of a large-scale
+study, covering over 2,000 projects [10]. However, this workdoes not consider the F
+ORK JOIN framework. Although the
+work of Dig et al. [37] considered the F ORK JOIN frameworkwhen converting sequential code to parallel code, the authors
+did not studied anti-patterns related to F ORK JOIN usage.
+Okur et al. [36] observed that misuses can account for 10%
+of the overall uses of parallel libraries. In the worst case,these misues can make the code run sequentially instead ofconcurrently. Lin et al. [34] found that, even though Java’s
+Concurrent collections provide thread-safe implementations,when composing two or more operations, developers canna¨ıvely misuse these collections and introduce atomicity vio-
+lations. Other studies propose tools that correct other commonmistakes (e.g., [35], [38]). These studies are complementary to
+ours since none of them focus on the F
+ORK JOIN framework.
+A recent study [13] investigated the impact of three thread-
+ing constructs on application energy consumption, one ofwhich is the F
+ORK JOIN framework. This study found that
+the energy consumption of a F ORK JOIN program is sensitive
+to the degree of parallelism achievable by the program: it
+outperforms two other concurrent programming models inapplications that are embarrassingly parallel, but underper-forms in the presence of large numbers of serial operations.This study did not investigate speciﬁc bottenecks faced by
+F
+ORK JOIN applications.
+Another study most closely related to our own was con-
+ducted by DeWael et al. [39]. In this study, the authors
+analyzed Java applications that employ F ORK JOIN to under-
+stand how real-world developers use ForkJoin. However, theauthors did not discuss on how the antipatterns identiﬁedcan be removed. Neither did they analyze the impact of theantipatterns on energy consumption.
+VIII. C
+ONCLUSIONS
+This paper describes a comprehensive study on parallelism
+bottlenecks in F ORK JOIN applications. Based on an in-depth
+analysis over A KKA , together with 30 open-source F ORK JOIN
+applications on GitHub, we present a taxonomy of 6 bottle-necks, whose removal and mitigation may lead to performanceimprovement and energy savings. We sent our patches to thedevelopers of 15 projects, and 7 out of the 9 projects thatreplied to our patches have accepted them.
+The bottlenecks we have identiﬁed in this paper largely
+group into three categories: thread management (Bottleneck1), data management (Bottlenecks 2, 3, and 4), and synchro-nization management (Bottlenecks 5 and 6). We believe theapplicability of identifying and overcoming these bottlenecksmay go beyond F
+ORK JOIN. In the future, we plan to generalize
+these ﬁndings, and investigate their applicability on othermulti-threaded language runtimes.
+A
+CKNOWLEDGEMENTS
+We would like to thank the reviewers for their valu-
+able comments. This work is partially supported by CNPq(406308/2016-0, 453611/2017-6, 304755/2014-1), PROPE-SP/UFPA, FACEPE (APQ-0839-1.03/14), FACEPE PRONEX(APQ 0388-1.03/14), NSF CCF-1526205, NSF CNS-1613023,ONR N00014-14-1-0549, and ONR N00014-16-1-2913.
+774
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. REFERENCES
+[1] D. Lea, “A java fork/join framework,” in Java Grande, 2000, pp. 36–43.
+[2] T. J. Tutorials, “Parallelism (The Java Tutorials >Collections >Ag-
+gregate Operations),” https://docs.oracle.com/javase/tutorial/collections/
+streams/parallelism.html, accessed: 2015-07-02.
+[3] P . Haller and M. Odersky, “Scala actors: Unifying thread-based and
+event-based programming,” Theor . Comput. Sci., vol. 410, no. 2-3, pp.
+202–220, Feb. 2009.
+[4] Groovy, “The groovy programming language,” http://www.groovy-lang.
+org/, 2015, [Online; accessed 12-Aug-2015].
+[5] Clojure, “A dynamic programming language that targets the java virtual
+machine,” http://www.clojure.org/, 2015, [Online; accessed 12-Aug-2015].
+[6] X. Ding, K. Wang, P . B. Gibbons, and X. Zhang, “Bws: Balanced work
+stealing for time-sharing multicores,” in Proceedings of the 7th ACM
+European Conference on Computer Systems, ser. EuroSys ’12, 2012,pp. 365–378.
+[7] L. Wang, H. Cui, Y . Duan, F. Lu, X. Feng, and P .-C. Yew, “An adaptive
+task creation strategy for work-stealing scheduling,” in CGO ’10, 2010,
+pp. 266–277.
+[8] K. Agrawal, C. E. Leiserson, Y . He, and W. J. Hsu, “Adaptive work-
+stealing with parallelism feedback,” ACM Trans. Comput. Syst., vol. 26,
+pp. 7:1–7:32, 2008.
+[9] H. Ribic and Y . D. Liu, “Energy-efﬁcient work-stealing language
+runtimes,” in Architectural Support for Programming Languages and
+Operating Systems, ASPLOS ’14, Salt Lake City, UT, USA, March 1-5,2014, 2014, pp. 513–528.
+[10] G. Pinto, W. Torres, B. Fernandes, F. Castor, and R. S. Barros, “A large-
+scale study on the usage of javas concurrent programming constructs,”Journal of Systems and Software, vol. 106, no. 0, pp. 59 – 81, 2015.
+[11] M. Frigo, C. E. Leiserson, and K. H. Randall, “The implementation
+of the cilk-5 multithreaded language,” in Proceedings of the ACM
+SIGPLAN 1998 Conference on Programming Language Design andImplementation, ser. PLDI ’98, 1998, pp. 212–223.
+[12] “Akka, http://akka.io/.”
+[13] G. Pinto, F. Castor, and Y . D. Liu, “Understanding energy behaviors
+of thread management constructs,” in Proceedings of the 2014 ACM
+International Conference on Object Oriented Programming Systems
+Languages & Applications, ser. OOPSLA ’14, 2014, pp. 345–360.
+[14] K. Liu, G. Pinto, and Y . D. Liu, “Data-oriented characterization of
+application-level energy optimization,” in Proceedings of the 18th In-
+ternational Conference on Fundamental Approaches to Software Engi-neering, ser. FASE’15, 2015.
+[15] H. David, E. Gorbatov, U. R. Hanebutte, R. Khanna, and C. Le, “Rapl:
+Memory power estimation and capping,” in Proceedings of the 16th
+ACM/IEEE International Symposium on Low Power Electronics andDesign, ser. ISLPED ’10, 2010, pp. 189–194.
+[16] “actors, https://github.com/plokhotnyuk/actors.”
+[17] G. Xu, M. Arnold, N. Mitchell, A. Rountev, and G. Sevitsky, “Go with
+the ﬂow: Proﬁling copies to ﬁnd runtime bloat,” in Proceedings of the
+2009 ACM SIGPLAN Conference on Programming Language Design
+and Implementation, ser. PLDI ’09, 2009, pp. 419–430.
+[18] S. Park, W. Jiang, Y . Zhou, and S. Adve, “Managing energy-performance
+tradeoffs for multithreaded applications on multiprocessor architectures,”inProceedings of the International Conference on Measurement and
+Modeling of Computer Systems, June 2007.
+[19] J. Li, J. F. Martinez, and M. C. Huang, “The thrifty barrier: Energy-aware
+synchronization in shared-memory multiprocessors,” in Proceedings of
+the 10th International Symposium on High Performance ComputerArchitecture, ser. HPCA ’04, 2004, pp. 14–.
+[20] L. Zhang, C. Krintz, and P . Nagpurkar, “Language and virtual machine
+support for efﬁcient ﬁne-grained futures in java,” in Proceedings of the
+16th International Conference on Parallel Architecture and CompilationTechniques, ser. PACT ’07, 2007, pp. 130–139.
+[21] M. Carbin, D. Kim, S. Misailovic, and M. C. Rinard, “Proving accept-
+ability properties of relaxed nondeterministic approximate programs,” inProceedings of the 33rd ACM SIGPLAN Conference on ProgrammingLanguage Design and Implementation, ser. PLDI ’12, 2012, pp. 169–180.
+[22] S. Misailovic, S. Sidiroglou, and M. C. Rinard, “Dancing with un-
+certainty,” in Proceedings of the 2012 ACM Workshop on Relaxing
+Synchronization for Multicore and Manycore Scalability, ser. RACES’12, 2012, pp. 51–60.[23] A. Kulkarni, Y . D. Liu, and S. F. Smith, “Task types for pervasive
+atomicity,” in Proceedings of the ACM International Conference on
+Object
+Oriented Programming Systems Languages and Applications, ser.
+OOPSLA ’10, 2010, pp. 671–690.
+[24] H. Miller, P . Haller, and M. Odersky, “Spores: A type-based foundation
+for closures in the age of concurrency and distribution,” in ECOOP 2014
+- Object-Oriented Programming - 28th European Conference, Uppsala,Sweden, July 28 - August 1, 2014. Proceedings, ser. Lecture Notes inComputer Science, R. Jones, Ed., vol. 8586. Springer, 2014, pp. 308–333.
+[25] T. David, R. Guerraoui, and V . Trigonakis, “Everything you always
+wanted to know about synchronization but were afraid to ask,” in Pro-
+ceedings of the Twenty-F ourth ACM Symposium on Operating SystemsPrinciples, ser. SOSP ’13, 2013, pp. 33–48.
+[26] R. Hassani, A. Malekpour, A. Fazely, and P . Luksch, “High performance
+concurrent multi-path communication for mpi,” in Proceedings of the
+19th European Conference on Recent Advances in the Message PassingInterface, ser. EuroMPI’12, 2012, pp. 285–286.
+[27] F. Castor, F. Soares-Neto, and A. L. M. Santos, “A preliminary as-
+sessment of haskell’s software transactional memory constructs,” inProceedings of the 28th Annual ACM Symposium on Applied Computing,ser. SAC ’13, 2013, pp. 1696–1697.
+[28] V . Pankratius, F. Schmidt, and G. Garreton, “Combining functional and
+imperative programming for multicore software: An empirical studyevaluating scala and java,” in Software Engineering (ICSE), 2012 34th
+International Conference on, June 2012, pp. 123–133.
+[29] G. Pinto, K. Liu, F. Castor, and Y . D. Liu, “A comprehensive study
+on the energy efﬁciency of java’s thread-safe collections,” in 2016
+IEEE International Conference on Software Maintenance and Evolution,ICSME 2016, Raleigh, NC, USA, October 2-7, 2016, 2016, pp. 20–31.
+[30] S. Lu, S. Park, E. Seo, and Y . Zhou, “Learning from mistakes: A
+comprehensive study on real world concurrency bug characteristics,” inProceedings of the 13th International Conference on Architectural Sup-port for Programming Languages and Operating Systems, ser. ASPLOSXIII, 2008, pp. 329–339.
+[31] G. Jin, L. Song, X. Shi, J. Scherpelz, and S. Lu, “Understanding and
+detecting real-world performance bugs,” in Proceedings of the 33rd
+ACM SIGPLAN Conference on Programming Language Design andImplementation, ser. PLDI ’12, 2012, pp. 77–88.
+[32] D. Y uan, Y . Luo, X. Zhuang, G. R. Rodrigues, X. Zhao, Y . Zhang, P . U.
+Jain, and M. Stumm, “Simple testing can prevent most critical failures:An analysis of production failures in distributed data-intensive systems,”inProceedings of the 11th USENIX Conference on Operating Systems
+Design and Implementation, ser. OSDI’14, 2014, pp. 249–265.
+[33] H. S. Gunawi, M. Hao, T. Leesatapornwongsa, T. Patana-anake, T. Do,
+J. Adityatama, K. J. Eliazar, A. Laksono, J. F. Lukman, V . Martin, andA. D. Satria, “What bugs live in the cloud? a study of 3000+ issuesin cloud systems,” in Proceedings of the ACM Symposium on Cloud
+Computing, ser. SOCC ’14, 2014, pp. 7:1–7:14.
+[34] Y . Lin and D. Dig, “Check-then-act misuse of java concurrent collec-
+tions,” in Proceedings of the 6th IEEE International Conference on
+Software Testing, V eriﬁcation and V alidation, ser. ICST, 2013.
+[35] Y . Lin, C. Radoi, and D. Dig, “Retroﬁtting concurrency for android
+applications through refactoring,” in Proceedings of the 22Nd ACM
+SIGSOFT International Symposium on F oundations of Software Engi-neering, ser. FSE 2014, 2014, pp. 341–352.
+[36] S. Okur and D. Dig, “How do developers use parallel libraries?” in
+Proceedings of the ACM SIGSOFT 20th International Symposium onthe F oundations of Software Engineering, ser. FSE ’12, 2012, pp. 54:1–54:11.
+[37] D. Dig, J. Marrero, and M. D. Ernst, “Refactoring sequential java code
+for concurrency via concurrent libraries,” in Proceedings of the 31st
+International Conference on Software Engineering , ser. ICSE ’09, 2009,
+pp. 397–407.
+[38] Y . Lin, S. Okur, and D. Dig, “Study and refactoring of android asyn-
+chronous programming (t),” in Proceedings of the 2015 30th IEEE/ACM
+International Conference on Automated Software Engineering (ASE),ser. ASE ’15, 2015, pp. 224–235.
+[39] M. De Wael, S. Marr, and T. V an Cutsem, “Fork/join parallelism in the
+wild: Documenting patterns and anti-patterns in java programs usingthe fork/join framework,” in Proceedings of the 2014 International
+Conference on Principles and Practices of Programming on the JavaPlatform: Virtual Machines, Languages, and Tools, ser. PPPJ ’14, 2014,pp. 39–50.
+775
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 15:29:03 UTC from IEEE Xplore.  Restrictions apply. 

@@ -1,0 +1,1643 @@
+NeuDep : Neural Binary Memory Dependence Analysis
+Kexin Pei
+kpei@cs.columbia.edu
+Columbia University
+New York, USADongdong She∗
+dongdong@cs .columbia.edu
+Columbia University
+New York, USAMichael Wang∗
+mi27950@mit .edu
+MIT
+Cambridge, USA
+Scott Geng∗
+scott.geng@columbia .edu
+Columbia University
+New York, USAZhou Xuan
+xuan1@purdue .edu
+Purdue University
+West Lafayette, USAYaniv David
+yaniv.david@columbia .edu
+Columbia University
+New York, USA
+Junfeng Yang
+junfeng@cs .columbia.edu
+Columbia University
+New York, USASuman Jana
+suman@cs.columbia.edu
+Columbia University
+New York, USABaishakhi Ray
+rayb@cs.columbia.edu
+Columbia University
+New York, USA
+ABSTRACT
+Determining whether multiple instructions can access the same
+memory location is a critical task in binary analysis. It is challeng-
+ing as statically computing precise alias information is undecidable
+in theory. The problem aggravates at the binary level due to the
+presence of compiler optimizations and the absence of symbols and
+types. Existing approaches either produce significant spurious de-
+pendencies due to conservative analysis or scale poorly to complex
+binaries.
+We present a new machine-learning-based approach to predict
+memory dependencies by exploiting the model’s learned knowl-
+edge about how binary programs execute. Our approach features
+(i) a self-supervised procedure that pretrains a neural net to reason
+over binary code and its dynamic value flows through memory ad-
+dresses, followed by (ii) supervised finetuning to infer the memory
+dependencies statically. To facilitate efficient learning, we develop
+dedicated neural architectures to encode the heterogeneous inputs
+(i.e.,code, data values, and memory addresses from traces) with spe-
+cific modules and fuse them with a composition learning strategy.
+We implement our approach in NeuDep and evaluate it on 41
+popular software projects compiled by 2 compilers, 4 optimizations,
+and 4 obfuscation passes. We demonstrate that NeuDep is more
+precise (1.5×) and faster (3.5×) than the current state-of-the-art.
+Extensive probing studies on security-critical reverse engineering
+tasks suggest that NeuDep understands memory access patterns,
+learns function signatures, and is able to match indirect calls. All
+∗These authors contributed equally to the paper
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+©2022 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-9413-0/22/11. . . $15.00
+https://doi.org/10.1145/3540250 .3549147these tasks either assist or benefit from inferring memory dependen-
+cies. Notably, NeuDep also outperforms the current state-of-the-art
+on these tasks.
+CCS CONCEPTS
+•Security and privacy →Software reverse engineering ;•
+Computing methodologies →Machine learning .
+KEYWORDS
+Memory Dependence Analysis, Reverse Engineering, Large Lan-
+guage Models, Machine Learning for Program Analysis
+ACM Reference Format:
+Kexin Pei, Dongdong She, Michael Wang, Scott Geng, Zhou Xuan, Yaniv
+David, Junfeng Yang, Suman Jana, and Baishakhi Ray. 2022. NeuDep :
+Neural Binary Memory Dependence Analysis. In Proceedings of the 30th
+ACM Joint European Software Engineering Conference and Symposium on
+the Foundations of Software Engineering (ESEC/FSE ’22), November 14–18,
+2022, Singapore, Singapore. ACM, New York, NY, USA, 13 pages. https:
+//doi.org/10.1145/3540250 .3549147
+1 INTRODUCTION
+Binary memory dependence analysis, which determines whether
+two machine instructions in an executable can access the same mem-
+ory location, is critical for many security-sensitive tasks, including
+detecting vulnerabilities [ 18,36,86], analyzing malware [ 38,93],
+hardening binaries [ 4,29,44,90], and forensics [ 19,35,58,91].
+The key challenge behind memory dependence analysis is that ma-
+chine instructions often leverage indirect addressing or indirect
+control-flow transfer ( i.e.,involving dynamically computed targets)
+to access the memory. Furthermore, most commercial software is
+stripped of source-level information such as variables, arguments,
+types, data structures, etc. Without this information, the problem
+of memory dependence analysis becomes even harder, forcing the
+analysis to reason about values flowing through generic registers
+and memory addresses. Consider the following code snippet where
+we show two instructions (within the same function) at different
+program locations. The function is executed twice, resulting in two
+different traces.
+747
+ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore K. Pei, D. She, M. Wang, S. Geng, Z. Xuan, Y. David, J. Yang, S. Jana, B. Ray
+Address Instruction Trace 1 Trace 2
+......
+0x06: mov [rax],rbx∗rax=0x3;rbx=0x1 rax=0x5;rbx=0x1
+......
+0x1f: mov rdi,[0x3] rdi=0x1 rdi=0x0
+......
+∗In Intel x86 syntax [77], mov [rax],rbx means writing register rbxto the memory
+pointed by register rax; [] means dereference a memory address.
+The two instructions are memory-dependent (read-after-write)
+when rax=0x3(Trace 1). When analyzing the code statically, it
+requires precise value flow analysis to determine what values can
+flow to raxfrom different program contexts.
+Over the last two decades, researchers have made numerous at-
+tempts to improve the accuracy and performance of binary memory
+dependence analysis [ 5,6,11,16,22,34,71]. The most common
+approach often involves statically computing and propagating an
+over-approximated set of values that each register and memory
+address can contain at each program point using abstract interpre-
+tation. For example, a seminal paper by Balakrishnan and Reps on
+value set analysis (VSA) [ 5] adopts strided intervals as the abstract
+domain and propagates the interval bounds for the operands ( e.g.,
+registers and memory locations) along each instruction. VSA detects
+two instructions to be dependent if their intervals intersect. Un-
+fortunately, these static approaches have been shown to be highly
+imprecise in practice [ 96].Composing abstract domains along mul-
+tiple instructions and merging them across a large number of paths
+quickly accumulate prohibitive amounts of over-approximation er-
+ror. As a result, the computed set of accessed memory addresses by
+such approaches often ends up covering almost the entire memory
+space, leading to a large number of false positives ( i.e.,instructions
+with no dependencies are incorrectly detected as dependent).
+With the advent of data-driven approaches to program analy-
+ses [3,69,89], state-of-the-art memory dependence analysis is in-
+creasingly using statistical or machine learning (ML) based methods
+to improve the analysis precision [ 35,58,87,96], but they still suffer
+from serious limitations. For example, DeepVSA [ 35] trains a neural
+network on static code to classify the memory locations accessed by
+each instruction into a more coarse-grained abstract domain such
+as stack, heap, and global, and use the predicted memory region
+to instantiate the value set in VSA. However, such coarse-grained
+prediction results in high false positives as any two instructions
+accessing the same region ( e.g.,stack) will always be detected as de-
+pendent even when the instructions access two completely different
+addresses. To avoid the precision losses by the static approaches,
+BDA [ 96] uses a dynamic approach that leverages probabilistic
+analysis to sample program paths and performs per-path abstract
+interpretation. However, as real-world programs often have many
+paths, the cost of performing per-path abstract interpretation for
+even a smaller subset of paths adds prohibitive runtime overhead,
+e.g.,taking more than 12 hours to finish analyzing a single pro-
+gram. It is perhaps not surprising—while a dynamic approach can
+be more accurate than static approaches, it can incur extremely
+high runtime overhead, especially while trying to achieve good
+code coverage.
+To achieve higher accuracy in a reasonably faster time, we pro-
+pose an ML-based hybrid approach. Our key strategy is to learn to
+Code
+Value Flows:
+Memory+T race
+ML Model
+Execute
+Code
+Representation
+Value Flow
+Representation
+Code
+Code
+Value Flows:
+Memory+T race
+Code Representation
+ML Model
+ Memory DependenciesPretraining (Dynamic):
+Finetuning (Static):
+Synthesize
+InterpretFigure 1: The workflow of our approach. We first pretrain the
+model to predict code based on its traces and predict traces
+based on its code. We then finetune the model to statically
+infer memory dependencies.
+reason about approximate memory dependencies from the execu-
+tion behavior of generic binary code during training. We then apply
+the learned knowledge to static code during inference without any
+extra runtime overhead (see Figure 1). Such a hybrid approach, i.e.,
+learning from both code and traces, has been shown promise in sev-
+eral Software Engineering applications, including clone detection,
+type inference, and program fixing and synthesis [ 60,63,64,89].
+However, none of these works can reason fine-grained value flows
+through different memory addresses as they do not explicitly model
+memory. To bridge this gap, we aim to model the memory addresses
+in the ML-based hybrid framework and try to make fine-grained
+predictions differentiating the memory contents of different data
+pointers. Modeling memory address is, however, challenging as
+it requires the model to (i) distinguish between different memory
+addresses, (ii) learn to reason about indirect address references
+and memory contents, and (iii) learn the compositional effects of
+multiple instructions that involve memory operations.
+To this end, we propose a new learning framework compris-
+ing pretraining and finetuning steps inspired by masked language
+model (MLM) [ 25], as shown in Figure 1. Unlike traditional MLM,
+where the input is restricted to a single input modality ( e.g.,text),
+our model learns from multi-modal information: instructions (static
+code), traces (dynamic values), and memory addresses (code spatial
+layout). We deploy a novel fusion module to simultaneously capture
+the interactions of these modalities for predicting memory depen-
+dencies. During pretraining, we mask random tokens from these
+modalities. While predicting masked opcode teaches the model to
+synthesize the instruction, predicting masked values in traces and
+memory addresses forces the model to learn to interpret instructions
+and their effect on registers and memory contents. For instance, if
+we mask the value of raxinmov [rax],rbx in the above example
+and train the model to predict it, the model is forced to interpret
+the previous instructions in the context and reason about how they
+compute their trace values that flow into rax. We hypothesize that
+748NeuDep : Neural Binary Memory Dependence Analysis ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+such pretraining helps the model gain a general understanding of
+the value flow behavior involving memory operations.
+After pretraining, the model is finetuned to statically (without
+the trace values) reason about the value flows (based on its learned
+knowledge from pretraining) across memory along multiple paths
+and predict the memory-dependent instruction pairs. Both pretrain-
+ing and finetuning steps are automated and data-driven without
+manually defining any propagation rules for value flows. As a re-
+sult, we show that our model is faster and more precise than the
+state-of-the-art systems (§5).
+We implement our approach in NeuDep by carefully designing
+a new neural architecture specialized for fine-grained modeling of
+pointers to distinguish between unique memory addresses (Chal-
+lenge i). We develop a novel fusion module to facilitate efficient
+training on the multi-modal bi-directional masking task, which
+helps the model to understand memory address content and thus,
+indirect memory references (Challenge ii). Finally, to teach the com-
+positional effects of instructions on memory values (Challenge iii),
+we leverage the principle of curriculum learning [ 8],i.e.,expose
+short training examples in the initial learning phase, and gradually
+increase the sample difficulties as the training progresses.
+We evaluate NeuDep on a wide range of popular software
+projects compiled with diverse optimizations and obfuscation
+passes. We demonstrate that NeuDep is more precise than state-
+of-the-art binary dependence analysis approaches, widely-used re-
+verse engineering frameworks, and even a source-level pointer anal-
+ysis tool that has access to much richer program properties. We also
+show that NeuDep generalizes to unseen binaries, optimizations,
+and obfuscations, and is drastically faster than existing approaches.
+We perform extensive ablation studies to justify our design choices
+over other alternatives studied in previous works [ 64,66]. Moreover,
+NeuDep is surprisingly accurate at many additional security-critical
+reverse engineering tasks, which either support or benefit from
+inferring memory dependencies, such as predicting memory-access
+regions, function signatures, and indirect procedure calls – NeuDep
+also outperforms the state-of-the-arts on all these tasks.
+We make the following contributions:
+(1)We propose a new neural architecture that can jointly learn
+memory value flows from code and the corresponding traces
+for predicting binary memory dependencies.
+(2)We implement our approach in NeuDep that contains a dedi-
+cated fusion module for learning encodings of memory address-
+es/trace values, and a composition learning strategy.
+(3)Our experimental results demonstrate that NeuDep is (3.5×)
+faster and more accurate (1.5 ×) than the state-of-the-art.
+(4)Our extensive ablation studies and analysis on downstream
+tasks suggest that our pretraining substantially improves the
+prediction performance and helps the model to learn value flow
+through different instructions.
+2 OVERVIEW
+2.1 Motivating Example
+Figure 2 shows that two instructions 𝐼2:mov rdi,[rax+0x8] and
+𝐼7:mov [rbp+rbx],rdi access the same memory location (and are
+thus memory-dependent) but via different addressing registers. To
+detect the dependency, the model needs to first understand that
+I1  mov rax,0x1234  
+I2  mov rdi,[rax+0x8]  
+I3  mov rdx,[rip+0xbf]  
+I4  mov rbx,0x1234  
+I5  xor rbp,rbp  
+I6  add rbp,0x8  
+I7  mov [rbp+rbx],rdi  
+I8  mov [rip+0x81],raxInstructions I
+NeuDep Existing ML ModelsStackMemory Layout
+Heap
+Global 1
+Global 2 
+...... 
+Execution T race
+I1 rax=0x1234  
+I2 rdi=[0x123c] 
+I3 rdx=[rip+0xbf]  
+I4 rbx=0x1234  
+I5 rbp=0x0  
+I6 rbp=0x8  
+I7 [0x123c]=rdi  
+I8 [rip+0x81]=raxrip+0xbf
+rip+0x810x123c
+Ground T ruth
+...... Figure 2: Motivating example of predicting memory de-
+pendencies in the function ngx_init_setproctitle from
+nginx-1.21.1 .𝐼2and𝐼7access the same heap variable (in
+blue );𝐼3and𝐼8access different global variables (in red).
+We find that existing ML-based approaches (learned on static
+code only) fail to detect 𝐼2and𝐼7are dependent by predicting
+they access to different memory regions and cannot distin-
+guish the memory accessed by 𝐼3and𝐼8due to the prediction
+granularity.
+the behavior of mov: both line 1 ( 𝐼1) and line 4 ( 𝐼4) set raxandrbx
+to the same value. It then needs to understand xorin line 5 sets
+rbpto 0, and addin line 6 performs addition and sets rbpto0x8.
+Finally, the model needs to compose these facts and concludes that
+rax+0x8 is semantically equivalent to rbp+rbx in such a context,
+i.e.,they both evaluate to 0x123c .
+Gap in Existing Solutions. We find that when running the ML
+model trained only on static code for this task [ 35], it mispredicts
+that𝐼2and𝐼7are not dependent as their memory-access regions ( 𝐼2
+accesses heap while 𝐼7is mispredicted to access stack) do not inter-
+sect, possibly because its inference depends on the spurious pattern
+that the stack base pointer rbpis used at line 7. Such mispredic-
+tions [ 35] might lead to a false negative by flagging two instructions
+as accessing non-overlapping memory regions.
+Proposed Solution. The above observation underscores the impor-
+tance of encoding the knowledge about each instruction’s contri-
+bution to value flows through memory and their compositions as
+part of the ML model. However, integrating a memory model as
+part of the encoded knowledge is challenging due to the presence
+of potentially complex flows involving indirect address references
+and their compositions. We address these challenges by designing
+(1)A novel training objectives to distinguish between unique mem-
+ory addresses (§2.2)
+(2)A dedicated fusion module sepcialized to capture the interaction
+between instruction, trace, and memory addresses (§2.3.2). Our
+new tracing and sampling strategies (§2.3.1) help the ML model
+to learn value flows across memory addresses.
+(3)Curriculum learning [ 8] in the training process to incrementally
+learn the compositional effects (§2.3.3).
+Table 1 shows some examples of how the pretraining task works
+and how it teaches the model to reason about value flows.
+749ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore K. Pei, D. She, M. Wang, S. Geng, Z. Xuan, Y. David, J. Yang, S. Jana, B. Ray
+Table 1: Examples of masking (in grey ) instructions and traces (represented as input (In) and output (Out) of each instruction).
+The model has to dereference the memory content and interpret or synthesize instruction(s) to infer the masked parts. We
+include the actual operations performed by the instructions (noted in green) and the formal semantics that the model essentially
+needs to learn for each example (last column).
+Example DescriptionsInstruction(s) Trace Underlying
+Mnemonic Operand In Out Semantics
+Example 1: Interpreting memory operands in bitwise operations rax=rax⊕[rbx] 𝑣1=0x2,𝑣2=0x7
+𝑣=𝑣1⊕𝑣2
+𝑣=0x5Let the output value of raxinxor rax,[rbx] be masked. To predict the masked value ( i.e.,rax=0x5), the model
+needs to understand the semantics of xoron its inputs rax=0x2and[rbx] =0x7.xorrax
+[rbx]0x2
+0x70x5
+0x7
+Example 2: Synthesizing Arithmetic Operations with memory operands rbp=rbp+[rdi] 𝑣1=0x4,𝑣2=0x8
+𝑣=𝑣1^𝑣2,𝑣=0xc
+^=addLetaddbe masked in add rbp,[rdi] . To predict the masked add(e.g.,out of sub,mov, etc.), the model needs to
+associate addto the behavior that increments the its first operand by that of its second operand.addrbp
+[rdi]0x4
+0x80xc
+0x8
+Example 3: Reverse Interpreting Arithmetic Operations with memory operands rcx=rcx-[rdx] 𝑣2=0x1,𝑣=0x8
+𝑣=𝑣1−𝑣2
+𝑣1=0x9Let the input value of rcxinsub rcx,[rdx] be masked. To predict the masked value, the model needs to
+interpret subbackward given its output 0x8and the value of its second operand 0x1stored on memory.subrcx
+[rdx]0x9
+0x10x8
+0x1
+Example 4: Interpreting Compositions of Multiple Memory Operationsrsp=rsp-0x8
+[rsp]=rdi
+rsi=[rsp]
+More than one instructions are executing. Let the output value of rsiinpush rdi;mov rsi,[rsp] be masked.
+To predict the masked value, the model needs to first interpret push and understand its side effect: decrements
+the stack pointer rspby 8 bytes and store the value of rdi(0x6) on stack referenced by rsp.pushrdi
+rsp0x6
+0x80x6
+0x0𝑣1=𝑣1−0x8
+[𝑣1]=0x6
+𝑣2=[𝑣1]
+𝑣2=0x6The model then needs to first dereference the indirect addressing of [rsp] to infer 0x6is stored at rsp(0x0). It
+then needs to interpret movand understand it assigns the value from its second operand to the first operand to
+infer the masked value to be 0x6.movrsi
+[rsp]0x0
+0x00x6
+0x0
+2.2 Problem Formulation
+Let𝑓denote an ML model parameterized by 𝜃. Before directly
+training𝑓towards predicting memory dependencies, we pretrain 𝑓
+to reason about the value flows (see §3.4 for details). Now consider
+𝑓with pretrained parameters 𝜃, we formalize the task of analyzing
+memory dependencies as follows.
+Definition 2.1 (Memory Dependency Prediction) .Given a pair
+of assembly code instructions {𝐼𝑖,𝐼𝑗}within a code block 𝐼con-
+sisting of𝑛assembly instructions: (𝐼1,...,𝐼𝑛), our neural memory
+dependency predictor 𝑓, parameterized by the pretrained weight 𝜃,
+predicts whether the instruction pair can access the same memory
+location, i.e.,𝑦=𝑓(𝐼𝑖,𝐼𝑗,𝐼;𝜃),𝑦∈[0,1].𝑦=0denotes{𝐼𝑖,𝐼𝑗}do
+not have memory dependency, and 𝑦=1denotes dependent.
+Any𝑦between 0 and 1 denotes the probability of 𝐼𝑖and𝐼𝑗being
+dependent. Figure 2 shows an example how our model predicts
+different instruction pairs. We elaborate on how our neural archi-
+tecture implements 𝑓in the above definition in §3.5.
+2.3 NeuDep ’s Design
+Training the model to learn value flows for memory dependence
+analysis opens up several interesting design spaces, ranging from
+tracing to introduce diverse behaviors to designing appropriate
+inductive biases in the model architecture and training strategies.
+We overview our design in the following and provide detailed de-
+scriptions in §3.
+2.3.1 Trace Collection. Pretraining requires high-quality training
+data to expose diverse program execution. We implement a forced
+execution engine [ 30,67] to execute individual functions with full
+path coverage without the reliance on program test cases. Our
+execution engine differs from the existing works in two key aspects.First, we note that existing works [ 28,66,67] implement the
+forced execution by violating the control flow semantics, i.e.,step-
+ping through control transfer instructions, to obtain traces with
+high coverage. However, this introduces noisy traces as they are
+not realizable in practice. On the contrary, respecting control trans-
+fers [ 64] will inevitably suffer from the coverage problem, as they
+have to find test cases to cover different paths [ 12,20,59]. To cir-
+cumvent this problem, we implement a coverage-guided semantic-
+preserving branch-flipping mechanism to expose diverse paths
+within the function without breaking the branching instructions’
+semantics (§3.1).
+Second, existing works do not trace behaviors of the external
+procedure calls [ 64,66], but this is especially important to model
+memory operations as heap allocation is often performed via li-
+brary calls ( e.g.,viamalloc ). Our tracing engine provides complete
+environment support by pre-loading the whole program and its
+dependent libraries. The side effect of all function call instructions
+can thus be traced and logged as their input-output behavior (§3.1).
+2.3.2 Representing and Fusing Code, Trace, and Memory. Assembly
+instructions and their traces are highly heterogeneous, i.e.,instruc-
+tion consists of discrete tokens like mnemonics and operands, while
+trace consists of mostly continuous values. To better encode the
+nature of each sequence, we employ two distinct modules to learn
+on these two inputs and then fuse them to make the joint inference.
+Specifically, we learn the instruction sequence with self-attention
+layers [ 83] to encode the instructions grounded on their neighbor-
+ing context. We learn the trace values by a per-byte convolution
+network. After learning a basic representation of the code and trace
+values, we employ a fusion module (§3.3) to augment the contextu-
+alized instruction embeddings with the trace value embeddings.
+We represent the code address space during execution as an ad-
+ditional input aligned to the instructions. This helps the model stay
+750NeuDep : Neural Binary Memory Dependence Analysis ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+aware of the instructions’ order to their execution effect. Moreover,
+we observe that rip-relative addressing is frequently used to access
+global variables in position-independent code. Therefore, feeding
+addresses can help the model to learn the semantics of memory
+addressing. For example, consider the following instructions from
+the function quotearg_free inruncon from Coreutils-8.30.
+0x449c: cmp [rip+0x4d65],2 # rip+0x4d65=0x9208
+......
+0x44bc: movsxd rax,[rip+0x4d45] # rip+0x4d45=0x9208
+......
+0x450e: mov [rip+0x4cf0],1 # rip+0x4cf0=0x9208
+Three instructions use ripwith different offsets to access the same
+global variable stored at 0x9208 . By encoding the address of each
+instruction, we help the model infer the value of ripand thus assist
+reasoning of the memory dependencies.
+2.3.3 Training Design (Composition Learning). Inspired by how
+humans learn, we aim to develop a strategy that trains the model to
+gradually build up its knowledge. Ideally, the model should start by
+learning easy samples and then generalize its learned knowledge by
+getting exposed to more challenging training samples. As demon-
+strated in Table 1, the training samples with more instructions are
+more challenging to predict than those with fewer instructions, as
+the model has to learn the compositional execution effect of multiple
+instructions. Moreover, the more masks applied, the less context
+the model can leverage to make the prediction, thus increasing
+difficulty. Therefore, we develop a curriculum learning strategy [ 8]
+by sorting the training samples based on their length and increasing
+the masking rate at each training epoch. As a result, the model al-
+ways starts learning from short code pieces with fewer masks at the
+early batches within each epoch, and the length of the code piece
+and the number of masks applied are increased in later epochs.
+2.4 Additional Reverse Engineering Tasks
+To explore how exactly pretraining helps analyze memory depen-
+dencies, we investigate what knowledge or properties of programs
+the pretrained model learns. We resort to probing , which uses the
+encoded instruction representations of the pretrained model and
+finetunes them on the probing tasks, usually with a small number
+of labeled data and training epochs [ 54]. Specifically, we consider
+three critical reverse engineering tasks, which either assist or bene-
+fit from analyzing memory dependencies. If the pretrained model
+performs well on these reverse engineering ( i.e.,probing) tasks, it
+gives evidence that pretraining has encoded useful representation
+for analyzing memory dependencies.
+Inferring Memory Regions. Inferring memory-access regions
+helps reduce the spurious dependencies reported by VSA (§1). We
+consider the task sketched in DeepVSA [ 35], where the model needs
+to statically predict the memory region accessed by each instruction
+that operates on memory.
+Definition 2.2 (Memory Region Prediction) .Given a code block
+consisting of a sequence of 𝑛assembly instructions: 𝐼=(𝐼1,...,𝐼𝑛),
+a memory region predictor 𝑓𝑟, parameterized by the pretrained
+weights𝜃, predicts the memory region accessed by each instruction:
+𝑦=𝑓𝑟(𝐼;𝜃),𝑦∈M𝑛,M={stack,heap,global,other }.
+Inferring Function Signature. Traditionally, function signatures
+are predicted by analyzing the memory access patterns of variablesand propagating the types implied by the inferred patterns up to
+the function argument. Memory dependencies help the propagating
+types along the dependent instructions [ 49]. The inferred variable
+types, in turn, also help reduce the spurious bogus dependencies,
+i.e.,two memory accesses with different types are not dependent.
+We consider the task described in EKLAVYA [ 15], where the model
+statically predicts the function signature, including the (i) argument
+arity, (ii) argument types, and (iii) function return types.
+Definition 2.3 (Function Signature Prediction) .Given an𝑛-
+instruction procedure 𝑃:𝑃=(𝐼1,...,𝐼𝑛), a function signature pre-
+dictor𝑓𝑠, parameterized by the pretrained weights 𝜃, predicts the
+function signature as follows. (i) When 𝑃is treated as callee, 𝑓𝑠
+predicts𝑃’s signature: 𝑦=𝑓𝑠(𝑃;𝜃). (ii) When𝑃is treated as caller,
+𝑓𝑠takes call site 𝐼𝑐∈𝑃as an additional input, and predicts the sig-
+nature of the procedure that 𝐼𝑐calls:𝑦=𝑓𝑠(𝑃,𝐼𝑐;𝜃). In both cases,
+𝑦=(𝑎,𝐴,𝑟)is a tuple where (i) 𝑎∈[0,7]denotes argument arity
+with at most 7 arguments. (ii) 𝐴=(𝐴1,𝐴2,𝐴3)denotes𝑃’s first 3 ar-
+gument types: 𝐴𝑖∈{int,char,float,ptr,enum,union,struct}.
+(iii)𝑟∈{int,char,float,ptr,enum,union,struct,void}is the
+procedure𝑃’s return type.
+Matching Indirect Calls. Analysis of memory dependencies has
+been extensively applied to infer indirect calls [ 47,96]. Therefore,
+we study how the pretrained model performs on this task.
+Definition 2.4 (Matching Indirect Calls) .Given a pair of proce-
+dures𝑃𝑖,𝑃𝑗, an indirect call predictor 𝑓𝑐predicts whether 𝑃𝑖can call
+𝑃𝑗during runtime: 𝑦=𝑓𝑐(𝑃𝑖,𝑃𝑗), where𝑦∈{0,1};𝑦=1denotes
+𝑃𝑖can call𝑃𝑗while𝑦=0denotes𝑃𝑖cannot.
+Unlike the first two tasks, we define 𝑓𝑐as deterministic function
+that takes as input the inferred function signatures (Definition 2.3)
+of𝑃𝑗and the call-site within 𝑃𝑖.𝑓𝑐outputs 1 if and only if the
+signature of 𝑃𝑗closely matches at least one call-site signature within
+𝑃𝑖. We elaborate on the matching criteria in §3.6.
+3 METHODOLOGY
+This section elaborates on the design of NeuDep , including the
+tracing framework, the model’s input representation, the neural
+architecture, and the training tasks.
+3.1 Tracing Framework
+Algorithm 1 shows how our tracing framework works on a proce-
+dure. We consider the following two key designs (§2.3).
+Environment Support. As shown in Algorithm 1 line 1and2, we
+first load the entire binary into an emulator and make a snapshot of
+the process image after initializing all dependent libraries. We then
+iterate every function inside the binary and execute each function
+(line 4and5). Before the execution, we restore the process memory
+using the saved snapshot (line 6) to ensure that all the functions,
+including external library functions, are properly resolved.
+Branch Flipping. Inspired by coverage-guided fuzzing, we design
+a dynamic branch flipping mechanism for recording complete and
+diverse execution behaviors. We first maintain a list of covered
+basic blocks during past execution (line 8-15). We then hook every
+conditional branch during forced execution and monitor the jump
+target. If the jump target has already been covered before and
+another is not covered yet, we flip the branch. In order to ensure
+751ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore K. Pei, D. She, M. Wang, S. Geng, Z. Xuan, Y. David, J. Yang, S. Jana, B. Ray
+Algorithm 1 Coverage-Guided Semantic-Preserving Execution
+1:Load(𝑏𝑖𝑛𝑎𝑟𝑦) ⊲Load binary into emulator
+2:𝑚𝑒𝑚=Snapshot() ⊲Save memory snapshot after initialization
+3:𝑐𝑜𝑣𝑒𝑟𝑒𝑑 _𝑏𝑏={}
+4:for𝑓𝑢𝑛𝑐∈𝑏𝑖𝑛𝑎𝑟𝑦 do ⊲Loop every function
+5: Restore(𝑚𝑒𝑚) ⊲Restore memory snapshot
+6: Initialize(𝑠𝑡𝑎𝑐𝑘,𝑟𝑒𝑔𝑠) ⊲Initialize stack and registers with random values
+7: /* Loop every conditional branch */
+8: for𝑐𝑜𝑛𝑑 _𝑏𝑟𝑎𝑛𝑐ℎ∈ForceExec(𝑓𝑢𝑛𝑐)do
+9: /*𝑏𝑏1,𝑏𝑏2are jump targets, 𝑏𝑏1is the default one */
+10: if𝑏𝑏1∈𝑐𝑜𝑣𝑒𝑟𝑒𝑑 _𝑏𝑏and𝑏𝑏2∉𝑐𝑜𝑣𝑒𝑟𝑒𝑑 _𝑏𝑏then
+11: FlipBranch(𝑐𝑜𝑛𝑑 _𝑏𝑟𝑎𝑛𝑐ℎ)
+12: 𝑐𝑜𝑣𝑒𝑟𝑒𝑑 _𝑏𝑏.add(𝑏𝑏2)
+13: else
+14: 𝑐𝑜𝑣𝑒𝑟𝑒𝑑 _𝑏𝑏.add(𝑏𝑏1)
+the flipped branch does not introduce violations of instruction
+semantics, we implement a semantic-preserving mechanism by
+patching branch instructions with reverse conditions if it is flipped.
+For example, a flipped branch instruction je 0x8a will be patched
+tojne 0x8a .
+3.2 Input Representation
+At a high level, NeuDep takes three sequences as input, i.e.,assembly
+instructions, trace values, and instruction addresses.
+Assembly. We represent the assembly instructions 𝐼=(𝐼1,...,𝐼𝑛)
+as𝑛ordered tuples. Each tuple 𝐼𝑖consists of 3 members: 𝐼𝑖=
+(𝑐𝑖,𝑝𝑖,𝑚𝑖), where𝑐𝑖,𝑝𝑖,𝑚𝑖indicate code token, position, and
+whether𝑐𝑖accesses memory, respectively. Specifically, 𝑐𝑖denotes
+the tokens obtained from tokenizing the assembly instructions, re-
+moving punctuations, and transforming all constants to const . As
+we flatten each instruction to multiple tokens, we use 𝑝𝑖to anno-
+tate the relative position of 𝑐𝑖within the instruction to specify the
+instruction boundary. Moreover, 𝑝𝑖helps the self-attention layers,
+which are permutation-invariant to the input tokens, to understand
+the relative order of the operands. Finally, 𝑚𝑖∈{𝐹,𝑇}denotes
+whether𝑐𝑖accesses memory.
+Example 3.1. Consider the instruction sequence add
+rax,0x8;mov [rax],rbx . It will be represented as:
+𝐼𝐼1𝐼2𝐼3𝐼4𝐼5𝐼6
+©­
+«𝑐
+𝑝
+𝑚ª®
+¬©­
+«add
+1
+Fª®
+¬©­
+«rax
+2
+Fª®
+¬©­
+«const
+3
+Fª®
+¬©­
+«mov
+1
+Fª®
+¬©­
+«rax
+2
+Tª®
+¬©­
+«rbx
+3
+Fª®
+¬
+Trace. We represent the trace values using 𝑇=(𝑇1,...,𝑇𝑛)aligned
+to the assembly instruction sequence 𝐼. Each𝑇𝑖∈𝑇consists of a
+list𝑇𝑖=(𝑏𝑖
+1,...,𝑏𝑖
+8), where the numeric value is a (padded) 8-byte
+values𝑏𝑖
+𝑗∈[1,8]. This reduces a prohibitively large vocabulary ( 264)
+to a much more manageable size ( 256) [64]. The most and least
+significant byte is 𝑏1and𝑏8, respectively. We further normalize
+each byte𝑏𝑖
+𝑗∈[1,8]into[0,1)to stablize the training. For instruction
+tuples𝐼𝑖whose𝑐𝑖is not a register or a constant, its aligned trace
+values𝑇𝑖contains 8 dummy values ( -), which will not be masked
+during pretraining (§3.4). For 𝑇𝑖whose aligned 𝐼𝑖is not executed,
+we assign the value 𝑏𝑗=0x100,∀𝑗∈[1,8]. In pretraining, to predict
+the trace value consisting of all 100s instead of regular bytes, the
+model needs to determine whether the corresponding assemblyinstructions are executed by reasoning the branch predicate and
+control flow.
+Example 3.2. Consider the following 4 instructions: add
+rax,0x8;cmp rax,0x10;je 0x1004a8b5f;push rdi ; input
+rax=0x0.𝑇will look like (aligned with 𝑐𝑖):
+𝑐 add rax const cmp rax const je const push rdi
+𝑇𝑇1𝑇2𝑇3𝑇4𝑇5𝑇6𝑇7𝑇8𝑇9𝑇∗
+10
+©­­­­­­­­­­­
+«𝑏1
+𝑏2
+𝑏3
+𝑏4
+𝑏5
+𝑏6
+𝑏7
+𝑏8ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«-
+-
+-
+-
+-
+-
+-
+-ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«00
+00
+00
+00
+00
+00
+00
+00ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«00
+00
+00
+00
+00
+00
+00
+08ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«-
+-
+-
+-
+-
+-
+-
+-ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«00
+00
+00
+00
+00
+00
+00
+08ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«00
+00
+00
+00
+00
+00
+00
+10ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«-
+-
+-
+-
+-
+-
+-
+-ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«00
+00
+00
+01
+00
+4a
+8b
+5fª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«-
+-
+-
+-
+-
+-
+-
+-ª®®®®®®®®®®®
+¬©­­­­­­­­­­­
+«100∗
+100∗
+100∗
+100∗
+100∗
+100∗
+100∗
+100∗ª®®®®®®®®®®®
+¬
+*We show the byte value before normalization to save space. As 𝑇10corresponds to rdi, which
+is not executed, its value is 1, which is 0x100 before normalizing.
+Address. Similar to trace value sequence 𝑇, we represent the address
+of each instruction (when loaded in memory) as 𝑛ordered lists,
+𝐴=(𝐴1,...,𝐴𝑛), aligned to 𝐼.𝐴𝑖∈𝐴consists of 8 bytes organized
+as an ordered list: 𝐴𝑖=(𝑏𝑖
+1,𝑏𝑖
+2,...,𝑏𝑖
+8). On a 64-bit architecture, 8
+bytes are enough to represent all possible virtual addresses of a
+running program. For 𝑐𝑖within one instruction ( e.g.,Example 3.1),
+they share the same instruction address.
+Example 3.3. Consider 2 instructions: push rbp;jmp rax start
+from the address 0x14a8b .𝐴will look like (aligned with 𝑐𝑖):
+𝑐 push rbp jmp rax
+𝐴𝐴1𝐴2𝐴3𝐴4
+©­
+«𝑏6
+𝑏7
+𝑏8ª®
+¬©­
+«01
+4a
+8bª®
+¬©­
+«01
+4a
+8bª®
+¬©­
+«01
+4a
+8cª®
+¬©­
+«01
+4a
+8cª®
+¬
+We omit showing 𝑏1,...,𝑏 5as they are all zeros
+As the machine instruction of push rbp only takes one byte ( 0x55 ),
+the addresses of two instructions are off by one byte.
+3.3 NeuDep Architecture
+Figure 3 illustrates NeuDep ’s architecture. In the following, we
+describe how the inputs (§3.2) are embedded, fused, and further
+processed to make the prediction. All these steps are handled by
+neural modules that can be stacked together and trained end-to-end.
+Input Embeddings. Let𝑑denote the embedding dimen-
+sion, we denote the embeddings of each tuple (𝑐𝑖,𝑝𝑖,𝑚𝑖) as
+𝐸(𝑐𝑖),𝐸(𝑝𝑖),𝐸(𝑚𝑖)∈R𝑑. We sum these embeddings to form the
+embeddings of 𝐼𝑖:𝐸(𝐼𝑖)=𝐸(𝑐𝑖)+𝐸(𝑝𝑖)+𝐸(𝑚𝑖). We denote the
+embedding of all tokens as 𝐸0(𝐼)=(𝐸(𝐼1),...,𝐸(𝐼𝑛)), representing
+the instructions’ embeddings before the first self-attention layer.
+We first apply 𝑙self-attention layers on 𝐸0(𝐼)to learn the contextual
+embeddings of the assembly instructions: 𝐸𝑙(𝐼).
+To embed the 8-byte values in 𝑇and𝐴into a space that pre-
+serves their numerical properties, we employ a convolution net-
+work with 8 kernels to learn how bytes within each neighbor-
+ing size interact with each other. Let 𝐶𝑤denote applying a con-
+volution filter with width 𝑤and output channel 𝑂𝑤, we first
+apply 8 convolution filters on 𝑇𝑖=(𝑏1,...,𝑏 8)and concatenate
+them:𝐶𝑜𝑢𝑡=𝑐𝑜𝑛𝑐𝑎𝑡(𝜙(𝑚𝑎𝑥(𝐶1(𝑇𝑖))),...,𝜙(𝑚𝑎𝑥(𝐶8(𝑇𝑖)))). Here
+𝜙denotes an activation function, and we use ReLU in this paper.
+752NeuDep : Neural Binary Memory Dependence Analysis ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+E( m)+
+E( p) E( c)Self-Attention
+AConv Conv
+E0( I)El( I)
+T+Self-Attention
+Fuse  El( I), E( T), E( A) 
+E( T) E( A)Memory
+Dependency
+Prediction HeadsPr etrain
+T askDownstr eam
+T asks
+EL
+Weight Sharing
+IEl( I) E( T) E( A)GateE'( T) E'( A)
+concatGate+Efuse
+concatFuse
+Figure 3: NeuDep ’s high-level architecture with details of
+the fusion module. It takes as input 3 sequences: the instruc-
+tions𝐼, trace values 𝑇, and code addresses 𝐴(§3.2), where 𝐼
+is embedded by 𝑙self-attention layers, and 𝑇and𝐴are em-
+bedded by convolution networks. They are then fused by a
+fusion module. The fused embeddings go through another
+𝐿−𝑙self-attention layers and output the final embeddings
+𝐸𝐿(§3.3).
+𝐶𝑜𝑢𝑡∈RÍ8
+𝑤=1𝑂𝑤is the concatenated result. We then transform
+𝐶𝑜𝑢𝑡by a highway network [ 76] (see Appendix) and obtain the
+embedding for 𝑇𝑖:𝐸(𝑇𝑖).
+To learn a universal value representation from 8 bytes, we share
+the weights of this network by applying it on both 𝑇and𝐴. There-
+fore,𝐸(𝐴𝑖)is embedded similarly as described above.
+Fusing Heterogenous Inputs. Intuitively, after embedding all
+the inputs, they are expected to carry basic meaning in their
+own modalities. We then employ a fusion module that aug-
+ments the instruction embedding by its traces and address. Specif-
+ically, let𝐺𝑇𝑖=𝜎(𝑀𝐿𝑃(𝑐𝑜𝑛𝑐𝑎𝑡(𝐸𝑙(𝐼𝑖),𝐸(𝑇𝑖)))) and𝐺𝐴𝑖=
+𝜎(𝑀𝐿𝑃(𝑐𝑜𝑛𝑐𝑎𝑡(𝐸𝑙(𝐼𝑖),𝐸(𝐴𝑖))))denote the learned gates that con-
+trol how much 𝐸(𝑇𝑖)and𝐸(𝐴𝑖)should be fused in 𝐸𝑙(𝐼𝑖), we have:
+𝐸𝑓𝑢𝑠𝑒
+𝑖=𝐸𝑙(𝐼𝑖)+𝐺𝑇𝑖·𝑀𝐿𝑃(𝐸(𝑇𝑖))+𝐺𝐴𝑖·𝑀𝐿𝑃(𝐸(𝐴𝑖))
+Cross-Modality Inference. Let𝐿denote the total number of self-
+attention layers, in which 𝑙-th layers are used to learn the instruc-
+tion representation 𝐸𝑙(𝐼). We feed𝐸𝑓𝑢𝑠𝑒=(𝐸𝑓𝑢𝑠𝑒
+1,...,𝐸𝑓𝑢𝑠𝑒
+𝑛)to the
+remaining𝐿−𝑙layers. On top of the last self-attention layer, we
+obtain𝐸𝐿=(𝐸𝐿
+1,...,𝐸𝐿𝑛)and employ trainable prediction heads for
+pretraining (§3.4), finetuning (§3.5), and probing (§3.6).
+3.4 Pretraining: Interpret and Synthesize Code
+We give the formal definition of our pretraining task as follows.
+Definition 3.1 (Pretraining) .Given (i) a code block 𝐼=(𝐼1,...,𝐼𝑛),
+(ii) its trace𝑇:𝑇=(𝑇1,...,𝑇𝑛), and (iii) a mask rate 𝑟, we pretrain the
+model𝑓, parameterized by 𝜃, by the following training objectives.
+(1)Interpret𝐼: predict the masked trace 𝑇𝑀𝑇:𝑇𝑀𝑇⊆𝑇,|𝑇𝑀𝑇|=
+|𝑇|·𝑟, given𝐼and𝑇−𝑇𝑀𝑇:𝑇𝑀𝑇=𝑓(𝐼,𝑇−𝑇𝑀𝑇;𝜃).(2)Synthesize𝐼: predict the masked instructions 𝐼𝑀𝐼:𝐼𝑀𝐼⊆
+𝐼,|𝐼𝑀𝐼|=|𝐼|·𝑟, given𝐼−𝐼𝑀𝐼and𝑇:𝐼𝑀𝐼=𝑓(𝐼−𝐼𝑀𝐼,𝑇;𝜃).
+(3)Both: predict both 𝐼𝑀𝐼and𝑇𝑀𝑇given𝐼−𝐼𝑀𝐼and𝑇−𝑇𝑀𝑇:
+𝐼𝑀𝐼,𝑇𝑀𝑇=𝑓(𝐼−𝐼𝑀𝐼,𝑇−𝑇𝑀𝑇;𝜃).
+Specifically, the pretraining takes as input the output of the last
+self-attention layer 𝐸𝐿=(𝐸𝐿
+1,...,𝐸𝐿𝑛), and minimize the (1) cross-
+entropy (CE) between the predicted masked code ˆ𝑐and the actual
+code𝑐𝑀𝐼, and the (2) mean squared error (MSE) between predicted
+masked values (8 bytes) ˆ𝑇𝑀𝑇and the actual values 𝑇𝑀𝑇:
+arg min
+𝜃∑︁
+𝑖∈𝑀𝐼−𝑐𝑖log(ˆ𝑐𝑖)+𝛼∑︁
+𝑗∈𝑀𝑇(ˆ𝑇𝑗−𝑇𝑗)2(1)
+𝜃denote the trainable parameters NeuDep ’s model (§3.3) and the
+prediction heads: 𝑀𝐿𝑃𝑐and𝑀𝐿𝑃𝑇, two multilayer perceptrons
+that take𝐸𝐿as input and predict the masked instructions: ˆ𝑐𝑀𝐼=
+𝑀𝐿𝑃𝑐(𝐸𝐿
+𝑀𝐼)and trace values: ˆ𝑇𝑀𝑇=𝑀𝐿𝑃𝑇(𝐸𝐿
+𝑀𝑇).
+Composition Learning. We increase the masking percentage 𝑟
+(Definition 3.1) at each epoch. Let 𝐿,𝑈denote the lower and upper
+bound of the 𝑟, respectively, and 𝐸𝑃𝑂𝑝𝑟𝑒𝑡𝑟𝑎𝑖𝑛 denote the pretraining
+epochs, at𝑘-th epoch,𝑟=𝐿+(𝑈−𝐿)×(𝑘−1)/𝐸𝑃𝑂𝑝𝑟𝑒𝑡𝑟𝑎𝑖𝑛 .
+3.5 Finetuning: Predict Memory Dependencies
+As shown in Figure 1, after the model is pretrained, we let the model
+predict value flows between instructions based on its learned repre-
+sentation of assembly code without traces. To this end, we detach
+the fusion module and the convolution module for embedding the
+trace𝑇and addresses 𝐴(right part in Figure 3) and directly stack
+the upper𝐿−𝑙self-attentions on top of the first 𝑙self-attention
+layers.
+Given𝐸𝐿=(𝐸𝐿
+1,...,𝐸𝐿𝑛)(§3.3), we employ a prediction head
+𝑀𝐿𝑃𝑑𝑒𝑝that minimizes the binary cross-entropy (BCE) between
+the predicted dependency ˆ𝑦of{𝐼𝑖,𝐼𝑗}⊆𝐼and their ground truth 𝑦
+(Definition 2.1): arg min𝜃−𝑦·logˆ𝑦−(1−𝑦)·log(1−ˆ𝑦), where
+ˆ𝑦=𝑀𝐿𝑃𝑑𝑒𝑝(𝑐𝑜𝑛𝑐𝑎𝑡(𝜓𝑎(𝐸𝐿),𝐸𝐿
+𝑖,𝐸𝐿
+𝑗,|𝐸𝐿
+𝑖−𝐸𝐿
+𝑗|,𝐸𝐿
+𝑖⊙𝐸𝐿
+𝑗))
+Here𝜓𝑎denotes taking the mean pooling of 𝐸𝐿and⊙denotes
+element-wise multiplication. This results in the input shape to
+𝑀𝐿𝑃𝑑𝑒𝑝to beR5𝑑.
+3.6 Downstream Reverse Engineering Tasks
+As described in §2.4, we consider three security-critical reverse
+engineering tasks as our probing tasks. We follow the similar setup
+in §3.5 and stack separate prediction heads on top of 𝐸𝐿, and train
+with additional training samples collected for probing.
+Inferring Memory Regions. Given the output of the last self-
+attention layers 𝐸𝐿=(𝐸𝐿
+1,...,𝐸𝐿𝑛), we stack a prediction head 𝑀𝐿𝑃𝑟
+that predicts the memory-access regions for each instruction 𝐼𝑖. The
+training task then minimizes the sum of cross-entropy between the
+predicted memory regions ˆ𝑦ofeach instruction and their ground
+truth memory region 𝑦:arg min𝜃Í𝑛
+𝑖=1−𝑦𝑖·log(𝑀𝐿𝑃𝑟(𝐸𝐿
+𝑖)).
+Inferring Function Signature. As shown in Definition 2.3, pre-
+dicting function signatures consists of predicting 5 types of labels:
+{𝑎,𝐴1,𝐴2,𝐴3,𝑟}. For each label, we create two prediction heads:
+𝑀𝐿𝑃𝑐𝑎𝑙𝑙𝑒𝑟 and𝑀𝐿𝑃𝑐𝑎𝑙𝑙𝑒𝑒 . For example, 𝑀𝐿𝑃𝑎
+𝑐𝑎𝑙𝑙𝑒𝑟takes as input
+the embedding corresponding to the call site 𝑐∈[1,𝑛]from the last
+753ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore K. Pei, D. She, M. Wang, S. Geng, Z. Xuan, Y. David, J. Yang, S. Jana, B. Ray
+self-attention layer 𝐸𝐿, and predicts the number of arguments that
+the call site prepares: 𝑎=𝑀𝐿𝑃𝑎
+𝑐𝑎𝑙𝑙𝑒𝑟(𝐸𝐿𝑐).𝑀𝐿𝑃𝑎
+𝑐𝑎𝑙𝑙𝑒𝑒takes as input
+the embeddings from the last self-attention layer 𝐸𝐿and predicts the
+number of arguments the callee expects: 𝑎=𝑀𝐿𝑃𝑎
+𝑐𝑎𝑙𝑙𝑒𝑒(𝜓𝑎(𝐸𝐿))
+where𝜓𝑎denotes the average pooling of all embeddings in 𝐸𝐿. The
+training objective for each head then minimizes the cross-entropy
+loss between the predicted label and the ground truth label.
+Matching Indirect Calls. Given the signatures of a call site 𝑃𝑖and
+a callee𝑃𝑗, we implement the indirect call predictor 𝑓𝑐(Definition
+2.4) by considering the following 4 criteria. (i) Loose arity :𝑃𝑖must
+prepare at least as many arguments as 𝑃𝑗accepts. (ii) Strict arity :
+the arities of 𝑃𝑖,𝑃𝑗must match exactly. (iii) Argument type : the
+types of𝑃𝑖’s first three arguments must match 𝑃𝑗’s argument types
+in at least 2 or 3 positions. (iv) Return type : if𝑃𝑖is non-void, then 𝑃𝑗
+must be non-void. The four criteria can be composed to determine
+whether𝑃𝑖,𝑃𝑗matches. We evaluate the 8 compositions in §5.3.
+4 IMPLEMENTATION AND SETUP
+We implement NeuDep ’s tracing framework in Qiling [ 81] and the
+model architecture based on PyTorch. We run all experiments and
+baselines on a Linux server, with Intel Xeon 4214 at 2.20GHz with
+48 virtual cores, 188GB RAM, and 4 Nvidia RTX 2080Ti GPUs.
+Dataset. We collect 41 open-source projects, ranging from utility
+libraries like Binutils to popular libraries like OpenSSL (see Appen-
+dix). We compiled these projects with 4 optimizations, i.e.,O0-O3,
+using GCC-9.3.0, and 4 obfuscations based on Clang-8 [ 94],i.e.,
+bogus control flow (bcf), control flow flattening (cff), basic block
+splitting (spl), and instruction substitution (sub). Among the 41
+projects, we select 9 projects as our finetuning set and the rest for
+pretraining. They include bash-5.0, bc-1.07.1, binutis-2.30, bison-
+3.3.2, cflow-1.6, coreutils-8.30, curl-7.76.0, findutils-4.7.0, gawk-5.1.0.
+The 9 projects have disparate functionalities and sizes such that
+they are diverse and representative of real-world software. We per-
+form static disassembly (taking less than 0.1 seconds per input)
+followed by a simply post-processing to parse the raw assembly
+into the format that the model accepts (§3.2).
+Ground Truth Dependencies. We follow [ 96] by using dynamic
+analysis to collect the ground truth memory dependencies. To quan-
+tify how NeuDep and the baselines perform, we measure the de-
+tected dependencies among the reference ones ( detect ) and mark
+the rest as miss; we treat the predicted dependencies not included
+in the references as potential false positives (FP).
+Baselines. We compare NeuDep to Angr [ 85], Ghidra [ 1], SVF [ 78],
+and DeepVSA [35]. As SVF does support dumping its result to the
+compiled binary (confirmed with the authors) [ 78], we propagate its
+result using the DWARF information. As one source statement can
+map to multiple assembly instructions, we treat it as a true positive
+if its detected dependencies include the ground truth instruction
+pair. We thus omit evaluating SVF on the obfuscated binaries as
+the obfuscator significantly distorts the mapping in DWARF. For
+DeepVSA, its VSA implementation requires taking a crash dump as
+input and does not work for general memory dependence analysis.
+Therefore, we run its released trained model and use its predicted
+memory region to determine whether two memory-access instruc-
+tions are dependent. We note that PalmTree [ 51] also compared toDeepVSA on the standalone memory region prediction task without
+running its VSA module. However, as PalmTree does not release
+its trained model for memory region prediction, we cannot run
+PalmTree on our dataset to predict memory dependencies. There-
+fore, we instead compare NeuDep to PalmTree and its evaluated
+baselines (including DeepVSA) in our probing studies (5.3).
+BDA [ 96] is the state-of-the-art binary memory dependence
+analysis tool, to the best of our knowledge. We reached out to the
+authors and confirmed that BDA targets reducing false negatives in
+the inter-procedural setting, and they evaluated it on only O0 bina-
+ries. Per our requests, BDA authors performed preliminary studies
+and observed BDA achieves low miss rate (0.02%), but suffers from
+high false positive rate and runtime overhead. For example, on
+readelf compiled by O0, BDA has around 2.23% precision (detecting
+5,742 true dependencies out of a total of 256,596 predicted depen-
+dencies). Due to the different focuses between BDA and NeuDep ,
+we thus omit including BDA results to avoid unfair comparison.
+For probing tasks, we compare NeuDep to (i) PalmTree [ 51] and
+the other baselines that PalmTree evaluated such as DeepVSA [ 35],
+Asm2Vec [ 27], and Instruction2Vec [ 50], on predicting memory-
+access regions, (ii) EKLAVYA [ 15] on predicting function signatures,
+and (iii) EKLAVYA and TypeArmor [ 82] on predicting indirect calls.
+Hyperparameters. For composition learning, we set 𝐿=0.2and
+𝑈=0.8(§3.4). For pretraining (Equation 1), we set 𝛼=100by
+observing that MSE loss is around 100 ×smaller than that of CE in
+our experiments.
+5 EVALUATION
+We focus on three main research questions in the evaluation.
+•RQ1: How well does NeuDep perform in analyzing memory
+dependencies? (§5.1)
+•RQ2: How much does each design choice in NeuDep contribute
+to its performance? (§5.2)
+•RQ3: How well does NeuDep perform in downstream reverse
+engineering tasks? (§5.3)
+5.1 NeuDep Performance
+Table 2 presents the results of NeuDep and other baselines on the
+test set categorized by their optimization and obfuscation flags.
+NeuDep ’s results are obtained from finetuning a single model on all
+datasets, excluding the testing set. On average, NeuDep detects 1.5×
+more dependencies than the second-best (DeepVSA), while having
+4.5×fewer misses than the second-best (SVF). Ghidra has fewer
+false positives than NeuDep , but at the cost of missing substantial
+dependencies, detecting 3.3 ×fewer dependencies than NeuDep . Be-
+sides, we note that DeepVSA produces 6.4 ×more false positives on
+higher optimizations when compared to O0. This is likely because
+memory access patterns ( e.g.,using rbpandraxto access stack and
+heap, respectively, are largely broken by compilers.
+Zero-Shot Generalizability to Unseen Projects. In the above ex-
+periment, our training and testing set are randomly sampled with
+non-overlapping pairs, but they could come from the same software
+project. Therefore, we investigate how NeuDep performs when its
+testing set comes from entirely different software projects. We col-
+lect 2 software projects featuring a web server, i.e.,Nginx-1.21.1,
+754NeuDep : Neural Binary Memory Dependence Analysis ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+Table 2: NeuDep and other baselines’ results on the test set categorized by the compiler optimizations and obfuscations.
+Flags # DepAngr Ghidra SVF DeepVSA∗NeuDep
+Detect Miss FP Detect Miss FP Detect Miss FP Detect Miss FP Detect Miss FP
+O0 1,013 28 985 16 355 658 7 380 633 392 420 593 329 930 83 147
+O1 1,310 12 1,298 14 387 923 19 486 824 1,474 617 693 2,013 898 412 576
+O2 1,103 14 1,089 10 330 773 6 403 698 1,392 464 639 1,512 822 281 480
+O3 1,132 14 1,118 14 332 800 14 425 707 1,351 472 660 1,527 827 305 501
+bcf 3,144 23 3,121 14 160 2,984 0 - - - 613 2,531 445 3,122 22 127
+cff 758 22 736 9 208 550 0 - - - 337 421 113 724 34 56
+spl 1,296 24 1,272 18 173 1,123 2 - - - 515 781 181 1,245 51 77
+sub 938 22 916 14 264 674 7 - - - 393 545 236 885 53 127
+Avg. 1,337 20 1,317 14 276 1,061 7 424 716 1,152 478 858 795 1,182 155 261
+∗DeepVSA’s VSA implementation takes crash dumps as input and does not work on our dataset (regular binary code without crashes). Therefore, we run DeepVSA’s released model on our dataset
+and use its predicted memory region to flag dependent instructions (§4).
+Table 3: NeuDep performance when dividing its dataset by
+non-overlapping train-test vs. non-overlapping programs,
+optimizations, and obfuscations. Δdenotes the performance
+change scaled by the number of reference dependencies.
+Cross- # DepRegular Unseen Δ(+/-)
+Detect FP Detect FP Detect FP
+Proj.Nginx 226 164 56 155 68 -4% +5.3%
+Lynx 322 240 92 244 120 +1.2% +8.7%
+Opt.O0 1,013 959 90 958 103 -0.1% +1.3%
+O1 1,310 1,026 112 988 298 -2.9% +14.2%
+O2 1,103 919 195 908 208 -1% +1.2%
+O3 1,132 922 207 933 235 +1% +2.5%
+Obf.bcf 3,144 3,131 104 2,946 925 -5.9% +26.1%
+cff 758 746 38 748 35 +0.3% -0.4%
+spl 2,217 2,171 121 2,076 101 -4.3% -0.9%
+sub 938 907 76 914 89 +0.8% +1.4%
+Avg. 1,216 1,119 109 1,087 218 -2.6% +9%
+and a web browser, i.e.,Lynx-2.8.9, to which none of the projects
+in our dataset has similar functionality. We compile each software
+project with 4 optimizations (O0-O3), and test NeuDep on these
+unseen software projects. As a baseline, we finetune a model where
+its training set includes the project, but with non-overlapping in-
+struction pairs (“Regular” in Table 3).
+The first two rows in Table 3 demonstrate that NeuDep remains
+relatively robust when the testing set is collected from unseen
+projects, i.e.,on average, the number of detected dependencies
+only drops 1.4% and false positives increased by 7%. Interestingly,
+training without samples from Lynx even increases the detected
+dependencies, but at the expense of much higher false positives.
+Zero-Shot Generalizability to Unseen Optimizations/Obfusca-
+tions. Aggressive compiler transformations can bring many chal-
+lenges to inferring memory dependencies, e.g.,substituting instruc-
+tions introduces more pointer arithmetic operations, which requires
+reasoning over the bloated instructions to detect the value flows.
+To study whether NeuDep generalizes to unseen optimizations and
+obfuscations, we exclude binaries optimized or obfuscated by each
+strategy (§4) in training and test NeuDep on the excluded binaries.
+Table 3 presents results when testing NeuDep on each unseen
+optimizations and obfuscations. We also include the baseline re-
+sults when its training set includes those optimized or obfuscated
+binaries (but with non-overlapping pairs). We observe that NeuDepTable 4: Runtime of NeuDep vs. Angr and Ghidra. The last
+column shows the speedup over the second-best tool.
+Size (MB)Inference Time (s)SpeedupAngr Ghidra NeuDep
+bash 2.8 7685.9 60.4 24.4 2.5×
+bc 0.5 298.8 5.3 1.4 3.8×
+binutils 74 70157.1 3077.2 695.6 4.4×
+bison 1.6 1730.1 30.2 10.3 2.9×
+cflow 0.56 695.9 6.5 3 2.2×
+coreutils 16 40,188.2 392.2 105.9 3.7×
+curl 0.77 91.5 14.5 3.1 4.7×
+findutils 2.3 882.7 80.1 23.2 3.5×
+gawk 3.8 2305.3 55.0 14.1 3.9×
+Avg. 12.8 13781.7 413.5 110.1 3.5×
+generalizes to unseen optimizations and obfuscations, with only
+2.6% drop in detection rate and 9% increase in false positives.
+Runtime Performance. One of the most significant benefits of
+NeuDep over traditional approaches comes from its speed, as its
+analysis is amenable to parallelization with GPUs. Table 4 compares
+the speed of NeuDep to Angr and Ghidra. We run each tool on
+each project compiled with O0 from our finetuning dataset (§4). We
+observe that Angr often takes long time and cannot finish running
+(as also confirmed by [ 96]). Thus, we time it out after 5 minutes.
+Consequently, Angr’s actual runtime is under-estimated. We do
+not compare to (i) DeepVSA because it still relies on VSA, so it is at
+least as slow as any VSA implementation, and (ii) SVF because it
+works only on LLVM IR, not directly on binaries. Therefore, SVF has
+extremely high overheard from mapping LLVM IR results to binary.
+Table 4 shows that NeuDep is 3.5×faster than the second-best tool
+(Ghidra) and orders of magnitude faster (125.2 ×) than Angr.
+5.2 Ablation Study
+We study how much each design in NeuDep (§3) contributes to its
+performance. We follow the setup in §5.1. Table 5 summarizes the
+results where we bold NeuDep ’s default choice.
+Pretraining. We first ablate the effectiveness of pretraining in
+assisting memory dependence analysis. Table 5 shows that pretrain-
+ingNeuDep significantly improves its performance by 12.6% in the
+number of detected dependencies. The number of misses and false
+positives drop by 57.6% and 31.4%, respectively.
+755ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore K. Pei, D. She, M. Wang, S. Geng, Z. Xuan, Y. David, J. Yang, S. Jana, B. Ray
+Table 5: Ablation on NeuDep designs. We treat the first row
+of each design as the baseline and compute the improvement
+of other alternatives.
+Ablation Setup Detect Miss FPImprove (+/-)
+Detect Miss FP
+Pretrainw/o 8,780 1,914 1,477 0.0% 0.0% 0.0%
+w/ 9,882 812 1,013 +12.6% -57.6% -31.4%
+Value
+EmbedConcat 9,666 1,208 1,027 0.0% 0.0% 0.0%
+Conv. 9,882 812 1,013 +2.2% -32.8% -1.4%
+Fusing
+StrategySum 9,752 942 1,419 0.0% 0.0% 0.0%
+1st Layer 9,882 812 1,013 +1.3% -13.8% -28.6%
+3rd Layer 9,870 824 1,209 +1.2% -12.5% -14.7%
+5th Layer 9,700 994 1,186 +0.5% -5.5% -16.4%
+Compos.
+Learningw/o Compos. 9,806 888 1,389 0.0% 0.0% 0.0%
+w/ Compos. 9,882 812 1,013 +0.8% -8.6% -27.1%
+Code
+Addr.w/o Addr. 9,667 1,027 1,407 0.0% 0.0% 0.0%
+w/ Addr. 9,882 812 1,013 +2.2% -20.9% -28%
+Byte Aggregation. We study the effectiveness of encoding numeric
+values using convolutions with highway network (§3.2) by com-
+paring it to the baseline that concatenates the input bytes. Table 5
+shows that our encoding mechanism outperforms the baseline by
+2.2% and significantly reduces the miss detection rate by 32.8%.
+Input Fusion. We explore the effectiveness of input fusion by
+comparing it to the baseline that takes the vector sum of the input
+embeddings [ 64,66]. We also study fusing after which layer is the
+most effective. We note that simply summing the embeddings of
+code and trace values at input by assuming they are homogeneous
+performs the worst. This confirms our intuition that code and trace
+are heterogeneous data that benefit from different encoding mecha-
+nisms. In addition, we note that combining code and trace at earlier
+layers performs the best. This is likely because trace values can par-
+ticipate early in the model’s computation of interactions between
+instructions and trace values, i.e.,fusing in the later layers implies
+it has fewer remaining layers to learn how code and trace interacts.
+Composition Learning. We study whether composition learning
+(§2.3) would help the model’s finetuning performance for detecting
+memory dependencies. We compare it to the fixed masking per-
+centage strategy where the samples are shuffled randomly, and the
+masking rate 𝑟is fixed to 0.5 on both the code and trace tokens.
+Table 5 shows that composition learning moderately improves the
+model by 0.8% in detected dependencies but substantially reduces
+the number of false positives by 27.1%. This observation confirms
+our intuition that arranging the training samples based on their
+difficulty helps the model learn more efficiently.
+Modeling Address Layout. We study whether annotating the bi-
+nary code with its loaded addresses would bring a useful inductive
+bias to the model by comparing to the baselines that do not model
+them [ 64,66]. Table 5 shows that annotating the code with ad-
+dresses significantly reduces the model’s missed detection and false
+positives, i.e.,by 20.9% and 28%, respectively. This shows that the
+code address helps the model reduce the spurious dependencies.
+5.3 Performance on Reverse Engineering Tasks
+We probe pretrained NeuDep using three reverse engineering tasks
+that either assist or benefit from memory dependence analysis.Table 6: Comparison of F1 scores on memory region predic-
+tion between NeuDep and PalmTree and other baselines.
+Global Heap Stack Other Avg.
+Instruction2Vec 0.654 0.566 0.914 0.947 0.77
+Asm2Vec 0.517 0.359 0.911 0.948 0.684
+DeepVSA 0.835 0.584 0.944 0.959 0.831
+PalmTree 0.855 0.714 0.95 0.971 0.873
+NeuDep 0.91 0.904 0.977 0.976 0.942
+Table 7: We compare NeuDep to EKLAVYA on five function
+signature tasks across 4 optimizations for caller and callee.
+Caller Callee
+O0 O1 O2 O3 O0 O1 O2 O3Ret.EKLA. 66.62 70.59 73.63 76.19 91.59 88.87 91.92 95.32
+NeuDep 94.65 93.33 95.75 96.41 95.37 93.42 96.06 98.20𝐴1EKLA. 91.56 90.38 91.21 91.55 95.62 92.40 93.05 92.56
+NeuDep 97.03 97.09 98.47 99.17 97.24 95.10 97.01 97.84𝐴2EKLA. 81.82 78.70 81.81 82.03 87.25 82.67 82.40 85.07
+NeuDep 96.08 94.86 97.68 97.51 93.30 91.34 94.66 92.45𝐴3EKLA. 80.28 79.85 81.35 76.63 77.42 69.18 70.93 69.80
+NeuDep 96.88 96.89 97.09 97.24 96.55 94.42 94.66 95.68ArityEKLA. 92.03 86.02 83.80 82.79 97.48 76.24 77.49 78.69
+NeuDep 98.84 95.44 96.35 95.86 99.23 92.57 95.04 96.40
+Memory-Access Regions. We follow PalmTree by running NeuDep
+on the DeepVSA’s dataset and compare NeuDep to the reported F1
+scores of PalmTree, DeepVSA, and other baselines (§4). We note
+that DeepVSA’s datasets are all 32-bit x86 binaries, but NeuDep is
+pretrained on x86-64 binaries. However, we find that just our vocab-
+ulary constructed from x86-64 binaries covers 89.9% of DeepVSA’s
+dataset vocabulary, likely because both belong to the x86 family.
+Therefore, we simply apply our vocabulary on DeepVSA’s dataset
+and replace unseen tokens with “unknown” in the vocabulary.
+Table 6 shows that NeuDep remains robust across different mem-
+ory regions. On average, NeuDep outperforms PalmTree by 0.069.
+On more challenging labels such as heap, NeuDep outperforms
+PalmTree and DeepVSA by 0.19 and 0.32, respectively. This is likely
+because accessing these memory regions involves more diverse
+patterns, e.g.,via the stack pointer register (Figure 2).
+Function Signature. We compare NeuDep to EKLAVYA on re-
+covering function signatures. Table 7 shows that NeuDep outper-
+forms EKLAVYA on all signature inference tasks, achieving 12.6%
+higher accuracy on average. Most notably, NeuDep ’s performance
+remains robust across different tasks and optimization levels, while
+EKLAVYA’s accuracy shows clear drops. For instance, when com-
+paring the prediction accuracy of 3rd argument ( 𝐴3) and 1st argu-
+ment (𝐴1), EKLAVYA decreases by 16.61% while NeuDep ’s drops
+by only 1.19%. Likewise, within the arity task, EKLAVYA’s accuracy
+decreases 14.02% from O0 to O3, while NeuDep decreases 2.91%.
+Indirect Calls. Finally, we compare how well NeuDep , EKLAVYA,
+and TypeArmor detect indirect calls (Definition 2.4). We consider 8
+matching algorithms (§3.6) grouped row-wise by arity matching
+criteria detailed in Table 8. On all algorithms, NeuDep outper-
+forms EKLAVYA and TypeArmor, achieving 0.032 and 0.07 higher
+F1 scores, respectively. With loose arity and return type matching –
+756NeuDep : Neural Binary Memory Dependence Analysis ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+Table 8: NeuDep ’s F1 score on matching indirect calls using
+several heuristic algorithms. TypeArmor cannot infer argu-
+ment types, so the corresponding cells are dashed out.
+Arity Arity+Ret Arity+Arg Arity+Arg+RetLooseTypeArmor 0.75 0.752 - -
+EKLAVYA 0.777 0.778 0.8 0.801
+NeuDep 0.783 0.804 0.83 0.843StrictTypeArmor 0.777 0.778 - -
+EKLAVYA 0.818 0.817 0.811 0.811
+NeuDep 0.844 0.853 0.851 0.857
+the criterion adopted in TypeArmor – NeuDep outperforms TypeAr-
+mor by 0.052 in F1 score. We also note that NeuDep ’s performance
+increases as the matching algorithm incorporates more conditions,
+while the performance of other systems remains roughly the same.
+6 THREATS TO VALIDITY
+Architecture Bias. We only consider x86-64 binaries. While we
+have shown NeuDep generalizes to several x86-32 binaries (§5.3),
+it cannot directly be applied to binaries with significantly different
+syntax, e.g.,those running on ARM or MIPS architectures. However,
+as our trace engine supports other architectures well [ 81], we can
+potentially pretrain the model for other architectures. We also plan
+to extend our models to different programming languages that come
+with efficient tracing support [31, 57, 68].
+Performance Bias. We only compare NeuDep ’s runtime perfor-
+mance on GPUs with other baselines (§5.1), as NeuDep ’s neural
+module runs on GPU by default. However, we believe that signifi-
+cantly benefitting from GPU is indeed a key advantage of ML-based
+techniques over traditional binary analysis that cannot easily ex-
+ploit GPU parallelism and thus struggle to scale to large binaries.
+Ground Truth Bias. Obtaining complete ground truth for memory
+dependencies in real-world programs is intractable. Therefore, fol-
+lowing BDA’s approach [ 96], we resort to dynamic analysis and use
+the accessed memory locations observed during execution to collect
+the reference dependencies. While we cannot guarantee the ground
+truth to be complete, this approach can still quantify how many
+dependencies are missed by the evaluated tools. Table 2 shows that
+NeuDep outperforms all baselines with the fewest misses.
+Inter-Procedural Analysis. We only capture full execution be-
+havior starting from a callee. Therefore, NeuDep primarily expects
+instruction pairs to come from the same function. However, as we
+trace the full execution behavior of method calls, our model poten-
+tially learns to reason about the value flows across procedures. We
+plan to explore NeuDep ’s capability in inter-procedural analysis
+by modeling the complete calling context in our future study.
+7 RELATED WORK
+Binary Memory Dependence Analysis. There has been a long
+history of efforts to approach the problem of analyzing memory de-
+pendencies in executables [ 5,6,11,16,22,34,35,71,96]. Debray et
+al.[22] and Cifuentes et al. [16] pioneered this field by using abstract
+interpretation to propagate the abstract domain along the registers
+of each instruction. VSA [ 5] improves on their idea by supportingtracking value flows along both the registers and memory loca-
+tions. DeepVSA [ 35] further improves on VSA by learning a neural
+network to predict the memory-access regions of each instruction
+to pre-filter those not sharing the regions. BDA [ 96] uses proba-
+bilistic analysis to uniformly sample paths and performs per-path
+abstract interpretation to avoid precision losses from path merg-
+ing. While both DeepVSA and BDA sacrifice soundness, they have
+been shown to significantly assist in debugging crashes [ 19,58] and
+malware analysis. However, they still incur high runtime overhead
+and produce many false positives for optimized binaries – NeuDep
+substantially outperforms these tools (§5).
+Machine Learning for Program Analysis. Machine learning has
+shown great promises in analyzing both source code and executa-
+bles [ 3,24,62,74] in tasks like type inference [ 37,56,61,64,70,92],
+code completion [ 10,17,43], program synthesis and genera-
+tion [ 79,88], program repair and fix [ 2,26,41,80,97], code sum-
+marization [ 14,21,75,84], general code representation [ 13,39,
+46,51,53,89], bug/vulnerability detection [ 23,48,63,73], code
+clone detection and search [ 14,32,33,42,55,66], code transla-
+tion [ 72], comment suggestion [ 40,52], and reverse engineering
+tasks [ 7,9,45,65]. Recent works have observed that incorporating
+program behavior is beneficial to learning more effective program
+representations [ 45,60,63,64,66,89]. For example, Pei et al. [64,66]
+demonstrate that pretraining ML models with execution traces can
+help the model understand the program’s operational semantics,
+showing successes in detecting semantically similar binaries and
+type inference under various code transformations [ 95]. However,
+they have no support for data flow through memory and thus do
+not model fine-grained value flows across memory operations. We
+show in §5.2 that NeuDep ’s new designs absent in these works are
+critical to analyzing memory dependencies.
+8 CONCLUSION
+We present a new ML-based approach, NeuDep , to predict memory
+dependencies. We first pretrain NeuDep to understand how instruc-
+tions propagate dynamic values across memory and registers, then
+finetune the model to detect memory dependencies statically. We
+demonstrate that NeuDep is precise and efficient, outperforming
+the state-of-the-art in both detection accuracy (1.5 ×) and speed
+(3.5×). Extensive probing studies demonstrate that NeuDep under-
+stands memory access patterns, learns function signatures, and can
+match indirect calls – these tasks either assist or benefit from infer-
+ring memory dependencies. Notably, NeuDep also outperforms the
+state-of-the-art on these tasks.
+ACKNOWLEDGMENTS
+We thank the anonymous reviewers for their constructive and valu-
+able feedback. We thank the author of BDA, Zhuo Zhang, for pro-
+viding valuable insight and suggestion, and running experiments of
+BDA. This work is sponsored in part by NSF grants CCF-1845893,
+CCF-2107405, CNS-1564055, and IIS-2221943; ONR grant N00014-
+17-1-2788; an NSF Career Award; an Accenture Faculty Research
+Award; a Google Gift; an IBM Faculty Award. Any opinions, find-
+ings, conclusions, or recommendations expressed herein are those
+of the authors, and do not necessarily reflect those of the US Gov-
+ernment, NSF, ONR, Accenture, Google, or IBM.
+757ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore K. Pei, D. She, M. Wang, S. Geng, Z. Xuan, Y. David, J. Yang, S. Jana, B. Ray
+REFERENCES
+[1] National Security Agency. 2019. Ghidra Disassembler. https://ghidra-sre .org/.
+[2]Miltiadis Allamanis, Earl T Barr, Christian Bird, and Charles Sutton. 2014. Learn-
+ing natural coding conventions. In Proceedings of the 22nd ACM SIGSOFT Interna-
+tional Symposium on Foundations of Software Engineering . 281–293.
+[3]Miltiadis Allamanis, Earl T Barr, Premkumar Devanbu, and Charles Sutton. 2018.
+A survey of machine learning for big code and naturalness. Comput. Surveys
+(2018).
+[4]Paul-Antoine Arras, Anastasios Andronidis, Luís Pina, Karolis Mituzas, Qianyi
+Shu, Daniel Grumberg, and Cristian Cadar. 2022. SaBRe: load-time selective
+binary rewriting. International Journal on Software Tools for Technology Transfer
+(2022), 1–19.
+[5]Gogul Balakrishnan and Thomas Reps. 2004. Analyzing memory accesses in x86
+executables. In International conference on compiler construction .
+[6]Gogul Balakrishnan and Thomas Reps. 2010. WYSINWYX: What you see is not
+what you eXecute. ACM Transactions on Programming Languages and Systems
+(TOPLAS) 32, 6 (2010), 1–84.
+[7]Sébastien Bardin, Tristan Benoit, and Jean-Yves Marion. 2021. Compiler and
+optimization level recognition using graph neural networks. In MLPA 2020-
+Machine Learning for Program Analysis .
+[8]Yoshua Bengio, Jérôme Louradour, Ronan Collobert, and Jason Weston. 2009.
+Curriculum learning. In Proceedings of the 26th annual international conference
+on machine learning . 41–48.
+[9]Tristan Benoit, Jean-Yves Marion, and Sébastien Bardin. 2021. Binary level
+toolchain provenance identification with graph neural networks. In 2021 IEEE
+International Conference on Software Analysis, Evolution and Reengineering .
+[10] Avishkar Bhoopchand, Tim Rocktäschel, Earl Barr, and Sebastian Riedel. 2016.
+Learning python code suggestion with a sparse pointer network. arXiv preprint
+arXiv:1611.08307 (2016).
+[11] David Brumley and James Newsome. 2006. Alias analysis for assembly . Technical
+Report. Technical Report CMU-CS-06-180, Carnegie Mellon University.
+[12] Matteo Brunetto, Giovanni Denaro, Leonardo Mariani, and Mauro Pezzè. 2021.
+On introducing automatic test case generation in practice: A success story and
+lessons learned. Journal of Systems and Software 176 (2021), 110933.
+[13] Nghi DQ Bui, Yijun Yu, and Lingxiao Jiang. 2021. Infercode: Self-supervised
+learning of code representations by predicting subtrees. In 2021 IEEE/ACM 43rd
+International Conference on Software Engineering (ICSE) . IEEE, 1186–1197.
+[14] Nghi DQ Bui, Yijun Yu, and Lingxiao Jiang. 2021. Self-supervised contrastive
+learning for code retrieval and summarization via semantic-preserving trans-
+formations. In Proceedings of the 44th International ACM SIGIR Conference on
+Research and Development in Information Retrieval . 511–521.
+[15] Zheng Leong Chua, Shiqi Shen, Prateek Saxena, and Zhenkai Liang. 2017. Neural
+nets can learn function type signatures from binaries. In 26th USENIX Security
+Symposium .
+[16] Cristina Cifuentes and Antoine Fraboulet. 1997. Intraprocedural static slicing of
+binary executables. In International Conference on Software Maintenance .
+[17] Matteo Ciniselli, Nathan Cooper, Luca Pascarella, Denys Poshyvanyk, Massimil-
+iano Di Penta, and Gabriele Bavota. 2021. An empirical study on the usage of
+BERT models for code completion. In 2021 IEEE/ACM 18th International Confer-
+ence on Mining Software Repositories (MSR) . IEEE, 108–119.
+[18] Marco Cova, Viktoria Felmetsger, Greg Banks, and Giovanni Vigna. 2006. Static
+detection of vulnerabilities in x86 executables. In 2006 22nd Annual Computer
+Security Applications Conference (ACSAC’06) . IEEE, 269–278.
+[19] Weidong Cui, Xinyang Ge, Baris Kasikci, Ben Niu, Upamanyu Sharma, Ruoyu
+Wang, and Insu Yun. 2018. REPT: Reverse debugging of failures in deployed
+software. In Operating Systems Design and Implementation .
+[20] Robin David, Sébastien Bardin, Thanh Dinh Ta, Laurent Mounier, Josselin Feist,
+Marie-Laure Potet, and Jean-Yves Marion. 2016. BINSEC/SE: A dynamic sym-
+bolic execution toolkit for binary-level analysis. In 2016 IEEE 23rd International
+Conference on Software Analysis, Evolution, and Reengineering .
+[21] Yaniv David, Uri Alon, and Eran Yahav. 2020. Neural reverse engineering of
+stripped binaries using augmented control flow graphs. Proceedings of the ACM
+on Programming Languages 4, OOPSLA (2020), 1–28.
+[22] Saumya Debray, Robert Muth, and Matthew Weippert. 1998. Alias analysis of
+executable code. In Proceedings of the 25th ACM SIGPLAN-SIGACT symposium on
+Principles of programming languages . 12–24.
+[23] Renzo Degiovanni and Mike Papadakis. 2022. 𝜇BERT: Mutation Testing using
+Pre-Trained Language Models. arXiv preprint arXiv:2203.03289 (2022).
+[24] Prem Devanbu, Matthew Dwyer, Sebastian Elbaum, Michael Lowry, Kevin Moran,
+Denys Poshyvanyk, Baishakhi Ray, Rishabh Singh, and Xiangyu Zhang. 2020.
+Deep learning & software engineering: State of research and future directions.
+arXiv preprint arXiv:2009.08525 (2020).
+[25] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. 2019. BERT:
+Pre-training of deep bidirectional transformers for language understanding. In
+2019 Annual Conference of the North American Chapter of the Association for
+Computational Linguistics: Human Language Technologies .[26] Elizabeth Dinella, Todd Mytkowicz, Alexey Svyatkovskiy, Christian Bird, Mayur
+Naik, and Shuvendu K Lahiri. 2021. Deepmerge: Learning to merge programs.
+arXiv preprint arXiv:2105.07569 (2021).
+[27] Steven HH Ding, Benjamin CM Fung, and Philippe Charland. 2019. Asm2vec:
+Boosting static representation robustness for binary clone search against code
+obfuscation and compiler optimization. In 2019 IEEE Symposium on Security and
+Privacy (S&P) . IEEE, 472–489.
+[28] Manuel Egele, Maverick Woo, Peter Chapman, and David Brumley. 2014. Blanket
+execution: Dynamic similarity testing for program binaries and components. In
+23rd USENIX Security Symposium (USENIX Security 14) . 303–317.
+[29] Ulfar Erlingsson, Martín Abadi, Michael Vrable, Mihai Budiu, and George C
+Necula. 2006. XFI: Software guards for system address spaces. In Proceedings of
+the 7th symposium on Operating systems design and implementation . 75–88.
+[30] Patrice Godefroid. 2014. Micro execution. In 36th International Conference on
+Software Engineering .
+[31] Matthias Grimmer, Manuel Rigger, Roland Schatz, Lukas Stadler, and Hanspeter
+Mössenböck. 2014. Trufflec: Dynamic execution of c on a java virtual machine.
+InProceedings of the 2014 International Conference on Principles and Practices of
+Programming on the Java platform: Virtual machines, Languages, and Tools .
+[32] Wenchao Gu, Zongjie Li, Cuiyun Gao, Chaozheng Wang, Hongyu Zhang, Zenglin
+Xu, and Michael R Lyu. 2021. CRaDLe: Deep code retrieval based on semantic
+dependency learning. Neural Networks 141 (2021), 385–394.
+[33] Yi Gui, Yao Wan, Hongyu Zhang, Huifang Huang, Yulei Sui, Guandong Xu,
+Zhiyuan Shao, and Hai Jin. 2022. Cross-Language Binary-Source Code Matching
+with Intermediate Representations. arXiv preprint arXiv:2201.07420 (2022).
+[34] Bolei Guo, Matthew J Bridges, Spyridon Triantafyllis, Guilherme Ottoni,
+Easwaran Raman, and David I August. 2005. Practical and accurate low-level
+pointer analysis. In International Symposium on Code Generation and Optimization .
+IEEE, 291–302.
+[35] Wenbo Guo, Dongliang Mu, Xinyu Xing, Min Du, and Dawn Song. 2019. DEEP-
+VSA: Facilitating Value-set Analysis with Deep Learning for Postmortem Program
+Analysis. In 28th USENIX Security Symposium (USENIX Security 19) .
+[36] Liang He, Hong Hu, Purui Su, and Zhenkai Liang Liang, Yan Cai. 2022. FREEWILL:
+Automatically Diagnosing Use-after-free Bugs via Reference Miscounting Detec-
+tion on Binaries. In USENIX Security Symposium .
+[37] Vincent J Hellendoorn, Christian Bird, Earl T Barr, and Miltiadis Allamanis. 2018.
+Deep learning type inference. In European Software Engineering Conference and
+Symposium on the Foundations of Software Engineering .
+[38] Grant Hernandez, Farhaan Fowze, Dave Tian, Tuba Yavuz, and Kevin RB Butler.
+2017. Firmusb: Vetting usb device firmware using domain informed symbolic
+execution. In Computer and Communications Security .
+[39] Abram Hindle, Earl T Barr, Mark Gabel, Zhendong Su, and Premkumar Devanbu.
+2016. On the naturalness of software. Commun. ACM 59, 5 (2016), 122–131.
+[40] Yuan Huang, Xinyu Hu, Nan Jia, Xiangping Chen, Yingfei Xiong, and Zibin
+Zheng. 2019. Learning code context information to predict comment locations.
+IEEE Transactions on Reliability 69, 1 (2019), 88–105.
+[41] Faria Huq, Masum Hasan, Md Mahim Anjum Haque, Sazan Mahbub, Anindya
+Iqbal, and Toufique Ahmed. 2022. Review4Repair: Code review aided automatic
+program repairing. Information and Software Technology 143 (2022), 106765.
+[42] Abdullah Al Ishtiaq, Masum Hasan, Md Haque, Mahim Anjum, Kazi Sajeed
+Mehrab, Tanveer Muttaqueen, Tahmid Hasan, Anindya Iqbal, and Rifat Shahriyar.
+2021. BERT2Code: Can Pretrained Language Models be Leveraged for Code
+Search? arXiv preprint arXiv:2104.08017 (2021).
+[43] Maliheh Izadi, Roberta Gismondi, and Georgios Gousios. 2022. CodeFill: Multi-
+token Code Completion by Jointly Learning from Structure and Naming Se-
+quences. arXiv preprint arXiv:2202.06689 (2022).
+[44] Ridhi Jain, Rahul Purandare, and Subodh Sharma. 2022. BiRD: Race Detection in
+Software Binaries under Relaxed Memory Models. ACM Transactions on Software
+Engineering and Methodology (2022).
+[45] Xin Jin, Kexin Pei, Jun Yeon Won, and Zhiqiang Lin. 2022. SymLM: Predicting
+Function Names in Stripped Binaries via Context-Sensitive Execution-Aware
+Code Embeddings. In 2022 ACM SIGSAC Conference on Computer and Communi-
+cations Security .
+[46] Geunwoo Kim, Sanghyun Hong, Michael Franz, and Dokyung Song. 2022. Im-
+proving cross-platform binary analysis using representation learning via graph
+alignment. In Proceedings of the 31st ACM SIGSOFT International Symposium on
+Software Testing and Analysis . 151–163.
+[47] Sun Hyoung Kim, Cong Sun, Dongrui Zeng, and Gang Tan. 2021. Refining
+indirect call targets at the binary level. In Network and Distributed System Security
+Symposium, NDSS .
+[48] Yunho Kim, Seokhyeon Mun, Shin Yoo, and Moonzoo Kim. 2019. Precise learn-
+to-rank fault localization using dynamic and static features of target programs.
+ACM Transactions on Software Engineering and Methodology (2019).
+[49] JongHyup Lee, Thanassis Avgerinos, and David Brumley. 2011. TIE: Principled
+reverse engineering of types in binary programs. In 2011 Network and Distributed
+System Security Symposium .
+[50] Young Jun Lee, Sang-Hoon Choi, Chulwoo Kim, Seung-Ho Lim, and Ki-Woong
+Park. 2017. Learning binary code with deep learning to detect software weakness.
+758NeuDep : Neural Binary Memory Dependence Analysis ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+InKSII the 9th international conference on internet (ICONI) 2017 symposium .
+[51] Xuezixiang Li, Qu Yu, and Heng Yin. 2021. PalmTree: Learning an Assembly
+Language Model for Instruction Embedding. In 2021 ACM SIGSAC Conference on
+Computer and Communications Security .
+[52] Annie Louis, Santanu Kumar Dash, Earl T Barr, Michael D Ernst, and Charles
+Sutton. 2020. Where should I comment my code? A dataset and model for
+predicting locations that need comments. In Proceedings of the 42nd International
+Conference on Software Engineering: New Ideas and Emerging Results .
+[53] Wei Ma, Mengjie Zhao, Ezekiel Soremekun, Qiang Hu, Jie Zhang, Mike Papadakis,
+Maxime Cordy, Xiaofei Xie, and Yves Le Traon. 2021. GraphCode2Vec: Generic
+Code Embedding via Lexical and Program Dependence Analyses. arXiv preprint
+arXiv:2112.01218 (2021).
+[54] Christopher Manning, Kevin Clark, John Hewitt, Urvashi Khandelwal, and Omer
+Levy. 2020. Emergent linguistic structure in artificial neural networks trained by
+self-supervision. Proceedings of the National Academy of Sciences (2020).
+[55] Nikita Mehrotra, Navdha Agarwal, Piyush Gupta, Saket Anand, David Lo, and
+Rahul Purandare. 2021. Modeling functional similarity in source code with graph-
+based Siamese networks. IEEE Transactions on Software Engineering (2021).
+[56] Amir M Mir, Evaldas Latoskinas, Sebastian Proksch, and Georgios Gousios. 2021.
+Type4Py: Deep Similarity Learning-Based Type Inference for Python. arXiv
+preprint arXiv:2101.04470 (2021).
+[57] Shouvick Mondal, Denini Silva, and Marcelo d’Amorim. 2021. Soundy Automated
+Parallelization of Test Execution. In 2021 IEEE International Conference on Software
+Maintenance and Evolution (ICSME) . IEEE, 309–319.
+[58] Dongliang Mu, Wenbo Guo, Alejandro Cuevas, Yueqi Chen, Jinxuan Gai, Xinyu
+Xing, Bing Mao, and Chengyu Song. 2019. RENN: efficient reverse execution
+with neural-network-assisted alias analysis. In 2019 34th IEEE/ACM International
+Conference on Automated Software Engineering (ASE) . 924–935.
+[59] Manh-Dung Nguyen, Sébastien Bardin, Richard Bonichon, Roland Groz, and
+Matthieu Lemerre. 2020. Binary-level Directed Fuzzing for {Use-After-Free}
+Vulnerabilities. In 23rd International Symposium on Research in Attacks, Intrusions
+and Defenses (RAID 2020) . 47–62.
+[60] Maxwell Nye, Anders Johan Andreassen, Guy Gur-Ari, Henryk Michalewski, Ja-
+cob Austin, David Bieber, David Dohan, Aitor Lewkowycz, Maarten Bosma, David
+Luan, et al .2021. Show Your Work: Scratchpads for Intermediate Computation
+with Language Models. arXiv preprint arXiv:2112.00114 (2021).
+[61] Eirene V Pandi, Earl T Barr, Andrew D Gordon, and Charles Sutton. 2021. Type
+Inference as Optimization. In Advances in Programming Languages and Neu-
+rosymbolic Systems Workshop .
+[62] Corina S Păsăreanu and Mihaela Bobaru. 2012. Learning techniques for software
+verification and validation. In International Symposium On Leveraging Applications
+of Formal Methods, Verification and Validation . Springer, 505–507.
+[63] Jibesh Patra and Michael Pradel. 2022. Nalin: Learning from Runtime Behavior
+to Find Name-Value Inconsistencies in Jupyter Notebooks. In 2022 IEEE 31st
+International Conference on Software Engineering (ICSE) .
+[64] Kexin Pei, Jonas Guan, Matthew Broughton, Zhongtian Chen, Songchen Yao,
+David Williams-King, Vikas Ummadisetty, Junfeng Yang, Baishakhi Ray, and
+Suman Jana. 2021. StateFormer: fine-grained type recovery from binaries using
+generative state modeling. In Proceedings of the 29th ACM Joint Meeting on
+European Software Engineering Conference and Symposium on the Foundations of
+Software Engineering . 690–702.
+[65] Kexin Pei, Jonas Guan, David Williams-King, Junfeng Yang, and Suman Jana. 2021.
+XDA: Accurate, Robust Disassembly with Transfer Learning. In 2021 Network
+and Distributed System Security Symposium .
+[66] Kexin Pei, Zhou Xuan, Junfeng Yang, Suman Jana, and Baishakhi Ray. 2021. TREX:
+Learning Execution Semantics from Micro-Traces for Binary Similarity. In 2021
+IEEE Symposium on Security and Privacy .
+[67] Fei Peng, Zhui Deng, Xiangyu Zhang, Dongyan Xu, Zhiqiang Lin, and Zhendong
+Su. 2014. X-force: Force-executing binary programs for security applications. In
+23rd USENIX Security Symposium (USENIX Security 14) . 829–844.
+[68] Luís Pina and Michael Hicks. 2016. Tedsuto: A general framework for testing
+dynamic software updates. In 2016 IEEE International Conference on Software
+Testing, Verification and Validation (ICST) . IEEE, 278–287.
+[69] Michael Pradel and Satish Chandra. 2021. Neural software analysis. Commun.
+ACM 65, 1 (2021), 86–96.
+[70] Michael Pradel, Georgios Gousios, Jason Liu, and Satish Chandra. 2020. Type-
+writer: Neural type prediction with search-based validation. In 28th ACM Joint
+Meeting on European Software Engineering Conference and Symposium on the
+Foundations of Software Engineering .
+[71] Thomas Reps and Gogul Balakrishnan. 2008. Improved memory-access analysis
+for x86 executables. In International Conference on Compiler Construction .
+[72] Baptiste Roziere, Jie M Zhang, Francois Charton, Mark Harman, Gabriel Synnaeve,
+and Guillaume Lample. 2021. Leveraging Automated Unit Tests for Unsupervised
+Code Translation. arXiv preprint arXiv:2110.06773 (2021).
+[73] Hendrig Sellik, Onno van Paridon, Georgios Gousios, and Maurício Aniche.
+2021. Learning off-by-one mistakes: An empirical study. In 2021 IEEE/ACM 18th
+International Conference on Mining Software Repositories (MSR) .[74] Tushar Sharma, Maria Kechagia, Stefanos Georgiou, Rohit Tiwari, and Federica
+Sarro. 2021. A Survey on Machine Learning Techniques for Source Code Analysis.
+arXiv preprint arXiv:2110.09610 (2021).
+[75] Ensheng Shia, Yanlin Wangb, Lun Dub, Junjie Chenc, Shi Hanb, Hongyu Zhangd,
+Dongmei Zhangb, and Hongbin Suna. 2022. On the Evaluation of Neural Code
+Summarization. In 2022 International Conference on Software Engineering .
+[76] Rupesh Kumar Srivastava, Klaus Greff, and Jürgen Schmidhuber. 2015. Highway
+networks. arXiv preprint arXiv:1505.00387 (2015).
+[77] Visual Studio. 2006. x86 Assembly Guide. (2006).
+[78] Yulei Sui and Jingling Xue. 2016. SVF: interprocedural static value-flow analysis
+in LLVM. In International Conference on Compiler Construction .
+[79] Zeyu Sun, Qihao Zhu, Lili Mou, Yingfei Xiong, Ge Li, and Lu Zhang. 2019. A
+grammar-based structural cnn decoder for code generation. In Proceedings of the
+AAAI conference on artificial intelligence , Vol. 33. 7055–7062.
+[80] Alexey Svyatkovskiy, Todd Mytkowicz, Negar Ghorbani, Sarah Fakhoury, Eliza-
+beth Dinella, Christian Bird, Neel Sundaresan, and Shuvendu Lahiri. 2021. Merge-
+BERT: Program Merge Conflict Resolution via Neural Transformers. arXiv
+preprint arXiv:2109.00084 (2021).
+[81] The Qiling Team. 2020. Qiling – A True Instrumentable Binary Emulation
+Framework. https://qiling .io/.
+[82] Victor Van Der Veen, Enes Göktas, Moritz Contag, Andre Pawoloski, Xi Chen,
+Sanjay Rawat, Herbert Bos, Thorsten Holz, Elias Athanasopoulos, and Cristiano
+Giuffrida. 2016. A tough call: Mitigating advanced code-reuse attacks at the
+binary level. In 2016 IEEE Symposium on Security and Privacy .
+[83] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones,
+Aidan N Gomez, Łukasz Kaiser, and Illia Polosukhin. 2017. Attention is all
+you need. In 2017 Advances in Neural Information Processing Systems .
+[84] Chong Wang, Xin Peng, Mingwei Liu, Zhenchang Xing, Xuefang Bai, Bing Xie,
+and Tuo Wang. 2019. A learning-based approach for automatic construction
+of domain glossary from source code and documentation. In Proceedings of the
+2019 27th ACM joint meeting on european software engineering conference and
+symposium on the foundations of software engineering . 97–108.
+[85] Fish Wang and Yan Shoshitaishvili. 2017. Angr-the next generation of binary
+analysis. In 2017 IEEE Cybersecurity Development .
+[86] Guanhua Wang, Sudipta Chattopadhyay, Ivan Gotovchits, Tulika Mitra, and
+Abhik Roychoudhury. 2019. oo7: Low-overhead defense against spectre attacks
+via program analysis. IEEE Transactions on Software Engineering (2019).
+[87] Haojie Wang, Jidong Zhai, Xiongchao Tang, Bowen Yu, Xiaosong Ma, and Wen-
+guang Chen. 2018. Spindle: Informed Memory Access Monitoring. In 2018 USENIX
+Annual Technical Conference (USENIX ATC 18) .
+[88] Jingbo Wang, Chungha Sung, Mukund Raghothaman, and Chao Wang. 2021. Data-
+Driven Synthesis of Provably Sound Side Channel Analyses. 2021 International
+Conference on Software Engineering (2021).
+[89] Ke Wang and Zhendong Su. 2020. Blended, precise semantic program embeddings.
+InProceedings of the 41st ACM SIGPLAN Conference on Programming Language
+Design and Implementation . 121–134.
+[90] David Williams-King, Hidenori Kobayashi, Kent Williams-King, Graham Pat-
+terson, Frank Spano, Yu Jian Wu, Junfeng Yang, and Vasileios P Kemerlis. 2020.
+Egalito: Layout-agnostic binary recompilation. In Proceedings of the Twenty-Fifth
+International Conference on Architectural Support for Programming Languages and
+Operating Systems . 133–147.
+[91] Jun Xu, Dongliang Mu, Xinyu Xing, Peng Liu, Ping Chen, and Bing Mao. 2017.
+Postmortem program analysis with hardware-enhanced post-crash artifacts. In
+26th USENIX Security Symposium (USENIX Security 17) . 17–32.
+[92] Zhaogui Xu, Xiangyu Zhang, Lin Chen, Kexin Pei, and Baowen Xu. 2016. Python
+probabilistic type inference with natural language support. In 24th ACM SIGSOFT
+international symposium on foundations of software engineering .
+[93] Heng Yin, Dawn Song, Manuel Egele, Christopher Kruegel, and Engin Kirda.
+2007. Panorama: capturing system-wide information flow for malware detection
+and analysis. In ACM conference on Computer and Communications Security .
+[94] Naville Zhang. 2017. Hikari – an improvement over Obfuscator-LLVM. https:
+//github.com/HikariObfuscator/Hikari.
+[95] Weiwei Zhang, Shengjian Guo, Hongyu Zhang, Yulei Sui, Yinxing Xue, and Yun
+Xu. 2021. Challenging Machine Learning-based Clone Detectors via Semantic-
+preserving Code Transformations. arXiv preprint arXiv:2111.10793 (2021).
+[96] Zhuo Zhang, Wei You, Guanhong Tao, Guannan Wei, Yonghwi Kwon, and Xi-
+angyu Zhang. 2019. BDA: practical dependence analysis for binary executables
+by unbiased whole-program path sampling and per-path abstract interpretation.
+Proceedings of the ACM on Programming Languages 3, OOPSLA (2019), 1–31.
+[97] Qihao Zhu, Zeyu Sun, Yuan-an Xiao, Wenjie Zhang, Kang Yuan, Yingfei Xiong,
+and Lu Zhang. 2021. A syntax-guided edit decoder for neural program repair.
+InProceedings of the 29th ACM Joint Meeting on European Software Engineering
+Conference and Symposium on the Foundations of Software Engineering .
+759

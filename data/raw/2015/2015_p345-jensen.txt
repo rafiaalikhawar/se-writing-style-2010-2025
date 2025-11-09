@@ -1,0 +1,1258 @@
+MemInsight: Platform-Independent Memory Debugging for
+JavaScript
+Simon Holm Jensen
+Snowﬂake Computing, USA
+simon@hjensen.netManu Sridharan
+Samsung Research America, USA
+m.sridharan@samsung.com
+Koushik Sen
+UC Berkeley, USA
+ksen@cs.berkeley.eduSatish Chandra
+Samsung Research America, USA
+schandra@acm.org
+ABSTRACT
+JavaScript programs often suer from memory issues that
+can either hurt performance or eventually cause memory ex-
+haustion. While existing snapshot-based proling tools can
+be helpful, the information provided is limited to the coarse
+granularity at which snapshots can be taken. We present
+MemInsight , a tool that provides detailed, time-varying
+analysis of the memory behavior of JavaScript applications,
+including web applications. MemInsight is platform in-
+dependent and runs on unmodied JavaScript engines. It
+employs tuned source-code instrumentation to generate a
+trace of memory allocations and accesses, and it leverages
+modern browser features to track precise information for
+DOM (document object model) objects. It also computes
+exact object lifetimes without any garbage collector assis-
+tance, and exposes this information in an easily-consumable
+manner for further analysis.
+We describe several client analyses built into MemInsight ,
+including detection of possible memory leaks and opportuni-
+ties for stack allocation and object inlining. An experimental
+evaluation showed that with no modications to the runtime,
+MemInsight was able to expose memory issues in several
+real-world applications.
+Categories and Subject Descriptors
+D.2.5 [ Software Engineering ]: Testing and Debugging
+Keywords
+Memory proling, leak detection
+1. INTRODUCTION
+JavaScript has become a popular, mainstream program-
+ming language. It is the lingua franca of the web and is mak-
+ing inroads into other settings such as servers via node.js .
+However, developer tools for JavaScript still lag behind those
+Figure 1: Number of objects in memory for three
+moves in annex , as shown by MemInsight. The x-
+axis represents logical time.
+for better-established languages like C and Java, including
+tools for memory proling.
+Though free of traditional memory leaks, JavaScript pro-
+grams often suer from memory issues seen in other garbage-
+collected languages. It is common to nd avoidable instances
+ofdrag, i.e., objects reachable in the heap past their last
+use [ 32]; if such objects never become unreachable, they
+are considered leaked . JavaScript programs also suer from
+churn , i.e., frequent heap allocation of short-lived objects and
+bloat, i.e., wasteful representation of data. It is common to
+nd mistakes in the way JavaScript objects and the objects
+in the browser's document object model (DOM) interact,
+causing insidious DOM leaks. Moreover, although JavaScript
+frameworks such as jQuery [ 16] are intended to make web pro-
+gramming simpler, it is easy to introduce memory problems
+via incorrect use of framework APIs.
+As a concrete example of drag, consider Figure 1, which
+shows the number of objects in memory over time in annex [2],
+a Reversi-style game implemented as a web application. T1,
+T2 and T3 denote the start of the machine's computation of
+its move in response to the human player's rst three moves,
+respectively. The blue (upper) curve shows the number
+of objects reachable in the heap; the orange (lower) curve
+shows the number of stale objects reachable in the heap.
+An object is stale if it is reachable in the heap but will not
+be used again in the current execution. Such objects can
+waste space, since they cannot be reclaimed by the garbage
+collector. Although the memory for computation of the
+machine's move is de-allocated right after the computation,
+the peak memory consumption per move is increasing, and
+much of the memory is stale. If there were a way to release
+this stale memory early, or not allocate it to begin with, then
+the program's peak memory usage could be much lower. (In
+fact, using our tool, we were able to refactor this program to
+reduce its peak memory usage substantially; see Section 5.)
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior speciﬁc permission and/or a
+fee. Request permissions from Permissions@acm.org.
+Copyright is held by the owner/author(s). Publication rights licensed to ACM.
+ESEC/FSE’15 , August 30 – September 4, 2015, Bergamo, Italy
+ACM. 978-1-4503-3675-8/15/08...$15.00
+http://dx.doi.org/10.1145/2786805.2786860
+345A common approach to debugging memory issues in Java-
+Script applications is to take periodic snapshots of the heap,
+as implemented, for example, in the Chrome Developer Tools
+[5] (CDT). CDT allows for visualizing various useful proper-
+ties of a heap snapshot, e.g., a count of objects of each type
+(as determined by its constructor) and the access paths to
+those objects. The recommended way to diagnose memory
+issues with CDT is to compare (di) a series of snapshots
+and see if the counts of certain types of objects unexpectedly
+increase, indicating a possible memory leak.
+While useful, the snapshot approach suers from the key
+limitation that it misses many transient behaviors that occur
+between snapshots. For example, if snapshots were manually
+taken between computer moves for the execution shown in
+Figure 1 (e.g., at times T2 and T3), they would completely
+miss the staleness problem in this app. In fact, with snapshots
+alone, one cannot determine whether an object is stale or
+not. Snapshots may also miss object churn issues, as a large
+number of short lived objects may get allocated and collected
+between successive snapshots.
+For C and Java developers, a number of techniques and
+tools have been developed (e.g., Valgrind [ 26]) that go beyond
+heap snapshots to provide very detailed visibility into a
+program's memory usage and possible problems [ 3,17,22,
+24,28,38,40{42]. These techniques often modify language
+runtimes to monitor memory behaviors and apply various
+heuristics such as heap growth and object drag to detect
+memory problems. However, there are several challenges in
+simply porting these techniques and tools to JavaScript and
+web applications. First, JavaScript programs can be written
+for various platforms such as desktop browsers, browsers
+on mobile operating systems such as Tizen (www.tizen.org)
+theWebViewer component of iOS, and node.js all running
+dierent JavaScript engines having dierent native APIs.
+Therefore, it is not possible to develop a universal JavaScript
+memory debugging tool, which works for all platforms, by
+modifying a single JavaScript engine. Second, JavaScript
+engines of browsers can access, create, and manipulate DOM
+components of a browser. Such interactions allow objects to
+move from the JavaScript world to the DOM world and vice
+versa. Such data interactions across the language boundary
+create unique challenges when one cannot monitor memory
+behaviors by modifying a JavaScript engine.
+To address these challenges, we have developed Mem-
+Insight , a browser-independent extensible memory debug-
+ging tool for JavaScript and web applications. The tool works
+by instrumenting JavaScript programs and can run on any
+platform that provides a standard JavaScript engine. The
+overall architecture of MemInsight is shown in Figure 2.
+First, JavaScript code (A) is instrumented, such that exer-
+cising instrumented code (B) yields a trace (C) of operations
+relevant to memory analysis, described in Section 3.1. To
+trace DOM-related memory behaviors, MemInsight uses
+modern browser features to asynchronously observe DOM
+mutations, and employs select additional modeling to record
+informative allocation sites for nearly all DOM nodes in
+practice (details in Section 3.4). A separate lifetime anal-
+ysisrecovers object lifetime information from the trace by
+simulating the application's heap and combining reference
+counting with the Merlin algorithm [ 14] (see Section 3.2).
+Both the lifetime analysis and trace generation phases are
+carefully designed to handle unusual cases arising due to
+uninstrumented code and native library code (Section 3.3).The lifetime analysis produces an enhanced trace (D) that
+includes object unreachability events. Finally, a number of
+client analyses compute useful additional information based
+on the enhanced trace, such as potential memory leaks, drags,
+churns, and opportunities for stack allocation and object in-
+lining (Section 4). The results are shown in a web-based GUI.
+MemInsight is fully extensible: the enhanced trace gener-
+ated by MemInsight can be queried to implement other
+client analyses.
+We observed that simply reporting a memory problem is
+often not sucient to eectively debug the problem. Mem-
+Insight provides useful diagnostic information, call tree
+and access paths, for the objects responsible for a memory
+problem. A call tree shows us the calling context in which
+the problematic objects got allocated and the access paths
+reveal the chain of objects that is holding the problematic
+object and is preventing it from getting garbage collected.
+These information help developers to eectively understand
+and x the memory problems reported by MemInsight .
+A key advantage of MemInsight is that it is browser ag-
+nostic and requires no modication to a JavaScript runtime.
+As such the tool is usable across a variety of JavaScript envi-
+ronments, including desktop browsers, browsers on mobile
+operating systems like Tizen, and node.js on the server.
+Beyond the need for portability, building the tool without
+runtime modications brings advantages in maintainability
+and deployability. JavaScript runtimes and browsers evolve
+very quickly, making maintaining a modied runtime while
+retaining support for the latest browser features an enormous
+challenge. Deployment also becomes dicult with a modied
+runtime, as users must download and use a custom browser
+build for proling purposes. For all these reasons, we focused
+on developing a browser-independent, instrumentation-based
+approach to memory proling.
+InMemInsight , we addressed several challenges that arose
+due to our pragmatic decision to keep MemInsight browser
+independent:
+Reasoning about an object's staleness requires deter-
+mining when the object becomes unreachable. How-
+ever, JavaScript does not provide any built-in method
+for determining when an object is garbage collected
+(from which unreachability times can be computed [ 14]).
+Hence, we had to reconstruct object lifetime informa-
+tion in MemInsight with no support from the Java-
+Script runtime.
+Tools such as Valgrind typically assume that they are
+able to observe allmemory accesses in a program. For
+web applications, this assumption is very hard to satisfy
+without browser modication, due to various native
+libraries and the DOM. Furthermore, a user might
+wish to purposely exclude certain frameworks from
+instrumentation. We designed MemInsight so that it
+is resilient to passing of objects back and forth between
+instrumented and uninstrumented code.
+The DOM and its manipulation via JavaScript present
+special challenges. DOM manipulation can be per-
+formed via a wide variety of APIs that would be di-
+cult to model exhaustively. Also, the notion of staleness
+for a DOM node should take into account whether it
+is visible on the web page, which is not evident when
+just tracing memory accesses.
+Finally, JavaScript is a complex language, and dealing
+with features such as closures, constructors, getters and
+346(A)$JavaScript$code$
+(B)$Instrumented$JavaScript$code$
+Instrumentor$
+(C)$Trace$
+(D)$Enhanced$Trace$
+Life>me$analysis$
+Run$Client$analyses$
+GUI$Figure 2: MemInsight tool chain
+setters, etc. is not straightforward, particularly when
+instrumenting source code rather than a normalized
+intermediate representation within a runtime.
+To the best of our knowledge, no previous work has shown
+how to address all of these challenges together in a realistic
+and practical tool that runs on unmodied browser runtimes.
+We consider this as our key contribution.
+We performed an experimental evaluation to test both
+the overhead and usefulness of MemInsight on a variety
+of benchmarks. MemInsight incurred a reasonable 41.7X
+mean slowdown for the compute-intensive Octane bench-
+marks, with the slowdown being hardly noticeable for more
+typical web applications. Thus far, MemInsight has been
+used to discover or conrm memory issues in ten web and
+node.js applications, with several issues discovered by a
+product group at Samsung using the tool. In three cases, we
+submitted patches to x discovered issues that were merged
+by the developers.
+MemInsight is publicly available at https://github.com/
+Samsung/meminsight . A replication package for MemInsight
+has been successfully evaluated by the Replication Packages
+Evaluation Committee and found to meet expectations. We
+believe that MemInsight can be modied and extended
+easily even if a researcher/developer is not an expert in the
+internals of a JavaScript engine.
+The rest of the paper is organized as follows. Section 2
+gives a detailed overview of debugging a memory issue with
+MemInsight . The dierent phases of MemInsight are out-
+lined in Sections 3 and 4, as described above. Sections 5 and 6
+respectively present case studies showing MemInsight 's ef-
+fectiveness and a quantitative evaluation. Finally, Section 7
+discusses related work, Section 8 discusses limitations, and
+Section 9 concludes.
+2. DEBUGGING WITH MEMINSIGHT
+In this section, we highlight the use of MemInsight from
+a user's perspective. We present an example illustrating the
+types of memory leaks often present in web applications, and
+show how MemInsight 's features combine to help diagnose
+the problem.
+A small jQuery-based example is shown in Figure 3, based
+on a real drag issue found in our shopping list case study
+(see Section 5). In function f(), a new divDOM node is
+allocated (into variable newDiv ) (line 2), made to contain
+the text "Hello world" (line 3), and attached to an existing
+DOM node identied by the ID 'contents '(line 7). An event
+handler function is attached to the newly allocated node
+(lines 4{6), which changes the background color when a user
+clicks on the div. In function g(), the developer removes this
+new divfrom the DOM by assigning an empty string to the
+innerHTML property of the 'contents 'node (line 11).
+Alas, there is a memory problem. The jQuery framework
+caches event handlers associated with DOM nodes, and clears
+the cache only when a node is removed using a proper jQuery1function f() {
+2 var newDiv = $( '<div/> ');
+3 newDiv.html("Hello world");
+4 newDiv.click(function () {
+5 newDiv.css("backgroundColor", "red");
+6 });
+7 newDiv.appendTo( '#contents ');
+8}
+9
+10 function g() {
+11 document.getElementById( 'contents ').innerHTML = '';
+12 }
+Figure 3: scr_orig.js , a small leak example
+API call, e.g. (in this case) $('#contents ').empty() . Since
+the developer removed the node via innerHTML instead, the
+event handler closure remains in jQuery's cache and becomes
+stale, as it does not get used again.
+Since the event handler uses variable newDiv (line 5), a
+reference to the divelement remains in its closure, causing
+the DOM element itself to also drag; this is known in the
+developer community as leaking of DOM nodes, as it a
+common issue in web applications. (We will use the terms
+leak and drag interchangeably.) Closure-related drags are
+common in JavaScript programs, as even local variables
+unrelated to the function for which the closure is created
+can get retained by the closure, extending their lifetimes
+inadvertently.
+Assume that the creation of newDiv and buggy removal
+of that node by assignment to innerHTML is repeated a few
+times. How does one begin to notice a memory problem?
+As discussed in Section 1, MemInsight reports which ob-
+jects are stale and will not be used again, using an analysis for
+computing object lifetimes. Figure 4 shows screen captures
+from the MemInsight GUI. The time-line chart (A) shows
+the count of all objects with time (in blue) as well as all stale
+objects with time (in orange). The increasing count of stale
+objects is a cause for concern. The pie-chart on the right
+shows which allocation sites are the leading contributors to
+stale objects.
+If we click on the pie chart slice for line 4 of scr_orig.js ,
+MemInsight oers details for that allocation site, shown in
+Figure 4(C). We see a timeline chart for only the objects
+allocated from that site; a call tree leading up to that site
+(here it is called from main) and on demand, access paths to
+objects allocated at that site. The access paths show that
+the function object is held on by a cache internal to jQuery.
+We illustrate a case of DOM leak as well. Going through
+the list of sites that MemInsight nds having a high count
+of stale objects, we come across the DOM nodes allocated at
+line 490 in jQuery. For a DOM node d, staleness means that
+dis unused, detached from the document tree for the last
+time{hence not to be displayed again{and reachable from
+some JavaScript variable.
+347(A)
+ (B)
+(C)
+Figure 4: A,C. Memory proling for the example in Fig 3. B. Call tree and access paths for jQuery line 490.
+How does the user associate the allocation of DOM objects
+at line 490 in jQuery to the program in Figure 3? Details
+provided by MemInsight for line 490 show the call tree and
+access paths shown in Figure 4(B), which informs us that
+the allocation is the result of the $function called at line 2
+in Figure 3. But why does it show increasing staleness? The
+access paths reveal the answer: the variable newDiv is in the
+closure of the handler allocated at line 4 in Figure 3. We
+previously saw why the latter was leaking. This now shows
+that, inadvertently, that causes a DOM node leak as well.
+Incidentally, to discover DOM staleness, a tool must know
+the structure of the DOM as it evolves , noting when DOM
+nodes become detached from the main tree. This information
+is not evident from JavaScript execution alone: for this
+example, the nodes are allocated by calling the native method
+createElement and become detached from the main DOM
+due to the write to innerHTML at line 11 in Figure 3. Mem-Insight 's DOM modeling techniques enable it to handle this
+case correctly.
+3. TRACE GENERATION AND LIFETIME
+ANALYSIS
+In this section, we detail the trace generation and life-
+time analysis functionality of MemInsight . Basic trace
+generation, described in Section 3.1, uses source instrumen-
+tation to log a detailed trace of an execution's memory op-
+erations. The lifetime analysis, described in Section 3.2,
+uses this trace to compute exact object lifetimes, yielding
+an enhanced trace. Beyond this core functionality, we also
+describe MemInsight 's carefully-designed handling of unin-
+strumented code in Section 3.3 and DOM APIs in Section 3.4.
+Finally, we discuss handling of various tricky JavaScript con-
+structs in Section 3.5, and in Section 3.6 we describe key
+optimizations that help to reduce MemInsight 's overhead.
+3481var x = {};
+2var y = {};
+3function m(p,q)
+4{
+5 p.f = q;
+6};
+7m(x,y);
+8x = null;Declare x,y,m;
+AllocObj 2 at 1;
+Write x,2 at 1;
+AllocObj 3 at 2;
+Write y,3 at 2;
+AllocFun 4 at 3;
+Write m,4 at 3;
+Call 4 at 7;
+Declare p = 2,
+q = 3;
+Putfield 2,"f",3
+at 5;LastUse 2 at 5;
+Return at 7;
+LastUse 4 at 7;
+Write x,0 at 8;
+Unreachable
+2 at 8;
+Unreachable
+3 at end;
+Unreachable
+4 at end;
+Figure 5: A simple code example and the corre-
+sponding trace. Red entries are added in the en-
+hanced trace.
+3.1 Basic Trace Generation
+Our generated traces must be sucient to reconstruct
+object lifetimes, i.e., when objects are created and become
+unreachable. At a minimum, traces must include records
+of each object allocation and each memory write, both to
+variables and to object elds (\properties" in JavaScript
+parlance). (A JavaScript delete operation on an object,
+which removes a property, is modeled as a write of null.) To
+enable proper handling of JavaScript functions and closures in
+the lifetime analysis, the generator logs calls and returns, and
+also logs declarations of local variables. Finally, to enable
+reasoning about object staleness, we also log information
+about uses of each object: an object is used when it is
+dereferenced or, for function objects, when it is invoked.
+By default, MemInsight enables two optimizations that
+reduce trace size and instrumentation overhead. First, we
+avoid logging writes when the old and new values are both
+of primitive type; such writes are irrelevant for reasoning
+about object staleness and leaks. Similarly, by default we
+only log the lastuse of each object, rather than all uses, since
+this information is sucient for detecting staleness. These
+optimizations can be disabled at some cost in overhead (see
+Section 6), in case the additional information would be useful
+for some client analysis (e.g., object-equality proling [ 22,38];
+further discussion in Section 7).
+Figure 5 shows the generated trace for a simple example.
+Most entries includes a source location at the end. The
+allocation entries introduce a unique id used to name the
+corresponding object throughout the trace. We use a distinct
+entry type to identify function object allocation, to ease
+handling of closures in the lifetime analysis. In our imple-
+mentation, LastUse entries include a timestamp and appear
+at the end of the generated trace (since the last use is only
+known at the end of the program); a separate post-processing
+phase inserts the entries at the appropriate slots.
+3.2 Lifetime Analysis
+Here we describe how our lifetime analysis computes exact
+object lifetimes based on the initial trace, inserting Unreach-
+able events into an enhanced trace, shown as the red events
+in Figure 5.
+Heap graphs The trace as described in Section 3.1 enables
+simulation of the execution's heap graph. At each AllocObj
+andAllocFun trace entry, a new vertex is added to the
+graph. At each Putfield entry, an appropriate heap graph
+edge (labeled with the eld name) is added and/or removed.1var elem = document.createElement("div");
+2elem.innerHTML = "<p><h1>Hello World!</h1></p>";
+3document.getElementById("x").appendChild(elem);
+Figure 6: Example to illustrate handling of DOM-
+related code.
+Reasoning about variable writes in the presence of JavaScript
+closures is non-trivial, particularly since functions can update
+closure variables. For example:
+function f() {
+var x = { p: 5 } /* o1 */ , y = [1,2,3] /* o2 */ ;
+return { set: function (z) { x = z; },
+get: function () { return x; }
+}
+}
+var r = f(); r.set(null);
+Here, xis present in the returned setandgetclosures (with
+updates via setreected in future calls to get), but yis not,
+since it is not referenced by any nested function. Hence, the
+object labeled o2above becomes unreachable after the call
+tof, but o1remains reachable until after the call to r.set .
+The heap graph construction handles closures using an ap-
+proach similar to the \cactus stack" method of implementing
+rst class continuations [ 6].Context nodes in the heap graph
+represent variable bindings for closures, with parent pointers
+for lexical scoping. A separate syntactic analysis computes
+which variables from enclosing scopes are captured by each
+function, enabling a context to be sealed at function returns
+to remove pointers to uncaptured objects. For the example
+above, when the call to fcompletes, sealing removes the
+outgoing edge from the context corresponding to variable
+y. We correctly handle corner cases in JavaScript semantics,
+e.g., writing to an undeclared variable creates a fresh global.
+Exact lifetimes Given our simulated heap graph, we use
+standard reference counting to compute exact unreachability
+times for all objects except those in cyclic data structures,
+which reference counting cannot handle. To handle cyclic
+structures, we adopt techniques from lazy cycle collection [ 20].
+Whenever an object o's reference count is decremented to
+a non-zero value, ois placed in a cycle queue, as it may
+be in an unreachable cycle. To detect the true cycles, we
+periodically perform a mark-sweep over the heap, sweeping
+only from unmarked nodes in the cycle queue (sucient since
+the base reference counter handles acyclic structures).
+To detect exact unreachability times for nodes in cycles,
+we adopted the Merlin algorithm [ 14]. Whenever a node is
+placed in the cycle queue, it is stamped with the current
+time. If the node is already in the queue, its timestamp
+is updated. When sweeping unmarked queue nodes, the
+queue is rst sorted by descending timestamp. After this
+sort, we are guaranteed that the node nin or reachable from
+an unreachable cycle with the latest timestamp twill be
+processed rst, and that tis the true unreachability time
+for any unmarked node reachable from n. So, we simply
+propagatetas the unreachability time for all unmarked nodes
+encountered from n. The Merlin algorithm is presented in
+detail in Hertz et al. [ 14]; an extended version of the paper [ 15]
+contains an example of applying the technique.
+3.3 Uninstrumented Code
+MemInsight works robustly in the presence of uninstru-
+mented JavaScript code or native code from the environment.
+349In principle, uninstrumented code could arbitrarily mutate
+any memory locations to which it has access. Attempting
+to discover all such behavior via code instrumentation alone
+would be dicult or impossible, particularly since invoca-
+tions of uninstrumented code may not be observable (e.g.,
+a browser invoking an uninstrumented event handler). Fur-
+thermore, such detection would require frequent reective
+traversals of all heap state visible to uninstrumented code, a
+very costly operation.
+In practice, we have found a policy of only tracking refer-
+ences created in instrumented code to strike a good balance
+between coverage of relevant behaviors and analysis overhead.
+The policy is simple: at any variable or eld write in instru-
+mented code, if the value is a hitherto unseen object{which
+must have been allocated by uninstrumented code{we treat
+the write as \allocating" the object. For example, consider
+line 1 in Figure 6, which creates a DOM node using the
+native createElement function. At the write to elem, our
+instrumentation emits log entries AllocObj iat 1 and
+Write y,iat 1 (iis a fresh object ID), modeling line 1 as
+\allocating" the DOM node.
+Our analysis does notattempt to infer information about
+object references created in uninstrumented code. For the
+Figure 6 example, document.createElement is itself a func-
+tion object allocated by uninstrumented code. However,
+since the function is only invoked, and not assigned to a
+variable or eld, we do not assign it an object ID. While this
+makes our modeling less complete, we found that assigning
+object IDs in such cases added excessive noise to tool output
+and was not helpful in diagnosing memory issues in instru-
+mented code. Unmodeled native code can cause unusual
+trace events, e.g., an object \re-appearing" after becoming
+unreachable due to an unknown pointer. Our enhanced trace
+generator (Section 3.2) detects and handles such issues, and
+can report them to the developer in case further modeling
+or instrumentation is desired.
+MemInsight employs handwritten models for key built-
+in functions whose behavior is usually relevant to mem-
+ory analyses. Modeled functions include the array-
+manipulating functions in Array.prototype (push,pop, etc.),
+Object.defineProperty , and setTimeout .
+3.4 The DOM
+Since the DOM is often involved in leaks and other bad
+memory usage patterns (see Section 2), we employ special
+handling to provide better visibility into its structure. A
+key diculty in capturing DOM behavior via JavaScript
+instrumentation is handling the many ways the DOM may be
+mutated. Figure 6 shows two ways to mutate the DOM from
+JavaScript: assignment to innerHTML (line 2) and invoking
+theappendChild method (line 3). Many other JavaScript
+methods mutate the DOM, making fully-manual modeling
+arduous. Moreover, the construction of an initial DOM from
+static HTML occurs outside of JavaScript execution.
+For a baseline handling of all methods of DOM mutation,
+MemInsight uses the mutation observers [25] functionality
+available in modern browsers. A mutation observer receives
+asynchronous notications of mutation events for a set of
+observed DOM nodes. MemInsight attaches a mutation
+observer to as many DOM nodes as possible and use the
+notications to reect DOM mutations into the trace.
+To attach its mutation observer, MemInsight performs
+an initial DOM traversal after the page loads, attaching theobserver to each DOM node encountered. The observer then
+attaches itself to newly-inserted DOM nodes as it is notied
+of the insertions. DOM nodes are modeled as having a set
+of child nodes rather than an ordered list; this is sucient
+for memory analyses, and it reduces analysis overhead and
+complexity.1DOM tree mutations are modeled with special
+AddChild andRemoveChild log entries in the trace.
+Let us see how this mutation observer technique works for
+the code in Figure 6. Assume that the mutation observer is
+already attached to the node with ID x, e.g., through the
+initial DOM traversal. After the code executes, the observer
+will be notied that the elem node has been added as a
+child of x, which it models with an AddChild log entry.
+The observer then traverses the DOM sub-tree rooted at
+elem, discovering the nodes added at line 2; these nodes
+are reected in the trace via appropriate AllocObj and
+AddChild entries.
+While the above technique enables accurate modeling of
+DOM structure, further modeling is sometimes required to
+obtain informative DOM node allocation sites. For the code
+of Figure 6, the nodes created by the innerHTML assignment
+on line 2 are no longer associated with that line by the
+time the (asynchronous) mutation observer runs. To address
+this problem, MemInsight performs an eager traversal of
+the DOM trees created by innerHTML and such constructs,
+recording an accurate location for the corresponding nodes.
+Finally, MemInsight ags the root node of the main DOM
+tree in the trace. By knowing the root node and processing
+AddChild andRemoveChild entries appropriately, client
+analyses can determine which nodes reside in the main DOM
+tree at any point. Such reasoning is very useful for tracking
+object staleness, as the analysis can avoid inaccurately treat-
+ing \visible" DOM objects (those in the main DOM tree)
+as stale, though no uses may be observed for those nodes.
+We have found this functionality to be critical for reasoning
+about leaking DOM nodes in practice.
+3.5 JavaScript Challenges
+JavaScript's semantics have a number of corner cases that
+require careful handling during both trace generation and life-
+time computation. Here, we briey describe MemInsight 's
+handling of some interesting language features.
+Normalization We built our trace generator atop the Ja-
+langi framework [ 33], which does not normalize code to
+a three-address form before instrumentation. Hence, sub-
+expressions must be handled carefully, to avoid marking
+an object as unreachable too soon. Consider the simple
+expression f({a:1}, {b:2}) , which allocates two objects
+and passes them to f. For this expression, Jalangi provides
+three callbacks, rst for the {a:1} literal, then for {b:2} , and
+nally for the call. In the rst callback, the analysis observes
+no reference being created to the {a:1} literal, but it clearly
+should not be marked unreachable at this point. This issue
+could of course be addressed by rst normalizing the source
+code. But, this would cause extra code bloat, which could
+further slow execution. Also, normalization could change
+object lifetimes if temporary variables were not carefully
+nulled out after use, which would introduce even more bloat.
+Instead, the trace generator issues Flush entries at the end
+of each source-level statement (e.g., after the call to ffor the
+1Modeling child ordering is tricky since a single mutation
+could change the position of many other child nodes.
+350example above), and the lifetime analysis only marks nodes
+as unreachable at a Flush .
+Constructors The complex semantics of JavaScript con-
+structor calls require special handling. One key complication
+is that anyJavaScript function fcan be invoked as a con-
+structor via the newoperator. If fhas no explicit return
+statement, the value of new f(...) is a fresh object passed
+asthis tof(see the example below). However, if freturns
+some other object o, thenobecomes the value of the new
+expression. We employ special logic to ensure the this value
+is agged as the return value in the former case, so it does not
+appear to become unreachable at the end of the constructor
+call.
+A second issue is recording a good source location for
+constructor-allocated objects. Consider this example:
+1function C() { this.f = 3; }
+2var x = new C();
+Line 2 should be associated with the new Cobject, but at
+the source level, the new object cannot be observed until
+execution of the Ccall has already begun. To handle this
+common case, our implementation assigns an ID to the this
+object at the beginning of a constructor call, and it ags the
+object as \under construction." When an under-construction
+object is detected as the value of a completed constructor
+call, we clear the ag and log an UpdateLoc entry to update
+the allocation site for the object. For the above example, the
+Cobject would be allocated some ID iat the beginning of the
+Cfunction, and the log would later include an UpdateLoc
+iat 2 entry to set its allocation site as line 2.
+Other features Various other JavaScript features require
+special handling; we list a few cases here. For prototype
+chains, we model the creation of the __proto__ property at
+constructor calls, and the prototype property of functions.
+We reserve object ID 1 for the JavaScript global object [ 12]
+(whose properties are the global variables), as code can refer-
+ence and create aliases to this object. Getters and setters [ 27],
+which respectively enable accessor functions to execute at
+property reads and writes, require care. In particular, be-
+fore logging a eld write, we must ensure that the eld is
+not a setter, since in this case the write expression invokes
+the setter. Finally, JavaScript's eval construct is handled
+fully (including indirect eval, which has dierent scoping
+semantics) by using Jalangi to instrument the code before
+evaluation.
+3.6 Optimizations
+Here, we discuss some of the key optimizations we imple-
+mented to make MemInsight scale; these techniques may
+apply to other JavaScript dynamic analyses.
+Scaling the Lifetime Analysis In principle, one could im-
+plement MemInsight 's lifetime analysis in situ with a run-
+ning application via code instrumentation|the requisite
+heap traversals can be achieved using JavaScript's reective
+constructs (iteration over object properties and dynamic
+property accesses). However, this approach would induce
+such high overheads as to make most applications unusable.
+To address such cases, Jalangi provides a record-replay
+framework [ 33] that allows for an expensive dynamic analysis
+to be executed during an oine replay of the application,
+with the analysis running in situ with the replayed application
+to ease implementation.
+We rst implemented our object lifetime analysis using
+Jalangi replay, but we found that running the analysis insitu did not scale, even during oine replay. A key problem
+was that JavaScript's reective property access constructs
+have not been highly optimized in JavaScript runtimes, mak-
+ing reective heap traversals very expensive. Furthermore,
+implementing the analysis in situ required careful handling of
+both prototype chains and getters and setters during traver-
+sals, which was both fragile and further slowed the analysis.
+Finally, our custom DOM modeling (Section 3.3) did not
+t well with Jalangi record-replay, as it required persisting
+additional information during record mode.
+To avoid these issues, we switched to the approach of
+generating custom memory traces and running the lifetime
+analysis over a simulated heap graph, which led to orders-
+of-magnitude speed improvements. MemInsight runs the
+lifetime analysis in a concurrent process as the memory trace
+is generated by the instrumented application, so in many
+cases, the lifetime analysis requires no additional running
+time. Also, having full control of the trace format greatly
+simplied modeling of DOM operations.
+Scaling Trace Generation We implemented a number of
+techniques to reduce the overhead of trace generation in Mem-
+Insight . Since we were not using Jalangi 's record-replay
+feature, we implemented a specialized analysis runtime in Ja-
+langi without record support, reducing Jalangi 's baseline
+overhead. We also enhanced Jalangi to support optional
+disabling of instrumentation for certain language constructs,
+and leveraged this feature to completely avoid instrumenting
+operations irrelevant to MemInsight (arithmetic operations,
+etc.).
+Within our trace generation code, we encoded each object's
+metadata in a single 32-bit value to avoid unnecessary heap
+allocation. For maintaining the per-object metadata, we im-
+plemented two dierent strategies, one that stored metadata
+in a hidden object property and one that kept metadata in
+aWeakMap , a recently-added JavaScript feature.2We found
+that while time overhead was mostly comparable for the two
+approaches, hidden object properties caused a space blowup
+in some cases (see Section 6), likely due to some bad inter-
+action with the JavaScript runtime. Hence, MemInsight
+uses a WeakMap when available. Finally, we write traces in a
+compact binary format, minimizing the amount of overhead
+required to create trace entries.
+4. CLIENT ANALYSES
+Based on the enhanced trace produced by the lifetime anal-
+ysis (see Figure 2), we have implemented a number of useful
+client analyses to expose possible memory issues in the trace.
+As illustrated previously in Figure 1, we compute detailed
+information on object staleness to expose drag-related issues.
+We also implemented a client that can compute the access
+paths retaining some set of objects at some time, as shown
+in Figure 4(B). Below we discuss some other useful memory-
+related properties that we compute for each allocation site
+in the program. A developer could easily compute other
+interesting memory analyses using the enhanced trace (see
+Section 7 for some discussion).
+Let an ``-object' be an object allocated at site `. For each
+such site`, we compute the following information:
+isUnused : this ag is set if none of the `-objects are ever
+used, indicating that the `-objects may be unnecessary.
+2https://developer.mozilla.org/en-US/docs/Web/
+JavaScript/Reference/Global_Objects/WeakMap
+351isOneAliveAtATime : this ag is set if at most one `-
+object is alive (i.e., reachable) at any state during the
+execution. If this holds, it may be possible to replace
+the allocations with a single global object, reducing
+stress on the garbage collector.
+isNonEscaping : this ag is set if none of the `-objects
+escape their allocating function, indicating an opportu-
+nity for stack allocation of the corresponding data.
+isLeaking : the ag is set to true if the objects allocated
+at`exhibit a behavior indicative of a leak.
+consistentlyPointedBy : this property is set to site
+`06=`if each`-object is uniquely pointed-to throughout
+its lifetime by an `0-object. In such a scenario, one
+may be able to inline the properties of `-objects into
+the corresponding `0-objects [ 9]. This optimization
+can boost performance by reducing allocations and
+the number of dereferences required to access `-object
+properties.
+Given an enhanced trace containing unreachability events,
+the computation of the boolean ags isUnused and isOne
+AliveAtATime is straightforward. We experimented with a
+number of techniques for computing the isLeaking ag, and
+settled on the following criterion: isLeaking for`is set to
+true if, at all consecutive execution points where the call
+stack is empty, the number of stale objects allocated from `
+isstrictly increasing . We only consider points when the call
+stack is empty since this represents an idle state in a web
+application (e.g., between event handlers), where temporary
+objects should have been released. While this technique can
+miss leaks, we found that techniques that tolerated decreases
+in stale objects led to too many false positive leak reports.
+To compute the remaining two properties, we use an exe-
+cution index data structure, as described by Xin et al. [ 37].
+The execution index of a program state sis a sequence of the
+form [(`1;q1);(`2;q2);:::;(`n;qn)], where each `iis a call site
+on the call stack for s, andqiis the execution count for `i
+ins. By including both the call stack and execution counts
+for each contained call site, an execution index uniquely
+identies a function call in an execution. To compute the
+isNonEscaping property, we exploit the fact that for any
+execution indices e1ande2,e1is a prex of e2ie2is the
+execution index of a state reached after calling 0 or more
+functions in the dynamic context denoted by e1. We asso-
+ciate with each object othe execution index eaof the state in
+which the object is created and index euof the state where
+it becomes unreachable; oescapes ifeais not a prex of eu.
+If no`-object escapes, then `isisNonEscaping .
+We compute the consistentlyPointedBy ag as follows.
+We associate a meta-property pointedBy with each object o,
+initialized to?whenois created. After creation, if ois then
+written into a property of object o0via a Putfield operation,
+we seto'spointedBy too0. Ifoisever referenced by any
+other variable or object property, we set its pointedBy to
+>. The consistentlyPointedBy property is set to `0if the
+pointedBy meta-property of each `-object is an `0-object,
+andif each paired `and`0-object have similar lifetimes. We
+check for similar lifetimes for two objects by ensuring that
+(1) they are both allocated under the same execution index
+and (2) they both become unreachable at the same time.
+This lifetime check ensures that the parent object \owns" the
+child throughout its lifetime. If consistentlyPointedBy is
+set to`0for some`, then the`objects are a good candidate
+for object inlining into the `0objects.5. CASE STUDIES
+Among the web and node.js applications that have been
+tested using MemInsight , memory issues have been discov-
+ered or conrmed in ten cases, with several issues found
+by a separate product team using the tool. In three cases,
+patches were submitted to the developers and accepted. In
+this section, we highlight some of these memory issues in
+more detail. (None of the issues reported by the product
+team are discussed here.)
+shopping list Shopping List [ 36] is a Tizen web application.
+For this app, MemInsight showed leaking objects and DOM
+nodes deep inside the jQuery library. Call stacks at the
+allocation points of the leaking objects showed that they
+were allocated due to application calls for attaching event
+handlers. Access paths showed that the objects remained
+reachable due to pointers from an internal jQuery cache.
+The cause of the leak was similar to the defect shown in
+Figure 3. The code attempted to clear a DOM element as
+follows:
+if (self.currentView.resetListOfLists) {
+ShoppingListApp.listoflists.innerHTML = "";
+}
+The correct way when using jQuery would be to use jQuery
+construct $(ShoppingListApp.listoflists).empty(); in place
+of an assignment to innerHTML . This changes xed the leak,
+and a patch was accepted by the developer.3
+annex The annex app was discussed previously in Section 1.
+We exercised annex by playing in 1-person mode (the com-
+puter responding to human moves) for three moves. Mem-
+Insight identied excessive drag, as shown previously in
+Figure 1. Most stale objects were being allocated within a
+function used for move evaluation. MemInsight 's access
+path view for the site revealed that these objects were accu-
+mulated in a global recursive data structure corresponding to
+computing a minimax game tree. The code uses the following
+computation to identify the best (highest-value) computer
+move from possible moves:
+ret = possible[0];
+var value = this.evaluate(ret);
+for (var p=1; p<possible.length; p++) {
+var v = this.evaluate(possible[p]);
+if (v > value){
+value = v;
+ret = possible[p];
+}
+}
+The same game tree is retained across multiple calls to
+evaluate , but the code could equivalently start with a fresh
+tree every time, freeing stale memory earlier. We applied
+this refactoring and found a drastic reduction in the peak
+counts as well as staleness of objects.4We have contacted
+the developer, who has agreed to look at the issue (though
+has not conrmed our x as of this writing).
+MemInsight also identied an allocation site with high
+count and the isNonEscaping andisOneAliveAtATime ags
+set (see Section 4) in the following code (edited for brevity):5
+3Seehttp://goo.gl/Xx5eRo .
+4The timeline graph for the xed app appears in the extended
+version [15].
+5This allocation site was also noted in previous work [ 33],
+by a simpler analysis that only tracked allocation counts; it
+did not track whether allocated objects escaped.
+352return {
+type: type,
+value: id,
+lineNumber: lineNumber,
+lineStart: lineStart,
+range: [start, index]
+};return {
+type: type,
+value: id,
+lineNumber: lineNumber,
+lineStart: lineStart,
+start: start,
+end: index
+};
+Figure 7: An excerpt from esprima illustrating bloat
+and object inlining
+getValue: function(place){
+var i = parseInt(place[0]);
+var j = parseInt(place[1]);
+var mtable = {
+0:{ 0:100, 1:-50, 2:40, 3:30, 4:30, 5:40, ...},
+1:{ 0:-50, 1:-30, 2:5, 3:1, 4:1, 5:5, ...},
+...
+};
+return parseInt(mtable[i][j]);
+}
+The object assigned to mtable was identical for each call
+togetValue , and these allocations were causing signicant
+unnecessary churn. The issues could be xed by replacing
+the allocations with a single global object. Performing this
+transformation led to a 10% bottom-line speedup for com-
+puter move computation, and the x was accepted by the
+developer.6
+dataTables DataTables [ 7] is a popular JavaScript library
+that, among other things, provides a way to render a large
+table in paginated form, e.g. ten rows at a time with nav-
+igation support. We exercised DataTables to reproduce a
+previously-identied leak of DOM nodes [ 8], by loading a
+table, navigating through a few pages, and then destroying
+the table. MemInsight indicated excessive staleness at the
+site allocating the DOM nodes, and the access paths view
+showed a settings object on all paths retaining the nodes.
+We applied a suggested patch that nulls out the contents of
+the settings object [ 8], and conrmed that the problem was
+xed. Note that MemInsight 's support for reasoning about
+visible DOM nodes was critical for identifying the truly stale,
+leaking nodes.
+esprima Esprima [ 11] is a widely-used JavaScript parser
+written in JavaScript. For our case study, we used an older
+version of Esprima with code like the left fragment in Figure 7.
+In this code, the object literal being returned points to an
+array of length two throughout its lifetime via the range
+eld. As this array is always accessed through the returned
+object, we can reduce bloat in the data structure by inlining
+this child array into the object. We ran MemInsight on
+the unxed version, and the consistentlyPointedBy ag
+described in Section 4 agged the site as a candidate for
+object inlining. A subsequent commit by the developers
+inlined the objects as in the right code fragment of Figure 7,7
+yielding a roughly 10% bottom-line speedup when parsing
+large JavaScript les. Note that knowledge of object lifetimes
+was key to determining that these objects were inlineable.
+escodegen Escodegen [ 10] serializes JavaScript ASTs back to
+source code. We noticed poor performance in Escodegen for
+large ASTs, so we investigated by running Escodegen with
+6Seehttp://goo.gl/hWfIYm .
+7Seehttp://goo.gl/I3wLs8 .MemInsight for a smaller input. MemInsight immediately
+identied a very high allocation count of SourceNodeMock
+objects. However, MemInsight did not show a leak or exces-
+sive staleness for the objects. Further manual investigation
+showed that SourceNodeMock objects were unnecessary in
+the common case, and a patch eliminating the objects yielded
+a roughly 10X speedup for large inputs and was accepted by
+the developers.8While MemInsight could not automatically
+identify this complex refactoring opportunity, it still provided
+useful information, in particular that the objects were not
+leaking and that a deeper x would likely be needed.
+6. EVALUATION OF IMPLEMENTATION
+MemInsight is implemented primarily in TypeScript, with
+trace generation implemented using Jalangi [33]. The life-
+time analysis is implemented in Java for eciency and to
+leverage existing libraries. In addition to the case studies dis-
+cussed in Section 5, we measured MemInsight 's eectiveness
+according to the following two evaluation criteria:
+(EC1) Does MemInsight run with reasonable overhead for
+real-world, interactive web applications?
+(EC2) Does MemInsight eectively expose DOM-related
+memory behavior?
+6.1 Overhead
+In our experience with several real-world applications, we
+found that the slowdown introduced by MemInsight 's trace
+generation was reasonably low, with the applications remain-
+ing usable and interactive. Since interactive applications
+tend not to be compute-intensive, our JavaScript instru-
+mentation does not dramatically impact their usability. As
+rigorous measurement of overhead on interactive applications
+is dicult, we also ran MemInsight on programs from the
+Octane benchmark suite [ 29],9and found that MemInsight
+introduced a mean of 41.7X time overhead (11.8X{102.3X).10
+This overhead is comparable with previous instrumentation
+tools and analyses [ 14,21,26,31]. For web applications, this
+overhead only applies to JavaScript execution, typically a
+small percentage of total execution time.
+We also measured the overhead of MemInsight on Octane
+while disabling the two optimizations described in Section 3.1,
+namely recording of only the last use of an object and eliding
+putelds where the value is a primitive type. We found
+that recording all uses had a mean overhead of 55.1X, and
+recording all putelds had a mean 47.9X overhead. While
+somewhat higher than the default conguration, these over-
+heads are still manageable and may be worth incurring to
+enable other compelling clients (see Section 7 for further
+discussion). Finally, we found that our lifetime analysis ran
+in an average of 3.9 seconds on the Octane benchmarks (0.4s{
+162.4s). As noted in Section 3.6, MemInsight runs this
+phase concurrently with trace generation, and for typical
+web applications this phase requires no extra time.
+6.2 DOM Handling
+Table 1 quanties the eectiveness of MemInsight 's DOM
+modeling for the three web applications used as case studies
+8Seehttp://goo.gl/XlBX51 .
+9We excluded the mandreel benchmark as, at roughly 277
+KLOC (automatically generated from a large C++ program),
+it exceeded the size that could be instrumented by Jalangi .
+10For a detailed table of all experimental data, see the ex-
+tended version of the paper [15].
+353Table 1: DOM node measurements
+app base model initunknown det
+annex 45 290215 0 46
+shopping 604 1298 993 01592
+dataTables 607 233 47 0768
+hackerweb 81850 185 14 872
+(to be described further in Section 5), and also hackerweb [ 13],
+an additional app that does signicant DOM mutation. For
+each application, the table gives the number of DOM nodes
+with allocation sites from our baseline handling of uninstru-
+mented code (\base"), nodes with allocation sites from the
+additional DOM modeling of Section 3.3 (\model"), nodes
+in the initial DOM from parsing static HTML (\init"), and
+nodes with unknown allocation sites (\unknown"). Overall,
+MemInsight 's DOM modeling was very eective, exposing
+many more DOM allocation sites via modeling as compared
+to the baseline. The \det" column gives the number of nodes
+observed to be detached from the main DOM tree during
+execution. Such nodes must be carefully managed to avoid
+leaks, and the signicant number of detached nodes in the
+apps shows the property's importance for a memory proler.
+7. RELATED WORK
+Object lifetime analyses Our enhanced trace format has
+similarities to garbage collection traces [ 14], used to simulate
+garbage collection algorithms. We adopted the Merlin algo-
+rithm [ 14] to compute exact object lifetimes (see Section 3.2).
+Later work by Ricci et al. [ 31] enhances the GC trace format
+in a fashion similar to ours with call/return information.
+Resurrector [ 39] is a lifetime analysis technique which incurs
+much less overhead than Merlin while maintaining mostly-
+precise lifetimes. Resurrector leverages a modied virtual
+machine, so we cannot easily adopt its techniques.
+Biographical proling In the context of functional lan-
+guages executed by graph reduction, R ojemo and Runci-
+man [ 32] present a proler that measures lag, drag (staleness)
+and void. Lag is the time from creation until rst use, and
+void is an object that is never used. All of these metrics can
+be computed using MemInsight , with lag requiring tracing
+of the rst and last use of each object.
+Leak detection One application of MemInsight is leak
+detection for JavaScript programs. Much previous work on
+leak detection exists; we will cover the most pertinent here.
+AjaxScope [ 18] includes a leak detector specically aimed
+at nding heap cycles involving DOM nodes, which could
+not be garbage collected in older browsers. JSWhiz [ 30] is a
+static analysis that detects memory leaks caused by misuses
+of the Google Closure framework.
+Chilimbi and Hauswirth present the SWAT tool [ 4] which
+uses statistical proling to predict if an object is stale or
+will be used again, based on its previous access patterns. In
+Sleigh [ 3], Bond and McKinley adapt the SWAT approach
+to Java and reduce the overhead by using unused bits in the
+object header. MemInsight computes staleness precisely
+without modifying the runtime, but with higher overhead
+than these approaches. Shaham et al. [ 34,35] use an instru-
+mented VM to nd stale objects and the references keeping
+it alive. Furthermore the tool computes when a programmer
+can safely remove a reference to reduce staleness. Mem-Insight enables a programmer to do the same by providing
+access paths and last use sites.
+With LeakBot [ 24] Mitchell and Sevitsky detect leaks in
+enterprise Java applications by identifying memory regions
+that grow unboundedly, based on initial heap snapshots and
+selective tracing. A similar approach is taken in Cork [ 17],
+using summarization instead of snapshots. Detecting growing
+regions is complementary to staleness as currently computed
+byMemInsight , and we leave this to future work.
+GC assertion frameworks [ 1] allow programmers to write
+assertions about object lifetimes and then verify these asser-
+tions based on a garbage collection trace. LeakChaser [ 41]
+allows the programmer to assert invariants about object life-
+times and to dene transaction boundaries in the program
+that correspond to object lifetimes. Mitchell [ 23] uses heap
+dominators to present a view of a memory use that allows
+a programmer to see which objects are responsible for large
+subgraphs. As future work we will consider similar ways to
+present results to the programmer.
+Bloat Reduction Many techniques have been proposed for
+detecting run-time bloat. Copy proling [ 40] and the more
+general reference propagation proling [ 42] track data ow to
+expose issues like excessive allocation of temporary objects.
+Object-equality proling [ 22,38] explores another way of re-
+ducing bloat, in which sets of equivalent objects are replaced
+with a single representative object. Cachetor [ 28] is able
+to nd repeated allocation of identical objects. Techniques
+similar to these could be implemented atop MemInsight
+when congured to record all reads and writes to the heap;
+we plan to investigate such techniques in future work.
+Object inlining is a well-studied method for reducing
+bloat [ 9]. Lhot ak and Hendren [ 19] studied possibilities
+of object inlining in Java applications via tracing. They also
+performed a ner-grained analysis, where individual elds
+(rather than full objects) are also considered for inlining. This
+ner-grained analysis could also be built on MemInsight .
+8. LIMITATIONS
+MemInsight can miss a real memory issue if it does not
+occur during a test execution. Moreover, MemInsight may
+not be able to detect a memory issue if the application is run
+for a short period of time. This limitation can be removed
+by testing a web application more exhaustively. Also, Mem-
+Insight uses heuristics to detect memory leaks and drags.
+We developed these heuristics based on existing research
+results and our experience with several web apps. For drag
+or leak reports, a dynamic analysis cannot conclusively infer
+that a stale object can never be used in the future. Therefore,
+MemInsight can give false warnings.
+9. CONCLUSIONS
+We have presented MemInsight , a platform-independent
+tool for detailed memory proling of JavaScript applications.
+On unmodied JavaScript runtimes, MemInsight can handle
+complex JavaScript constructs, expose memory behavior of
+DOM objects, and compute exact object lifetimes. Our
+experimental results show that these rich features can be
+achieved with reasonable runtime overhead, and that Mem-
+Insight 's functionality can expose memory issues in real-
+world applications.
+35410. REFERENCES
+[1]E. Aftandilian and S. Z. Guyer. GC assertions: using
+the garbage collector to check heap properties. In PLDI ,
+pages 235{244, 2009.
+[2]Annex. HTML5WebApps - Annex. https://01.org/
+html5webapps/webapps/annex . Accessed: 2015-07-14.
+[3]M. D. Bond and K. S. McKinley. Bell: bit-encoding
+online memory leak detection. In ASPLOS , pages 61{72,
+2006.
+[4]T. M. Chilimbi and M. Hauswirth. Low-overhead mem-
+ory leak detection using adaptive statistical proling. In
+ASPLOS , pages 156{164, 2004.
+[5]ChromeDevTools. Chrome developer tools overview.
+https://developer.chrome.com/devtools/index . Ac-
+cessed: 2015-07-14.
+[6]W. Clinger, A. Hartheimer, and E. Ost. Implementation
+strategies for continuations. In Proceedings of the 1988
+ACM Conference on LISP and Functional Programming ,
+LFP '88, pages 124{131, New York, NY, USA, 1988.
+ACM. ISBN 0-89791-273-X. doi: 10.1145/62678.62692.
+URL http://doi.acm.org/10.1145/62678.62692 .
+[7]DataTables. Datatables - table plug-in for jQuery. http:
+//datatables.net/ . Accessed: 2015-07-14.
+[8]DataTablesLeak. Datatables patch-1. http://www.
+mozartrocks.ro/dt-test/patch-1.html . Accessed:
+2015-07-14.
+[9]J. Dolby and A. Chien. An automatic object inlining
+optimization and its evaluation. In PLDI , 2000. ISBN
+1-58113-199-2. doi: 10.1145/349299.349344. URL http:
+//doi.acm.org/10.1145/349299.349344 .
+[10]Escodegen. Escodegen. https://github.com/
+Constellation/escodegen . Accessed: 2015-07-14.
+[11]Esprima. Esprima. http://esprima.org . Accessed:
+2015-07-14.
+[12]GlobalObject. ECMAScript language specication -
+ECMA-262 edition 5.1: The global object. http://www.
+ecma-international.org/ecma-262/5.1/#sec-15.1 .
+Accessed: 2015-07-14.
+[13]HackerWeb. Hackerweb { a simply readable hacker
+news web app. http://hackerwebapp.com/ . Accessed:
+2015-07-14.
+[14]M. Hertz, S. M. Blackburn, J. E. B. Moss, K. S. McKin-
+ley, and D. Stefanovic. Generating object lifetime traces
+with Merlin. ACM Trans. Program. Lang. Syst. , 28(3):
+476{516, 2006.
+[15]S. Jensen, M. Sridharan, K. Sen, and S. Chandra.
+Meminsight: Platform-independent memory debugging
+for JavaScript. Technical Report SRA-FCS-2015-001,
+Samsung Research America, 2015.
+[16]jQuery. jQuery. http://jquery.com . Accessed: 2015-
+07-14.[17]M. Jump and K. S. McKinley. Cork: dynamic memory
+leak detection for garbage-collected languages. In POPL ,
+pages 31{38, 2007.
+[18]E. Kiciman and B. Livshits. AjaxScope: A platform
+for remotely monitoring the client-side behavior of Web
+2.0 applications. ACM Trans. Web , 4(4):13:1{13:52,
+Sept. 2010. ISSN 1559-1131. doi: 10.1145/1841909.
+1841910. URL http://doi.acm.org/10.1145/1841909.
+1841910 .
+[19]O. Lhot ak and L. Hendren. Run-time evaluation of
+opportunities for object inlining in Java. Concurrency
+and Computation: Practice and Experience , 17(5-6):
+515{537, 2005.
+[20]R. D. Lins. Cyclic reference counting with lazy mark-
+scan. Inf. Process. Lett. , 44(4):215{220, 1992.
+[21]C.-K. Luk, R. Cohn, R. Muth, H. Patil, A. Klauser,
+G. Lowney, S. Wallace, V. J. Reddi, and K. Hazel-
+wood. Pin: Building customized program analysis tools
+with dynamic instrumentation. In PLDI , pages 190{
+200, 2005. ISBN 1-59593-056-6. doi: 10.1145/1065010.
+1065034. URL http://doi.acm.org/10.1145/1065010.
+1065034 .
+[22]D. Marinov and R. O'Callahan. Object equality proling.
+InOOPSLA , pages 313{325, 2003.
+[23]N. Mitchell. The runtime structure of object ownership.
+InECOOP , pages 74{98, 2006.
+[24]N. Mitchell and G. Sevitsky. Leakbot: An automated
+and lightweight tool for diagnosing memory leaks in
+large Java applications. In ECOOP , pages 351{377,
+2003.
+[25]MutationObservers. DOM standard: Muta-
+tion observers. http://dom.spec.whatwg.org/
+#mutation-observers . Accessed: 2015-07-14.
+[26]N. Nethercote and J. Seward. Valgrind: A framework
+for heavyweight dynamic binary instrumentation. In
+PLDI , 2007. ISBN 978-1-59593-633-2. doi: 10.1145/
+1250734.1250746. URL http://doi.acm.org/10.1145/
+1250734.1250746 .
+[27]M. D. Network. Working with objects: Dening
+getters and setters. https://developer.mozilla.org/
+en-US/docs/Web/JavaScript/Guide/Working_with_
+Objects#Defining_getters_and_setters . Accessed:
+2015-07-14.
+[28]K. Nguyen and G. H. Xu. Cachetor: detecting cacheable
+data to remove bloat. In ESEC/FSE , 2013. doi: 10.
+1145/2491411.2491416. URL http://doi.acm.org/10.
+1145/2491411.2491416 .
+[29]OctaneBenchmarks. Octane. https://developers.
+google.com/octane/ . Accessed: 2015-07-14.
+[30]J. Piennar and R. Hundt. JSWhiz - static analysis for
+JavaScript memory leaks. In Proceedings of the 10th
+annual IEEE/ACM international symposium on Code
+generation and optimization , 2013.
+355[31]N. P. Ricci, S. Z. Guyer, and J. E. B. Moss. Elephant
+Tracks: portable production of complete and precise GC
+traces. In ISMM , pages 109{118, 2013.
+[32]N. R ojemo and C. Runciman. Lag, drag, void and use;
+heap proling and space-ecient compilation revisited.
+InProceedings of the First ACM SIGPLAN Interna-
+tional Conference on Functional Programming , ICFP
+'96, pages 34{41, New York, NY, USA, 1996. ACM.
+ISBN 0-89791-770-7. doi: 10.1145/232627.232633. URL
+http://doi.acm.org/10.1145/232627.232633 .
+[33]K. Sen, S. Kalasapur, T. Brutch, and S. Gibbs. Jalangi:
+A selective record-replay and dynamic analysis frame-
+work for JavaScript. In ESEC/FSE , 2013. ISBN 978-
+1-4503-2237-9. doi: 10.1145/2491411.2491447. URL
+http://doi.acm.org/10.1145/2491411.2491447 .
+[34]R. Shaham, E. K. Kolodner, and M. Sagiv. On the
+eectiveness of GC in Java. In ISMM , 2000.
+[35]R. Shaham, E. K. Kolodner, and M. Sagiv. Heap pro-
+ling for space-ecient Java. In PLDI , 2001. ISBN
+1-58113-414-2. doi: 10.1145/378795.378820. URL
+http://doi.acm.org/10.1145/378795.378820 .
+[36]Shopping List. HTML5WebApps - Shopping list. https:
+//01.org/html5webapps/webapps/shopping-list . Ac-
+cessed: 2015-07-14.[37]B. Xin, W. N. Sumner, and X. Zhang. Ecient program
+execution indexing. In PLDI , pages 238{248, 2008.
+[38]G. H. Xu. Finding reusable data structures. In OOPSLA ,
+2012.
+[39]G. H. Xu. Resurrector: a tunable object lifetime pro-
+ling technique for optimizing real-world programs. In
+OOPSLA , pages 111{130, 2013.
+[40]G. H. Xu, M. Arnold, N. Mitchell, A. Rountev, and
+G. Sevitsky. Go with the ow: proling copies to nd
+runtime bloat. In PLDI , pages 419{430, 2009. doi:
+10.1145/1542476.1542523. URL http://doi.acm.org/
+10.1145/1542476.1542523 .
+[41]G. H. Xu, M. D. Bond, F. Qin, and A. Rountev.
+Leakchaser: helping programmers narrow down causes
+of memory leaks. In PLDI , pages 270{282, 2011.
+[42]D. Yan, G. H. Xu, and A. Rountev. Uncovering
+performance problems in Java applications with ref-
+erence propagation proling. In ICSE , 2012. doi:
+10.1109/ICSE.2012.6227199. URL http://dx.doi.org/
+10.1109/ICSE.2012.6227199 .
+356

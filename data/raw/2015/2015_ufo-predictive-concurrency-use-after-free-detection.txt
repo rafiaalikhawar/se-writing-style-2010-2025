@@ -1,0 +1,1092 @@
+UFO: Predictive Concurrency Use-After-Free Detection
+Jeﬀ Huang
+Parasol Laboratory
+Texas A&M University
+jeﬀ@cse.tamu.edu
+ABSTRACT
+Use-After-Free (UAF) vulnerabilities are caused by the pro-
+gram operating on a dangling pointer and can be exploited to
+compromise critical software systems. While there have been
+many tools to mitigate UAF vulnerabilities, UAF remains
+one of the most common attack vectors. UAF is particularly
+diﬃcult to detect in concurrent programs, in which a UAF
+may only occur with rare thread schedules. In this paper,
+we present a novel technique, UFO, that can precisely pre-
+dictUAFs based on a single observed execution trace with a
+provably higher detection capability than existing techniques
+with no false positives. The key technical advancement of
+UFOis an extended maximal thread causality model that
+captures the largest possible set of feasible traces that can
+be inferred from a given multithreaded execution trace. By
+formulating UAF detection as a constraint solving problem
+atop this model, we can explore a much larger thread sched-
+uling space than classical happens-before based techniques.
+We have evaluated UFOon several real-world large complex
+C/C++ programs including Chromium and FireFox. UFO
+scales to real-world systems with hundreds of millions of
+events in their execution and has detected a large number of
+real concurrency UAFs.
+CCS CONCEPTS
+•Software and its engineering →Software testing
+and debugging ;•Security and privacy →Browser
+security ;
+KEYWORDS
+UAF, Concurrency, Vulnerabilities, UFO
+ACM Reference Format:
+Jeﬀ Huang. 2018. UFO: Predictive Concurrency Use-After-Free
+Detection. In ICSE ’18: 40th International Conference on Software
+Engineering , May 27-June 3, 2018, Gothenburg, Sweden. ACM,
+New York, NY, USA, 11 pages. https://doi.org/10.1145/3180155.
+3180225
+Permission to make digital or hard copies of all or part of this work
+for personal or classroom use is granted without fee provided that
+copies are not made or distributed for proﬁt or commercial advantage
+and that copies bear this notice and the full citation on the ﬁrst page.
+Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To
+copy otherwise, or republish, to post on servers or to redistribute to lists,
+requires prior speciﬁc permission and/or a fee. Request permissions
+from permissions@acm.org.
+ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+©2018 Copyright held by the owner/author(s). Publication rights
+licensed to the Association for Computing Machinery.
+ACM ISBN 978-1-4503-5638-1/18/05...$15.00
+https://doi.org/10.1145/3180155.31802251 INTRODUCTION
+Programs written in unsafe languages such as C/C++ are
+prone to memory errors. Among them, Use-After-Free (UAF)
+vulnerabilities are a severe threat to software security. Just
+a few years back [ 1], UAF vulnerabilities have become the
+most exploited memory errors in both Windows Vista and
+Windows 7, and many zero-day cyber attacks targeting web
+browsers and network servers have been launched through
+UAF vulnerabilities [2].
+A UAF occurs when the program accesses data via a dan-
+gling pointer, a pointer which points to an invalid object,
+i.e., the memory that stored the object has been deallocated
+and/or reallocated for storing another object. UAFs are par-
+ticularly diﬃcult to detect in concurrent programs, in which
+multiple threads may interleave when accessing memory via
+pointers. Due to diﬀerent thread schedules, a program can
+execute in many diﬀerent ways even with exactly the same
+program input. When the useandfreeof a certain pointer
+happen in diﬀerent threads and are not properly synchro-
+nized, they may constitute a UAF that can rarely manifest in
+the testing phase, because the particular thread schedule thattriggers the UAF is diﬃcult to occur. However, the UAF has
+a much larger chance to happen in production runs, where
+there is a large user base to exercise diﬀerent schedules, and
+worse, the schedules may be controlled by attackers [3].
+Existing techniques [ 4–6] are very limited in detecting such
+concurrency UAFs . Most dynamic tools, e.g., AddressSani-
+tizer [ 5] and KASAN [ 7], are evidence-based, such that they
+can only detect a UAF when it actually happened. Otherrecent techniques such as DangSan [
+13], DangNull [ 2] and
+FreeSentry [ 1] are eﬀective in preventing UAF vulnerabilities
+by tracking pointers at runtime and nullifying them before
+the pointed objects are destroyed, but they cannot defend
+UAF vulnerabilities that are not observed.
+Web browsers are one of the hardest-hit areas of concur-
+rency UAF vulnerabilities. Browsers are often built fromcomponents using diﬀerent memory management methods.For example, in Google Chrome and Firefox, JavaScript
+objects are garbage-collected, XPCOM objects are reference-
+counted, and the layout engine uses manual management.
+This mixture makes it extremely diﬃcult to reason about
+objects shared between codes using diﬀerent memory man-
+agement methods. Figure 1 shows a Priority-0 ( most ur-
+gent) bug that aﬀects the recent Chrome browser on Linux
+and OS X as well as Chrome OS. In this bug, client is a
+MidiManagerClient object, and it is managed by a ren-
+derer process; send_thread is owned by the browser process,
+which is independent of any renderers. It is possible that the
+client is freed when the corresponding renderer process
+6092018 ACM/IEEE 40th International Conference on Software Engineering
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Jeff Huang
+MidiManagerAlsa::DispatchSendMidiData(){
+...
+send_thread_.message_loop()->PostTask(
+FROM_HERE,
+base::Bind(
+&MidiManagerClient::AccumulateMidiBytesSent,base::Unretained(client),data.size()));
+...
+Figure 1: A real-world concurrency UAF in the
+Chrome browser (http://crbug.com/564501).
+dies, but the tasks are still in the message loop. When the task
+starts, it calls MidiManagerClient::AccumulateMidi-
+BytesSent on the client , which is already freed. This bug
+is a typical concurrency UAF and can be exploited to escape
+the sandbox [14].
+In this paper, we present a novel technique called UFO
+(UAF Finder Optimal ) for detecting concurrency UAFs. A
+salient feature of UFOis that it can predict UAF vulner-
+abilities that are unseen from the observed execution, but
+guarantee to happen in an alternative run of the same pro-
+gram with a diﬀerent schedule. Moreover, every reportedUAF by
+UFOmust be real and reproducible with a corre-
+sponding schedule to manifest it. Such an ability, which we
+callsound predictability , is unique for concurrent programs,
+because alternative thread schedules can be inferred from anobserved execution, based on a sound thread causality model
+such as the classical happens-before model [ 19] or the more
+recent maximal causality model ( MaxModel ) [16].
+UFOis underpinned by the MaxModel (discussed in more
+detail in Section 3). A key strength of MaxModel is that given
+an observed execution trace ( i.e.,t h eseedtrace), it can cap-
+ture the maximal set of feasible traces that can be inferred
+from the seed trace. However, MaxModel is blind to seman-
+tic properties such as UAFs. By extending MaxModel with
+additional useandfreeevents to support UAF detection,
+UFOis empowered with the maximal predictive power: UFO
+detects all possible and real concurrency UAFs based on an
+observed seed trace and it is impossible to precisely detect
+more concurrency UAFs than UFObased on the same seed
+trace1. In other words, any new UAF that is not detected by
+UFObut detected by another technique on the same observed
+execution could be a false positive.
+Moreover, we introduce a novel constraint encoding for
+UAFs. This is challenging because of the UAF semanticsand memory reuse (Section 4.2.2). By encoding both theUAF violations and the extended
+MaxModel as ﬁrst order
+logical constraints over the observed events in the execution
+and solving the constraints with a high performance SMT
+solver [ 22],UFOdetects a maximal number of real UAFs from
+the observed traces.
+1To clarify, UFOmay still miss real UAFs under a diﬀerent seed trace,
+e.g., one generated from a diﬀerent program input.We have implemented UFOfor Pthread-based multithreaded
+C/C++ programs based on ThreadSanitizer [ 17], and eval-
+uated it on several large real-world concurrent systems in-
+cluding the Chromium and the FireFox web browsers. Our
+experimental results show that UFOis powerful in detecting
+UAFs and can scale to real-world program executions with
+hundreds of millions of critical events. UFOdetected many
+UAF vulnerabilities that industrial-strength tools such as
+AddressSanitizer [ 5], Dr.Memory [ 18] and Valgrind [ 21] all
+fail to detect. At the time of writing, UFOhas detected 79
+UAFs in Chromium and 105 in Firefox.
+In summary, this paper makes the following contributions:
+•We present UFO, a powerful predictive detection tech-
+nique for concurrency UAF vulnerabilities. To our best
+knowledge, UFOis the ﬁrst concurrency UAF detec-
+tion technique with sound predictability, i.e.,i tc a n
+precisely predict a maximal set of UAFs from a multi-
+threaded program execution trace while the predicted
+UAFs are all real and can be reproduced.
+•We implement and evaluate UFOon both popular
+benchmarks and real applications. Experiments show
+that UFOcannot only detect known UAF violations,
+but also new UAFs that cannot be detected by industrial-
+strength tools. Moreover, with numerous performance
+optimizations, UFOscales to large complex programs
+such as Chromium and Firefox.
+•UFOis open source: https://github.com/parasol-aser/UFO .
+2 MOTIVATION
+In this section, we show how UFOcan predict UAFs from an
+observed execution, why it has a higher detection capability
+than other UAF detectors, and why it is precise, i.e., every
+reported UFOis real.
+initially:x=0p = malloc(10); q = malloc(10);
+Thread1:1. start(t2);
+2. lock(l)3. free(q);
+4. unlock(l)
+5. lock(l)6 .x=1 ;
+7. unlock(l)
+8. free(p);9. join(t2);Thread2:
+10. lock(l)11. *q=0 ;
+12. if(x == 0)13. *p=0 ;
+14. unlock(l)
+Figure 2: Motivating example.
+Figure 2 shows a simple example illustrating the UAF
+problems in a multithreaded program. The program contains
+two possible UAFs: the pointer dereference at line 11
+executed after free(q) at line 3, which is a real UAF that can
+occur under certain thread interleavings; a potential UAF
+between lines 8 and 13, which in fact can never occur.
+610
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. UFO: Predictive Concurrency Use-After-Free Detection ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+Suppose that the program is executed following the sched-
+uleS0denoted by lines:
+S0: 1-10-11-12-13-14-2-3-4-5-6-7-8-9,
+the evidence-based UAF detectors [ 5,7,18,21] cannot ﬁnd
+the real UAF , because it does not occur in the observed
+schedule. The classical happen-before based data-race de-
+tectors [ 17] can neither ﬁnd this UAF, because at the time
+when the free(q) operation is executed, threads 1 and 2 are
+happens-before synchronized by the unlock(l) operation at
+line 14 and the lock(l) operation at line 2. In other words,
+there is a determined happen-before edge from the event at
+line 11 to the event at line 3. However, it is possible that
+thread 1 acquires the lock lﬁrst and frees the memory pointed
+byqat line 3 before the pointer access at line 11, following
+the schedule S1:
+S1: 1-2-3-4-10-11-12-13-14-5-6-7-8-9,
+which manifests the UAF .
+How about the UAF between lines 8 and 13? It should
+be noticed that in the example above, the read xat line
+12 can read diﬀerent values depending on the execution of
+line 6. In other words, the pointer dereference at line 13 is
+control-dependent on line 6. If the free(p) operation at line 8
+is executed before line 13, then line 12 will read value 1 on x
+and hence line 13 will not be executed. Thus the UAF is a
+false positive.
+UFOcan detect the real UAF and at the same time
+precisely determine that the UAF is not possible (hence
+prevents from reporting any false positives). The basic idea of
+UFOis to infer other feasible schedules based on an observed
+execution trace and to detect UAFs in all the inferred sched-
+ules, in addition to the observed schedule. UFOis inspired by
+early work on predictive race detection [ 16], which proposes a
+MaxModel to capture a maximal set of feasible schedules from
+a trace. By encoding all potential pointer UAFs as additional
+constraints to the MaxModel ,UFOis able to verify all feasible
+UAFs that can be inferred from an execution.
+The key technical novelty of UFOis extending the Max-
+Model to support UAF detection, which requires both ex-
+tending the original trace model and eﬃciently encoding
+UAF constraints while ensuring every detected UAF is real
+and no UAF is missed. Moreover, we develop two practical
+optimizations to improve the runtime performance of UFO.
+In the rest of this paper, we ﬁrst introduce the MaxModel
+in Section 3 and then present the design and technical details
+ofUFOin Section 4. We present the implementation of UFO
+in Section 5 and evaluation results of UFOin Section 6.
+3 MAXIMAL CAUSAL MODEL
+Taking as input an observed execution trace of a multi-
+threaded program, the MaxModel captures the largest set
+of feasible traces that can be inferred from the observed trace.
+This allows us to detect all potential UAF vulnerabilities cap-
+tured by the MaxModel that are also real: for every detected
+UAF there exists a valid execution that manifests it (possibly
+via an alternative schedule).A trace is a full sequence of events, which are operations
+performed by threads on concurrent objects. For example, a
+write event to memory location xwith value vby thread t
+is denoted as write(t,x,v) . A full sequence means that all
+events on concurrent objects are included, i.e., no critical
+event is missing. The following common types of critical
+events (by a thread t) are considered in the original MaxModel :
+•read(t,x,v)/write(t,x,v) : read/write xwith value v;
+•lock(t,l)/unlock(t,l) : acquire/release lock l;
+•start(t,t’) : fork a new thread t/prime;
+•join(t,t’) : block until thread t/primeterminates.
+•begin(t)/end(t) : the ﬁrst/last event of thread t; these
+are extra events introduced to capture the happens-
+before relation between threads.
+When a multithreaded program Pis executed, a set of
+ﬁnite traces of events will be produced, called P-feasible
+traces. There are two important properties held by the sets
+ofP-feasible traces: preﬁx closedness andlocal determinism .
+The former says that the preﬁxes of a P-feasible trace are also
+P-feasible. The latter means the execution of a concurrent
+operation is only determined by the previous events in the
+same thread. More speciﬁcally,
+Preﬁx Closedness: P-feasible is preﬁx closed: if τ1τ2∈
+P-feasible, then τ1∈P-feasible. Preﬁx closedness ensures
+that the events are generated in execution order, with the
+possibility of interleaving in-between any of them.
+Local Determinism: Each event is determined only by
+the previous events in the same thread (and not other events
+of other threads) and can occur at any consistent moment
+after them.
+In addition to the two basic axioms deﬁned above, the sets
+ofP-feasible traces must also obey a memory consistency
+model, i.e., which value a read can return. Note that the event
+valueis also a part of the deﬁnition. For example, if the value
+returned by a read is changed, it becomes a diﬀerent read
+event, such that a conditional after the event may produce a
+diﬀerent trace. The original MaxModel focuses on sequential
+consistency and has also been extended to relax memory
+models such as TSO and PSO [ 20]. In this paper, we follow
+the original MaxModel for sequential consistency only.
+Together, MaxModel enables associating a maximal set of
+traces MaxModel (τ)to any consistent trace τ, which comprises
+precisely the traces that can be generated by any program
+that can generate τ.I ti ss h o w ni n[ 16]t h a t MaxModel (τ)is
+both sound and maximal: any program which can generate
+τcan also generate all traces in MaxModel (τ), and for any
+traceτ/primenot in MaxModel (τ)there exists a program gener-
+atingτwhich cannot generate τ/prime. In contrast, traditional
+happens-before causal models [ 19] consisting of all the legal
+interleavings of τare not maximal. In other words, there are
+feasible traces that are captured by MaxModel but not by the
+happen-before model.
+Example: Consider the example in Figure 2 again. The
+traceτ0as shown in Figure 3 will be generated following
+the schedule S0. Note that the original MaxModel does not
+model pointer useandfreeevents. For illustration purpose,
+611
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Jeff Huang
+Traceτ0:
+1. start(t1,t2)
+begin(t2)
+10: lock(t2,l)
+11: read(t2,q, *q)
+11: write(t2, *q,0)
+12: read(t2,x,0)13: read(t2,p, *p)
+13: write(t2, *p,0)
+14: unlock(t2,l)
+end(t2)
+2: lock(t1,l)3: read(t1,q, *q)
+3: write(t1, *q,0)
+4. unlock(t1,l)
+5. lock(t1,l)6. write(t1,x,1)
+7. unlock(t1,l)
+8. read(t1,p, *p)
+8. write(t1, *p,0)
+9. join(t1,t2)Traceτ
+1:
+1. start(t1,t2)2: lock(t1,l)3: read(t1,q, *q)
+3: write(t1, *q,0)
+4. unlock(t1,l)
+begin(t2)
+10: lock(t2,l)11: read(t2,q, *q)
+11: write(t2, *q,0)
+12: read(t2,x,0)
+13: read(t2,p, *p)
+13: write(t2, *p,0)
+14: unlock(t2,l)
+end(t2)
+5. lock(t1,l)
+6. write(t1,x,1)
+7. unlock(t1,l)
+8. read(t1,p, *p)
+8. write(t1, *p,0)
+9. join(t1,t2)
+Figure 3: Traces for the motivating example.
+we use two events (a read and a write) to model each pointer
+use and free. For example, ∗p=0at line 11 corresponds
+toread(t2,q, *q)andwrite(t2, *q,0),i nw h i c h *q
+denotes the left value of the pointer q(i.e., the address
+of memory location storing the pointed value). In the next
+section, we will extend MaxModel to support UAF detection.
+Fromτ0, the trace τ1(which manifests the UAF ) can be
+inferred by the MaxModel . However, this trace is not allowed
+by the traditional happens-before model, because there is a
+happens-before edge from the unlock (t2,l) event at line 14
+to the lock(t1,l) event at line 2. On the other hand, there
+is no way to generate a trace in MaxModel that can put
+the event at line 13 after the event at line 8 (which could
+manifest the UAF ), because that would violate the local
+determinism and memory consistency model of MaxModel .
+More speciﬁcally, if line 13 is after line 8, then the value of x
+will be set to 1 by the write event at line 6 ﬁrst, and the read
+event at line 12 will return the value 1 (instead of 0 as that in
+τ0). Because the read event at line 12 is now a diﬀerent event,
+it is possible that the event at line 13 becomes infeasible ( e.g.,
+due to a ifbranch as in the example program).
+4 PREDICTIVE UAF DETECTION
+The MaxModel allows us to deﬁne a maximal notion of UAFs:
+a traceτhas a UAF iﬀ there is some τ/prime∈MaxModel (τ), which
+contains a read or a write to a memory region that has already
+been deallocated. In this section, we ﬁrst extend MaxModel
+to support concurrency UAF detection by introducing new
+types of events. Then we present our algorithm for detecting
+UAFs by encoding both the extended MaxModel and the
+UAFs as ﬁrst-order logical constraints.4.1 Extended MaxModel
+We introduce three additional types of events into the model:
+•malloc(t, addr, size) : allocate a new memory region
+from the address addrtoaddr+size;
+•use(t, addr, range) : read/write the memory region
+from address addrtoaddr+range ;
+•free(t, addr, size) : deallocate the memory region
+from address addrtoaddr+size, such that it can be
+reused.
+These events are relevant to the UAF detection and all
+their attributes can be obtained at runtime. A malloc event
+corresponds to allocating a dynamic memory on the heap,
+e.g., creating a new object. The addrandsizecorrespond to
+the return value and the calling parameter, respectively, of
+the*malloc(size_t size) function (or calloc ,new).
+When memory allocation is done, the actual heap space
+allocated is one word larger than the requested memory. The
+extra word is used to store the size of the allocation andis later used by
+free.Auseevent is an ordinary read or
+write event that accesses a memory region. The addrand
+range correspond to the beginning address of the accessed
+memory and the bit-length of the accessed data. A free
+event corresponds to a memory deallocation function ( free,
+delete ,o r realloc ) and the attributes addr andsize
+correspond to the beginning address and the size, respectively,
+of the deallocated memory.
+4.2 The UFOAlgorithm
+Given an observed trace τ(with all the events in the extended
+MaxModel included), our basic idea for detecting UAFs is to
+generate MaxModel (τ)and the UAF conditions among the
+events in τ, both are encoded as constraints. By solving the
+conjuncted constraints with an SMT solver, we can determine
+if there exists any trace τ/prime∈MaxModel (τ), in which a free
+event is executed before a useof the same memory region,
+and the memory address of the use is originated from the
+samemalloc corresponding to the free.
+We introduce an order variable Oifor each event eiin
+τ, and construct a formula Φover these variables, in which
+Oi<Ojmeans that the event eihappens before the event
+ej.Φis a conjunction of two sub-formulas: Φ=Φ max∧Φuaf,
+whereΦmaxencodes the MaxModel andΦuafencodes each
+potential UAF. In the rest of this section, we present Φmax
+andΦuafin detail.
+4.2.1 MaxModel Constraints. Φmaxis constructed by a
+conjunction of two sub-formulas: Φsync∧Φrw, whereΦsync
+denotes the inter-thread order constraints determined by
+synchronization events, and Φrwthe data-validity constraints
+over read and write events. Φsynccan be further decomposed
+asΦmhb∧Φlock, the conjunction of the must-happen-before
+constraints Φmhband the lock-mutual-exclusion constraints
+Φlock.
+Must-happen-before constraints ( Φmhb).The must-happen-
+before (MHB) constraints reﬂect a subset of the classical
+happens-before relation, ensuring a minimal set of ordering
+612
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. UFO: Predictive Concurrency Use-After-Free Detection ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+relations that events in any feasible interleaving must obey.
+Speciﬁcally, MHB requires that (1) the total order of the
+events in each thread is always the same; (2) a beginevent can
+happen only after the thread is started by another thread; (3)
+ajoinevent can happen only after the endevent of the joined
+thread. Clearly MHB yields a partial order over the events
+ofτwhich must be respected by any trace in MaxModel (τ).
+We denote MHB by ≺, which will be used later. We can
+specify≺easily as constraints Φmhbover the Ovariables:
+we start with Φmhb≡trueand conjunct it with a constraint
+Oe1<Oe2whenever e1ande2are events by the same thread
+ande1occurs before e2,o rw h e n e1is an event of the form
+start(t,t/prime) ande2of the form begin(t/prime), etc.
+Lock-mutual-exclusion constraints ( Φlock).The locking se-
+mantics requires that any two code regions protected by the
+same lock are mutually exclusive, i.e., they should not inter-
+leave.Φlockcaptures the ordering constraints over lockand
+unlock events. For each lock l, we extract the set Slof all
+the corresponding pairs, (ea,eb),o flock/unlock events on l,
+following the program order locking semantics: the unlock
+is paired with the most recent lockon the same lock by the
+same thread. Then we conjunct Φlock≡truewith the formula
+/logicalanddisplay
+(ea,eb),(ec,ed)∈Sl(Oeb<Oec∨Oed<Oea)
+Data-validity constraints ( Φrw).The data-validity con-
+straints ensure that every event in the considered trace is
+feasible. Note that in constructing MCM for an input trace
+τ, the considered trace does not necessarily contain all the
+events in τbut may contain a subset of them, so that all
+the trace preﬁxes corresponding to partial executions of the
+program are considered as well. For an event to be feasible, all
+the events that must-happen-before it should also be feasible.Moreover, every read event that must-happen-before it shouldread the same value as that in the input trace; otherwise the
+event might become infeasible due to a diﬀerent value read
+by an event that it depends on. Each read, however, mayread a value written by any write, as long as all the other
+constraints are satisﬁed.
+Let≺edenote the set of events that must-happen-before
+an event e. Consider a read event rin≺e,read(t,x,v),w e
+letWxbe the set of write(_,x,_)events in τ(‘_’ denotes
+any value), and Wx
+vthe set of write(_,x,v)events in τ. The
+data-validity constraint of an event e,Φrw(e), is deﬁned as/logicalandtext
+r∈≺ eΦvalue(r), whereΦvalue(r)≡
+/logicalortext
+w∈Wxv(Φrw(w)∧Ow<Or/logicalandtext
+w/negationslash=w/prime∈Wx(Ow/prime<Ow∨Or<Ow/prime))
+The constraint Φrw(e)enforces that every read that must-
+happen-before eshould read the same value as that in the
+input trace. The constraint Φvalue(r,v)enforces the read
+eventr=read(t,x,v)to read the value vonx(written by
+anywrite eventw=write(_,x,v)inWr
+v), subject to the
+condition that the order of wis smaller than that of rand
+there is no interfering write(_,x,_)in between. In addition,
+witself must be feasible, which is ensured by Φrw(w).Since the MaxModel models all the partial traces as well,
+the data-validity constraint Φrwis thus satisﬁable if any
+event in the input trace τis feasible, written as a disjunction
+of the feasibility constraints of all events in τ:
+Φrw≡/logicalordisplay
+e∈τΦrw(e)
+It is worth noting that each solution of the order vari-
+ables to Φmaxcorresponds to the schedule of a trace in
+MaxModel (τ). The size of MaxModel (τ)may be huge as the
+number of unique solutions to Φcan be exponential. In
+practice, however, we do not need to directly solve Φmaxto
+produce all the schedules in MaxModel (τ). For example, when
+used for checking UAFs, it suﬃces to ﬁnd one schedule that
+satisﬁes the UAF condition.
+4.2.2 UAF Constraints. In large programs, memory allo-
+cation and deallocation requests from function call such as
+malloc andfree can be very frequent because the applica-
+tion memory is heavily reused. It is common that the memory
+region returned for one malloc request overlaps with a previ-
+ousmalloc request (which has been freed). When a useevent
+accesses a memory region that overlaps with another memory
+region that has been freed before, it does not necessarily
+mean a UAF, because the memory region may have beenreused. To illustrate this problem, consider the example in
+Figure 4:
+Thread1:
+1. p1 = malloc(100)
+//address:[100, 200]
+2. free(p1)3. p2 = malloc(100)
+//address:[100, 200]
+...
+4.*p 4=0
+Thread2:...
+5. free(p2)
+6. p3 = malloc(150)
+//address:[150, 300]Thread3:
+...
+7. free(p3)
+Figure 4: A memory access event matched with mul-
+tiple malloc and freepairs.
+There are three malloc andfreepairs: pair1 withmalloc
+at line 1 and freeat line 2, pointed by p1;pair2 with
+malloc at line 3 and freeat line 5, pointed by p2;pair3
+withmalloc at line 6 and freeat line 7, pointed by p3.T h e
+corresponding memory regions are 100–200,100–200, and
+150–300. The write event at line 4 writes to the address
+150, and it happened in parallel with pair2 andpair3 .
+Because it is unclear from the generated event trace where
+613
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Jeff Huang
+p4is derived from, it is hard to determine whether the write
+should be matched with pair1, pair2,o r pair3.
+To address this problem, we propose three solutions: 1)
+no memory reusing, 2) pointer origin tracking, and 3) purely
+constraint solving. The ﬁrst solution is simple: do not really
+perform the free. We modify the memory allocator such that
+upon a free, we only record the free operation in the trace but
+do not free the actual memory. This works well for test runs
+with small inputs as long as the memory is not exhausted, but
+may not work for production with long running executions.
+The idea of origin tracking is to associate each useand
+freeevent with a corresponding malloc which the used mem-
+ory address propagates from. This solution produces simple
+constraints because each usecan be match with a unique free
+according to their associated malloc event. The downside is
+that it requires data-ﬂow tracking on pointers at runtime,
+which incurs extra performance overhead.
+The third solution does not require pointer tracking, but
+generates more constraints. The basic idea is that when there
+are multiple malloc-free pairs that a usemay match with,
+although it is unknown which pair the useshould be matched
+with, there must be a UAF if the use can be matched with
+more than one pair. The reason is that a safe usecan be
+matched with one and only one malloc-free pair. Otherwise,
+it means that the memory address of the useoriginated from
+one malloc is used to access a memory region allocated by
+another malloc.
+We next present these two solutions in more detail.Pointer Origin Tracking
+. This approach tracks the ori-
+gin of the pointer address in the useevent, i.e.,w h i c hmalloc
+event it corresponds to. Similarly, for each freeevent, we track
+its corresponding malloc event, which allocates the memory
+region that the freeevent deallocates. The diﬀerence is that
+amalloc event is expected to have a unique corresponding
+freeevent. Otherwise, if there is more than one, the program
+has a double-free error, and if there is none, the program has
+a memory leak. Since we focus on detecting UAFs only, we
+assume there is a one-to-one mapping from malloc tofree
+events.
+We hence perform an online data-ﬂow analysis on pointer
+variables to record the malloc event of the pointer address
+that is used by each useevent and each freeevent. More
+speciﬁcally, for each p = malloc(size) operation, we call
+the corresponding malloc event as the origin of the pointer p.
+If the value of pﬂows to another pointer p’, then the malloc
+event of pis also the origin of p’. When p’is used in a use
+orfreeevent, we can connect the useorfreeevent with the
+origin, i.e.,t h emalloc.
+After matching each useandfreewith the malloc event,
+we can encode the UAF constraint as follows: for each free
+event,efree, and for each useevent,euse, that has the same
+origin as efree, we add the constraint Φuaf=euse>efree.
+IfΦuaf∧Φmaxis satisﬁable, it means that there exists a
+schedule of the program (which produced τ) in which euse
+happens after efree. In other words, the useof a pointer
+happens after the freeof the memory pointed by the pointer.Purely Constraint Construction . Consider a useevent
+euseand suppose it has three potentially matching malloc-free
+pairs: P1( em1,ef1), P2(em2,ef2) and P3( em3,ef3) . Ideally,
+we would construct three constraints Om1<Ouse<Of1,
+Om2<Ouse<Of2andOm3<Ouse<Of3, and count the
+number of solutions. If at least two of these three constraints
+can be satisﬁed (conjuncted with the constraints generated
+from MaxModel ), theneusewith one of the two freeevents
+(whose constraints are satisﬁed) constitutes a real UAF.
+However, solving such constraints requires computing the
+number of solutions for individual constraint clauses, which isnot well supported by existing high performance SMT solvers
+s u c ha sZ 3[ 22]. We hence develop a sub-optimal solution
+for this problem, but generates simple constraints. It is sub-
+optimal in that it does not encode all possible UAFs, but only
+a subset of them. The key idea is that all malloc-free pairs
+with overlapping memory regions must be globally ordered,
+i.e., all these malloc andfreeevents must be synchronized. If a
+usecan happen outside of all its potentially matching malloc-
+free pairs, then it must be a UAF. In other words, suppose
+the three malloc-free pairs P1-P2-P3 are globally ordered as
+em1-ef1-em2-ef2-em3-ef3in the observed trace. Then if in a
+certain schedule the useeventeusecan be executed in the
+gap between any freeand its next malloc, then the eusemust
+be involved in a UAF. The constructed constraints can be
+written as ( Of1<Ouse<Om2)∨(Of2<Ouse<Om3)∨
+(Of3<Ouse).
+Φmhb:O1<O 2<...<O 9
+O10<O 11<...<O 14
+O1<O 10∧O14<O 9
+Φlock:O4<O 10∨O14<O 2
+∨(O4<O 10∧O14<O 7)
+Φrw:O12<O 6
+Φuaf1:O3<O 11
+Φuaf2:O8<O 13
+Figure 5: The encoded constraints for the motivatingexample in Figure 2.
+4.3 Example
+Figure 5 shows the constructed constraints for the two pos-
+sible UAFs andin our motivation example in Figure 2.
+For, the UAF constraint is written as O3<O 11, because
+theuseevent at line 11 and the freeevent at line 3 have the
+same origin, which is the malloc event corresponding to the
+statement q = malloc(10) . Similarly, the UAF constraint
+foris written as O8<O 13.
+Figure 5 also shows the constructed constraints for Φmax.
+For example, O1<O 2is included in Φmhbbecause the event
+at line 1 should always happen before the event at line 2,and
+O1<O 10because the ﬁrst event of Thread2 should
+happen after its starting event by Thread1 at line 1. Φmhbis
+written as O4<O 10∨O14<O 2∨(O4<O 10∧O14<O 7),
+614
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. UFO: Predictive Concurrency Use-After-Free Detection ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+because the three lock regions protected by lock/unlock event
+pairs at lines (2,4), (5,7) and (10,14) cannot overlap. Φrmis
+written as O12<O 6, because the read event on xat line 12
+returns the value 1 in the observed trace τ, and to ensure the
+consistency of this read event (and the feasibility of the other
+events following it), the write event at line 6 which writes 1
+toxmust happen before it.
+Next, we employ an SMT solver to solve each formula
+Φmax∧Φuaf1andΦmax∧Φuaf2.F o r, the solver returns
+a solution, in which O1=1,O2=2,O3=3,O4=4,O5=
+10,O6=1 1,O7=1 2,O8=1 3,O9=1 4,O10=5,O11=
+6,O12=7,O13=8,O14=9, corresponding to the schedule:
+1-2-3-4- 10-11-12-13-14 -5-6-7-8-9.
+Hence, we ﬁnd a real UAF vulnerability: free(q) (line 3)
+can be executed before * q=0 (line 11) following the schedule
+above. For , however, the formula is not satisﬁable, so it is
+not a real UAF.
+5 UFO IMPLEMENTATION
+We have implemented UFObased on ThreadSanitizer [ 17]
+and the Z3 SMT solver [ 22] for Pthread-based multithreaded
+C/C++ programs, with around 12K additional code. UFO
+consists of two main phases: online program tracing and
+oﬄine predictive trace analysis.
+5.1 Trace Generation
+We modiﬁed ThreadSanitizer to generate the trace containing
+events deﬁned in our extended MaxModel . To generate mem-
+ory access events, we ﬁrst instrument the target program with
+an LLVM pass, and record each load or store instructions on anon-local variable as a tuple
+/angbracketlefttid,PC,addr,isWrite,value,pc/angbracketright .
+For implicit events through function calls, e.g., free() ,
+delete(), memcpy() andstrcmp(), we wrap these func-
+tions during linking. When these functions are invoked at
+runtime, we intercept the call and generate an event from thefunction type and parameters. For example, memcpy(a,b,100)
+by thread
+twill generate two events: range_read(t,b,100)
+andrange_write(t,a,100).
+To map the events back to the source code when reporting
+UAF violations, besides the memory access and thread inter-
+action information, we store in the events the PC, which is
+the code address of the load/store instruction or the called
+function, as well as the address and oﬀset of each module
+loaded by the target program.
+All events are encoded in a compact format, and are writ-
+ten to ﬁles for oﬄine predictive analysis. At runtime, a huge
+number of events will be generated in a very fast way (around
+twenty million events per second), and the normal execution
+of an application may be blocked for a relatively long time
+when ﬂushing events to disk. To reduce the runtime pertur-
+bation from the tracing library, we allocate a thread-local
+buﬀer for each live thread, such that events are buﬀered ﬁrst.
+When a thread-local buﬀer is full, it is ﬂushed to a global
+buﬀer queue, such that the application thread can continue
+executing without being blocked. A worker thread running
+the background is invoked once a local buﬀer is ﬂushed, andcompresses the data in the queue using Snappy [ 23] and
+ﬂushes it to disk asynchronously.
+For multiple-process programs ( e.g.,Chromium andFirefox ),
+we store the trace of each process in separate directories and
+invoke the analyzer for diﬀerent processes in parallel to im-
+prove the performance. In addition, because UAFs cannot
+happen in a single thread, we do not start tracing until the
+ﬁrst child thread has been forked by the main thread.
+5.2 Trace Analysis
+In the trace analysis phase, we build the MaxModel constraints
+from the thread local traces. Then, we search for malloc
+andfreepairs and the conﬂicting memory accesses. In our
+implementation, we only consider concurrency UAFs, i.e.,
+theuseandfreeevents are from diﬀerent threads. For each
+pair of useandfreeevents that have overlapping memory
+region, we ﬁrst run a fast happens-before algorithm to identify
+candidate UAFs. If the useandfreedo not happen before
+each other by inter-thread synchronization, we consider them
+as a candidate UAF. For each candidate UAF, we proceed to
+build the constraints Φuaf∧Φmaxand invoke Z3 to solve them.
+The default constraint solving time is set to two minutes for
+each invocation. If the solver returns a solution, we report
+the UAF as well as the schedule that can manifest it.
+To report the detected UAFs, we ﬁrst retrieve the PCs of
+the call stacks from the trace and calculate the oﬀset address
+of each PC from the stored module information. We theninvoke a symbolizer, e.g.,
+llvm-symbolizer oratos to
+map the UAF to the source code.
+For long running programs, the size of the generated trace
+could be very large, and it is diﬃcult to even load andprocess the whole trace. In addition, long traces lead to a
+huge number of constraints, which are diﬃcult to solve in a
+reasonable time. Previous predictive techniques [ 16] propose
+a windowing strategy, which splits the whole trace into pieces
+and analyzes only a limited number of events each time. In
+UFO, we design an adaptive windowing algorithm that loads
+events based on the number of threads alive in that speciﬁc
+window: the fewer threads, the more events we load. For
+example, in a period of execution, if there are more threads
+interacting with each other, the number of events loadedfrom each thread is decreased. One limitation of splitting
+the trace is that if the conﬂicting useandfreeare loaded in
+diﬀerent windows, some real UAFs may be missed.
+6 EVALUATION
+In this section, we aim to answer the following two questions:
+(1)UAF detection eﬀectiveness - Can UFOdetect real
+UAFs in real-world applications? If so, how eﬀective is
+it?
+(2)Performance - What is the runtime overhead of UFO?
+What is the trace size and how eﬃcient is the oﬄine
+analyzer? Can it scale to read-world large programs?
+615
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Jeff Huang
+Table 1: Experimental Results on Pbzip2 and HTTrack.
+ProgramTrace #UAFTime#threads #events #read #write #sync #malloc #use #free Candidate Real
+Pbzip2 4 1590 957 249 263 77 1206 44 39 23 14s
+HTTrack 2 27.7M 23.6M 4M 2696 38.9K 27.6M 32.8K 33 4 9s
+6.1 Methodology
+We evaluated UFOon four real-world open source programs,
+including two popular benchmarks with known UAFs ( Pbzip2 )
+or concurrency bugs ( HTTrack ) collected from [ 15], and
+two popular web browsers: Chromium andFirefox .F o r
+Chromium andFirefox , we conducted a set of real user
+interactions and generated a collection of traces. We set the
+timeout period for analyzing each trace to two hours and the
+adaptive window size to 100K.
+For performance evaluation, we collected three popular web
+benchmarks Octane [ 26], SunSpider [ 27], and Dromaeo [ 28],
+and measured the runtime overhead and trace ﬁle size by
+running the UFOinstrumented browsers with these bench-
+marks.
+For encoding the UAF constraints, we evaluated all the
+three solutions (recall Section 4.2.2). We found that the sim-
+ple “no memory reusing” solution works well for our UAFdetection tests, but it does not work for the performance
+tests (because the memory can be quickly exhausted). Both
+the Pointer Origin Tracking and the Purely Constraint Con-
+struction solutions work for performance tests, but PurelyConstraint Construction works better: it detects the same
+number of unique UAFs as that by the Pointer Origin Track-ing solution. However, it is more eﬃcient at runtime because
+tracking the dynamic ﬂow of pointers is expensive, e.g.,i t
+incurs around 4X additional runtime overhead. The UAFdetection data reported in Section 6.2 corresponds to thesimple solution, and the performance data in Section 6.3
+corresponds to the Purely Constraint Construction solution.
+All experiments were conducted on an 8-core 2.60GHz
+Intel i7 machine with 24GB memory running Ubuntu 14.04.
+6.2 UAF Detection Eﬀectiveness
+6.2.1 Pbzip2 and HTT rack. Table 1 summarizes the results
+onPbzip2 andHTTrack . Overall, UFOdetected 23 real
+UAFs in Pbzip2 a n d4i n HTTrack . We note that every
+report UAF by UFOhas a unique signature (we remove those
+dynamic UAFs from the same program source locations). We
+also tested these two benchmarks with AddressSanitizer [ 5],
+Dr.Memory [ 18] and Valgrind [ 21]. None of the other tools
+reported any UAF violations in normal executions of these
+programs, because no real UAF actually happened in the
+observed trace.
+Pbzip2 is a frequently studied parallel compression tool
+containing known UAFs [ 8]. To decompress a ﬁle, it ﬁrst loads
+the ﬁle into memory and stores the chunks in a FIFO list,
+and then starts several new threads to operate on the FIFO
+list. However, due to the lack of proper synchronization, itis possible that the FIFO list is deleted by the main thread
+before the other parallel tasks ﬁnish. The observed tracecontains four thread with a total of 1590 events, including
+957 reads (or range reads), 249 writes (or range writes), and
+263 synchronization events (thread fork, join, mutex lock,
+unlock, etc.). There are 77 malloc,4 4 free, and 1206 use
+events. In total, UFOdetected 39 candidate UAFs ( i.e., pairs
+ofuseandfreeevents accessing overlapping memory regions,
+but are from diﬀerent threads). Among them, 23 are veriﬁed
+to be real ( i.e., the solver returns solutions to the generated
+constraints). For example, UFOdetected six real UAFs in
+Pbzip2 for each ﬁle operation: there are six accesses to the
+FIFO list in the void *consumer(void *)function, which
+are not properly synchronized with the freecall from the
+main thread. The total oﬄine analysis time is 14s.
+HTTrack is an oﬄine browser utility that can download
+a web site to local directory. It has a known order viola-tion concurrency bug [
+9] between creation of a global data
+structure global_opt and the use of it, which may result in
+null-pointer dereference and hence program crashes. However,
+it was unknown if this program has UAF vulnerabilities or
+not. UFOconﬁrmed that HTTrack does have UAF vulnera-
+bilities. The observed trace contains two threads performing
+more than 27M events in total, including 23.6M reads, 4M
+writes, 2696 synchronization events, 39K malloc, 33 free, and
+27.6M useevents. In total, UFOdetected 33 candidate UAFs,
+among which 4 UAFs are veriﬁed to be real. The total oﬄine
+analysis time is 9s.
+6.2.2 Chromium and Firefox. We evaluated UFOonChrom-
+iumandFirefox both built from trunk as of July 2017. To
+generate traces that contain risky useandfreeevents, we
+manually checked their issue trackers, and analyzed the cur-
+rent unresolved issues. We found that the PDF module and
+the printing facilities in Chromium are more prone to bugs
+than other components. Several unresolved issues are related
+to actions related to PDF and printing. In our experiments,
+we conducted a number of browser actions related to PDF
+and printing: open ﬁve PDF ﬁles, including one that triggered
+a UAF vulnerability in MuPDF [ 29], print these PDF ﬁles,
+cancel printing jobs, close ﬁles before printing ﬁnishes, etc. In
+addition, we opened several rich web pages such as Youtube
+andFacebook , and performed actions related to multimedia
+and printing.
+In total, Chromium forked 16 processes with 334 threads
+together, Firefox forked 15 processes with over 460 threads.
+UFOtook 11 hours to analyze the 162GB compressed traces
+and detected 184 UAFs (79 in Chromium and 105 in Firefox )
+in four processes. The results are reported in Table 2.
+616
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. UFO: Predictive Concurrency Use-After-Free Detection ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+Table 2: Experimental Results on Chromium and Firefox.
+Program PidTrace #UAFTime#threads #events #read #write #sync #malloc #use #free Candidate Real
+Chromium#1 16 222M 140M 80M 446K 655K 220M 545K 113 65 469s
+#2 15 268M 170M 90M 340K 650K 266M 530K 40 14 108s
+Firefox#1 88 520M 370M 148M 740K 965K 518M 660K 629 70 1323s
+#2 41 145M 110M 34M 180K 225K 144M 147K 148 35 83s
+Table 3: Performance evaluation on Chromium and Firefox.
+Benchmark Chromium Firefox
+Original
+ScoreUFO Original
+ScoreUFO
+score #event trace size score #event trace size
+SunSpider 205 535 3.1G 11 GB 225 605 10.4G 47.4GB
+Octane 36215 23389 1.9G 8.5GB 31828 575 10.8G 48.0GB
+Dromaeo JS 1640 768 7.4G 22.5GB 1382 31 10.1G 30.7GB
+Dromaeo DOM 2451 1512 5.1G 16.8GB 3460 67 5.8G 22.7GB
+For instance, for a Chromium process (pid #1), the trace
+contains 16 threads performing 220M events in total, includ-
+ing 140M reads, 80M writes, 450K synchronization events,
+660Kmalloc, 550K free, and 220M useevents. UFOdetected
+113 candidate UAFs, among which 65 UAFs are veriﬁed to
+be real by Z3. The total oﬄine analysis time is 469s. For
+the Firefox process (pid #2), the trace contains 88 threads
+performing around 520M events in total, including 370M
+reads, 148M writes, 740K synchronization events, around
+1M malloc, 660K free, and 518M useevents. In 1323s, UFO
+identiﬁed 629 candidate UAFs and veriﬁed that 70 UAFs are
+real. Many UAFs share the same free site, but with diﬀerent
+use sites.
+We have also manually inspected these UAFs and re-
+ported them to the developers. However, due to complexity
+of these two projects, developers are still in the processof conﬁrming them. Many UAFs found in
+Chromium are
+under the base/message_loop package where a pointer
+freed by a child thread (we believe it is a render thread) in
+theincoming_task_queue.cc can be used by the main
+browser thread. Most UAFs in Firefox were found in the
+JavaScript Engine. For example, a pointer freed in js::Lifo
+Alloc::freeAll() can be referenced by several methods in
+js::jit::BacktrackingAllocator . We have ﬁled bug
+reports in the Chromium bug database [ 10] and Mozilla
+Bugzilla [ 11]. More UAFs will be disclosed at our open source
+repository [12] once they are conﬁrmed and ﬁxed.
+6.3 UFOPerformance
+Table 3 reports the runtime performance results of UFOon
+the two browsers. For SunSpider and Octane, the scores are
+the time in ms to perform the benchmark computation. The
+lower, the better. For Dromaeo, the scores are the number ofruns per second. The higher, the better. The average runtimeoverhead of
+UFOis 11X without pointer origin tracking, and050000100000150000200000250000
+0 50000 100000 150000 200000 250000 300000
+candidate UaFs formula variables
+Figure 6: Tradeoﬀ between oﬄine analysis perfor-mance and the detection ability by the window size.
+it does not impose signiﬁcant slowdown for normal interac-
+tion between application and users, thus indicating that UFO
+can be used for in-house testing for applications as largeas desktop web browsers. For the JavaScript engine bench-marks,
+UFOintroduced 207% overhead on average. This is
+because JavaScript is compiled by the JIT-compiler, and is
+executed without UFOinstrumentation. For HTML rendering
+benchmarks, the average slowdown of UFOis 26X.
+The runtime performance of UFOis determined by the
+amount of traced events, and the oﬄine analysis time of UFO
+is highly inﬂuenced by the window size. Figure 6 shows the
+correlation between window size and the number of constraint
+variables and the number of candidate UAFs for analyzing a
+trace in Chromium. As the window size become larger, the
+number of constraint variables grows linearly and the number
+of candidate UAFs also increases. However, there exists atradeoﬀ between
+UFOoﬄine analysis performance and the
+detection ability, which can be tuned by the window size.
+617
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden Jeff Huang
+7 RELATED WORK
+Researchers have proposed several types of approaches for de-
+tecting UAF vulnerabilities, including dynamic detectors [ 4,
+5], static detectors [ 30,31], as well as hybrid techniques [ 6].
+For example, Undangle [ 6] is a hybrid detection tool that
+combines runtime tracing and oﬄine analysis. In general,
+static detectors are imprecise, while existing dynamic tech-
+niques suﬀer from limited code coverage or inability to handle
+concurrent programs. UFOis distinguished by the ability to
+precisely and maximally predict UAFs that are unseen from
+the observed multithreaded dynamic execution.
+GUEB [ 30] is a static tool that detects heap UAF vulnera-
+bilities on binary code. The key idea is that for a program path
+with UAF vulnerabilities, three events will happen orderly:
+allocating heap memory, free memory, and accessing the heap
+memory. GUEB tracks heap operations and address transfers
+(pointer assignments), and discovers which program location
+allocates or frees which heap memory. Then it analyzes the
+resulting graph to identify UAF vulnerabilities. GUEB pro-
+vides better coverage of UAF detection than dynamic tools.
+However, due to the imprecision of points-to analysis, GUEBis neither sound or precise. Also, the path analysis and value
+set analysis performed by GUEB are expensive and diﬃcult
+to scale to large programs.
+UAFChecker [ 31] is a static UAF detector. It applies the
+inter-procedure analysis to make the result more accurate. It
+uses function inlining and function summary to perform the
+inter-procedure analysis. UAFChecker builds a ﬁnite statemachine to model the UAF vulnerabilities. This step mayreport many candidate UAF vulnerabilities. UAFChecker
+then uses symbolic execution to check the satisﬁability of path
+constraints of the candidate vulnerabilities, and eliminate
+the false positives.
+DOUBLETAKE [ 4] detects three types of memory errors:
+UAF, heap buﬀer overﬂow and memory leak. At runtime, the
+program execution is divided into epochs, each ends with an
+irrevocable system call. At the beginning of an epoch, DOU-
+BLETAKE checks program state (registers and all writable
+memory). At the end of an epoch, DOUBLETAKE checksprogram state again to see if any memory errors have oc-curred. If so, it rollbacks current epoch and re-execute the
+epoch with additional instrumentation to pinpoint the exact
+locations of the error. DOUBLETAKE replaces the system
+memory allocator with a deterministic allocator: given the
+same sequence of malloc and free requests, it must provide
+the same addresses for allocated objects. During re-execution,
+DOUBLETAKE utilizes the hardware watchpoints to pause
+the program when the memory error happens.
+AddressSanitizer [ 5] is a popular dynamic memory error
+detector that detects a wide range of runtime memory errors
+including UAFs and memory leaks. To ﬁnd UAF vulnerabili-
+ties, AddressSanitizer uses shadow memory to record whether
+each byte of application is accessible, and instruments the
+program to check the shadow memory on each store or load.
+To compact the shadow memory, AddressSanitizer encodesthe state (accessibility) of every 8-byte sequence of heap mem-
+ory into one byte, and uses a direct mapping to translate
+an application address to its shadow memory. The average
+overhead is 2.3X. AddressSanitizer may miss UAF if a larger
+memory (e.g., 1 MB) has been allocated and deallocated
+between the freeand the following use.
+Similar to AddressSanitizer, KASAN [ 7] is a dynamic mem-
+ory error detector for ﬁnding use-after-free and out-of-bounds
+bugs in the Linux kernel.
+Many UAF vulnerabilities are explored by crafting bogus
+virtual table of the C++ code. T-VIP [ 32] tackles such prob-
+lems by instrumenting binary code and adding runtime policy
+enforcements to prevent UAFs. Ironclad C++ [ 33] tries to
+address this problem by augmenting existing C++ programs
+with additional pointer library in a semi-automatic way.
+DANGULL [ 2] and FreeSentry [ 1] try to prevent UAFs
+from happening by tracking object pointers at runtime, and
+nullifying them when the object is destroyed. DangSan [ 13]i s
+a more recent system that signiﬁcantly improves the runtime
+performance of UAF detection by optimizing the detection
+workloads. It scales to programs with large numbers of pointer
+writes and many concurrent threads. However, although it
+can eﬃciently detect UAFs in concurrent programs, it does
+not have the predictive power.
+8 CONCLUSION
+Concurrency Use-After-Free (UAF) vulnerabilities are a ris-
+ing threat to software security. We have presented UFO, a new
+technique that can eﬀectively and precisely predict concur-
+rency UAFs based on a single execution trace, even though
+the UAFs do not happen in the observed execution. Thefoundation of
+UFOis the maximal thread causality model
+(MaxModel ), which we have extended to encode UAF vulnera-
+bilities as ﬁrst-order logical constraints. By formulating UAF
+detection as a constraint-solving problem and leveraging the
+power of the MaxModel ,UFOenables maximally verifying
+all real UAFs that can be inferred from an execution. Ex-
+periments on real-world applications demonstrate that UFO
+can detect new UAF vulnerabilities that cannot be found by
+existing industrial-strength UAF detection tools. Moreover,
+UFOscales to large complex applications such as Chromium
+and Firefox and has detected many concurrency UAFs.
+9 ACKNOWLEDGEMENTS
+We would like to thank the anonymous reviewers for their
+helpful feedback on earlier versions of this paper. This work
+was supported by a Google Faculty Research Award and NSF
+awards CCF-1552935 and CNS-1617985.
+REFERENCES
+[1]Yves Younan. Freesentry: protecting against use-after-free vulner-
+abilities due to dangling pointers. In NDSS , 2015.
+[2]Byoungyoung Lee, Chengyu Song, Yeongjin Jang, Tielei Wang,
+Taesoo Kim, Long Lu, and Wenke Lee. Preventing use-after-free
+with dangling pointers nulliﬁcation. In NDSS , 2015.
+[3]Lei Xu, Jeﬀ Huang, Sungmin Hong, Jialong Zhang, and Guofei
+Gu. Attacking the Brain: Races in the SDN Control Plane. In
+USENIX SECURITY , 2017.
+618
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. UFO: Predictive Concurrency Use-After-Free Detection ICSE ’18, May 27-June 3, 2018, Gothenburg, Sweden
+[4]Tongping Liu, Charlie Curtsinger, and Emery D. Berger. Double-
+take: Fast and precise error detection via evidence-based dynamic
+analysis. In ICSE, 2016.
+[5]AddressSanitizer. https://github.com/google/sanitizers/wiki/
+AddressSanitizer.
+[6]Juan Caballero, Gustavo Grieco, Mark Marron, and Antonio
+Nappa. Undangle: Early detection of dangling pointers in use-
+after-free and double-free vulnerabilities. In ISSTA , 2012.
+[7]The Kernel Address Sanitizer. https://www.kernel.org/doc/html/
+latest/dev-tools/kasan.html.
+[8]Concurrency bugs in pbzip2. https://github.com/jieyu/
+concurrency-bugs/blob/master/pbzip2-0.9.4/.
+[9]Concurrency bugs in HTTrack. https://github.com/jieyu/
+concurrency-bugs/tree/master/httrack-3.43.9/.
+[10]UAF bug report in Chromium. https://bugs.chromium.org/p/
+chromium/issues/detail?id=759205.
+[11]UAF bug report in Firefox. https://bugzilla.mozilla.org/show_
+bug.cgi?id=1392831.
+[12]UFO open source git repository. https://github.com/parasol-aser/
+UFO
+[13]Erik van der Kouwe, Vinod Nigade, and Cristiano Giuﬀrida. Dan-
+gsan: Scalable use-after-free detection. In Proceedings of the
+Twelfth European Conference on Computer Systems , EuroSys
+’17, pages 405–419, 2017.
+[14] Chromium use-after-free bug. http://crbug.com/564501.
+[15]Jie Yu, and Satish Narayanasamy. A Case for an InterleavingConstrained Shared-memory Multi-processor. In International
+Symposium on Computer Architecture , pages 325-336, 2009.
+[16]Jeﬀ Huang, Patrick O’Neil Meredith, and Grigore Rosu. Maximal
+sound predictive race detection with control ﬂow abstraction. In
+ACM SIGPLAN Conference on Programming Language Design
+and Implementation, pages 337–348, 2014.
+[17]ThreadSanitizer. http://clang.llvm.org/docs/ThreadSanitizer.
+html.
+[18]Derek Bruening and Qin Zhao. Practical memory checking with
+dr. memory. In CGO, 2011.
+[19]Leslie Lamport. Time, clocks, and the ordering of events in a
+distributed system. Communications of the ACM , 21(7):558–565,
+1978.
+[20]Shiyou Huang and Jeﬀ Huang. Maximal causality reduction for
+TSO and PSO. In Proceedings of the 2016 ACM SIGPLAN Inter-
+national Conference on Object-Oriented Programming, Systems,
+Languages, and Applications , pages 447–461, 2016.
+[21] Nicholas Nethercote and Julian Seward. Valgrind: A Framework
+for Heavyweight Dynamic Binary Instrumentation. In ACM
+SIGPLAN Conference on Programming Language Design and
+Implementation, pages 89–100, 2007.
+[22]Leonardo De Moura and Nikolaj Bjørner. Z3: an eﬃcient SMT
+solver. In International Conference on Tools and Algorithms for
+the Construction and Analysis of Systems, pages = 337–340, 2008.
+[23] Google Snappy. https://google.github.io/snappy.
+[24]Yannis Smaragdakis, Jacob Evans, Caitlin Sadowski, Jaeheon
+Yi, and Cormac Flanagan. Sound predictive race detection in
+polynomial time. In ACM SIGPLAN-SIGACT Symposium on
+Principles of Programming Languages , pages 387–400, 2012.
+[25] The PARSEC Benchmarks. http://parsec.cs.princeton.edu/.
+[26]Octane Benchmark Suite. https://developers.google.com/octane.
+[27]SunSpider JavaScript Benchmark. https://webkit.org/perf/
+sunspider/sunspider.html.
+[28]Dromaeo JavaScript Performance Test Suite. http://dromaeo.com.
+[29]Cve-2016-6265: Mupdf library use after free. https://cve.mitre.
+org/cgi-bin/cvename.cgi?name=CVE-2016-6265.
+[30]Josselin Feist, Laurent Mounier, and Marie-Laure Potet. Statically
+detecting use after free on binary code. J. Computer Virology
+and Hacking Techniques , 10(3):211–217, 2014.
+[31]Jiayi Ye, Chao Zhang, and Xinhui Han. Poster: Uafchecker:
+Scalable static detection of use-after-free vulnerabilities. In CCS,
+2014.
+[32]Robert Gawlik and Thorsten Holz. Towards automated integrity
+protection of c++ virtual function tables in binary programs. In
+ACSAC , 2014.
+[33]Christian DeLozier, Richard Eisenberg, Santosh Nagarakatte,
+Peter-Michael Osera, Milo M.K. Martin, and Steve Zdancewic.
+Ironclad C++: A library-augmented type-safe subset of C++. In
+OOPSLA , 2013.
+619
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 10:54:18 UTC from IEEE Xplore.  Restrictions apply. 

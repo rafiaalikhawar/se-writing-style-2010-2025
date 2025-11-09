@@ -1,0 +1,1329 @@
+Data-Guided Repair of Selection Statements
+Divya Gopinath Sarfraz Khurshid Diptikalyan Saha Satish Chandra
+University of Texas at Austin, USA IBM Research, India Samsung Electronics, USA
+{divyagopinath,khurshid}@utexas.edu diptsaha@in.ibm.com schandra@schandra.org
+ABSTRACT
+Database-centric programs form the backbone of many enterprise
+systems. Fixing defects in such programs takes much human effort
+due to the interplay between imperative code and database-centric
+logic. This paper presents a novel data-driven approach for auto-
+mated ﬁxing of bugs in the selection condition of database state-
+ments (e.g., WHERE clause of SELECT statements) – a common
+form of bugs in such programs.
+Our key observation is that in real-world data, there is informa-
+tion latent in the distribution of data that can be useful to repair se-
+lection conditions efﬁciently. Given a faulty database program and
+input data, only a part of which induces the defect, our novelty is
+in determining the correct behavior for the defect-inducing data by
+taking advantage of the information revealed by the rest of the data.
+We accomplish this by employing semi-supervised learning to pre-
+dict the correct behavior for defect-inducing data and by patching
+up any inaccuracies in the prediction by a SAT-based combinatorial
+search. Next, we learn a compact decision tree for the correct be-
+havior, including the correct behavior on the defect-inducing data.
+This tree suggests a plausible ﬁx to the selection condition.
+We demonstrate the feasibility of our approach on seven real-
+world examples.
+Categories and Subject Descriptors
+D.2.4 [ Software/Program Veriﬁcation ]: Reliability; D.2.5 [ Testing
+and Debugging ]: Debugging Aids
+General Terms
+Reliability, Algorithms, Languages
+Keywords
+Machine Learning, Program Repair, Databases, data-centric pro-
+grams, ABAP, Support Vector Machines, SAT
+1. INTRODUCTION
+A majority of enterprise software systems are database-centric
+programs. Defects in such programs, speciﬁcally in database ma-
+nipulating statements, are expensive to ﬁx and can require much
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for proﬁt or commercial advantage and that copies
+bear this notice and the full citation on the ﬁrst page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc
+permission and/or a fee.
+ICSE ’14, May 31 - June 7, 2014, Hyderabad, India
+Copyright 14 ACM 978-1-4503-2756-5/14/05 ...$15.00.1SELECT CstId Price Year from OrderTab INTO itab
+2
+3SORT itab by CstId
+4DEL from itab where Year <= 2009 and Price > 5
+5LOOP AT itab INTO wa
+6 AT NEW CstId
+7 amount =0
+8 ENDAT
+9 amount =amount +wa.Price
+10 AT END CstId
+11 WRITE wa .CstId amount
+12 ENDAT
+13ENDLOOP
+Figure 1: A sample ABAP code segment.
+human effort in understanding the interplay between traditional im-
+perative code and database-centric logic. Automated tools to help
+diagnose these defects, and furthermore, to assist with ﬁxing them
+can make a substantial reduction in the cost of developing and
+maintaining database-centric programs.
+1.1 Problem Context
+Our speciﬁc focus is on SAP ERP systems, in which database-
+centric programming is carried out in a proprietary language called
+ABAP. ABAP contains SQL-like commands, but it mixes impera-
+tive code and SQL’s declarative syntax. We introduce the essential
+constructs of ABAP that are relevant for this paper using a small
+example (Figure 1).
+The meaning of this ABAP code segment is straightforward. At
+line 1, it reads all rows from a database called OrderTab into an
+internal table called itab. The SORT statement sorts this internal
+table by CstId , which is the key. The DELstatement at line 4 re-
+moves from itab those rows that match the condition described in
+the statement. The LOOP at line 5 iterates over itab. When it en-
+counters a new CstId —that is when AT NEW at line 6 is true— it
+resets an accumulator called amount , and it prints the accumulated
+amount when the last record of that CstId has been visited; this is
+done when AT END on line 10 is true. ( AT NEW andAT END help with
+key-wise aggregation akin to the SQL GROUP-BY construct.)
+Table 1: A sample input to program in Figure 1. The last col-
+umn with ‘+’/‘-’ is not a part of the input table.
+CstId Price Year
+1 20 2012 +
+1 16 2011 +
+1 12 2001 -
+1 10 2002 -
+1 15 2011 +
+Continued on right . . .CstId Price Year
+2 7 2005 -
+2 13 2007 -
+2 15 2010 +
+2 10 2011 +
+3 4 2012 +
+3 3 2009 +
+3 9 2001 -Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior speciﬁc permission and/or a
+fee. Request permissions from Permissions@acm.org.
+ICSE’14 , May 31 – June 7, 2014, Hyderabad, India
+Copyright 2014 ACM 978-1-4503-2756-5/14/05...$15.00
+http://dx.doi.org/10.1145/2568225.2568303
+243
+Suppose the program in Figure 1 is run on the database in Ta-
+ble 1. The rows marked ‘+’ are retained in itab after the DELstate-
+ment. The output of the program is, which unfortunately differs
+from the expect output, also shown:
+ID Amount Expected Amount
+1 51 51
+2 25 32
+3 7 7
+The bug arises from an error in the condition of the DELstate-
+ment, which causes the ﬁrst row for CstId 2 to be incorrectly deleted
+(shown by a bold ‘ -’).
+We can think of the DELstatement as a (equivalent) SELECT
+statement: SELECT *FROM itab WHERE Year > 2009 OR Price <=
+5. We call such a defect a selection bug, because the bug is due
+to an incorrect WHERE condition in a SELECT statement. The
+problem is to ﬁnd an alternate WHERE condition for the faulty
+SELECT statement (whose location is assumed to be known), so
+that the entire output, corresponding to each of the keys, is correct.
+Selection bugs are common in ABAP programs. In fact, many
+database statements in ABAP programs allow a selection condition,
+and therefore, are vulnerable to a selection bug. For example, the
+ABAP READ and DELETE ADJACENT statements can be modeled as
+selection statements. Based on our experience working with prac-
+titioners in IBM Global Business Services, about 25% of the ABAP
+code level defects have to do with selection. Such bugs typically
+do not reveal themselves while testing with limited set of data that
+is available in the test environment. The production environment
+has a lot more data and therefore exposes the corner cases that do
+not show up while testing. Moreover, the lack of an automated test-
+case generation tool for this framework is another reason why such
+bugs are not discovered while testing. Therefore, techniques that
+can help in ﬁxing defective selection statements are of much value.
+Note that in our setting of debugging ABAP programs, the pro-
+cess starts with the end user of this software ﬁling a bug report,
+citing a deviation of the actual output from the expected output on
+given input data. Thus, the expected output of the program is al-
+ready known to the programmer (or the maintainer). As we shall
+see, the challenge here is in determining the correct behavior of the
+defective SELECT statement from the expected output of the entire
+program , and in determining an alternate WHERE condition for
+the selection that would match the correct behavior .
+An obvious technique to generate a correct selection condition
+would be to explore the space of syntactic mutations of the buggy
+condition. Because of the possible presence of data values in the
+clauses that constitute the conditions, the search space for a mutation-
+based technique is immense. The size of the mutation search space
+for our suite of benchmarks is reported in Section 3. This makes
+the technique very inefﬁcient for real use. In comparison, our
+approach, presented next, sidesteps the drawbacks of a mutation-
+based approach.
+1.2 A Data-Driven Approach: An Overview
+Our key observation is that in real-world data, there is informa-
+tion latent in the distribution of data that can be useful to repair the
+WHERE condition efﬁciently. Syntactic search completely ignores
+this latent information. In this work, we show that it is possible
+to ﬁnd a good repair suggestion efﬁciently if we took advantage of
+this information.
+In our approach, we ﬁrst discover the correct behavior of the
+selection statement on the failure causing input data, and then ﬁnd
+an alternate selection statement that exhibits the correct behavior.
+Our approach leverages the distribution of input data in both of
+these phases.
+0	  5	  10	  15	  20	  25	  
+2000	  2002	  2004	  2006	  2008	  2010	  2012	  2014	  Price	  
+Year	  Distribu.on	  of	  Posi.vely	  and	  Nega.vely	  Labeled	  Data	  
+Pos	  Neg	  TBD	  
+Figure 2: Distribution of data in Table 1
+A defective selection statement assigns incorrect + or - labels
+to some of the rows of the input; for example, some of the rows
+forCstId 2 do not have the correct labels. To discover the correct
+behavior of the defective selection statement, we need to search
+through all possible assignments of labels to rows that have possi-
+ble incorrect labels. Our technique carries out this search efﬁciently
+by taking advantage of the distribution of data.
+Since part of the output is correct, we can assume that the rows
+that contributed to that part are labeled correctly; the remaining
+rows are possibly mislabeled. Our premise is that a possibly mis-
+labeled row that is geometrically close to a correctly-labeled row is
+likely to require the same label. Obviously, this notion of proximity
+is not guaranteed to produce the correct labels, but they can serve
+as a very good starting point from which to carry out the search
+for the right labeling. This is exactly what we do: use a labeling
+computed on the basis of geometric proximity, but ﬁx it up based
+on local search around that labeling.
+In Figure 2, data of passing keys in Table 1 is shown with dia-
+monds for positively labeled data and squares for negatively labeled
+data. For rows belonging to CstId 2, whose labels as generated by
+the WHERE condition are suspect, data is shown with a triangle
+(unlabeled). Assuming that points that are spatially close are likely
+to be labeled similarly, an assignment of a positive label to the two
+unlabeled points on the right can be done with relatively high con-
+ﬁdence. The two unlabeled data points in the middle of the chart
+could go either way, so an assignment of a negative label to the two
+points in the middle can be done only with low conﬁdence. Ta-
+ble 2 shows a sample assignment of predicted labels to the failing
+rows. We generated these predications using an implementation of
+support vector machines (SVM [24, 2]). Informally, SVM creates
+separating lines A, B, and their center–C–as its best effort on how
+to separate positively and negatively labeled data. In this particular
+example, the line D would have be the perfect separator; so, the
+two points that are close to separator C are predicted incorrectly.
+The incorrect lower-conﬁdence predictions can be ﬁxed up by a
+combinatorial search for labels, until we obtain correct labels for all
+the rows (correctness validated by the ﬁnal output matching the ex-
+pected output). We carry out this search iteratively, starting with the
+Table 2: Predicted label assignment for the failing rows
+CstId Price Year Predicted Label Correct Label Conﬁdence
+2 7 2005 - + 0.3
+2 13 2007 + - 0.2
+2 15 2010 + + 0.9
+2 10 2011 + + 0.9244(a)	  Split	  on	  Year	  <=	  2008	  (b)	  Split	  on	  Price	  <=	  10	  Year	  <=	  2008	  Price	  <=	  10	  Year	  >	  2008	  Price	  >	  10	  Figure 3: Splitting the data points on the basis of alternative
+conditions
+row with the least conﬁdent prediction. In realistic problem sizes,
+this strategy, which takes advantage of data distribution, is signiﬁ-
+cantly more efﬁcient than combinatorial search on all the rows.
+Once we have the correct labels for all the rows, the problem
+reduces to that of ﬁnding a function (a classiﬁer ) that attaches cor-
+rect + or - labels to rows depending on the contents of the row. As
+mentioned before, it is difﬁcult to ﬁnd such a function by looking
+for syntactic variations on the existing WHERE condition. In gen-
+eral, a vast number of different functions could produce the correct
+labels for a given set of rows. Not all of these would be close to
+the one intended by the programmer, because they may be over-
+ﬁtted to the data, in the sense that those functions may not label
+as-yet-unseen data correctly. A common heuristic is to look for a
+compact function, because it is more likely to be generalizable, and
+therefore (presumably) correct.
+We use the distribution of data to guide the search for a com-
+pact function using a well-known technique known as decision-tree
+learning. This technique performs a greedy search over a space of
+functions, being guided by the distribution of data and the label for
+each row of data. The way this greedy search works is to ﬁrst iden-
+tify a predicate that classiﬁes most of the data correctly, and then
+iteratively identify additional predicates as required to classify the
+residual data.
+In the running example, ﬁrst it would realize that partitioning the
+rows of the table on the basis of Year2008 gives the maximum,
+though not perfect, efﬁcacy in terms of clubbing the + and - labeled
+rows in distinct partitions. See Figure 3(a), which shows the result
+of splitting on the basis of Year2008 ; again, squares are neg-
+atively labeled points and diamonds are positively labeled points,
+and the data is for the correct labels on all rows of Table 1. An
+alternate split, say on the basis of Price10, shown in Fig 3(b)
+is less effective in clubbing the + and - labeled data in distinct par-
+titions. The ID3 decision-tree learning algorithm [21] captures this
+intuition using the concept of information entropy and automati-
+cally chooses the most advantageous splitting predicate.
+In the partition for which Year2008 , the maximum efﬁcacy
+is obtained by further partitioning on the basis of Price8, at
+which point, all positives are perfectly separated from the nega-
+tives. In the partition for which Year >2008 , all rows are positive
+regardless of the price. This decision tree is (written as conjunc-
+tions of clauses on paths from root to +ve leaf nodes, and disjunc-
+tion over such paths): Year >2008_(Year2008^Price8).
+By DeMorgan’s laws, this simpliﬁes to the following condition:
+Year >2008_Price8Comparing this to the previous incor-
+rect WHERE condition, we see that while the learned WHERE
+clause for Year is slightly but gratuitously different, for Price it is
+crucially different.
+Our technique manages to ﬁnd “natural” conditions that a pro-
+grammer would have written, and therefore ends up offering use-
+ful repair suggestions. We attribute this desirable property to our
+data-guided approach. A WHERE condition that a programmer1Repair (s,Out ,CorrectOut ,key_fields ,Trace )
+2
+3 / / initialize
+4find FKeys ,PKeys ,sFKeys ,sPKeys
+5
+6 / / step 1 :predict labels for failing keys input of s
+7projPrediction ,inputPrediction ,Map ,prodTbl =
+8 predict (sFKeys ,sPKeys ,sIn ,sOut ,s)
+9
+10 / / step 2 :Correct label computation
+11sCorrectOutSet =label (s,Trace ,sFKeys ,
+12 projPrediction )
+13
+14 / / step 3 :WHERE condition generation
+15generate _conditions (sCorrectOutSet ,prodTbl ,Map ,
+16 inputPrediction )
+Figure 4: Algorithm: Generating repair suggestions for selec-
+tion statement
+writes is intended to classify regions of data uniformly, as opposed
+to cherry picking points in the data space and classifying them in-
+dividually by some complex conditional logic. This is the reason
+that predictions based on spatial proximity work well, and also the
+reason that the heuristic of ﬁnding a compact decision tree works.
+1.3 Contributions
+Our contributions are the following:
+1. We describe a new approach for repairing faulty selection con-
+ditions in database statements. Our approach tries to extract infor-
+mation from the way the incumbent selection condition treats the
+part of the data that exhibits correct behavior, and from the relative
+distribution of passing and defect-inducing data.
+2. We give a new way of combining machine learning and com-
+binatorial search in determining the correct labels for the failing
+keys. The learning part takes advantage of the known behavior
+for the passing keys, whereas, the combinatorial part makes up for
+cases in which the knowledge from passing keys does not extend
+perfectly to the failing keys.
+3. We present an evaluation of the proposed approach on a suite
+of programs drawn from an industrial setting. These programs are
+excerpts of real programs,1and the data sets we use come from real
+data: this is crucial because the effectiveness of our approach can-
+not be gauged based on synthetic data, which may not be represen-
+tative of distributions found in real data. The evaluation indicates
+promise in the approach.
+2. REPAIR ALGORITHM
+In this section we describe the repair algorithm in detail. As
+shown in Figure 4, the algorithm has three major steps: 1) exploit
+the distribution of data to predict the selection result for the in-
+put rows of the faulty selection statement, 2) verify the predictions
+and if required determine the selection result using combinatorial
+search for the parts where the predictions are incorrect, and 3) gen-
+erate correct conditions using decision-tree learning algorithm.
+We illustrate the steps of the algorithm using an example shown
+in Figure 5. The example is a slight variation of the example pre-
+sented in Section 1 to illustrate some salient features of the algo-
+rithm. The SELECT statement (shown in Lines 1-4) is the faulty
+statement. Below are the entities used in the algorithm:
+1The excerpts of real programs, the buggy selection conditions, and
+their ﬁxes are available at [6]2451SELECT CstId Price Year
+2from Order ,Material into itab
+3where Item =ItemId
+4and Year > 2009
+5LOOP AT itab INTO wa
+6AT NEW CstId
+7 amount =0
+8ENDAT
+9amount =amount +wa.Price
+10AT END CstId
+11 WRITE wa .CstId amount
+12END AT
+13ENDLOOPProgram Output
+(Out)
+CstId Total
+2 5
+3 32
+Correct Program Output
+(CorrectOut)
+CstId Total
+1 10
+2 19
+3 32
+SELECT Statement Input (sIn)
+Order
+CstId Item
+1 i1
+1 i2
+2 i3
+2 i4
+2 i5
+2 i6
+3 i7
+3 i8
+3 i9
+3 i10
+3 i11Material
+ItemId Year Price
+i1 2009 10
+i2 2002 6
+i3 2012 5
+i4 2005 7
+i5 2006 7
+i6 2007 14
+i7 2011 20
+i8 2012 12
+i9 2001 9
+i10 2001 12
+i11 2002 10Stmt. Output (sOut)
+CstId Price Year
+2 5 2012
+3 20 2011
+3 12 2012
+Correct Stmt. Output
+(sCorrectOut)
+CstId Price Year
+1 10 2009
+2 5 2012
+2 14 2007
+3 20 2011
+3 12 2012
+Figure 5: An ABAP program and data; s is the SELECT statement
+Trace : the execution trace which produces incorrect output.
+s: the trace occurrence of the faulty statement
+sIn,sOut: the set of input tables and current output of s
+Out: incorrect program output
+CorrectOut : expected correct program output
+sCorrectOut : a correct output of swhich can produce
+CorrectOut
+key_fields : a set of ﬁelds which uniquely identiﬁes each
+row of Out
+The Out,CorrectOut ,sIn,sOut,sCorrectOut for the example
+are shown in Figure 5.
+In the domain of data-centric programs, each row in the output
+is identiﬁed by a set of ﬁeld-value pairs, called key. The algorithm
+compares the current program output ( Out) and the expected output
+(CorrectOut ) to determine a set of failing keys ( FKeys ) and pass-
+ing keys ( PKeys ) for the program output. A passing key is a set
+of key_ﬁeld-value pairs which identiﬁes identical rows in Outand
+CorrectOut . A failing key is a set of key_ﬁeld-value pairs which
+identiﬁes a row which exists in Outbut not in CorrectOut or vice
+versa or identiﬁes a row in Outand a row in CorrectOut which dif-
+fer in at-least one non-key_ﬁeld value. In the example, CstId=3 is
+the passing key, whereas CstId=1 andCstId=2 are the failing keys.
+Note that, CstId=1 corresponds to a missing row in the output.
+All the input rows in s(obtained using the cartesian product of
+all tables in sIn), that directly or indirectly affect the failing rows
+(incorrect/missing/unwanted) in the program output are considered
+asfailing input rows and the rest are considered as passing input
+rows . Such classiﬁcation is performed based on a key-based de-
+pendency analysis between the passing and failing keys in the out-
+put of the program and the input rows in s. The set of passing and
+failing keys for sare denoted as sPKeys and sFKeys . In the ex-
+ample, rows corresponding to hCstId,1iandhCstId,2iaresFKey
+rows, and those corresponding to hCstId,3iaresPKey rows. As
+described in Section 1, the prediction algorithm predicts the selec-
+tion result for the rows corresponding to sFKeys using the selection
+result for the sPKey rows.1predict (sFKeys ,sPKeys ,sIn ,sOut ,s)
+2 svm_in=empty
+3 prodTbl =empty [s.t.empty X t =t]
+4 for each t2sIn ,prodTbl =prodTbl X t
+5
+6 / / creating classification for prediction
+7for each r2prodTbl
+8 r_class = 0 if r .key2sFKeys
+9 r_class = +1 if r .key2sPKeys ,selection (r,s)
+10 r_class = 1if r .key2sPKeys , !selection (r,s)
+11 svm_in.add ( <r,r_class >)
+12
+13 / / label input rows
+14 Set<r,r_predict >in_prediction =SVM (svm_in)
+15 where r _predict is a real number
+16
+17 / / label projected rows (for Joined Table in Input )
+18 for each r2prodTbl st .r.key2sFKeys
+19 projected _row =projection (r,s)
+20 Map (projected _row ) .add (r)
+21 for each projectedRow p in Map .keySet
+22 predict (p)=Max (in_prediction (r) ) |r2Map (p)
+23 return predict ,in_prediction ,Map ,prodTbl
+Figure 6: Algorithm: Prediction
+1label (s,Trace ,sFKeys ,prediction )
+2model =code 2model (Trace ,s)
+3sCorrectOutSet =empty
+4for each sFKey 2sFKeys
+5 threshold = 0
+6 while (true )
+7 label =empty
+8 for each p2prediction .KeySet s .t.p.key=sFKey
+9 predValue =prediction .get (p)
+10 if |predValue | >threshold
+11 label (p)=true if predValue > 0
+12 label (p)=false if predValue < 0
+13 keyCorrectOutSet =SAT (label^Model^CorrectOut )
+14 if keyCorrectOutSet is Empty
+15 threshold =threshold +ParamThresholdIncrement
+16 if(threshold >maximum _confidence _value )
+17 return failure
+18 else
+19 continue ;
+20 else
+21 break
+22 sCorrectOutSet =sCorrectOutSet X keyCorrectOutSet
+23 Add passing key data to each selection in
+24 sCorrectOutSet
+25 return sCorrectOutSet
+Figure 7: Algorithm: Labeling for failing keys
+Prediction of correct output of s.The Function predict in
+Figure 6 ﬁrst creates the input ( prodTbl ) by performing the Carte-
+sian product of all input tables (in the example, Material andOrder ),
+then assigns label 0 (signifying rows whose values are to be pre-
+dicted) to the input rows corresponding to sFKeys . The existing
+selection clause behaves (either selects or deselects) correctly for
+thesPKey rows. Each passing row in the input is thus classiﬁed
+as +1 if the row has been selected, and -1 if the row has not been
+selected, denoting known and correct classiﬁcation (Lines 7-11).
+This forms the input to an SVM, which assigns to each input row
+with label 0, a signed value called prediction (Line 14). The sign
+(called label ) indicates whether the input row has been predicted to
+be selected (positive value) or not selected (negative value). The
+unsigned prediction value denotes the conﬁdence associated with
+the prediction. In the example, the prodTbl contains 121 rows, 22
+of them are for CstId=1 and 44 rows are for CstId=2 , which are
+marked 0. The remaining 55 rows for CstId=3 are labeled +1 (22
+rows) or -1 (33 rows).246Note that a SELECT statement ﬁrst performs a selection of the
+rows in prodTbl , followed by a projection to generate the output
+ofs(projected rows ). The set of input rows which correspond to a
+projected row, is called the block of the projected row. A projected
+row is in the output of s, if at-least one input row from its block
+is selected. SVM is employed to predict the outcome of the selec-
+tion of the input rows. Our algorithm uses this to determine the
+prediction for the projected rows (Lines 18-22). The likelihood of
+a projected row being present in the output of s, is determined by
+the maximum likelihood of selection of the input rows in its block.
+The algorithm determines the prediction of the projected row as the
+maximum prediction (signed value) of all the rows in its block.
+In the example, there are 121 rows in the prodTbl , which project
+to 33 rows, 11 rows per key. The predictions for the projected rows
+ofCstId=1 andCstId=2 , are shown below.
+CstId=1, projected rows
+CstId Price Year Pred.
+1 10 2009 +0.8
+1 6 2002 -0.4
+1 5 2012 -1
+1 7 2005 -1
+1 7 2006 -1
+1 14 2007 -1
+1 20 2011 -1
+1 12 2012 -1
+1 9 2001 -1
+1 12 2001 -1
+1 10 2002 -1CstId=2, projected rows
+CstId Price Year Pred.
+2 10 2009 -1
+2 6 2002 -1
+2 5 2012 +1
+2 7 2005 -0.1
+2 7 2006 +0.1
+2 14 2007 +0.2
+2 20 2011 -1
+2 12 2012 -1
+2 9 2001 -1
+2 12 2001 -1
+2 10 2002 -1
+The salient features of this step are summarized here:
+Determining passing and failing input rows and exploiting
+the data-distribution to predict selection results of the failing
+input rows.
+Mapping prediction values from input rows to the projected
+rows based on the maximum likelihood of selection.
+Determining Correct Output of s.The next step is to use
+these signed values to determine the part of sCorrectOut corre-
+sponding to the failing keys. The algorithm, described in Figure 7,
+tries to determine this per failing key (Line 4), for a reason de-
+scribed later. First, the output of sis created strictly as per the
+predicted labeling. The label is determined by the sign of predic-
+tion, which if positive denotes that the row is to be selected to the
+output, and not selected (label = false) if negative. If this does
+not yield the CorrectOut , then the projected rows corresponding to
+thesFkeys are gradually unlabeled. The decision whether a row
+would be unlabeled is done based the conﬁdence of its prediction.
+A parameter threshold is used to gradually un-label low conﬁ-
+dence projected rows. A projected row having conﬁdence value
+above this threshold is labeled. Note that, the algorithm starts with
+threshold value zero to make all the projected rows labeled. In the
+running example, for CstId=1 , the prediction selects only one row
+with Price=10 (corresponding to item i1), whereas for CstId=2 , it
+selects 3 rows with Price values 5 ( i3), 7 ( i5), and 14 ( i6).
+Next, we discuss how we verify whether the labeling based on
+predictions yields sCorrectOut and if not, how we use combinato-
+rial search to label the rows whose predictions are relaxed based on
+the threshold adjustment.
+Ifscontains a selection bug, then there exists a subset of its pro-
+jected rows that can produce the expected program output. There
+can be combinatorial number of ways to create subsets of the pro-
+jected rows. We employ a SAT solver to efﬁciently search for sub-
+set/s that lead to the ﬁnal program output matching CorrectOut .
+The scalability of the search depends on the input table size,
+which is usually large. To reduce space, we perform this search
+separately for every failing key. Further, as described earlier, we1generate _conditions (sCorrectOutSet ,prodTbl ,Map ,
+2 inputPred )
+3ConditionSet =empty
+4for each sCorrectOut 2sCorrectOutSet
+5 weight (sCorrectOut ) = average prediction value of
+6 sFKey rows in answer
+7rankedSet =sort sCorrectOutSet based on weights
+8for each sCorrectOut 2rankedSet in order
+9 c=getCondition (prodTbl ,sCorrectOut ,Map ,
+10 prediction )
+11 ConditionSet .add (c)
+12 if no more results required
+13 return ConditionSet ;
+14
+15getCondition (prodTbl ,sCorrectOut ,Map ,
+16 predictedlabels )
+17 for each projectedRow p 2Map .keySet
+18 if p2sCorrectOut
+19 max_pred =maximum prediction of rows in
+20 Map .get (p)
+21 for each r2Map .get (p)
+22 r_pred =predictedlabels .get (r)
+23 class (r)=+1 , if r _pred =max_pred
+24 or ( |r_pred | >threshold ,
+25 r_pred > 0)
+26 =  1,if ( |r_pred | >threshold ,
+27 r_pred < 0)
+28 else
+29 for each r2Map .get (p)
+30 class (r) = 1
+31 return ID 3(class )
+Figure 8: Algorithm: Selection condition generation
+rely on the predicted labelings for rows whose conﬁdence is greater
+than threshold and perform combinatorial search only on the re-
+maining unlabeled rows.
+The algorithm creates a model of the code which can execute af-
+tersas a ﬁrst order formula using Alloy (Line 2). The details of
+the translation is not provided in this paper, but is available at [6].
+A SAT solver (Line 13) is used to validate if the predicted labeling
+yields the correct output for the respective sFkey , and if not, per-
+form combinatorial search to ﬁnd such a labeling. It either returns
+no solution or returns a set of correct selections per failing key.
+The SAT solver may not yield any satisfying truth assignments
+to the unlabeled projected rows for a failing key. This can be at-
+tributed to incorrect labels for rows marked based on the predic-
+tions. In this case, the algorithm increases the threshold to un-label
+some more low conﬁdent projected rows. Iteration based on adjust-
+ing threshold increases the domain size for combinatorial search.
+However, in our experiments we have seen that many iterations are
+seldom needed.
+In the running example, SAT solver validates the prediction for
+CstId=1 , but fails for CstId=2 (yields total 26, expected 19). The
+low conﬁdence projected rows for CstId=2 , corresponding to
+ItemId=i4,i5,i6 are unlabeled. Combinatorial search in the sec-
+ond iteration yields two satisfactory combinations for CstId=2 -
+(i3, i4, i5) , and (i3, i6) . Both of them yield total Price value
+19 as in CorrectOut .
+Combining all solutions for failing keys (Line 22) and adding the
+passing key selection (Line 23) the algorithm generates the follow-
+ing two sCorrectOut s.
+CstId Price Year
+1 10 2009
+2 5 2012
+2 14 2007
+3 20 2011
+3 12 2012CstId Price Year
+1 10 2009
+2 5 2012
+2 7 2005
+2 7 2006
+3 20 2011
+3 12 2012247Note that, considering each failing key separately has another
+advantage apart from reducing the search space. It avoids unneces-
+sary un-labeling of rows corresponding to keys for which the cur-
+rent labeling yields the correct output for the respective keys.
+The salient features of this step are summarized below:
+An iterative algorithm to label fewer projected rows based on
+predictions, if the current labeling does not yield sCorrectOut .
+Performing SAT-based combinatorial search on a per failing
+key basis, to determine the set of correct outputs for s.
+Selection condition generation. The algorithm for selection
+condition generation is presented in Figure 8. The generation of
+selection condition is performed using a home-grown implemen-
+tation of the ID3 decision-tree learning algorithm which learns a
+classiﬁer that provides 100% accurate classiﬁcation for the train-
+ing data. The Function ID3takes the selection result for the input
+rows to derive a compact condition satisfying the selection. The
+algorithm ﬁrst ranks the set of correct outputs of sobtained in the
+previous step and calls the function getCondition corresponding to
+each sCorrectOut in order of the ranking. (Lines 8-13).
+The Function getCondition classiﬁes each input row of swith
++1 or -1 based on the correct labeling for the projected rows. This is
+a reverse label mapping of what is done in Function predict . If the
+projected row is not present in the sCorrectOut , then all the input
+rows in its corresponding block should not be selected (Line 29). If
+a projected row is in output then one or more corresponding input
+rows can be selected. We mark the input row with the maximum
+prediction value as the one to be selected. (Line 23). For each of
+the other rows in the block, we use the predicted label if its conﬁ-
+dence is higher than the running threshold (Lines 24-26). Lesser
+conﬁdence rows are not fed to the decision-tree learner. Finally ID3
+is called with the classiﬁed input.
+The conditions generated using this method are shown below:
+(Item = ItemId) and (Year > 2006)
+(Item = ItemId) and (Year > 2008 or Price = 7)
+Note that the ﬁrst condition is more preferable over the second
+as it is more compact and not overﬁtted to a speciﬁc value, hence
+it has more chances of being valid for unseen inputs. In general
+there can be many solutions given by combinatorial search. Since
+generating all possible repair suggestions is time consuming, our
+approach selects as input to the decision-tree learner the solution
+which has the potential to generate a good selection condition. The
+algorithm ﬁrst ranks the solutions (Figure 8, Line 6) based on the
+average prediction value of the projected rows present in the re-
+spective sCorrectOut s. In our example, for CstId=2 , the weight of
+the ﬁrst solution, consisting of items i3,i6is (1+.2)/2=0.6 whereas
+it is (+1+0.1-0.1)/3=0.33 for the second solution corresponding to
+the selection i3,i4,i5. Based on our heuristics, the ﬁrst solution
+is preferred over the second as the ﬁrst solution has ( i4) which is
+predicted to not be selected.
+The basis of labeling input rows and ranking solutions is the
+same - it is possible to generate better quality condition by fol-
+lowing the SVM prediction. There could be multiple outputs to
+theSELECT statement that yield the expected output of the program,
+however the where condition generated based on the labelings pre-
+dicted by SVM is the most natural condition or closest to the ideal
+manual repair (refer Section 3 for experimental validation)
+The salient features of the ﬁnal step are summarized below:
+Ranking multiple solutions returned by combinatorial search.Labeling input rows based on the correct labels for the pro-
+jected rows.
+Using ID3 to generate compact selection conditions.
+More subtle variations of the algorithm, such as handling of mul-
+tiple occurrences of the faulty statement and variations in threshold
+adjustment, are available in [6].
+Pragmatics. The application of SVMs to the problem at hand
+requires several steps of data conditioning. The main issue is that
+SVMs prefer to view data as numerical values for the purpose of
+distance computation. Relational database tables seldom contain
+data in this form. We discuss the problems and our solutions.
+Nominal Attributes The table could contain nominal attributes,
+which are compared for equality, but not for order. For example,
+State (2-letter state abbreviation) is a nominal attribute. For such
+data, we introduce fresh columns, one for each distinct value of
+the nominal attribute that appears in tables. For State , we might
+introduce boolean attributes such as State=AK toState=WY and
+hide the original State attribute. At other times, data that looks
+like non-numeric data might need to be treated numerically. For
+example, dates have to be mapped to a numeric interval.
+Key Attributes Keys are usually nominal data in that value-based
+proximity of two keys is not meaningful. Table joins created by
+Cartesian cross product of two tables contain distinct key attributes
+coming from each of the tables in the join. Since it would re-
+quire too many additional attributes to “de-nominalize” these key
+attributes, we instead include an additional boolean attribute that
+denotes the equality of these two keys (as it is common to have key
+equality comparison in SELECT statements for a natural join.)
+Scaling It is typical in the use of SVMs to scale data to a normalized
+[0.0,1.0] range for each attribute. In case the range of data for a
+certain attribute is very large due to a few outliers, care is needed
+to prevent lower values being scaled down to too close to zero.
+Selecting Relevant Attributes for ID3. The input tables of the
+buggy query typically have large number of attributes, many of
+which are irrelevant. We heuristically perform the following se-
+lection of potentially relevant attributes: (1) all attributes projected
+by the query (2) attributes that have been frequently used when-
+ever this table has been used earlier in the code(such as key at-
+tributes). (3) attributes having the same data-type and overlapping
+values with the state variables at that execution point.
+Seeding Synthetic Attributes in ID3. Decision-tree based algo-
+rithms are only equipped to learn clauses that compare attribute
+values with constants. However, WHERE conditions can contain
+comparison of two attributes. We seed binary-valued equality pred-
+icates between attributes as extra attributes into the learning algo-
+rithm. These predicates are seeded based on domain knowledge,
+for instance, attributes of the same data-type and having same range
+of values may be compared to select records.
+In the current state of our tool, each of the three modules of the
+algorithm are automated except as follows; predict requires data-
+conditioning as described above, label works based on a manual
+translation of the ABAP code-fragment to Forge Intermediate Lan-
+guage following the pseudo-code in [6], and generate_conditions
+requires heuristic selection and seeding of attributes.
+3. CASE STUDIES
+This section ﬁrst presents a summary of the experimental results
+which is subsequently explained using case studies of a select set of
+subject programs. Finally, it discusses relevant research questions
+and limitations of our approach.248Table 3: Summary of results. Time in Minutes.
+Subjects # Passing # Failing Prediction Accuracy(%) Correct label computation Decision-tree learning
+input rows input rows (# correct labels) time search space #iterations #soln. time Useful repair suggestion?
+Ex1 40129 10032 99.9 (10029) 4 6 3 1 2 Yes
+Ex2 16641 30 36.6 (11) 2 22+2172 32 10 Yes
+Ex3 316 12 100 (12) 1 0 1 1 0.16 Yes
+Ex4 274 58 25.8 (15) 3 25830 1 0.03 No
+Ex5 993 84 92.8 (78) 8 243 1 0.08 Yes
+Ex6 90346 1816 99.8 (1814) 5 4 3 1 5 Yes
+Ex7 13911 2 0 (0) 2 4 2 1 25 Yes
+We selected seven subject programs, which are fragments of
+ABAP code from industrial applications running on real data sets.
+The criteria employed to select these subjects were: (1) cover dif-
+ferent types of selection bugs commonly found in bug reports (2)
+highlight the different characteristics and design decisions of the re-
+pair algorithm. Our evaluation covers different types of statements
+such as SELECT statements on single tables and JOINs of tables with
+buggy WHERE clauses, and DELETE statements with buggy COMPARING
+clauses. The repair is applied on different types of faults such as
+missing ﬁeld checks, incorrect data value used in the conditions,
+incorrect/missing join conditions and also incorrect/missing range
+checks (equivalent to two missing conditions). The subjects ﬁt into
+different scenarios (Section 3.1) highlighting the different features
+of our approach. The excerpts of real programs, the buggy selection
+conditions, and their ﬁxes are available at [6]. The bugs in these
+programs are actual bugs that occurred in the past. In all cases we
+know the manual ﬁx to the bug.
+Our implementation uses the Alloy 4.2 [11] tool-set (speciﬁ-
+cally, Forge, Kodkod and miniSAT), SVM Light [13] in transduc-
+tive learning mode, and a home-grown implementation of the ID3
+decision-tree learning algorithm. All experiments were conducted
+in a 2.53Ghz CPU, 4GB RAM laptop running Ubuntu Linux.
+The summary of our experimental results is shown in Table 3.
+For every candidate, we recorded the number of rows in the in-
+put table corresponding to the passing and failing keys, shown as
+#Passing input rows and#Failing input rows respectively in Ta-
+ble 3. Column 4 highlights the prediction accuracy, i.e. the %
+of failing rows for which the labels were predicted correctly. We
+also tabulate the total time for correct label computation (domi-
+nated by SAT solving times), the combinatorial search space, the
+total number of threshold relaxation iterations, and the number of
+sCorrectOut s generated. We also present the time to learn the
+WHERE condition. Finally, we state whether the repair suggestion
+was useful or not by comparing how close it was with the manual
+ﬁx for the bug.
+3.1 Example Scenarios
+We describe details of applying our approach to four subjects to
+highlight some of its key characteristics and how it handles differ-
+ent types of faults.
+Scenario 1: Accurate predications. We start with a simple case
+where a straightforward application of our approach produces a re-
+pair very quickly.
+Consider the following buggy SELECT statement in Ex3,
+selectfrom ekbe into table tab _ekbe
+where (vgabe eq ’2 ’or vgabe eq ’3 ’ )
+/ /and ebeln in ebeln_range .Needed in the correct query
+The WHERE clause is essentially missing two predicates in the
+form of a missing range-check predicate for the ﬁeld ebeln . This
+error results in 12 unexpected rows in the output of the program.Correct Label Computation . The incorrect rows in the program
+output correspond to 12 failing rows in the input ekbe table. Each
+row corresponds to a unique key value, so there are 12 sFkeys . The
+number of passing key rows are much higher (316 sPkeys ). The
+predictions were 100% accurate. All the 12 sFkey input rows were
+given negative prediction values by SVM. Our algorithm assigns all
+the rows with negative labels in the ﬁrst iteration. This labeling was
+veriﬁed (by SAT) to produce the correct output within a minute.
+Decision-tree learning. The decision-tree learning module was in-
+voked with the passing rows labeled as per the existing output of
+the statement and the failing rows marked with negative labels. The
+condition learned was as given below and was correct in not select-
+ing exactly the 12 failing rows.
+vgabe = ’2’and
+ebeln <= 4500000229The generation of a comparison on
+ebeln conveys to the programmer that
+a bound check is missing. Indeed, the
+source code deﬁnes the constant ebeln_range as [ebeln_low ,
+ebeln_high ], but the buggy query fails to use it. Because of the
+data-distribution in this test case, the generated repair condition
+does not contain the the lower bound on ebeln , nor could it gen-
+erate the additional condition on vgabe . However, the generated
+condition presents a useful hint to the user to add the missing bound
+check on ebeln .
+Scenario 2. SELECT with table joins. This scenario illustrates a
+case where highly accurate prediction helps to signiﬁcantly reduce
+the combinatorial search space for labeling.
+The program ( Ex1) creates a sales order report by calculating or-
+der amount and unbilled amount for each sales order. It ﬁrst creates
+a table called p_i_vbrp using the following query:
+select vbeln posnr aubel aupos matnr netwr
+from vbrp ,p_i_vbap
+into table p _i_vbrp
+where aubel =p_i_vbap vbeln
+and aupos =p_i_vbap posnr
+/ /and netwr > 0 .Needed in the correct query
+However, the missing netwr > 0 predicate from the WHERE
+condition causes incorrect p_i_vbrp formation, shown below for
+the key aubel=102 .
+Computed:
+aubel aupos netwr
+102 20 0.00
+102 20 8000.00
+102 30 0.00
+102 30 11200.00Expected:
+aubel aupos netwr
+102 20 8000.00
+102 30 11200.00
+The program logic after the SELECT statement reads the rows
+<102, 20, 0> and <102, 30, 0> corresponding to two posnr val-
+ues20and30, instead of <102, 20, 8000> and<102, 30, 11200> ,
+which it would have read from the correct version of the table. This
+leads to the incorrect output for the failing key 102. Altogether
+there are 18 failing keys in this example.249Correct Label Computation . There were 40129 passing input rows
+that were labeled as per their outcome in the existing execution.
+10032 failing input rows were unlabeled. SVM attached a positive
+prediction to 19 unlabeled rows and a negative prediction to the re-
+maining. As noted in Table 3, in this case the prediction is highly
+accurate (99.9%), leaving only 3 input rows incorrectly predicted.
+Each of these rows corresponds to a distinct failing key. and hap-
+pens to be the one with the maximum prediction value in the block
+of the respective projected row. Thus for each of the 3 failing keys,
+the projected row was incorrectly labeled. For each key, the itera-
+tive threshold adjustment process was invoked until a correct solu-
+tion was found. For example, for key 146, initially both rows were
+marked negative (as shown below) leading to unsatisﬁability.
+aubel aupos netwr pred
+146 10 0 -0.99972347
+146 10 30 -0.39996994With a threshold of 0.4, the
+second row with conﬁdence
+less than 0.4 was assigned an
+unknown label (to be deter-
+mined by SAT), while the ﬁrst row was given negative label. The
+same was done with the other two failing key records. SAT as-
+signed positive labels to these rows leading to satisﬁable solutions.
+In all, this process completed in 4 minutes. Utilizing predictions
+produces a total search space of 3:21= 6 for the SAT solver.
+We also give an estimate of the combinatorial search space if
+predictions had not been used at all. For each of the 18 failing
+keys, on average there are 3 projected rows, where each projected
+row maps to a block size of 227 input rows. For each failing key,
+the state space for choosing the set of projected rows that yield the
+correct output is 23. Each solution comprising of projected rows,
+needs to be mapped to input rows of the joined table, before being
+fed to the ID3. The state space for this would be 2273in worst case,
+when the solution contains all three projected rows. Thus the total
+search space, in worst case, to generate correct condition without
+using any predictions would 18(23+ 2273). As explained earlier,
+use of predictions helps reduce this space to just 6.
+Decision-tree Learning . Decision-tree learning discovered the cor-
+rect WHERE condition:
+aubel = p_i_vbap-vbeln and
+aupos = p_i_vbap-posnr
+and netwr > 6Note that our approach was
+able to learn the join condi-
+tion. For each projected row,
+the input row that is selected
+from the corresponding block, is critical in determining the correct
+join condition. We would like to highlight that for the given data,
+the only input row in every block that satisﬁed the join condition,
+was the one with maximum prediction value in that block. Hence
+the selection of any other row from the block would have not lead
+to the discovery of the join condition. This adds evidence to the
+fact that our design decision of selecting the row with maximum
+prediction value, would result in producing high quality conditions
+close to the ideal.
+The constant discovered is 6 rather than 0, due to the distribution
+of the data. But it is a good repair suggestion since it points out an
+important missing clause.
+Scenario 3. Use of predictions to rank candidate solutions. This
+scenario highlights that our repair algorithm is not restricted only
+to SELECT statements, and further illustrates a case where pre-
+dictions aid in reducing the space of candidate solutions on which
+decision-tree learning has to be performed.
+The buggy statement in this example ( Ex2) is a DELETE state-
+ment, shown below.
+DELETE ADJACENT DUPLICATES FROM db _tab
+COMPARING kunnr matnr
+/ /arktx Needed in the correct queryThe DELETE ADJACENT DUPLICATES statement deletes a row from
+the table that has same values in its immediately previous row for
+the ﬁelds speciﬁed in COMPARING clause. This could be modeled as
+an equivalent SELECT statement as shown below.
+selectfrom db _tab_rc as db _tab 1 ,db_tab_rc as db _tab2
+where db _tab 1 .rc=db_tab 2 .rc+1and
+db_tab 1 .kunnr =db_tab 2 .kunnr and
+db_tab 1 .matnr =db_tab 2 .matnr and
+/ /db_tab1.arktx = db_tab2.arktx Needed in correct query
+Where db_tab_rc has an extra column rcin addition to all the
+columns of db_tab . It contains the same records as db_tab with
+therccolumn populated with the row number.
+This statement selects rows that would need to be deleted by the
+original statement. The code after the DELETE statement, in a nut-
+shell, aggregates the netwr amounts corresponding to every unique
+value in monat ﬁeld on db_tab . The output report has incorrect
+amounts displayed for two monat values - Sep2008 andOct2008 (2
+failing keys).
+Correct Label Computation. The db_tab has 10 records with monat
+asSep2008 and 20 records with Oct2008 . Note that although the
+SELECT is over a join and every row of db_tab_rc maps to a
+block of rows in the joined table, we know upfront the exact record
+that needs to be considered from every block. To comply with the
+semantics of DELETE ADJACENT DUPLICATES , the only record that
+can be selected in the block corresponding to every failing row of
+db_tab is the one where db_tab1.rc = db_tab2.rc+1 is satisﬁed.
+Hence the search space remains 10 and 20 respectively for the two
+failing keys.
+Label Predictions. There are only 80 positively labeled passing key
+records compare to 12691 negatively labeled records in the joined
+table. Hence the accuracy of predicting positive labels is low. All
+rows are assigned prediction values -1.0 and -1.0000001. The ﬁrst
+iteration assigning all failing key rows with negative labels was un-
+satisﬁable. However, with a threshold of 1.0, rows with prediction
+values -1.0000001 were marked negative, while the remaining were
+assigned labels based on SAT-based search. For Sep2008 , there was
+exactly one correct solution, while for Oct2008 , there were 32 pos-
+sible correct solutions. The reason for the large space of possi-
+bilities in the latter case was that there were 5 records with netwr
+amounts of 0. The presence or absence of each of these records
+yields the same ﬁnal output. Hence SAT produces 32 different so-
+lutions yielding the expected output.
+It would be inefﬁcient to generate 32 possible WHERE clauses.
+This is where predictions aid in heuristically selecting the solution
+that is most likely to yield the ideal WHERE clause.
+Label Predictions-based solution ranking. The 32 solutions were
+ranked based on their average prediction values. The solution with
+the highest average prediction value is the one whose constituent
+rows have the highest likelihood of being assigned positive labels.
+In practice, the decision-tree learning would be invoked on the
+highest ranked solution ﬁrst, the condition would be presented to
+the user and conditions for the remaining solutions would be gen-
+erated only if the user is not satisﬁed with the ﬁrst condition. How-
+ever, for our experiment we invoked the decision-tree learning on
+all the solutions to evaluate the efﬁcacy of our selection heuristic.
+Decision-tree Learning . The WHERE clause of the SELECT
+statement, learnt for the highest ranked solution was,
+db_tab1.rc = db_tab2.rc + 1 and
+db_tab1.kunnr = db_tab2.kunnr and
+db_tab1.arktx = db_tab2.arktxAs can be ob-
+served, the condi-
+tion on arktx that
+was missing in the
+incorrect version is correctly discovered. However, the condition
+onmatnr is missing from the learned clause. This is because the250matnr values are equal for all adjacent records in which the other
+two conditions are also satisﬁed. This makes the learned WHERE
+clause correct for the given input set. The conditions learnt
+for the other solutions with lower ranks were of poorer quality.
+As can be seen from the numbers shown below, the number of
+clauses present in the conditions generated from the other solu-
+tions, were very high. These conditions were overﬁtted and very
+different from the intended ﬁx.
+# of clauses, # of solutions
+6, 12
+7, 2
+8, 1
+9, 5
+10, 6
+11, 2
+12, 1
+13, 2Scenario 4. Impact of in-
+correct selection on passing
+keys .Ex4 displays an inter-
+esting scenario which violates
+our assumption about the cor-
+rectness of erroneous SELECT
+statement for the passing keys.
+The ﬁnal output corresponding
+to passing keys is still correct but the SELECT acts incorrectly on
+some of them.
+The erroneous SELECT statement given below leads to the in-
+clusion of 58 extra records for the failing keys in the actual output
+of the program, compared to the expected correct output.
+select ebeln ebelp belnr buzei bewtp
+budat matnr werks ernam
+from ekbe into table it _ekbe
+where budat in s _crdate
+/ /AND vgabe = 1 Needed in the correct query
+In this example, for the passing keys too, the erroneous SE-
+LECT statement selected some extra rows, but subsequently they
+got deleted by a DELETE statement in the program. Consequently,
+these passing keys yielded the correct ﬁnal output anyway.
+Correct Label Computation . The incorrect labeling for 16 passing
+key records where vgabe = 1 impacts the accuracy of predictions
+as seen from Table 3. Hence the approach of using predictions
+to label records performs poorly. The algorithm passes through
+4 iterations of threshold adjustment and produces correct solution
+only when all records are labeled based on SAT-based search.
+Decision-tree Learning . The incorrect labeling of the passing key
+records impacts the WHERE clause condition learned.
+belnr<=5000000236 OR
+(budat = 61111) OR
+(budat > 61111 AND
+(ebeln = 4500000022))The condition is quite different
+from the one in the correct version
+of the code. It leads to the expected
+ﬁnal output on this data set, but this
+is not a useful repair suggestion.
+3.2 Discussion
+Based on our experimental evaluation we address the following
+key research questions.
+RQ1. Do the predictions based on the data distribution aid in
+ﬁnding the correct output for the failing keys efﬁciently?
+In all cases, prediction based labeling of rows helps in determining
+a correct output state to the faulty statement within 8 minutes in the
+worst case.
+The efﬁciency of our algorithm is attributed to high prediction
+accuracy which effectively reduces the combinatorial search space,
+and further design decisions such as: 1) an iterative threshold re-
+laxation strategy which judiciously un-labels incorrect predictions.
+The low number of iterations (in most cases) suggest that there
+were only few incorrect predictions that needed to be labeled by
+SAT, 2) ranking of solutions based on predictions which saves the
+effort of generating conditions corresponding to all the solutions.As noted in Scenario 2 ( Ex1), in the absence of predictions, in
+the worst case, a combinatorial search based strategy has to explore
+huge search space to arrive at useful solution. Even for subjects that
+do not involve joins predictions-based labeling brings about signif-
+icant reduction in search spaces: 87% reduction from a total of
+210+ 220forEx2, and almost 100% reduction from a total of 284
+forEx5.
+RQ2. How useful are the repair suggestions?
+The usefulness of the generated repair suggestions is summarized
+in the last column of Table 3. Except for Ex4, the repair sugges-
+tions were close to manual (ideal) ﬁxes for the bugs. The reason
+for high quality of our repair suggestions can be attributed to the
+labeling of failing-key data based on its proximity to passing-key
+data which generates the conditions that classify regions of data
+uniformly, which is typical of WHERE clauses. Even though the-
+oretically it is possible to generate many sCorrectOut s which gen-
+erate the expected correct output of the program, our approach only
+generates few of them based on the prediction. This in turn gener-
+ates few good conditions which are close to the ideal ﬁx.
+ForEx6, we show below the manual ﬁx and the condition gen-
+erated by our approach using a solution that respects the predicted
+labels. In this case p_p_werks is a parameter to the program which
+had a value GBS1. As can be seen, this condition is very close the
+ideal ﬁx.
+Ideal ﬁx for Ex6:
+vbeln = p_i_vbak-vbeln and
+werks = p_p_werksCondition learned from a solution
+based on predictions:
+vbeln = p_i_vbak-vbeln and
+werks = ’GBS1’
+We also show few conditions generated from other solutions that
+yield CorrectOut but do not use the predicted labels. Clearly such
+solutions are far away from the ideal ﬁx.
+Conditions learned from other solutions
+vbeln = p_i_vbak-vbeln and
+(werks = ’GBS1’ and
+(vbeln <= 102.0 and
+(waer = ’EUR’) or
+(waer = ’USD’ and
+(posnr <= 15.0))) or
+(vbeln > 102.0))vbeln = p_i_vbak-vbeln and
+(werks = ’GBS1’ and
+(vbeln <= 102.0 and
+(netwr <= 3524.4) or
+(netwr > 6336.4)) or
+(vbeln > 102.0))
+RQ3. Is syntactic mutation technique feasible for real data?
+To check the feasibility of mutation-based repair, we consider a re-
+pair strategy which checks if the WHERE condition could be cor-
+rected by either adding one clause, removing one existing clause,
+or replacing an existing clause with a new one. Clauses of the form
+Field Operator Field ,Field Operator Constant and
+Field Operator Variable are considered as mutants.
+Subjects Mutation based Repair
+time(min) Space
+Ex1 24.5 17663
+Ex2 22 15860
+Ex3 8.9 6434
+Ex4 0.9 63
+Ex5 56.1 40434
+Ex6 25.4 18346
+Ex7 200 147350In almost all the cases the
+search space of the number of
+mutants is very huge (in the
+order of 40,000) leading to a
+blow-up in the worst-case ex-
+ploration time (in the order of
+40 hours assuming an average
+of 5 seconds to execute 1 mu-
+tant). The main reason being
+the large number of distinct values that could be compared in the
+clauses of the form Field Operator Constant . An algorithm that
+does not consider clauses that involve constants would work much
+faster, however it would be unsuccessful in discovering the correct
+WHERE condition for bugs such as in Ex1,Ex3, and Ex7.251Limitations.
+1. Our technique assumes that the incorrect selection criteria works
+correctly for keys that satisfy the ﬁnal output correctness criteria.
+Violation of this assumption ( Ex4) impacts the quality of the pre-
+dictions and the WHERE condition learned.
+2. Sufﬁcient amount of diverse passing data is required to make
+the learning effective. For example, in Ex7, the failing rows were
+all erroneously predicted to be negatively labeled. This is because
+majority of the rows corresponding to the passing keys were nega-
+tively labeled; very few rows were positively labeled.
+3. Attention must be paid to data conditioning, which currently
+uses heuristics based tuning (described in Pragmatics in Section 2)
+to arrive at good label prediction.
+4. ID3 algorithm is designed to correctly label all training data.
+However, if the data in the current execution is not representative
+enough, then the WHERE condition created may be overﬁtted to
+the data ( Ex4). Techniques to avoid overﬁtting [21] compromise
+the accurate labeling of training data. Finding the right balance for
+our application is the subject of future work.
+5. Our algorithm strives to generate the most compact classiﬁer
+for the given data. In some cases, this could exclude clauses that
+would be in general necessary, but do not impact the outcome for
+the given data. To reiterate, our technique generates useful repair
+suggestions and not necessarily plug-and-play repairs.
+4. RELATED WORK
+Recent years have seen much progress in techniques for auto-
+mated debugging – both for fault localization [16], i.e., ﬁnding the
+locations of (likely) faulty lines of code, as well as program re-
+pair [26], i.e., correcting the faulty lines of code to ﬁx the fault(s),
+which is the focus of this paper.
+Fault localization. The application of machine learning to debug-
+ging is largely conﬁned to fault localization. Decision tree gen-
+eration algorithms, including C4.5, have been used in conjunction
+with the fault localization tool Tarantula [15] to cluster failing tests
+in order to help developers manually ﬁx bugs in their code more ef-
+fectively [15, 3]. Statistical debugging techniques [19, 12] employ
+statistical analysis on the data collected from passing and failing
+program runs to determine likely faulty statements.
+Program repair. The problem of program repair has been the focus
+of a number of recent techniques, including those based on evo-
+lutionary algorithms [26], speciﬁcations [7], program code trans-
+formations [5], as well as program state mutations [4]. The key
+novelty of our technique with respect to previous work is two-fold:
+(1) previous work has not considered repair of SQL statements, in
+general, and ABAP programs, in particular; and (2) machine learn-
+ing and systematic search have not been integrated before for pro-
+gram repair.
+Jobstmann et al. [14] employed a technique to replace faulty pro-
+gram expressions with unknowns and formed a model checking
+problem in order to repair a faulty program with respect to its lin-
+ear time logic speciﬁcation. Griesmayer et al. [8] map the problem
+or repairing boolean programs to ﬁnding a memoryless, stackless
+strategy in a game and explore the game graph to ﬁnd a repair for
+the boolean program, and show how it can be used to repair a class
+of C programs. Malik et al. [20] use a search-based technique for
+data structure repair [17] as a basis of program repair. Speciﬁcally,
+they use mutations done on program state to ﬁx corrupt data struc-
+tures as a basis of synthesizing program statements that abstract
+those ﬁxes using program variables. Gopinath et al. [7] introduce
+nondeterminism in the program’s operations and use SAT solvers to
+generate valid program states (with respect to given speciﬁcations),
+which are then abstracted into program expressions that evaluate tothose states and provide the ﬁxes. Chandra et al. [4] use changes to
+program states in a faulty program to approximate the behavior of
+a correct program with respect to a given set of passing and failing
+tests, and use these state mutations to guide syntactic changes to
+code in order to repair it.
+Weimer et al. [26] introduced the idea of program repair us-
+ing genetic programming, where existing parts of code are used to
+patch faults in other parts of code and patching is restricted to those
+parts that are relevant to the fault. Ackling et al. [1] simpliﬁes the
+repair problem by evolving patches to ﬁx the faulty program rather
+than evolving the program itself. Debroy et al. [5] used syntactic
+mutations to repair faults. The technique is in the context of Taran-
+tula and uses passing and failing tests to focus mutations. However,
+the approach fails to scale to real world applications. Wei et al. [25]
+represent class contracts, and execution proﬁles of tests in terms of
+boolean queries/methods of the class. A comparison between fail-
+ing and passing proﬁles is performed for fault localization and a
+subsequent program synthesis effort generates the repaired state-
+ments.
+Program synthesis. A closely related area to program repair is
+program synthesis , where the goal is to generate (parts of) a pro-
+gram independently of a given incorrect version. A number of pro-
+gram synthesis techniques are based on speciﬁcations [23, 18, 10].
+Programming by sketching [23] employs SAT solvers to generate
+missing parts of a given skeletal program with respect to another
+reference program that serves as a speciﬁcation. A SAT solver com-
+pletes the implementation details by generating expressions to ﬁll
+the “holes” of the skeletal program by exploring several of its vari-
+ants. Kuncak et al. [18] generalize decision procedures into syn-
+thesis procedures to synthesize code snippets from speciﬁcations.
+Some recent techniques support synthesis based on given concrete
+input/output examples. Gulwani [9] presents such a technique for
+synthesizing string processing code for spreadsheets using exam-
+ples of how a user processes sample strings. More recently, Singh
+et al. [22] integrate scenarios , which illustrate steps of modifying
+speciﬁc data structure instances, with given code skeletons and in-
+ductive deﬁnitions to facilitate program synthesis. At present, tech-
+niques for synthesis have largely been developed independently of
+techniques for repair.
+5. CONCLUSION AND FUTURE WORK
+We presented a novel approach to generate repair suggestions for
+defective database programs with faults in the selection condition
+of database statements. Our key novelty is to determine the correct
+behavior of the defect-inducing data using a combination of SAT-
+based search and prediction generated by support vector machines.
+We learn a decision tree from the behavior shown on the defect-
+free data as well as the correct behavior determined for the defect-
+inducing data. The decision tree provides useful repair suggestions.
+Experiments using a prototype of our approach on a suite of real
+programs show the promise it holds in automated debugging.
+While our current work focuses on repairing database statements,
+we envisage an extension of our idea of data-driven repair to more
+general imperative programs. A direct application would be to cor-
+rect faulty branch conditions that are covered by both passing and
+failing tests. The outcomes of the condition on faulty runs could
+be predicted based on passing runs, which in turn could be used to
+learn a condition that works correctly for all the tests.
+6. ACKNOWLEDGEMENTS
+This work was funded in part by the National Science Founda-
+tion (Grant No. CCF-0845628) and was carried out in part at IBM
+Research India, where the ﬁrst author was interning and the last
+author was employed at that time.2527. REFERENCES
+[1] Thomas Ackling, Bradley Alexander, and Ian Grunert.
+Evolving patches for software repair. In GECCO , pages
+1427–1434, 2011.
+[2] Kristin P. Bennett and Colin Campbell. Support vector
+machines: hype or hallelujah? SIGKDD Explor. Newsl. ,
+2(2):1–13, December 2000.
+[3] Lionel C. Briand, Yvan Labiche, and Xuetao Liu. Using
+machine learning to support debugging with Tarantula. In
+ISSRE , pages 137–146, 2007.
+[4] Satish Chandra, Emina Torlak, Shaon Barman, and Rastislav
+Bodik. Angelic debugging. In ICSE , pages 121–130, 2011.
+[5] Vidroha Debroy and W. Eric Wong. Using mutation to
+automatically suggest ﬁxes for faulty programs. In ICST ,
+pages 65–74, 2010.
+[6] Divya Gopinath, Sarfraz Khurshid, Diptikalyan Saha, and
+Satish Chandra. Data-Guided Repair of Selection
+Statements. Technical report, IBM Research. India, 2014.
+IBM Technical Report RI14004, available from
+http://domino.watson.ibm.com/library/CyberDig.nsf/home.
+[7] Divya Gopinath, Muhammad Zubair Malik, and Sarfraz
+Khurshid. Speciﬁcation-based program repair using SAT. In
+TACAS , pages 173–188, March 2011.
+[8] Andreas Griesmayer, Roderick Bloem, and Byron Cook.
+Repair of boolean programs with an application to C. In
+CAV, pages 358–371, 2006.
+[9] Sumit Gulwani. Automating string processing in
+spreadsheets using input-output examples. In POPL , pages
+317–330, 2011.
+[10] Sumit Gulwani, Susmit Jha, Ashish Tiwari, and
+Ramarathnam Venkatesan. Synthesis of loop-free programs.
+InPLDI , pages 62–73, 2011.
+[11] Daniel Jackson. Alloy: a lightweight object modelling
+notation. ACM Trans. Softw. Eng. Methodol. , 11(2), April
+2002.
+[12] Lingxiao Jiang and Zhendong Su. Context-aware statistical
+debugging: from bug predictors to faulty control ﬂow paths.
+InASE, pages 184–193, 2007.[13] T. Joachims. Making large-scale svm learning practical.
+Advances in Kernel Methods - Support Vector Learning ,
+1999.
+[14] B. Jobstmann, A. Griesmayer, and R. Bloem. Program repair
+as a game. In CAV, pages 226–238, 2005.
+[15] James A. Jones, James F. Bowring, and Mary Jean Harrold.
+Debugging in parallel. In ISSTA , pages 16–26, 2007.
+[16] James A. Jones, Mary Jean Harrold, and John Stasko.
+Visualization of test information to assist fault localization.
+InICSE , pages 467–477, 2002.
+[17] Sarfraz Khurshid, Iván García, and Yuk Lai Suen. Repairing
+structurally complex data. In SPIN , pages 123–138, 2005.
+[18] Viktor Kuncak, Mikael Mayer, Ruzica Piskac, and Philippe
+Suter. Complete functional synthesis. In PLDI , pages
+316–329, 2010.
+[19] Ben Liblit, Mayur Naik, Alice X. Zheng, Alex Aiken, and
+Michael I. Jordan. Scalable statistical bug isolation. In PLDI ,
+pages 15–26, 2005.
+[20] M. Z. Malik, K. Ghori, B. Elkarablieh, and S. Khurshid. A
+case for automated debugging using data structure repair. In
+ASE, pages 615–619, November 2009.
+[21] T. Mitchell. Machine Learning . McGraw Hill, 1997.
+[22] Rishabh Singh and Armando Solar-Lezama. SPT:
+Storyboard programming tool. In CAV, pages 738–743, 2012.
+[23] Armando Solar-Lezama. The sketching approach to program
+synthesis. In APLAS , pages 4–13, 2009.
+[24] V . Vapnik. The Nature of Statistical Learning Theory .
+Springer Verlag, 1995.
+[25] Yi Wei, Yu Pei, Carlo A. Furia, Lucas S. Silva, Stefan
+Buchholz, Bertrand Meyer, and Andreas Zeller. Automated
+ﬁxing of programs with contracts. In ISSTA , pages 61–72,
+2010.
+[26] Westley Weimer, ThanhVu Nguyen, Claire Le Goues, and
+Stephanie Forrest. Automatically ﬁnding patches using
+genetic programming. In ICSE , pages 364–374, 2009.253

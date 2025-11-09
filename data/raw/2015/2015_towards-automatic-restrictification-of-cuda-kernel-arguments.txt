@@ -1,0 +1,449 @@
+Towards Automatic Restrictification of CUDA Kernel Arguments
+Rokiatou Diarra
+SATIE, Univ. Paris-Sud, Univ. Paris Saclay
+Gif-sur-Yvette, France
+rokiatou.diarra@u-psud.fr
+ABSTRACT
+Many procedural languages, such as C and C ++, have pointers.
+Pointers are powerful and convenient, but pointer aliasing still
+hinders compiler optimizations, despite several years of research
+on pointer aliasing analysis. Because alias analysis is a difficult
+task and results are not always accurate, the ISO C standard 99has
+added a keyword, named restrict to allow the programmer to specify
+non-aliasing as an aid to the compiler’s optimizer and to thereby
+possibly improve performance. The task of annotating pointers
+with the restrict keyword is still left to the programmer. This task
+is, in general, tedious and prone to errors especially since the C
+does not perform any verification to ensure that restrict keyword is
+not misplaced. In this paper we present a static analysis tool that
+(i) finds CUDA kernels call sites in which actual parameters do not
+alias; (ii) clones the kernels called at such sites; (iii) after performing
+an alias analysis in these kernels, adds the restrict keyword to their
+arguments; and (iv) replaces the original kernel call by a call to the
+optimized clone whenever possible.
+CCS CONCEPTS
+•Computing methodologies →Parallel programming lan-
+guages ;Graphics processors ;•Software and its engineering
+→Automated static analysis; Source code generation ;
+KEYWORDS
+GPU, CUDA, restrict, compilers, program optimization, aliasing
+ACM Reference Format:
+Rokiatou Diarra. 2018. Towards Automatic Restrictification of CUDA Ker-
+nel Arguments. In Proceedings of the 2018 33rd ACM/IEEE International
+Conference on Automated Software Engineering (ASE ’18), September 3–
+7, 2018, Montpellier, France. ACM, New York, NY, USA, 4 pages. https:
+//doi.org/10.1145/3238147.3241533
+1 PROBLEM
+Today variants of the C language, such as CUDA and OpenCL, are
+still used to program on multicore or GPU machines. One of the
+most important characteristics of languages such as C is the exis-
+tence of pointers. Pointers are powerful and convenient, but they
+can also hinder compiler optimization. Indeed, it is hard to know
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a
+fee. Request permissions from permissions@acm.org.
+ASE ’18, September 3–7, 2018, Montpellier, France
+©2018 Association for Computing Machinery.
+ACM ISBN 978-1-4503-5937-5/18/09. . . $15.00
+https://doi.org/10.1145/3238147.3241533where pointers are pointing and compilers must be conservative
+in their presence. Consider the example provided in listing 1, with-
+out further knowledge or special hardware support, the compiler
+must assume that A,qandpmay refer to the same memory region
+or overlapping regions so that the loop cannot be parallelized or
+software-pipelined because it has to be ensured that an update of
+q[i]is performed before the next value of p[j+1]is loaded for ex-
+ample. This constraint also prevents the compiler from generating
+loads for multiple array elements of Aandpat the same time since
+the subsequent store to q[i]may modify elements of arrays Aor
+p. Because the compiler must conservatively assume the pointers
+alias, it will compile this code inefficiently, even if the programmer
+knows that the pointers never alias.
+vo id vectMatMul ( f l o a t ∗A , f l o a t ∗q , f l o a t ∗p ) {
+f o r (i n t i = 0 ; i < NI ; i ++)
+f o r (i n t j = 0 ; j < NJ ; j ++)
+q [ i ] += A[ i ∗NJ + j ] ∗p [ j ] ;
+}
+Listing 1: A vector and matrix multiplication example
+To ensure that the correct code is generated in the presence of
+aliases, compilers have to perform an alias analysis to determine
+the aliases in the program. Although the literature of alias analysis
+is abundant and much work (e.g: [ 3,4,6,13]) have been done in the
+last few decades, the research community has not yet solved pointer
+alias analysis satisfactorily. Many alias analyzer are implemented
+in mainstream compilers but the results of these analyzers are
+often inaccurate. Pointer analysis imprecision is a severe problem
+while it prevents the compiler from optimizing some code where
+there is no aliasing. To mitigate the problem posed by pointers,
+some programming languages furnish developers with high-level
+constructs that they can use to tell compilers that variables do not
+alias each other. Therefore the C programming language, since the
+C99Standard, features the restrict keyword, that can be used by
+the programmer to give the compiler information about aliasing.
+In fact, it is applied to a pointer pto say that only por a pointer
+derived from it can access that memory region during its lifetime.
+Hence, if pis a restricted pointer then, any access to pthrough
+any other means may result in undefined behavior. Therefore if the
+arguments of example routine, in listing 1, have been annotated
+with the restrict qualifier, thereby allowing the compiler to perform
+more aggressive optimization, such as instructions scheduling, loop
+invariant code motion, redundant load/store elimination, etc.
+Although the restrict keyword has been available for several
+years already, it remains less used by programmers and its insertion
+is left to the programmer. The task of inserting the restrict qualifier
+is, in general, tedious and prone to errors especially since the C does
+not perform any verification to ensure that restrict keyword is not
+misplaced. Although many work have been done on alias analysis,
+928
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 14:10:52 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France R. Diarra
+fewer have been done on automatic insertion of restrict keyword.
+While nvcc (the NVIDIA compiler) supports restricted pointers via
+the__restrict__ keyword, we propose a new static analysis tool that
+(i) finds CUDA kernels call sites in which actual parameters do not
+alias; (ii) clones the kernels called at such sites; (iii) after performing
+an alias analysis in these kernels, adds the restrict keyword to their
+arguments; and (iv) replaces the original kernel call by a call to the
+optimized clone whenever possible.
+2 BACKGROUND
+In this section, we provide some background about pointer alias
+analysis and CUDA programming model.
+2.1 Pointer Alias Analyzer Characteristics
+A pointer alias analysis attempts to determine when two pointer
+expressions refer to the same storage location [ 8]. For instance, if
+two pointers pandqboth reference the same memory location,
+then pandqare said to alias. There are many challenges for alias
+analysis including the complexity, the scalability and the precision
+of the analysis. Alias analysis can be classified as flow-sensitive or
+flow-insensitive, depending on whether statements order informa-
+tion is used during the analysis. By not considering the order of
+statements, and therefore computing a conservative summary, a
+flow-insensitive analysis can be more efficient, but less accurate
+than a flow-sensitive analysis [ 8,15]. In addition to flow-sensitivity,
+there are several other design options including context sensitivity
+(if different calling contexts are considered, the analysis is context-
+sensitive otherwise it is context-insensitive) and structure modeling
+(treat structures elements as individual locations: field-sensitivity
+or treat entire structure as a single location: field-insensitivity ?).
+2.2 CUDA Programming Model
+CUDA is a parallel computing programming model that fully uti-
+lizes hardware architecture and software algorithms to accelerate
+various types of computation. In CUDA, the programmer writes
+device code in functions called kernel . A kernel will be executed by
+many GPU threads. During kernel execution, threads have access
+to different types of memory on the GPU. Before launching kernels,
+data must be transfered to GPU memories. To obtain optimized
+code, the programmer must understand well GPU architecture and
+CUDA optimization strategies like memory-coalescing access, effi-
+cient usage of shared memory or tiling technology. Listing 2 shows
+a simple CUDA kernel example. While, nvcc, the NVIDIA com-
+piler supports restricted pointers, we can add the __restrict__ type
+qualifier to our pointers declaration.
+_ _ g l o b a l _ _ v oi d gemm ( f l o a t ∗_ _ r e s t r i c t _ _ a ,
+f l o a t ∗_ _ r e s t r i c t _ _ b , f l o a t ∗_ _ r e s t r i c t _ _ c ,
+f l o a t alpha , f l o a t b e t a ) {
+i n t j = b l o c k I d x . x ∗blockDim . x + t h r e a d I d x . x ;
+i n t i = b l o c k I d x . y ∗blockDim . y + t h r e a d I d x . y ;
+i f( ( i < NI ) && ( j < NJ ) ) {
+c [ i ∗NJ + j ] ∗= b e t a ;
+f o r(i n t k = 0 ; k < NK ; k ++)
+c [ i ∗NJ + j ] += a l p h a ∗a [ i ∗NK + k ]
+∗b [ k ∗NJ + j ] ; } }
+Listing 2: Simple gemm kernel example in CUDA3 PREVIOUS WORK
+In this section, we review some previous work about alias analysis
+and static analysis of CUDA programs.
+3.1 Pointer Alias Analysis
+Alias analysis is one of the most used techniques that aim to opti-
+mize languages with pointers. It is no surprise that this topic has
+received much attention in many fields including compilation and
+program verification. The literature of alias analysis is abundant.
+For a quite exhaustive bibliography, see for instance [ 7]. In this
+paper, we shall be limited to related work that are the most rel-
+evant for our study of interest. The most popular algorithm for
+context-insensitive, flow-insensitive, iterative and constrains-based
+points-to analysis is known as inclusion-based or Andersen-style
+analysis [ 3]. Alves et al. provided in [ 2] two ways to determine at
+runtime when two memory locations can overlap. They concluded
+that the combination of cloning plus dynamic disambiguation of
+pointers is an effective way to make compiler optimizations more
+practical. Sperle et al. presented in [ 16] three different techniques
+to disambiguate pointers used as arguments of functions. Their
+first technique relies on the static alias analysis already available in
+mainstream compilers to perform pointer disambiguation and the
+others combine static bound inference with code cloning, hence,
+extending the reach of pointer disambiguation. Maalej et al. intro-
+duced in [ 13] a new technique to disambiguate pointers, which
+relies on a less-than analysis. Their alias analysis uses the observa-
+tion that if p1andp2are two pointers, such that p1<p2, then they
+cannot alias. They designed in [ 12] another alias analysis algorithm
+that uses a combination of less-than analysis and classical range
+analysis to show that two pointers cannot dereference the same
+memory location.
+3.2 Static Analysis of CUDA Kernel
+There have been many efforts on optimization of GPU programs,
+on modeling of GPU power consumption as well as on analysis of
+GPU programs, but none of them have focused on pointer aliasing
+problem in GPU programs. Here, we briefly describe some of these
+studies. Lim et al. presented in [ 11] a static analyzer tool for tuning
+CUDA kernels based on static analysis that considers fine-grained
+code structure and the specific GPU architecture features. Their ana-
+lyzer can identify the computational intensity of a kernel, construct
+a control flow graph, estimate the occupancy of the multiproces-
+sors, and suggest optimizations in terms of threads and register
+usage. Kerr et al. proposed in [ 9] a set of metrics for GPU workloads
+and uses these metrics to analyze the behavior of GPU programs.
+Reena et al. presented in [ 14] a framework that statistically models
+the regularity in code-localized memory access patterns of GPGPU
+applications and the parallelism in GPU’s execution model to cre-
+ate miniaturized memory proxies. Helal et al. presented in [ 1] an
+automated framework that uses hybrid analysis to find the best
+dependency-preserving parallel schedule of a given sequential code.
+GPUVerify, a tool for formal analysis of GPU kernels written in
+OpenCL and CUDA, is able to prove that kernels are free from data
+races [ 5]. SESA, a symbolic execution based tool for detecting data
+races in practical CUDA programs, uses parametric execution to
+efficiently handle large numbers of threads [10].
+929
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 14:10:52 UTC from IEEE Xplore.  Restrictions apply. Towards Automatic Restrictification of CUDA Kernel Arguments ASE ’18, September 3–7, 2018, Montpellier, France
+4 PROPOSED APPROACH
+To tackle the problem described in section 1, we propose a static
+analyzer tool that automatically annotate CUDA kernel pointers
+arguments with the restrict keyword. Our tool includes three parts.
+The firs part perform some preprocessing step. The second part is
+the alias analyzer and the third insert the restrict keyword into the
+input file. We will discuss these parts of our tool.
+4.1 Frama-C
+Our alias analyzer was implemented as a Frama-C plug-in, thus we
+give here a brief description of Frama-C due to space limitation.
+Frama-C1is a software platform which helps the development of
+static analysis tools for C programs thanks to a plug-ins mechanism.
+It relies on C Intermediate Language to generate an Abstract Syntax
+Tree (AST). A common kernel centralizes information and conducts
+the analysis. Plug-ins interact with each other through interfaces
+defined by the kernel. Frama-C contains several ready-to-use plug-
+ins for the static analysis of C code and any new plug-in can use
+the results or functionalities provided by the existing plug-ins.
+4.2 Preprocessing Part
+Frama-C takes as input a C file. Since Frama-C does not support any
+keyword or type that is not part of the C standard, in order to be able
+to analyze CUDA programs with Frama-C, we need to perform some
+preprocessing tasks. For that purpose, we developed a program in
+Perl. This program takes a input file (.c or .cu), copies it in a new
+file, hides all CUDA specific keywords or types (e.g.: __global__,
+<<,>>, etc.) while retaining the original program structure and
+line number information and then generate an intermediate file.
+It also adds an identifier to the kernels names so that we can find
+them in next steps.
+4.3 Alias analysis Part
+This part, designed as a Frama-C plug-in, perfom the alias analysis
+and it run in two steps.
+In first step, by visiting the AST (i) find all CUDA kernels call sites
+and store some information for each kernel (call site line number,
+list of actuals parameters and name of caller function); (ii) for each
+kernel caller analysis its body by searching Andersen constrains
+[3]; and (iii) if no constrain, involving any actuals parameters of
+the called kernel, is found then we are sure that kernel actuals
+arguments do not alias and then generate messages (also called
+commands) that will make it possible to carry out later a runtime
+less-than check by using the method proposed in [13].
+In second step, by traversing the AST analysis each called kernel
+by searching Andersen constrains. If not found any constrain in-
+volving any formal parameters of the analyzed kernel then generate
+commands that will make it possible (i) to clone this kernel; (ii)
+rename the clone; (iii) add restrict keyword to its arguments; and
+(iv) change this kernel call sites by adding an ifstatement allowing
+to call either the clone or the original version depending on the
+runtime less-than check result.
+1https://frama-c.com/plugins.html
+PreprocessingFrama-C
+Plug-in: alias 
+analyzerNormalized 
+C file Output
+command 
+file Post-processing__global__ void vectMat(float* A,  float* x,  float* y) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) {
+    for(int j = 0; j < N; j++) 
+      y[i] += A[i * N + j] * x[j];
+  }
+}
+void main(int argc, char** argv) {
+   //……..
+   vectMat<<< grid, block>>>(A, x, y);
+  //……...
+}__global__ void vectMat(float* A,  float* x,  float* y) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) {
+    for(int j = 0; j < N; j++) 
+      y[i] += A[i * N + j] * x[j];
+  }
+}
+__global__ void vectMat_rest(float *__restrict__  A,  
+float *__restrict__   x,  float *__restrict__   y) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) {
+    for(int j = 0; j < N; j++) 
+      y[i] += A[i * N + j] * x[j];
+  }
+}
+void main(int argc, char** argv) {
+  //……..
+  if ((A + size_a  <= x  || x + size_xy <= A) && 
+       (A + size_a  <= y  || y + size_xy <= A) && 
+       (x + size_xy <= y || y + size_xy <= x)) {
+          vectMat_rest<<< grid, block>>>( A, x, y);
+  } else {
+          vectMat<<< grid, block>>>(A, x, y);
+  }
+  //……..
+}Figure 1: An overview of our static analysis tool
+Note that unlike many alias analysis methods, our method does
+not use any control flow or program dependency graph. It only
+uses the AST and the value plug-in of Frama-C.
+4.4 Post Processing Part
+Our post-processing is performed by a Perl program that takes as
+input the command file generated by the second part described
+in 4.3. This command file contains the instructions for (i) cloning
+a kernel, changing the name of the clone and adding the restrict
+keyword its arguments; (ii) testing if kernel actual arguments do
+not alias and (iii) adding call to the clone whenever possible. The
+Perl program applies the command file to the initial input file and
+generate a final output file. Figure 1 shows an overview of our tool.
+5 APPLICATION
+We tested our tool on kernels taken from the PolyBench2bench-
+mark suite. We chose the PolyBench benchmark suite because
+there are many kernels where the pointers may be aliased. Our
+preliminary results showed that the developed tool was success-
+fully able to annotate all pointers arguments of kernels with the
+__restrict__ keyword without any misplacement. We compared
+the performance of restricted codes obtained to that of the origi-
+nal versions to show that the restrict keyword really contributes
+to improve performance. Performance data were collected on a
+NVIDIA GPU Quadro M2000M hosted in an Intel I7 CPU, CUDA
+Driver/Runtime version is 9.1and we used Ubuntu 16.04.
+Figure 2 shows factors relative to the original code for the kernels
+performance (compute time, executed instructions count, global
+load and L2 read transactions). We observed that the restrict quali-
+fier improve kernel compute time by a reduction factor of 0.76×on
+average. However, this factor is more interesting for the correlation
+andcovariance application where there are many potential pointer
+aliasing and redundant load/store. We found that annotating point-
+ers arguments with the restrict reduced the executed instruction
+count by a factor of 0.94×on average. We observed that the us-
+age of the restrict keyword reduce the global load transaction only
+when there are many redundant load as it is the case for the adi,
+gesum, gramschmidt andmvtkernels. Regarding the L2 cache read
+transactions, we found that the restrict keyword reduced it by a
+factor of 0.82×on average.
+2https://sourceforge.net/projects/polybench/
+930
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 14:10:52 UTC from IEEE Xplore.  Restrictions apply. ASE ’18, September 3–7, 2018, Montpellier, France R. Diarra
+ 0 0.2 0.4 0.6 0.8 1 1.2 1.4
+2mm 3mm adi atax bicg correlation covariance gemm gemver gesum gramschmidt mvt trmmSpeedup relative to original codeCompute_time
+Executed_instructions
+Global_load_transaction
+L2_read_transaction
+Figure 2: Restrict keyword impact on CUDA kernels perfor-
+mance
+6 PLAN FOR EVALUATION
+At this stage, our developed tool is able to efficiently annotated
+CUDA kernel pointers arguments with the restrict keyword, as we
+have tested it on PolyBench benchmark suite kernels. Our alias
+analyzer is field-insensitive, we work to make it field-sensitive. For
+the moment, it takes as input a CUDA codes. We plan to extend our
+took in order to be able to perform an alias analysis on OpenACC
+and OpenMP 4.5codes, which would imply to be able to take into
+account the offloading model of these two standards. While Frama-
+C has two deductive verification plug-ins, we intend to use them in
+our tool in order to be able to prove the reliability of OpenACC and
+OpenMP programs for GPU. Ultimately, we intend to evaluate our
+tool on more complex benchmarks, for instance the Rodinia, Parboil
+and SPEC benchmarks in order to demonstrate its scalability ad
+efficiency.
+7 CONTRIBUTIONS AND STATUS
+Pointer aliasing still hinders compiler optimizations, in spite of
+years of research on pointer disambiguation. This PhD work presents
+a new static analysis tool, based on Frama-C, that performs an alias
+analysis and then automatically annotates CUDA kernel pointers
+arguments with the restrict qualifier. With our tool, the programmer
+would be relieved of the task of annotating pointers with restrict
+keyword. We showed an application of the proposed tool on some
+kernels taken from the PolyBench benchmark suite and proved that
+the restrict keyword improves CUDA program’s performance in
+general. The development of our tool is still in progress. We also
+discussed next steps and presented a plan for evaluation.
+8 SUBMITTED PAPERS
+Authors have one submitted paper entitled "Exploring performance
+improvement opportunities in directive-based GPU programming"
+to DASIP2018 conference.ACKNOWLEDGMENTS
+This work is part of a PhD thesis supervised by Alain MERIGOT
+and Bastien VINCKE. Thanks to my supervisors.
+REFERENCES
+[1]E. Helal Ahmed, Feng Wu-chun, Jung Changhee, and Y. Hanafy Yasser. 2017.
+AutoMatch: An automated framework for relative performance estimation and
+workload distribution on heterogeneous HPC systems. In IEEE International
+Symposium on Workload Characterization (IISWC), 2017. IEEE.
+[2]Péricles Alves, Fabian Gruber, Johannes Doerfert, Alexandros Lamprineas, Tobias
+Grosser, Fabrice Rastello, and Fernando Magno Quintão Pereira. 2015. Runtime
+Pointer Disambiguation. SIGPLAN Not. 50, 10 (Oct. 2015), 589–606. https:
+//doi.org/10.1145/2858965.2814285
+[3]Lars Ole Andersen. 1994. Program Analysis and Specialization for the C Program-
+ming Language. Ph.D. Dissertation. DIKU, University of Copenhagen.
+[4]George Balatsouras and Yannis Smaragdakis. 2016. Structure-Sensitive Points-
+To Analysis for C and C++. Rival X. (Eds) Static Analysis. SAS 2016 (2016).
+https://link.springer.com/chapter/10.1007/978-3-662-53413-7_5
+[5]Ethel Bardsley, Adam Betts, Nathan Chong, Peter Collingbourne, Pantazis Deli-
+giannis, Alastair F. Donaldson, Jeroen Ketema, Daniel Liew, and Shaz Qadeer. 2014.
+Engineering a Static Verification Tool for GPU Kernels. In Proceedings of the 16th
+International Conference on Computer Aided Verification - Volume 8559. Springer-
+Verlag, Berlin, Heidelberg, 226–242. https://doi.org/10.1007/978-3-319-08867-9_
+15
+[6]Ben Hardekopf and Calvin Lin. 2011. Flow-sensitive Pointer Analysis for Mil-
+lions of Lines of Code. In Proceedings of the 9th Annual IEEE/ACM International
+Symposium on Code Generation and Optimization (CGO ’11). IEEE Computer Soci-
+ety, Washington, DC, USA, 289–298. http://dl.acm.org/citation.cfm?id=2190025.
+2190075
+[7]Michael Hind. 2001. Pointer analysis: havenâĂŹt we solved this problem yet?. In
+Proceedings of Workshop on Program Analysis For Software Tools and Engineering.
+ACM, 54–61.
+[8]Michael Hind and Anthony Pioli. 2000. Which Pointer Analysis Should I Use?
+SIGSOFT Softw. Eng. Notes 25, 5 (Aug. 2000), 113–123. https://doi.org/10.1145/
+347636.348916
+[9]Andrew Kerr, Gregory Diamos, and Sudhakar Yalamanchili. 2009. A Characteri-
+zation and Analysis of PTX Kernels. In Proceedings of the 2009 IEEE International
+Symposium on Workload Characterization (IISWC) (IISWC ’09). IEEE Computer So-
+ciety, Washington, DC, USA, 3–12. https://doi.org/10.1109/IISWC.2009.5306801
+[10] Peng Li, Guodong Li, and Ganesh Gopalakrishnan. 2014. Practical Symbolic Race
+Checking of GPU Programs. In Proceedings of the International Conference for
+High Performance Computing, Networking, Storage and Analysis (SC ’14). IEEE
+Press, Piscataway, NJ, USA, 179–190. https://doi.org/10.1109/SC.2014.20
+[11] Robert V. Lim, Boyana Norris, and Allen D. Malony. 2017. Autotuning
+GPU Kernels via Static and Predictive Analysis. CoRR abs/1701.08547 (2017).
+arXiv:1701.08547 http://arxiv.org/abs/1701.08547
+[12] Maroua Maalej, Vitor Paisante, Fernando Magno Quinto Pereira, and Laure
+Gonnord. 2018. Combining Range and Inequality Information for Pointer
+Disambiguation. Sci. Comput. Program. 152, C (Jan. 2018), 161–184. https:
+//doi.org/10.1016/j.scico.2017.10.014
+[13] Maroua Maalej, Vitor Paisante, Pedro Ramos, Laure Gonnord, and Fernando
+Magno Quintão Pereira. 2017. Pointer Disambiguation via Strict Inequali-
+ties. In Proceedings of the 2017 International Symposium on Code Generation
+and Optimization (CGO ’17). IEEE Press, Piscataway, NJ, USA, 134–147. http:
+//dl.acm.org/citation.cfm?id=3049832.3049848
+[14] Reena Panda, Xinnian Zheng, Jiajun Wang, Andreas Gerstlauer, and Lizy K. John.
+2017. Statistical Pattern Based Modeling of GPU Memory Access Streams. In
+Proceedings of the 54th Annual Design Automation Conference 2017 (DAC ’17).
+ACM, New York, NY, USA, Article 81, 6 pages. https://doi.org/10.1145/3061639.
+3062320
+[15] Marc Shapiro and Susan Horwitz. 1997. Fast and Accurate Flow-insensitive
+Points-to Analysis. In Proceedings of the 24th ACM SIGPLAN-SIGACT Symposium
+on Principles of Programming Languages (POPL ’97). ACM, New York, NY, USA,
+1–14. https://doi.org/10.1145/263699.263703
+[16] Victor Hugo Sperle Campos, Péricles Rafael Alves, Henrique Nazaré Santos, and
+Fernando Magno Quintão Pereira. 2016. Restrictification of Function Arguments.
+InProceedings of the 25th International Conference on Compiler Construction (CC
+2016). ACM, New York, NY, USA, 163–173. https://doi.org/10.1145/2892208.
+2892225
+931
+Authorized licensed use limited to: LAHORE UNIV OF MANAGEMENT SCIENCES. Downloaded on August 07,2025 at 14:10:52 UTC from IEEE Xplore.  Restrictions apply. 

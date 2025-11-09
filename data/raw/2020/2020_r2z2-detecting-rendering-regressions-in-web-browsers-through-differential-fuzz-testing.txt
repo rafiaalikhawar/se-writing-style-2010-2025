@@ -1,0 +1,1366 @@
+R2Z2: Detecting Rendering Regressions in Web Browsers
+through Differential Fuzz Testing
+Suhwan Song
+Seoul National University
+Seoul, South Korea
+sshkeb96@snu.ac.krJaewon Hur
+Seoul National University
+Seoul, South Korea
+hurjaewon@snu.ac.krSunwoo Kim
+Seoul National University
+Seoul, South Korea
+sunwoo28.kim@snu.ac.kr
+Philip Rogers
+Google
+Mountain View, CA, United States
+pdr@google.comByoungyoung Lee∗
+Seoul National University
+Seoul, South Korea
+byoungyoung@snu.ac.kr
+ABSTRACT
+Arenderingregressionisabugintroducedbyawebbrowserwhere
+a web page no longer functions as users expect. Such rendering
+bugscriticallyharmtheusabilityofwebbrowsersaswellasweb
+applications.Theuniqueaspectofrenderingbugsisthattheyaffect
+thepresentedvisualappearanceofwebpages,butthosewebpageshavenopre-definedcorrectappearance.Therefore,itischallenging
+to automatically detect errors in their appearance. In practice, web
+browservendorsrelyonnon-trivialandtime-prohibitivemanual
+analysis to detect and handle rendering regressions.
+This paper proposes R2Z2, an automated tool to find render-
+ing regressions. R2Z2uses the differential fuzz testing approach,
+whichrepeatedlycomparestherenderingresultsoftwodifferent
+versions of a browser while providing the same HTML as input.
+Iftherenderingresultsaredifferent, R2Z2furtherperformscross
+browsercompatibilitytestingtocheckiftherenderingdifferenceisindeedarenderingregression.Afteridentifyingarenderingre-
+gression, R2Z2will perform an in-depth analysis to aid in fixing
+the regression. Specifically, R2Z2 performs a delta-debugging-like
+analysistopinpointtheexactbrowsersourcecodecommitcausing
+the regression,as well asinspecting the renderingpipeline stages
+to pinpoint which pipeline stage is responsible. We implemented a
+prototypeof R2Z2particularlytargetingtheChromebrowser.So
+far,R2Z2found 11 previously undiscovered rendering regressions
+in Chrome, all of which were confirmed by the Chrome developers.
+Importantly, in each case, R2Z2correctly reported the culprit com-
+mit. Moreover, R2Z2correctly pin-pointed the culprit rendering
+pipeline stage in all but one case.
+∗Corresponding author
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+onthe firstpage.Copyrights forcomponentsof thisworkowned byothersthan the
+author(s)mustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,or
+republish,topostonserversortoredistributetolists,requirespriorspecificpermission
+and/or a fee. Request permissions from permissions@acm.org.
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+© 2022 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-9221-1/22/05...$15.00
+https://doi.org/10.1145/3510003.3510044CCS CONCEPTS
+•Software and its engineering →Software testing and de-
+bugging.
+KEYWORDS
+rendering regression, web-browser, differential testing
+ACM Reference Format:
+Suhwan Song, Jaewon Hur, Sunwoo Kim, Philip Rogers, and Byoungyoung
+Lee.2022. R2Z2:DetectingRenderingRegressionsinWebBrowsersthrough
+Differential Fuzz Testing. In 44th International Conference on Software Engi-
+neering(ICSE’22),May21–29,2022,Pittsburgh,PA,USA. ACM,NewYork,
+NY, USA, 12pages.https://doi.org/10.1145/3510003.3510044
+1 INTRODUCTION
+A rendering regression is a bug introduced by a web browser
+where a web page’s visual appearance no longer matches what
+users expect. Rendering regressions impact the usability of web
+browsers, the revenue of websites, as well as long-term trust in
+webbrowsers.Asanexample,amajorcloudcomputingplatform,
+ServiceNow, suffered a service outage due to a rendering regres-sion where Chrome 89 failed to paint parts of the web page [
+20].
+AccordingtotheChrometeam’sbugtracker,18,400bugswerefiled
+against rendering-related components (i.e., DOM, Style, Layout,
+and Paint) between 2016 and 2021 [ 4], highlighting the non-trivial
+andprohibitivedevelopmentcoststomaintaincorrectrenderingin
+Chrome.
+The unique aspect of rendering bugs1is that they affect the
+presentedvisuallookofawebpagewhichhasnoclear,formally-
+defined notion of a bug decision boundary. In particular, we found
+twokeychallengesrelatedtorenderingbugs.First,itischallenging
+to identify rendering bugs because it is difficult to determine thecorrectness of rendering results. The correctness of browser ren-
+dering is mostly dictated by the complex HTML and CSS specifica-
+tions, which are difficult to completely express into programmable,
+software-friendly conditions for automated verification. Further-more, specifications are incomplete and do not cover all aspectsof rendering (e.g., table width distribution is only partially spec-ified [
+16]). Second, even after identifying a rendering bug, it is
+challengingtoanalyzeandfixit.Unlikememorycorruptionbugs,
+rendering bugs do not raise an immediate violation, so they do
+1In this paper, the word “bug” implies “regression bug” if not specifically mentioned.
+18182022 IEEE/ACM 44th International Conference on Software Engineering (ICSE)ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Suhwan Song, Jaewon Hur, Sunwoo Kim, Philip Rogers, and Byoungyoung Lee
+notleaveaclueaboutwhichcodeisresponsibleforabug.Worse
+yet, for performance, rendering is processed through a multi-stage
+pipeline, further complicating the bug analysis. We note that these
+unique aspects and challenges are not present in common tradi-
+tionalbugssuchasmemorycorruptionbugs,whichcanbemodeled
+usingaclearviolationconditionafterdefiningavalidmemoryre-
+gion [46, 53].
+Inthispaper,wepropose R2Z2,adifferentialfuzztestingtech-
+nique to find rendering regressions in web browsers. In order to
+addresstheaforementionedtwochallenges, R2Z2’sapproachescan
+besummarizedintothefollowingtwofeatures.First, R2Z2features
+abugoraclealongwithrenderingchangedetection. R2Z2runstwo
+versionsofabrowserwitharandomlygeneratedHTMLfile,and
+attempts to identify rendering image differences. In order to avoid
+falsepositivebugs, R2Z2developedaregressionoracle,whichisca-
+pableofdeterminingifagivenbugisindeedarenderingregression
+bugornot.Thisregressionoracleexploitstwointerestingcharac-
+teristicsin webbrowsers—1)ifmultiple independentlydeveloped
+browsersgeneratethesamerenderingresultsfromthesameHTML
+input, it is likely that both produce the correct rendering; and 2)
+browserdevelopersaddatestcasewhenthereisarenderingfeature
+update, which can be used to validate the rendering correctness
+with respect to the new feature.
+Second,R2Z2features two automated analyses, the bisect analy-
+sis and the rendering pipeline analysis, which pinpoint the culprit
+commitandpipelinestageresponsibleforthebug.Asdevelopers
+are currently doing this manually, we believe R2Z2’s automated
+analyses can significantly reduce engineering costs.
+More specifically, R2Z2designs fourcomponents, i)change de-
+tector, ii) bisect analysis, iii) regression oracle, and iv) rendering
+pipeline analysis. The change detector finds any HTML file where
+renderingresultsaredifferentacrosstwodifferentbrowserversions.
+Then the bisect analysis finds the culprit browser commit which
+firstintroducestherenderingdifference.Oncefindingtheculprit
+browser commit, the regression oracle determines if the rendering
+difference is truly due to a regression bug. Lastly, the rendering
+pipelineanalysisperformsin-depthdifferentialtestingtopin-point
+which pipeline stage is responsible for the regression.
+We implemented R2Z2and evaluated it with the popular web
+browser, Chrome. In the courseof our evaluation, R2Z2identified
+11new renderingbugs, allof whichare confirmedbythe Chrome
+developers.Forthoserenderingbugs, R2Z2correctlypinpointedthe
+culprit commit. R2Z2also correctly pinpointed the culprit pipeline
+stage in all cases except one, demonstrating its practical ability to
+assist in the bug fix process as well.
+The key point that R2Z2exploits is that differential testing is
+made possible by the existence of multiple independently devel-oped implementations, and we can use that to bootstrap quality
+in all web browser implementations. Hence, the general ideas and
+lessons that we developed and learned from R2Z2can further be
+utilized for various suites of programs meeting this criterion in the
+future.Theseprogramsincludeanysetofmultipleindependentim-
+plementations targeting the same standards, such as PDF viewers,SVG engines, Java virtual machines, or SSL/TLS servers or clients.
+To summarize, this paper makes the following contributions:
+•Design.
+We designed R2Z2, a differential fuzz testing tool to
+automaticallydetectbrowserrenderingregressionbugs.Afterdetectingrenderingimagedifferences,itfeaturesabugoracle
+to filter out falsepositive cases. R2Z2also performs automated
+analyses to spot a specific code commit and pipeline stage re-
+sponsibleforthebug,whichcansignificantlyreducetheentailed
+engineering costs.
+•Promising Results. While performing the evaluation, R2Z2
+found11newrenderingregressionsinChrome.Allofthesewere
+confirmed by the Chrome developers and six have already been
+fixed.Forallbugs, R2Z2correctlyspottedtheculpritcommit.For
+allbugsexceptone, R2Z2correctlyspottedtheculpritrendering
+pipelinestage.Theseresultssuggestthestrongpracticalaspects
+of R2Z2 to detect and triage browser rendering bugs.
+2 BACKGROUND
+2.1 Fuzz Testing and Differential Testing
+Fuzzing. Fuzzingisapopularbugfindingtechnique.Itrepeatedly
+generates random test cases to run against a target program and
+monitors for erroneous behaviors such as crashing, hanging, or
+memory access violations. From an engineering point of view, fuzz
+testing doesnot require expert domainknowledge of atarget pro-gram, so it has been widely used in various software applications.
+Most fuzzers are designed to find bugs where it is easy to ex-
+pressthebuggyconditions(socallednon-semanticbugs).Thisis
+relatedtothefactthatafuzzeralonedoesnothavethecapability
+to detect a bug—it has to observe a certain buggy condition during
+the fuzzing. As such, most fuzzing techniques have been proposed
+tofindmemorycorruptionbugs[ 2,14,27,29,30,40,54],whichare
+operated with the memory error detectors which clearly exhibit
+buggy conditions (e.g., ASAN [53] and UBSAN [23]).
+DifferentialTesting. Fuzztestingaloneisnoteffectiveinfinding
+semanticbugs[ 45]becausesemanticbugsaredifficulttoexpress
+as a bug condition and thus require domain knowledge to deter-
+mine.Inthisregard,differentialtestingmethodscanbeaneffective
+technique to find semantic bugs. Differential testing runs multiple
+programs, all of which are supposed to produce the same output
+for the same input. Differential testing then compares the outputs,
+and if the output is different, it determines that the program likely
+hasasemanticbug.Forinstance,previousworksleverageddiffer-
+ential testing to find semantic bugs in Java virtual machines (JVM),
+SSL/TLSimplementations,webbrowsers,graphicdriverlibraries,
+and CPU RTLs [28, 31–34,36,39,43,51].
+In fact, fuzz testing and differential testing can be employed
+together if the input of the differential testing is provided through
+the fuzzing procedure, which we refer to as differential fuzz testing
+throughout this paper.
+2.2 The Rendering Pipeline of a Web Browser
+Renderingistheprocessofturningresources(e.g.,HTMLandCSS)
+into pixels. Modern web browsers, including Chrome, Firefox, and
+Safari,useroughlythesamehigh-levelsteps[ 35,38]whichform
+the rendering pipeline: 1) DOM, 2) Style, 3) Layout, 4) Paint.DOM.
+The Document Object Model (DOM) is an in-memory tree
+of nodes with the most common node types being elementand
+text. The DOM is initially constructed from an HTML file using a
+well-definedparsingalgorithm[ 17]andcanlaterbemodifiedusing
+1819R2Z2: Detecting Rendering Regressions in Web Browsers through Differential Fuzz Testing ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+
+
+$
+
+$
+
+
+
+#$)
+ )+ $#*!(	 ,
+&+" %	 ,
+
+#$)
+
+
+
+ )
+
+& ' " 
+&
+
+ )
+
+$$
+  )
+#$) &
+
+	   
+
+ 	 
+
+!
+!
+
+
+ )
+&$
+(#  ".''
+)#  ",''
+*# "'
++# "'
+
+###
+
+(#  ".''
+)#  "-',
+*# "'
++# "'
+
+###
+$
+  )
+#$) &
+
+
+
+
+###	
+
+
+$!
+%
+"
+"'
+"'
+".''",/'"&
+
+
+	
+
+
+$!
+%
+"
+"'
+")-)
+
+"
+"
+ ".''	,''
+
+"
+
+
+
+###
+
+ ".''	,/'
+
+"
+
+###
+
+
+
+
+
+
+	
+
+###
+
+Figure 1: The high-level rendering pipeline of modern web browsers.
+JavaScript APIs. For example, in the DOM tree construction shown
+inFigure1(b),theelementnodesare html,head,style,body,and
+div, and there is a text node with the string hello world .
+Style.VisualeffectsareappliedtoDOMnodesbythestylestep.
+Cascading Style Sheets (CSS) defines style properties such as
+font-size ,background , andposition. CSS also defines "selectors"
+formappingthesepropertiestoDOMnodes.Thestylestepdeter-
+minestheCSSpropertiesandvalues,togethercalledthe"computed
+style", that apply to each DOM node. For example, as described
+inFigure 1(c), the divelement has the CSS property background
+with value #aaa.
+Layout. LayouttakestheDOMnodeswithcomputedstylesand
+computes boxeswithsizeandlocation.Aboxcanbeassimpleasan
+individualnodeintheDOMtree.MultipleboxescanbecreatedforaDOMnode,suchasoneboxforeachlineoftext.CSSspecifications
+definewhentocreateboxes,aswellashowtocalculatetheirsize
+andlocation.Forexample,asshownin Figure1(d),the hello world
+textnodeproducesoneboxforeachline.Thesizeofthetextresults
+in the box for the parent divexpanding to 706pxtall.
+Paint.Paint iterates the boxes from the layout step in back-to-
+front order to produce low-level graphics instructions (i.e., paintrecord). CSS specifications define the order [
+8]. For example, in
+the case of the div, the rectangular background with color #aaa
+would be painted before the text hello world . Then, pixels are
+finallyproducedbyrasterizingthepaintrecords.Additionally,some
+compositor-only CSS properties such as scrolling effects and 3Dtransforms are applied at this step. "Threaded compositing", orjust "compositing", is the use of two techniques to improve the
+efficiency of rasterization: threading andcompositing. Threading is
+theoptimizationofrasterizingononeormoreadditionalthreads.
+Compositingistheoptimizationofcachingportionsofrasterized
+outputthatchangetogether.Theportionsofrasterizedoutputfrompaintrecordsthatchangetogetherareplacedinthesamelayer.For
+scrollingcontent,therasterizedpixelsforanentirescrollingarea
+are cached in a texture, which avoids needing to rasterize on every
+scroll.
+2.3 Rendering Bugs
+A rendering bug is a bug where the browser fails to render a given
+page according to HTML and CSS specifications (if specified), or
+how the user expects. Rendering bugs can manifest in many differ-
+ent ways to users. For instance, if the layout stage has a bug, the
+browsermayincorrectlyplaceanHTMLelement[ 18],harmingthe1<html>
+2<style>
+3.class7 {
+4 backdrop-filter: hue-rotate(1deg);
+5 filter: brightness(0.32269068);
+6 padding: 66%;
+7}
+8</style>
+9<body>
+10 THE EXAMPLE OF RENDERING BUG
+11 <span class="class7" ></span >
+12 </body>
+13</html>
+(a) PoC HTML code
+(b) Correct (Chrome 85)
+(c) Incorrect (Chrome 86)
+Figure2:Arenderingbugexample(ChromeIssue#1122021).
+(a) Correct (Chrome 79.0.3944)
+ (b) Incorrect (Chrome 79.0.3945)
+Figure3:Therenderingbug(ChromeIssue#1037830),which
+was triggered on Apple’s homepage, https://support.apple.
+com.Themenubarisdisappearedontheright(highlighted
+with the red box).
+userexperiencebydisruptingtheweb-pagelayout.Takinganotherexample,ifthepaintstagehasabug,visualeffectsonsomecontent
+may be incorrect [10].
+WeexplaintheexampleofarenderingbugthroughtheHTML
+code, as shown in Figure 2. In this example, CSS style filteris
+appliedto <span>element.Thus,thecorrectrenderingistopaint
+the<span>element with gray, which is rendered by Chrome 85.
+However, Chrome 86 renders this incorrectly, painting the outside
+of<span>element with gray as well. The root cause of this bug
+is that Chrome 86 incorrectly includes the empty rectangles (i.e.,
+width and height are zero) if their offsets are outside the frame, so
+the area specified by <span>is over-extended.
+If such a web page is used for commercial services, rendering
+bugscancriticallydamagethereliabilityandfidelityofthepage.For instance, Figure 3shows a case where a rendering bug made
+the menu bar unusable on Apple’s homepage.
+1820ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Suhwan Song, Jaewon Hur, Sunwoo Kim, Philip Rogers, and Byoungyoung Lee
+3 CHALLENGES AND OUR APPROACH
+Thissection firstidentifies challengesin identifyingrenderingre-
+gressions in web browsers (§3.1). Then we shortly describe our
+approach to address these challenges (§3.2).
+3.1 Challenges of Rendering Bugs
+Inthissubsection,weelaborateontwochallengesinidentifying
+and analyzing rendering bugs.
+Challenge#1: Identifying Rendering Bugs. In order to detect
+the rendering bugs, one should be able to clearly determine the
+correctness of the rendered result. However, it is challenging to
+design sucha rendering bugoracle. This isprimarily becauseren-
+dering bugs are semantic bugs—the rendering bug involves se-mantically incorrect rendering results which violate HTML andCSS specifications where it is difficult to confirm semantic cor-
+rectness/incorrectnessthroughautomatedorprogrammatictech-
+niques.Inotherwords,givenanHTMLanditsrenderedresult,it
+is challenging to develop systematic mechanisms or tools which
+determine if the rendered result indeed follows the HTML and CSS
+specifications[ 9,13]. Forthis reason,in practice, renderingbugs
+areconfirmedthroughmanualinspectionbydomainexperts(i.e.,
+browser developers).
+There have been two general research directions to handle this
+issue: i) formalized methods [ 44,47,48] and ii) differential test-
+ing. Formalized methods attempt to statically verify if the browser
+implementation of the browser follows HTML and CSS specifi-cations. Using various static analysis techniques (such as formal
+verification techniques or symbolic execution), this method can
+completelyinspectthecorrectnessofanentirebrowser’srendering
+implementation. However, converting the HTML and CSS spec-
+ifications to formalized rules is labor-intensive and error-prone,
+demandingexpertdomainknowledgeofspecificationsaswellas
+browser implementation.
+Differentialtestingcomparestheresultoftwodifferentbrowsers
+to detect rendering bugs. It determines there is a rendering bug
+when two browsers produce different results (e.g., two rendered
+images)fromthesameHTMLinput.Unlikeformalizedmethods,this approach can be easily adapted to detect the rendering bugs
+asitdoesnotrequiredomainknowledgeandhumaneffortssuch
+as writing formalized rules. In practice, however, the rendered
+imagegeneratedfromthesameHTMLcanbequitedifferentacross
+different browsers due to benign browser incompatibilities.
+We observe two main factors behind benign browser incompati-
+bilities. First, web browsers can have different development status
+in supporting features, so a certain standard feature may or may
+notbesupportedbyeachbrowser.Asaresult,renderingresultsforsuchapartiallysupportedfeaturearedifferentacrosswebbrowsers.Forinstance,CSS
+contain: strict issupportedbyChromebutnot
+Safari (illustrated in Figure 4). Thus, Chrome and Safari render the
+HTMLdifferently.Second,webbrowsersgeneratetheirownunique
+rendering for featuresthat are not specified by specifications (i.e.,
+under-specified). For instance, the designs of <input type=file>
+in Chrome and Firefox are different, introducing rendering results
+differences(illustratedin Figure5).Therefore,differentialtesting
+alonecangeneratemanyfalsepositivesduetothesebenignbrowser
+incompatibilities.1<style>
+2div{
+3 contain: strict;
+4 height: 0;
+5 }
+6</style>
+7<div>invisible if
+8contain is supported
+9</div>
+(a) Example code
+(b) Chrome
+ (c) Safari
+Figure 4: Example of supported feature differences.
+1<html>
+2<head ></head >
+3<body>
+4 <input type="file">
+5</body>
+6</html>
+(a) Example code
+ (b) Chrome
+ (c) Firefox
+Figure 5: Example of benign design differences.
+Inshort,bothpreviousapproachessufferfromhighfalseposi-
+tives.Inpractice,browserdevelopersinvestconsiderablemanual
+effort to identify rendering bugs. If any rendering issue is reported,
+manual analysis is needed to confirm if a bug is present, imply-ing that the complete automation of detecting rendering bugs is
+challenging.
+Challenge#2: Analyzing Rendering Bugs. We find that it is
+difficult to analyzeand fix renderingbugs due to the following two
+mainfactors:1)complexrenderingpipeline;and2)semanticbug.
+Inordertofixarenderingbug,itisessentialtofindoutwhichstage
+of the rendering pipeline and which part of code in the stage has a
+bug.
+However, as described in §2.2, the rendering pipeline of the
+browserislong,andeachstageofthepipelinehashighcomplexity
+aswellasadependencyontheresultofitspreviousstage(factor1).Inaddition,renderingbugsaresemanticbugssotheydonotgener-
+ate a clear violation such as crash (factor 2). In the case of memory
+corruptionbugs,theydisplaytheviolationsothatthedevelopers
+canobtainclearviolationcontextsfromtheviolationfordebugging.
+However, unlike the memory corruption bugs, it is challenging to
+get clear violation contexts without any violation signal from a
+renderingbug, soonly renderedresults maysuggest theviolation
+context.Inordertopin-pointthetrueviolationcontext,onemay
+need to manually trace back the complex implementation of the
+rendering pipeline. In this respect, previous work only focused on
+howtofindthebug,nothowtoaidinfixingthebug.Inpractice,
+browser developers rely on manual analysis to fix rendering bugs.
+3.2 Our Approach
+To address the challenges that we described in §3.1, we propose
+two approaches.
+Approach#1: Bug Oracle along with Change Detection. We
+add the bug (pseudo) oracle capability (§4.3) along with the changedetectioncapability(§4.1).Previouswork(onfuzzingordifferential
+testing)focusesondetectingchanges.However,changedetection
+1821R2Z2: Detecting Rendering Regressions in Web Browsers through Differential Fuzz Testing ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+alone may generate false positives, as we mentioned in §3.I no r -
+dertosolvethischallenge,weproposetheregressionbugoracle
+component, which can reduce the false positive issues.
+The key idea of the regression oracle is to use cross-browser in-
+teroperability to detect correctness. Cross-browser interoperability
+is where different browsers (e.g., Chrome and Firefox) generate the
+samerenderedresultfromthesameHTMLfile,becausetheyfollow
+the same HTML and CSS specifications. Therefore, it is worth not-
+ingthatwhentwodifferentbrowsersrenderthesameHTMLthe
+same,wecansaybothbrowsersproperlyrendertheHTML,andtherenderedresultcanbethereferenceresultoftheHTMLfile.Inthis
+respect,we canusethis referenceresultasan oracletodetermine
+whether a new browser version is correctly implemented. We will
+explain the details of regression oracle in §4.3.
+Approach#2: Automated Rendering Bug Analysis. We fol-
+lowed the manual bug analysis process of browser teams and auto-
+matedit.Inthebuganalysisprocess,weobservedthatthebrowser
+team manually performed 1) version bisect, and 2) pipeline pin-point analysis. The version bisect is to find out which commitintroduces a bug. The pipeline pin-point analysis is to find out
+which stage of the rendering pipeline triggers a bug.
+R2Z2automates the version bisect through the bisect analy-
+sis(§4.2)andthepipelinepin-pointanalysisthrough thebugren-
+dering pipeline analysis (§4.4). First, the key idea of bisect analysis
+istoutilizethedeltadebuggingtechniquealongwithchangede-
+tection.Theintuitionbehinddeltadebuggingisthattherendered
+image should be significantly changed before and after the culprit
+commit.Inordertoautomaticallypin-pointtheculpritcommit,the
+bisect analysis performs a binary search using the change detector.
+Second, the key idea of the rendering pipeline analysis is to
+utilize the cross-version differential testing to compare the results
+of each pipeline stage in order. The intuitions here are 1) thereshould be a culprit stage which introduces the rendering bug inthe rendering pipeline; and 2) the culprit stage is the stage thatgenerates the different results in two versions for the first time,
+becauseeachstageofrenderingpipelinegeneratesitsoutputbased
+on the output of its previous stage. In this respect, the renderingpipeline analysis sequentially compares the results of each stage
+from two adjacent versions of the browser, which is obtained from
+thebisectanalysis.Then,iftheresultsofacertainstagearedifferent,
+the analysis regards that stage as the culprit stage and terminates.
+4 DESIGN
+Nowwedescribethedesignof R2Z2.Theoverallworkflowof R2Z2
+isshownin Figure6,whichhasfourcomponentsoperatinginorder:
+1) change detector (§4.1), 2) bisect analysis (§4.2), 3) regression
+oracle (§4.3), and 4) rendering pipeline analysis (§4.4).
+Thechangedetectorin R2Z2firstgeneratesanHTMLfile(which
+werefertoas html).Thenitopens htmlusingtwodifferentversions
+of the same browser, say AandB, and captures two rendered im-
+ages (1inFigure 6). Next, it checks whether two rendered results
+aredifferent.Ifdifferent, R2Z2minimizes htmlanddeterminesthat
+htmlhasapotentialtobearenderingbug(whichwecallacandi-
+daterenderingbug, htmlCandBug)(2).Thenextisthebisectanalysis,
+whichfindstheculpritversion(i.e.,culpritcommit),raisingthefirst""  
+
+ " 
+
+
+
+	
+
+
+
+
+	
+
+
+	
+!"$!! 
+
+
+
+
+#
+ !!
+ 
+
+ $!! 
+ 
+  	
+
+ 
+  	
+"
+	"  "$
+ 
+"# 
+" 
+Figure 6: The overall workflow of R2Z2.
+renderingdifferencebetween AandB(3).Werefertotheculprit
+commit as B★and the previous commit as A★.
+Thisbisectanalysisisessentialforthenexttwocomponents:the
+regressionoracleandtherenderingpipelineanalysis.Theregres-
+sionoracleidentifies htmlOracleBug,whichfiltersoutbenignissues
+from htmlCandBug(4).R2Z2performsrenderingpipelineanalysis
+onthe htmlOracleBugtoidentifywhichstageofrenderingpipelineis
+responsiblefortheregressionbug( 5).Itcompareseachresultof
+fourstagesontwobrowsers A★andB★,allofwhichareaninternal
+representation during the browser rendering pipeline procedure—
+DOM tree, Style tree, Layout tree, and Paint output (i.e., Layers)
+(6). After this testing, R2Z2can tell which state (as well as value)
+introduced htmlOracleBug.Werefertothefirstdifference-introducing
+stageasabugstage.Finally, R2Z2generatesafinalbugreporton
+htmlOracleBug(7), which includes the following information: a min-
+imizedHTMLfile,thescreenshotsof A★andB★,theculpritcommit,
+and the pipeline stage and details of the bug.
+4.1 Change Detector
+The change detector leverages cross-version differential testing
+todetectrenderingchangesbetweentwomajorbrowserversions
+(e.g.,Chromev91andChromev92)onagiven html.Asdescribed
+in§3.1, a rendering difference is required for a rendering bug, but
+a difference alone is not sufficient to determine a bug is present.
+Oneexampleofabenigndifferenceistheimplementationofanewfeaturewhichisexpectedtohavearenderingchange.Therefore,the
+change detector identifies a candidate bug (i.e., htmlCandBug) which
+is used by later stages to determine true bugs (i.e., htmlOracleBug).
+Wechose pHashtodetecttherenderingdifference. pHashisawell
+known perceptual hashing algorithm, producing representativefingerprint of a given image using a graphical algorithm [
+3,52,
+56].pHashcomputes the hash value based on the low frequency
+componentsofimage.Aftercompletingthehashcomputation,each
+pixel in a low frequency filtered image is converted to 1 (or 0) if its
+valueishigher(orlower)thanthemedianvalueofallthepixels.We
+notethatitispossibletouseotherimagecomparisonalgorithms
+instead of using pHash.
+Afterobtainingindividual pHashvaluesfromtworenderedim-
+ages,wemeasurethedistancebetweentwoimagesbycomputing
+the hamming distance between two hash values, which we refer
+to as|PA−PB|. Here,PAandPBdenote pHashvalues of htmlon the
+browserversion AandB,respectively.Itisworthnotingthata pHash
+1822ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Suhwan Song, Jaewon Hur, Sunwoo Kim, Philip Rogers, and Byoungyoung Lee
+value is not a scalar value but a vectorized value, so we compute
+|PA−PB|usingthehammingdistanceforeachelementinthevec-
+tor. The minimum value of |PA−PB|is zero which indicates that
+two rendered images are visually identical. The maximum value of
+|PA−PB|isthenumberof pHashbits(e.g.,ifthenumberofbitsis64,
+the maximum hamming distance is also 64) which indicates that
+two rendered images are significantly different. R2Z2’s decision
+boundary on a candidate rendering bug is a configurable threshold
+value, Thresh—i.e., if|PA−PB|is larger than Thresh, it determines the
+giveninput htmlishtmlCandBug.Inourpreliminaryexperiments,we
+tuned the threshold value of pHashto have the following two prop-
+erties: (i) the threshold value should avoid false negatives as much
+as possible and (ii) the threshold value may allow false positives
+tosome extent.This isbecause R2Z2’sregression oracleis ableto
+cater false positive issues (as we will describe at §4.3), so we de-
+signedthechangedetectionphasetofocusonnotmissingpotentialbugsifpossible.Usinginitialtestcases,weobtainedtheempirically-
+tunedthresholdvalue140whileconsideringtheaforementioned
+two properties.
+4.2 Bisect Analysis
+Thebisectanalysislocatestheculpritcommit, B★,responsiblefor
+the rendering differenceof htmlCandBug. This isimportant because
+the change detector uses major release versions of a web browser,
+wheremanycodecommitsaretakenplaceinbetween.Forexam-
+ple, there are approximately 14,500 commits between Chrome v91
+and Chrome v92. Thus, the bisect analysis pinpoints the culprit
+commit from a wide range of commits, allowing R2Z2to avoid any
+unintentional side-effects from unrelated commits in the follow-up
+analyses.
+Inordertoefficientlyidentifytheculpritcommit,abinarysearch
+isperformedoverthelinearsequenceofcommits.Itispossiblethatmultiplecommitsareresponsibleforthedifference,butthecurrent
+design of R2Z2assumes that the latest commit from those is the
+culpritcommit.Thisisfollowingthecommonpracticeexercisedbybrowserdevelopmentteamsforengineeringefficiency,i.e.,thelater
+commitlikelyshadowsthepreviouscommit.Theculpritcommit
+willbethen usedbythe bugregression oracle(§4.3),to filterout
+false positives,and therendering pipelineanalysis (§4.4), toavoidunrelated differences.
+Workflow of Bisect Analysis.
+The workflow of bisect analysis
+is as follows: 1) Given two versions of browsers, AandB,R2Z2
+computes pHashvaluesof html,PAandPB;2)R2Z2picksaversion
+between AandB, sayM, andthen computes PM;3 )R2Z2computes
+|PM−PB|.I f|PM−PB|is larger than Thresh,R2Z2will search the half
+between MandB.I f|PM−PB|is zero (i.e., the PMis the same as PB),
+itwillsearchtheotherhalf,between AandM.4)R2Z2recursively
+searches through the region—i.e., it returns to step 2 and keeps
+continuinguntilthetwoversionofbrowsers AandBareadjacent.
+5)IfAandBareadjacent,thepre-culpritcommit, A★,issetto A.The
+culprit commit, B★, is set to B.
+4.3 Regression Oracle
+R2Z2develops a pseudo bug oracle, called regression oracle, to han-
+dle the challenges in identifying rendering bugs (§3.1). Specifically,
+given htmlCandBug(§4.1) as well as the bisected browser versionB★
+≠R
+ B★
+=R
+A★
+≠R
+Not a Bug (Case 1) Not a Bug (Case 2)
+A★
+=R
+Bug (Case 3) Infeasible ( A★≠B★)
+(a) Interoperability oracle.
+A★
+B★
+R
+ Decision
+FailFail - Nota Bug (Infeasible, Case 1)
+Fail Pass Fail Nota Bug (Case 2)
+Fail Pass Pass Bug(Case 3)
+Pass - - Nota Bug (Infeasible, Case 4)
+(b) Non-feature-update oracle.
+Figure 7: Regression oracle decision table.
+information (§4.2), the regression oracle aims to filter out false
+positiveissuesindetectingrenderingbugs.Theregressionoracle
+operates with two chained sub-oracles, the interoperability ora-
+cle (§4.3.1) and the non-feature update oracle (§4.3.2).
+4.3.1 Interoperability Oracle. Theinteroperabilityoracleisbased
+on the following assumption:
+Assumption: Interoperable rendering is correct. If two
+independently-implemented browsers (e.g., Chrome and Fire-
+fox)generatethesamerenderedresultfromthesameinput,it
+is likely that both produce the correct rendering.
+Thisassumptionisbasedontheobservationthatbrowsersare
+independentlyimplementedtofollowthesameHTML/CSSstan-
+dards.Letussupposetwodifferentbrowsersrenderagiven html
+the same, then both browsers are either correct or incorrect. Of
+these two possible outcomes, itis unlikely that both browsers are
+incorrect—forthistobethecase,bothwouldneedtohaveindepen-
+dentlyimplementedthesamebug.Furthermore,iftwobrowsersdo
+contain the same bug, it is possible that many web developers are
+already aware of the bug and thus develope their websites depend-
+ing on the bug, making the buggy behavior a de facto, empirical
+standard. Therefore, we assume that the interoperable behavior
+islikelyimplicatingthatbothbrowsersproduceacorrectrender-ingbehavior.Runningadditionalbrowsers(e.g.,Chrome,Firefox,
+Internet Explorer, Opera) can further strengthen this assumption.
+It is worth noting that cross-version testing in the change de-
+tector (§4.1) does not leverage this interoperability because two
+versionsofthesamebrowserarenotindividuallyimplementedand
+can have the same bug.
+Constructing Interoperability Oracle. R2Z2constructsthein-
+teroperability oracle based on rendering interoperability. Given
+htmlCandBug(i.e.,anHTMLtestcasewhichgeneratesdifferentren-
+dering results), the interoperability oracle determines if it is a true
+bugorafalsepositive. R2Z2runsareferencebrowser,denotedas R,
+which has an independent implementation from the base browser
+used in the previous phases (change detection (§4.1) and bisect
+analysis(§4.2 )).Thecurrentprototypeof R2Z2runsChromeasthe
+base browser and Firefox as the reference browser.
+1823R2Z2: Detecting Rendering Regressions in Web Browsers through Differential Fuzz Testing ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+Running the reference browser and two versions of the base
+browserwith thesame htmlCandBug,the interoperabilityoracle ob-
+servesthreepossiblecasesasshownin Figure7a.First,Case1repre-
+sents the case where both browsers have different rendered results
+withR.Sincetherenderinginteroperabilitycannotbeleveragedfor
+differentrenderedresults,theoraclecannotinferthecorrectness
+ofanybrowsers.Thus,theoracledeterminesthatCase1isnota
+bug.Case2representsthecasewhere A★hasthedifferentrendered
+result.Inthiscase,astherenderedresultsof B★andRarethesame,
+we can learn that both B★andRare correct according to the ren-
+deringinteroperability.Theoracle determinesCase2isnotabug,
+because A★isanolderversionof B★andthusthelatest B★fixedthe
+bug presented in A★. Case 3 represents the case where only B★has
+adifferentrenderedresult.Inthiscase,astherenderedresultsof
+A★andRare the same, we can infer that both A★andRare correct
+becausetheyareinteroperable.Hencetheoracledeterminesthat
+Case3isabug— B★isanewerversionof A★socase3impliesthat A★
+(andR)correctlyrenderedtheHTMLfile,andabugisintroduced
+inB★.
+In summary, the interoperability oracle determines htmlCandBug
+is a bug if it falls into Case 3 in Figure 7a, otherwise it is not a bug.
+4.3.2 Non-feature-update Oracle. To avoid potential rendering re-
+gressions and ensure interoperable behavior, web browser develop-
+ers are strongly encouraged to add web-platform-tests (WPT) [ 26]
+for every code commit introducing a new rendering feature. Here,
+afeaturecanrefertosomethinginanewspecification,orevena
+part of an existing specification. WPT tests are written in a format
+that can be run in all browsers and there is continuous integration
+testingthis. R2Z2usesthebehaviorofnewly-addedWPTteststo
+filteroutcommitswhere thebasebrowserisimplementinga new
+feature.
+ConstructingNon-feature-updateOracle. R2Z2constructsthe
+non-feature-update oracle which is capable of determining if a
+certaincodecommit(i.e., B★)introducesanewrenderingfeature
+that is not supported in the reference browser R. If the commit
+introducesanewfeature, R2Z2determinesthatitisnotabug.This
+is because, although htmlCandBugtriggers rendering changes which
+breakinteroperability,therenderingdifferencecanbeduetothe
+newfeature,whichshouldnotbeconsideredasabug.Ifthecommit
+does not introduce a new feature, R2Z2 determines it is a bug.
+Morespecifically,thenon-feature-updateoracleisconstructed
+as follows. First, the non-feature update oracle checks whether B★
+hascorrespondingWPTtests.Ifnot,itdeterminesthat htmlCandBug
+is a bug. Next, R2Z2runs each corresponding WPT test on A★,B★,
+andR, where the decision table is summarized in Figure 7b. In this
+table, it is assumed that A★always fails the WPT test while B★
+shouldalwayspassbecausethatistheoriginalfunctionoftheWPT
+test. Although it is practically infeasible, it is still possible that this
+pre-condition does not hold if the WPT test itself has a correctness
+issue(i.e.,theWPTtestingcodehasabug).As R2Z2cannotlearn
+any from these cases (i.e., Case 1 and Case 4 in Figure 7b), the
+non-featureupdateoracledeterminesthisasanot-a-bugcaseso
+as to conservatively avoid false positives. For the case that A★fails,
+B★passes, and Rfails (i.e., Case 2), the non-feature update oracle
+determinesitisnotabug.Thisisbecause B★isthefirstbrowserthat
+ 
+ 
+
+
+
+	
+
+
+	
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+	
+
+	
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
+	
+
+Figure 8: Overview of the rendering pipeline analysis.
+
+	  
+
+ 		
+  		
+ 
+    
+			
+ 
+		
+	
+   
+!	
+  !
+  ! 	
+		
+			
+ 
+
+	 	
+Figure 9: Final bug report example.
+introducesthenewfeature,sotherenderingchangesof htmlCandBug
+can possibly be due to this new feature update.
+However, for the case that A★fails, B★passes, and Rpasses,
+thenon-featureupdateoracledeterminesitisabug(i.e.,Case3).
+This case implies that both B★andRcorrectly implemented the
+new feature associated with the WPT test, but htmlCandBugis not
+relevanttothisnewfeature— B★andRproduceddifferentrendering
+results as already tested by the interoperability oracle.
+To summarize, the non-feature-update oracle determines the
+given htmlCandBug(which passed the interoperability oracle) is a
+bug if A★fails,B★passes, and Rpasses the corresponding WPT test
+as shown in Case 3. Since this bug is passed by both interoper-ability oracle and the non-feature update oracle, we term this as
+htmlOracleBugwhich passes the regression oracle.
+4.4 Rendering Pipeline Analysis
+Once finding htmlOracleBugusing the regression oracle, a rendering
+pipeline analysis attempts to figure out which rendering stage trig-
+gers the bug. To be specific, R2Z2first opens an htmlOracleBugfile
+in two versions of thesame browser, A★andB★. Then throughout
+the rendering pipeline stages of web browsers (§2.2), R2Z2per-
+forms differential testing using the internal representation of each
+pipeline stage. More specifically, R2Z2performs the following four
+differential testing on each rendering stage (Figure 8): 1) DOM test,
+2) Style test, 3) Layout test, 4) Paint test. Note that this test runs
+fourpipelinestagesinorder.Ifthetestfindsadifference,itstops
+andreportsthecurrentstage.Thisisbecauselaterstageswillbe
+different once a difference is present.
+1824ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Suhwan Song, Jaewon Hur, Sunwoo Kim, Philip Rogers, and Byoungyoung Lee
+DOM Test. In DOM test, R2Z2checks if two versions of the same
+browsergeneratethesameDOMtree.Tothisend, R2Z2performsa
+DOMtreeequalitycheck—bothshouldhavethesametreestructure
+and eachnode should have thesame tag and attributes.If any of
+these is different, R2Z2determines there is a DOM bug and gen-
+eratesa human-readablereport showingthe DOMtreedifference.
+More specifically, R2Z2first opens htmlOracleBugonA★andB★(1).
+Then, it obtains a DOM tree from each and traverses the DOM tree
+in a depth-first order to compare the tag name (e.g., bodyanddiv)
+and attributes (e.g., type) of each node ( 2).
+Style Test. After DOM test, R2Z2compares the style information
+generated from each of the browser (i.e., A★andB★) through style
+treeequalitycheck—nodesinbothtreesshouldhavethesameprop-
+erty names and values. In particular, it obtains style information
+from the browser after a style stage in the rendering pipeline, and
+traverses again the DOM tree in a depth-first order while com-paring the style information (e..g.,
+font-size: 30px )(3).R2Z2
+determinesthereisaStylebugifanyoftreenodeshavedifferent
+style information, as in DOM test.
+Layout Test. In Layout test, R2Z2checks if two versions of the
+same browser generate the same Layout boxes. To perform the
+layout box equality check, each matching box (i.e., a layout boxpointed by the same node in both DOM trees) should have thesame size and location. Since we already checked the equality of
+the DOM trees, we traverse both DOM trees in the same order and
+comparethegeometricpropertiesofthelayoutboxespointedby
+thesameDOMnode( 4).R2Z2determinesthatanydifferencein
+this stage is a Layout bug.
+Paint Test. Finally in Paint test, R2Z2checks if two browsers
+generate the same layers. R2Z2performs the equality check—both
+browsersgeneratethesamenumberoflayerswiththesamesize,
+compositingreason,andpaintrecords.Tobespecific, R2Z2obtains
+the layers using Chrome DevTools [ 11], and sequentially compares
+each layer’s size, compositing reason, and paint records ( 5). If any
+of these are different, R2Z2 determines it is a Paint bug.FinalBugReport.
+Attheendof R2Z2’sanalysis, R2Z2generates
+a final rendering bug report ( 6). We provide the example of the
+final bug report in Figure 9. The report includes 1) a raw HTML
+code triggering the bug, 2) rendering screenshots of A★andB★,
+3) the bug commit (i.e., B★), and 4) the triaged bug stage as well as
+the specific elements having different pipeline results.
+5 IMPLEMENTATION
+We implemented R2Z2targeting the Chrome browser. We used
+Domatofuzzer[14],Imagehash[ 19],Selenium[ 21],andChromeDe-
+vTools[11].Domatofuzzerisagrammar-basedDOMfuzzerthatuses
+the context-free grammars to generate HTML files. We modified
+theDomatofuzzertogenerate HTMLfileswithouttheanimations.
+Weimplementedthechangedetectorandbisectanalysisof R2Z2by
+using1)Seleniumtocapturetherenderedresultsfromtwodifferent
+versions of browser, and 2) Imagehash to compute a phashvalue of
+imagesanddeterminewhethertwoimagesaredifferent.Wesetthe
+numberofhashbitsas4,096tocomputea phashvalueand Threshas
+140 to determine if the two images are different. In order to imple-
+ment the regression oracle, we used Firefox as a reference browser.
+We implemented the rendering pipeline analysis by using DOMBrowser setting Test env. 1 Test env. 2
+Version AChrome 84.0.4138.0 Chrome 91.0.4472.0
+(Release Date) (May 07, 2020) (Apr 09, 2021)
+BChrome 86.0.4188.0 Chrome 94.0.4585.0(Jul 01, 2020) (Jul 24, 2021)
+RFirefox 82.0 Firefox 93.0a1(Aug 25, 2020) (Aug 09, 2021)
+#of commits b/w A&B 18,091 34,052
+Figure 10: Experimental configurations.
+APIsandSeleniumtocomparetheresultsofDOM,style,andlayout
+between two browsers. We used Chrome DevTools to compare the
+layer information such as paint records and compositing reason
+between two browsers. In terms of the implementation complexity,
+R2Z2is implemented with 2,000 lines of Python and 100 lines of
+JavaScript.
+6 EVALUATION
+Thissectionevaluatesvariousaspectsof R2Z2,particularlyfocusing
+on answering the following research questions:
+•RQ 1.How many candidate bugs can the change detector find?
+(§6.1)
+•RQ 2.Canthebisectanalysis(§4.2)accuratelyidentifyculprit
+commit of candidates? (§6.2)
+•RQ 3.Cantheregressionoracle(§4.3)accuratelyidentifytrue
+regression bugs from the candidates? (§6.3)
+•RQ 4.Can the rendering pipeline (§4.4) analysis correctly de-
+termine the bug introducing stage? (§6.4)
+ExperimentalSetup. Wetested R2Z2withtwosetsofdifferent
+browser versions, as shown in Figure 10. R2Z2considers stable
+(released)versionsas Aandthelatestdevelopmentversionas B.This
+is because animportant aspect in this paperis specifically finding
+regression bugs. Even though two versions of a browser may have
+thesamebug,onlythelaterversioncouldhavea"regression".In
+thisrespect,itisimportanttofixregressionbugsthatarecurrentlyimpacting end-users, so we picked the stable version as
+A. Then we
+usedthelatestdevelopmentversionasthe B,which(i)maximizes
+thecommitwindowtobesearchedforand(ii)offersacertainlevelofstability.Next,weusedthereferencebrowser
+Rwiththebrowser
+releasedatthenearesttimeas B,becausebrowserdeveloperstry
+tokeepthecompatibilitybetweendifferentonesreleasedaround
+the same time [ 6]. It is possible that two browsers (i.e., Chrome
+andFirefox)maysupportdifferentfeatures,butwenotethatthis
+does not cause false positive issues for R2Z2. This is because the
+interoperability oracle identifies the bug only if A★andRwere the
+same(Case3),whichimpliesbothbrowserssupportallthefeatures
+to run the testcase.
+Forthefirsttestingenvironment,weselectedChrome84.0.4138.0
+(i.e.,commitposition766,000)as A,Chrome86.0.4188.0(i.e.commit
+position784,091)as B,whichhas18,091commitsinbetween.We
+used Firefox 82.0 as the reference browser R. For the second, we
+selected Chrome 91.0.4472.0 (i.e., commit position 870,763) as A,
+Chrome94.0.4585.0(i.e.,commitposition904,815)as B,whichhas
+34,052commitsinbetween.WeusedFirefox93.0a1asthereference
+browser R. We ran all experiments on a 24-core server running
+Ubuntu18.04withIntelXeon(R)Gold5118(2.30GHz)processors
+1825R2Z2: Detecting Rendering Regressions in Web Browsers through Differential Fuzz Testing ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+Statistics Test env 1 Test env 2
+#of tested html 200K 200K
+#o fhtmlCandBug6,785 16,205
+Elapsed time (h) 2 2.5
+Throughput (HTML/s) 27.78 22.22
+(a) Change detector.
+Statistics Test env 1 Test env 2
+#of tested htmlCandBug6,785 16,205
+# of bisected htmlCandBug6,643 15,986
+Elapsed time (h) 4 10
+Throughput (HTML/s) 2.17 2.25
+(b) Bisect analysis.
+Figure 11: Run-time statistics of change detector and bisect
+analysis in R2Z2.
+and 512GB memory. Then, we leveraged the Domato fuzzer to
+generateHTMLinputswhicharefedinto R2Z2forchangedetection
+and analysis.
+6.1 Effectiveness of Change Detection
+We counted the number of candidate bugs (i.e., htmlCandBug) that
+thechangedetectoridentifiedasshownin Figure11a.Aftertesting
+200K randomly generated HTML files, the change detector in each
+test environment found 6,785 and 16,205 htmlCandBug, respectively.
+Thenumberof htmlCandBuginthesecondenvironmentisdoubled
+from thefirst, which is due tothe large commitgap ofthe second
+test environment.
+Onaverage,about5%ofthe htmlfilescausedrenderingdiffer-
+ences between AandB. While 5% can be interpreted as a small
+number, it accounts for 6,785 or 16,205 htmlCandBug. These all may
+beworthmanuallyanalyzing,butitwouldimposeprohibitiveengi-
+neering costs. This result supports the challenge in identifying the
+renderingbugsthatwedescribedin §3.1,whichalsosignifiesthe
+importanceofhandlingfalsepositiveissueswith R2Z2’sregression
+oracle.
+6.2 Effectiveness of Bisect Analysis
+In order to evaluate the effectiveness of bisect analysis, we first
+checked whether the bisect analysis properly finds the culprit com-mitofeachcandidateandthenmeasuredtheelapsedtimeofbisect
+analysis.Inthisexperiment,weassumedthatallChromecommit
+versions between AandBwere pre-built for the bisect analysis,
+whichare,inpractice,alreadyavailablefromtheautomatedbuild
+testing infrastructure. Thus, we did not include such overheads as
+it is already part of the browser development chain.
+Theresultofbisectanalysisisshownin Figure11b.Inthefirst
+testing environment, 6,643 out of 6,785 htmlCandBug(i.e., 97.9%)
+were successfully bisected to culprit commits. It failed to pin-point
+the culprit commit of 142 candidates. The result for the second
+testingenvironmentwassimilar,with219 htmlCandBugfailing.These
+failurecasesaremostlyduetoChromefailingtorender,suchasthe
+browser crashing or hanging. For instance, while Chrome was able
+torender htmlCandBugatboth AandB,itfailedtorenderatacertaincommit in between. For the failed commit, R2Z2cannot capture
+the rendering result, so R2Z2terminates the bisect analysis. While
+failingtorenderlimitstheeffectivenessof R2Z2’sbisectanalysis,
+this is rare and we believe addressing this issue is an orthogonal
+researchproblem[ 5].Intermsoftheanalysistime,theelapsedtime
+wasabout4and10hours,foreachtestingenvironment,respectively.
+Translatingtheseresultsintothethroughput, R2Z2processedabout
+2.21htmlCandBugfiles per second, which we believe is reasonably
+fast enough to be used in the production development chain.
+With respect to the correctness of the bisect analysis, R2Z2was
+abletocorrectlypin-pointtheculpritcommit.Specifically,asshowninFigure12,allculpritcommitsof13
+htmlTrueBug(whichR2Z2found
+in§6.3)wereconfirmedtobecorrectbyChromedevelopers(i.e.,the
+accuracyofthebisectanalysisis100%).ConsideringthefactthatthebisectanalysisismanuallyperformedbyChromedevelopers,
+we argue that R2Z2’s automation can significantly improve the
+efficiency of the bug triage and debug processes.
+6.3 Effectiveness of Regression Oracle
+This section evaluates the effectiveness of the regression oracle.
+We first use an interoperability oracle and then use non-feature-
+update oracle to find htmlOracleBug. Then, for deduplication, we
+classified the htmlOracleBugby their culprit commit and picked one
+htmlOracleBugfrom each culprit commit. Specifically, R2Z2detected
+27/247 htmlOracleBugfrom6,643/15,986candidatesbyusingtheinter-
+operabilityoracleinthefirst/secondtestenvironments,respectively.
+Then27/247 htmlOracleBugwerebisectedinto10/11uniqueculprit
+commits, respectively. From 21 unique culprit commits, we picked
+anhtmlOracleBugfromeachuniqueculpritcommit.Thenumberof
+true/falsebugs is14/7 (i.e.,thetrue positiverateis 66.7%).Among
+21 commits, the culprit commits of eight true and five false bugs
+haveweb-platform-tests,respectively.Non-feature-updateoracle
+filteredoutfourfalsepositivesandonetruebug.Itfailedtofilter
+out two false positives as they do not have web-platform-tests. To
+sumup,given22,629 htmlCandBug,theregressionoracleidentified
+16htmlOracleBug.Afterreportingthese,13bugswereconfirmedas
+true regression bugs, and three htmlOracleBugwere false positives
+ofR2Z2(i.e., the true positive rate is 81.25%, and the false positive
+rate is 18.75%).
+NewRegressionBugs. Throughtheevaluation, R2Z2identified
+13trueregressionbugs.Outofthese,11regressionbugswerenewly
+identified by R2Z2and two were previously (and independently)
+identifiedbyotherusersandresearchers.Thelistofnewrendering
+regression bugs is shown in Figure 12. After reporting, six of these
+regression bugs were fixed by developers and thus R2Z2prevented
+such regression bugs from harming users, demonstrating R2Z2’s
+impact on spotting regression bugs.False Positives.
+Two false positive cases were due to the fact
+thatR2Z2was not able to use the non-feature update oracle—
+i.e., browser developers did not include WPT tests for these two,
+so the non-feature update oracle simply determined they were
+htmlOracleBug. While these false positive issues may seem to be the
+limitationof R2Z2,thetestcaseswereusefultobrowserdevelopers.
+Specifically, after reporting these bugs, browser developers men-tioned that
+htmlOracleBugin fact tests the new features that were
+1826ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Suhwan Song, Jaewon Hur, Sunwoo Kim, Philip Rogers, and Byoungyoung Lee
+updated by B★[24]. Therefore, htmlOracleBugcan be used to add
+missing testcases.
+6.4 CorrectnessofRenderingPipelineAnalysis
+In order to evaluate the correctness of the rendering pipeline anal-
+ysis, wefirst obtainedthe ground truth,a trueculprit stage forall
+htmlTrueBug. As we reported htmlTrueBug, the browser developers
+performedthemanualanalysisandlefttheannotationonwhich
+pipeline stage is responsible for the bug. We were able to obtain
+theground-truthfor12 htmlTrueBug(outoftotal13 htmlTrueBugthat
+R2Z2detected).Fortheoneremainingunlabeledone,browserde-
+velopersfailedtopinpointaspecificstagealthoughtheyconfirmed
+the bug.
+According to our evaluation, the rendering pipeline analysis
+correctly spotted all of 12 htmlTrueBug(i.e., the accuracy is 100%),
+showingtheeffectivenessofthisanalysis.Becauseno htmlTrueBug
+wereinDOMandStyle,wepreparedanextraevaluationwithex-
+isting DOM and style bugs which are reported by other Chrome
+contributors. Searching Chrome bug tracker [ 1], we selected three
+DOMbugs, whicharereproducedin olderversionsthanour eval-
+uation environment, because there was no recent DOM bug. We
+alsoselectedfourStylebugs,whicharevalidintheversionrange
+of our evaluation environment. The result is that R2Z2correctly
+pin-pointed all DOM bugs. However, in the case of Style bugs, it
+correctlypin-pointedthreeoutoffourStylebugs.Asshowninthis
+evaluation, R2Z2was able to correctly spot a culprit pipeline stage
+foralltestedbugsexceptoneStylebug,demonstratingitsstrong
+potentialtosignificantlysavemanualengineeringworkperformed
+bybrowserdevelopers.Finally,weconductedacasestudyonthe
+incorrectly pin-pointed Style bug to clarify the flaw of pipeline
+analysis as described below.
+Case Study: A Failure Case of Pipeline Analysis. In Style
+test, the pipeline analysis failed to find the culprit stage of the
+bug(Chromeissue#1154537 [22]).Thisisbecause R2Z2relieson
+getComputedStyle DOM API to retrieve the style information, but
+forsomecasesitdoesnotreturnthecompleteinternalinformation
+used in the style stage. For these cases, the complete internal infor-
+mationcanonlyberetrievedthroughinspectingtherawmemory
+while handling virtual address differences between two browser
+instances.Whilethisclearlyisalimitationof R2Z2,weleavethis
+as our future work as it only occurred in one case out of 19.
+7 DISCUSSION
+Thissectiondiscussesfutureresearchdirectionsof R2Z2,particu-
+larly stating how R2Z2 can further be utilized for other use-cases.DetectingRegressionsinOtherWebBrowsers. R2Z2
+currently
+supports Chrome but does not support other web browsers (e.g.,
+Safari,Firefox,andEdge).Sincethedesignof R2Z2isgeneric,these
+canbesupportedby R2Z2withmoderateimplementationeffort.In
+particular, R2Z2’srunscriptneedstobemodifiedtospawnthese
+other browser instances. The bisect analysis requires including
+a browser-specific build script for each version. The renderingpipeline analysis can be implemented in a similar way by using
+eachbrowser’sdevelopmentAPIstocollectintermediaterendering
+information.Issue Culprit CulpritCorrect Incorrect Confirmed FixedID Commit Stage
+#1121082 775116 () Paint ()
+  
+#1164652 779663 () Layout ()
+ 
+#1226558 780992 () Layout ()
+  
+#1231397 770064 () Paint ()
+ 
+#1237352 885372 () Paint ()
+  
+#1240854 885961 () Paint ()
+ 
+#1240856 890916 () Layout ()
+  
+#1241345 889344 () Undecided
+ 
+#1241356 888805 () Layout ()
+  
+#1241436 885635 () Paint ()
+  
+#1242851 887727 () Layout ()
+ 
+#1245637*784040() Paint ()
+  
+#1245639*766419() Paint ()
+  
+Figure12:Thelistof13 htmlTrueBugfoundbyR2Z2inChrome.
+11 bugs were newly identified by R2Z2, and two were in-
+dependently identified by other contributors (annotated
+with *).
+Using Regression Oracle for Other Programs. While this pa-
+perleveragestheregressionoracleforrenderingregressionbugs,it
+can be adopted to find regressions in other programs in the future.
+Therearemanyprogramsinwhichmultipleindependentprograms
+implement the same standards (e.g., PDF viewers, SVG engines,
+Javavirtualmachines,orSSL/TLSserversorclients).Sincethese
+programs have the same challenge in identifying regression issues
+as browser rendering (i.e., complex and unclear standard specifica-
+tions),R2Z2’s regression oracle can be utilized to correctly identify
+regressions while avoiding false positives.
+8 RELATED WORK
+Browser Layout Testing. Previous work has proposed tools to
+help web-page developers discover cross-browser incompatibili-
+ties inwebapplications [33, 34,43].They automaticallyidentified
+cross-browser incompatibilities in web applications by detecting
+rendering differences of two different browsers. Compared to this
+previouswork,thefocusof R2Z2isinidentifyingrenderingbugs
+in web browsers rather than web applications. Moreover, these do
+1827R2Z2: Detecting Rendering Regressions in Web Browsers through Differential Fuzz Testing ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+not employ the bug oracle, so they suffer from false positive issues.
+ThereisanotherworkthatfoundHTMLpresentationfailuresin
+web pages [ 41,42], which requires manually-developed oracles by
+domainexperts.Comparedtothese, R2Z2’soracledoesnotinvolve
+the manual processes.
+BrowserLayoutVerification. Thereareseveralworksthatpartly
+formalized the browser layout algorithm [ 44,47,48]. [48] proposes
+visual logic to express accessibility guideline and leverages finitiza-
+tionreductions toproperlyformalize thefragmentof thebrowser
+layoutalgorithm.Troika[ 49]proposesmodularlayoutproofsfor
+verification of web page layout. As described in §3.1, converting
+HTMLandCSSspecificationstoformalizedrulesislabor-intensive
+anderror-prone,requiringexpertdomainknowledgeofspecifica-
+tions as well as browser implementation. Compared to these, R2Z2
+is able to perform the automated rendering bug detection without
+domain expert’s knowledge.FuzzingtofindSemanticBugs.
+NEZHA[ 51]exploitsthebehav-
+ioral asymmetries between multiple test programs to find semantic
+bugs. DeepXplore [ 50] and DLFuzz [ 37] guide Deep Learning (DL)
+systemstoexposeincorrectbehaviorsusingneuroncoverage.Some
+studiesemploydifferentialtestingtodiscoversemanticbugsinJava
+VirtualMachine(JVM)implementations[ 28,31,32].GLFuzz[ 36]
+leverages metamorphic testing to find shader compiler bugs. Itinserts dead code into the graphics shading languages, such asOpenGL, and checks whether the original code and variant code
+aresemanticallyequivalentbasedontheirrenderedresults.GLFuzz
+determinesthatthevariantcodeisabugcasewhentherendered
+results are significantly different.
+DOM Fuzzing. ManyDOMfuzzers[ 7,12,14,15,25,55]arepro-
+posed to find the memory-related bugs from the web browsers. For
+instance, cross fuzz [ 7] dynamically generates the sequences of
+DOMAPIstobindmultipleHTMLdocumentsforstress-testingthe
+garbagecollectionmechanismsofwebbrowsers.Inthisway,itiden-
+tified about one hundred memory-related bugs from web browsers
+(e.g., Internet Explorer, Firefox, and Opera). DOMFuzz [ 15] uses
+DOMAPI callsto testsome partsof browserengines(e.g.layout).
+Wadi [25], Domato [ 14] and Dharma [ 12] are the generation-based
+DOM fuzzers, which generate HTML inputs based on their HTML,
+CSS, and JavaScript grammars. FreeDOM [ 55] leverages a context-
+aware intermediate representation to generate semantically-valid
+HTML documents.
+9 CONCLUSION
+This paper proposed R2Z2, a differential fuzz testing technique
+tofindrenderingregressionsinwebbrowsers. R2Z2featurestwo
+unique techniques to find and analyze rendering bugs. First, it fea-
+turesaregressionoraclealongwiththerenderingchangedetection
+soastodetectregressionbugswhileavoidingthefalsepositives.Second, it features the bisect analysis and the rendering pipelineanalysis, allowing
+R2Z2to spot the culprit commit and pipeline
+stage, which are responsible for the bug. With the prototype imple-
+mentation for the Chrome browser, it identified 11 new rendering
+bugs in Chrome, all of which were confirmed by Chrome develop-
+ers.10 DATA AVAILABILITY
+We disclosed our data used in this paper at https://doi.org/10.6084/
+m9.figshare.16569561.v1.
+ACKNOWLEDGMENTS
+Wewouldliketothankanonymousreviewersfortheirinsightful
+comments.ThisworkwaspartiallysupportedbyInstituteforIn-
+formation&communicationsTechnologyPromotion(IITP)grant
+fundedbytheKoreagovernment(MSIP)(No.2020-0-01840,Analysis
+ontechniqueofaccessing andacquiringuserdatainsmartphone)
+and National Research Foundation (NRF) of Korea grant funded by
+the Korean government MSIT (NRF-2019R1C1C1006095).The Insti-
+tute of Engineering Research (IOER) and Automation and Systems
+Research Institute (ASRI) at Seoul National University provided
+research facilities for this work.
+REFERENCES
+[1] Chromium bug tracker. https://bugs.chromium.org/p/chromium/issues/list.
+[2] american fuzzy lop. https://lcamtuf.coredump.cx/afl/.
+[3]Average hashing (ahash). http://www.hackerfactor.com/blog/index.php?
+/archives/529-Kind-of-Like-That.html.
+[4]Rendering-related chromium bugs reported between 2016 and 2021.
+https://bugs.chromium.org/p/chromium/issues/list?q=Component%3AInternals%3ECompositing%2CBlink%3EFonts%2CBlink%3EFullscreen%2CBlink%3ELayout%2CBlink%3ETextAutosize%2CBlink%3ECSS%2CBlink%3EEditing%2CBlink%3EPaint%2CBlink%3ECompositing%2CBlink%3ESVG%2CBlink%3EImage%2CBlink%3EHitTesting%2CBlink%3EGeometry%2CBlink%3ECanvas%2CBlink%3EDOM%2CBlink%3EHTML%2CBlink%3EForms%20Type%3DBug-Regression%2CBug%20opened%3E2016-1-
+1%20opened%3C2021-1-1%20-label%3APerformance-sheriff%20-label%
+3AClusterFuzz&can=1.
+[5] Clusterfuzz. https://google.github.io/clusterfuzz/.
+[6]Chrome git commit 4f8ac4264908b7717de500800688c13c028c0831.https://chromium.googlesource.com/chromium/src/+/
+4f8ac4264908b7717de500800688c13c028c0831.
+[7]Canonical randomized crawl version optimal for most browsers. https://lcamtuf.
+coredump.cx/cross_fuzz/.
+[8]Appendixe.elaboratedescriptionofstackingcontexts,. https://www.w3.org/
+TR/CSS2/zindex.html.
+[9] Css standard, . https://www.w3.org/TR/?tag=css.
+[10]Chromeissue1037830:pagehttps://support.apple.com/renderingerror,. https:
+//bugs.chromium.org/p/chromium/issues/detail?id=1037830.
+[11] Chrome devtools. https://developer.chrome.com/docs/devtools/.
+[12] Dharma. https://github.com/MozillaSecurity/dharma.
+[13] Dom standard, . https://dom.spec.whatwg.org/.
+[14] Domato, . https://github.com/googleprojectzero/domato.
+[15] Domfuzz, . https://github.com/MozillaSecurity/domfuzz/tree/master/dom.
+[16]A concrete example with tables which are underspecified. https://crbug.com/
+1214206.
+[17] Html specification, . https://html.spec.whatwg.org/.
+[18]Chrome issue 1003810: https://web.whatsapp.com/ rendering problems, . https:
+//bugs.chromium.org/p/chromium/issues/detail?id=1003810.
+[19] Imagehash python libaray. https://github.com/JohannesBuchner/imagehash .
+[20]Chrome issue 1184357: Chrome 89 doesn’t paint new fallback nodes added to
+slot.https://bugs.chromium.org/p/chromium/issues/detail?id=1184357.
+[21] Selenium webdriver. https://www.selenium.dev/.
+[22]Issue1154537:text-decoration-thicknessdoesn’tworkwithouttext-underline-
+offset.https://bugs.chromium.org/p/chromium/issues/detail?id=1154537.
+[23]Undefinedbehaviorsanitizer. https://clang.llvm.org/docs/
+UndefinedBehaviorSanitizer.html.
+[24]Issue 1237040: The thin line is drawn when using <colgroup>. https://bugs.
+chromium.org/p/chromium/issues/detail?id=1237040#c8.
+1828ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA Suhwan Song, Jaewon Hur, Sunwoo Kim, Philip Rogers, and Byoungyoung Lee
+[25] Wadi. https://github.com/sensepost/wadi.
+[26] web-platform-tests documentation. https://web-platform-tests.org/.
+[27]C. Aschermann, T. Frassetto, T. Holz, P. Jauernig, A.-R. Sadeghi, and D. Teuchert.
+Nautilus:Fishingfordeepbugswithgrammars. In Proceedingsofthe2019Annual
+Network and Distributed System Security Symposium (NDSS), San Diego, CA, Feb.
+2019.
+[28]T.Brennan,S.Saha,andT.Bultan. Jvmfuzzingforjit-inducedside-channeldetec-
+tion. InProceedings of the 42nd International Conference on Software Engineering
+(ICSE), Seoul, South Korea, June–July 2020.
+[29]P. Chen and H. Chen. Angora: Efficient fuzzing by principled search. In Proceed-
+ingsofthe39thIEEESymposiumonSecurityandPrivacy(Oakland),SanFrancisco,
+CA, May 2018.
+[30]P. Chen, J. Liu, and H. Chen. Matryoshka: fuzzing deeply nested branches. In
+Proceedingsofthe26thACMConferenceonComputerandCommunicationsSecurity
+(CCS), London, UK, Nov. 2019.
+[31]Y. Chen, T. Su, C. Sun, Z. Su, and J. Zhao. Coverage-directed differential testing
+of jvm implementations. In Proceedings of the 2016 ACM SIGPLAN Conference on
+ProgrammingLanguageDesignandImplementation(PLDI),SantaBarbara,CA,
+June 2016.
+[32]Y.Chen,T.Su,andZ.Su. Deepdifferentialtestingofjvmimplementations. In
+Proceedingsofthe41stInternationalConferenceonSoftwareEngineering(ICSE),
+Montreal, QC, Canada, May 2019.
+[33]S.R.Choudhary,H.Versee,andA.Orso. Webdiff:Automatedidentificationof
+cross-browserissues inwebapplications. In 2010IEEEInternational Conference
+on Software Maintenance, pages 1–10. IEEE, 2010.
+[34]S.R.Choudhary,M.R.Prasad,andA.Orso. Crosscheck:Combiningcrawlingand
+differencing to better detect cross-browser incompatibilities in web applications.
+In2012IEEEFifthInternationalConferenceonSoftwareTesting,Verificationand
+Validation, pages 171–180. IEEE, 2012.
+[35]L.Clark. Insideasuperfastcssengine:Quantumcss(akastylo). https://hacks.
+mozilla.org/2017/08/inside-a-super-fast-css-engine-quantum-css-aka-stylo/.
+[36]A. F. Donaldson, H. Evrard, A. Lascu, and P. Thomson. Automated testing of
+graphicsshadercompilers. ProceedingsoftheACMonProgrammingLanguages,1
+(OOPSLA):1–29, 2017.
+[37]J.Guo,Y.Jiang,Y.Zhao,Q.Chen,andJ.Sun. Dlfuzz:Differentialfuzzingtestingof
+deeplearningsystems. In Proceedingsofthe26thACMJointMeetingonEuropean
+SoftwareEngineeringConferenceandSymposiumontheFoundationsofSoftware
+Engineering (ESEC/FSE), Lake Buena Vista, FL, Nov. 2018.
+[38]C. Harrelson. Overview of the renderingng architecture. https://developer.
+chrome.com/blog/renderingng-architecture/#rendering-pipeline-structure.
+[39] J. Hur,S. Song,D. Kwon,E. Baek,J. Kim,andB. Lee. Difuzzrtl:Differential fuzz
+testing tofind cpubugs. In Proceedings ofthe 42ndIEEE Symposiumon Security
+and Privacy (Oakland), San Francisco, CA, May 2021.
+[40]D.R.Jeong,K.Kim,B.Shivakumar,B.Lee,andI.Shin. Razzer:Findingkernel
+racebugsthroughfuzzing. In Proceedingsofthe40thIEEESymposiumonSecurity
+and Privacy (Oakland), San Francisco, CA, May 2019.
+[41]S. Mahajan and W. G. Halfond. Finding html presentation failures using im-
+agecomparisontechniques. In Proceedingsofthe29thIEEE/ACMInternational
+Conference on Automated Software Engineering (ASE), Västerås, Sweden, Sept.2014.
+[42]S.MahajanandW.G.Halfond. Detectionandlocalizationofhtmlpresentation
+failures using computer vision-based techniques. In 2015 IEEE 8th International
+Conference on Software Testing, Verification and Validation (ICST), pages 1–10.
+IEEE, 2015.
+[43]A. Mesbah and M. R. Prasad. Automated cross-browser compatibility testing. In
+Proceedingsofthe33thInternationalConferenceonSoftwareEngineering(ICSE),
+Honolulu, HI, May 2007.
+[44]L. A. Meyerovich and R. Bodik. Fast and parallel webpage layout. In Proceedings
+ofthe19thInternationalWorldWideWebConference(WWW),Raleigh,NC,Apr.
+2010.
+[45]C. Min, S. Kashyap, B. Lee, C. Song, and T. Kim. Cross-checking semantic
+correctness: The case of finding file system bugs. In Proceedings of the 25th ACM
+Symposium on Operating Systems Principles (SOSP), Monterey, CA, Oct. 2015.
+[46]S. Nagarakatte, J. Zhao, M. M. Martin, and S. Zdancewic. Softbound: Highly
+compatible and complete spatial memory safety for c. In Proceedings of the 2009
+ACMSIGPLANConferenceonProgrammingLanguageDesignandImplementation
+(PLDI), Dublin, Ireland, June 2009.
+[47]P.PanchekhaandE.Torlak.Automatedreasoningforwebpagelayout.In Proceed-
+ings ofthe ACM SIGPLANInternational Conferenceon Object-Oriented Program-
+ming, Systems, Languages, and Applications (OOPSLA), Amsterdam, Netherlands,
+Nov. 2016.
+[48]P.Panchekha,A.T.Geller,M.D.Ernst,Z.Tatlock,andS.Kamil.Verifyingthatwebpageshaveaccessiblelayout. In Proceedingsofthe2018ACMSIGPLANConference
+onProgramming LanguageDesignand Implementation(PLDI),Philadelphia, PA,
+June 2018.
+[49]P. Panchekha, M. D. Ernst, Z. Tatlock, and S. Kamil. Modular verification of web
+page layout. Proceedings of the ACM on Programming Languages, 3(OOPSLA):
+1–26, 2019.
+[50]K.Pei,Y.Cao,J.Yang,andS.Jana. Deepxplore:Automatedwhiteboxtestingof
+deep learning systems. In Proceedings of the 26th ACM Symposium on Operating
+Systems Principles (SOSP), Shanghai, China, Oct. 2017.
+[51]T.Petsios,A.Tang,S.Stolfo,A.D.Keromytis,andS.Jana.Nezha:Efficientdomain-
+independentdifferentialtesting. In Proceedingsofthe38thIEEESymposiumon
+Security and Privacy (Oakland), San Jose, CA, May 2017.
+[52]P. Porwik and A. Lisowska. The haar-wavelet transform in digital image pro-
+cessing: its status and achievements. Machine graphics and vision, 13(1/2):79–98,
+2004.
+[53]K.Serebryany,D.Bruening,A.Potapenko,andD.Vyukov. Addresssanitizer:A
+fast address sanity checker. In Proceedings of the 2012 USENIX Annual Technical
+Conference (ATC) , Boston, MA, June 2012.
+[54]J. Wang, B. Chen, L. Wei, and Y. Liu. Skyfire: Data-driven seed generation forfuzzing. In Proceedings of the 38th IEEE Symposium on Security and Privacy
+(Oakland), San Jose, CA, May 2017.
+[55]W. Xu, S. Park, and T. Kim. Freedom: Engineering a state-of-the-art dom fuzzer.
+InProceedings of the 27th ACM Conference on Computer and Communications
+Security (CCS), Virtual, USA, Nov. 2020.
+[56]C.Zauner.Implementationandbenchmarkingofperceptualimagehashfunctions.
+2010.
+1829

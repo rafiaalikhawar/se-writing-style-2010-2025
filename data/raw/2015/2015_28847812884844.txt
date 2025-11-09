@@ -1,0 +1,1266 @@
+RETracer: Triaging Crashes by Reverse Execution from
+Partial Memory Dumps
+Weidong Cui
+Microsoft Research
+wdcui@microsoft.comMarcus Peinado
+Microsoft Research
+marcuspe@microsoft.comSang Kil Cha
+KAIST
+sangkilc@kaist.ac.kr
+Y anick Fratantonio
+UC Santa Barbara
+yanick@cs.ucsb.eduVasileios P . Kemerlis
+Brown University
+vpk@cs.brown.edu
+ABSTRACT
+Many software providers operate crash reporting services to auto-
+matically collect crashes from millions of customers and ﬁle bug
+reports. Precisely triaging crashes is necessary and important for
+software providers because the millions of crashes that may be re-
+ported every day are critical in identifying high impact bugs. How-
+ever, the triaging accuracy of existing systems is limited, as they
+rely only on the syntactic information of the stack trace at the mo-
+ment of a crash without analyzing program semantics.
+In this paper, we present RETracer, the ﬁrst system to triage
+software crashes based on program semantics reconstructed from
+memory dumps. RETracer was designed to meet the requirements
+of large-scale crash reporting services. RETracer performs binary-
+level backward taint analysis without a recorded execution trace to
+understand how functions on the stack contribute to the crash. The
+main challenge is that the machine state at an earlier time cannot
+be recovered completely from a memory dump, since most instruc-
+tions are information destroying.
+We have implemented RETracer for x86 and x86-64 native code,
+and compared it with the existing crash triaging tool used by Mi-
+crosoft. We found that RETracer eliminates two thirds of triage
+errors based on a manual analysis of 140 bugs ﬁxed in Microsoft
+Windows and Ofﬁce. RETracer has been deployed as the main
+crash triaging system on Microsoft’s crash reporting service.
+CCS Concepts
+•Software and its engineering !Software testing and debug-
+ging;
+Keywords
+triaging; backward taint analysis; reverse execution
+1. INTRODUCTION
+Many software providers, including Adobe [2], Apple [6], Goo-
+gle [16], Microsoft [15], Mozilla [28] and Ubuntu [41], operate
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full cita-
+tion on the ﬁrst page. Copyrights for components of this work owned by others than
+ACM must be honored. Abstracting with credit is permitted. To copy otherwise, or re-
+publish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+ICSE ’16, May 14-22, 2016, Austin, TX, USA
+© 2016 ACM. ISBN 978-1-4503-3900-1/16/05. . . $15.00
+DOI: http://dx.doi.org/10.1145/2884781.2884844crash reporting services that automatically collect crashes from mil-
+lions of customers and ﬁle bug reports based on them. Such ser-
+vices are critical for software providers because they allow them
+to quickly identify bugs with high customer impact, to ﬁle bugs
+against the right software developers, and to validate their ﬁxes.
+Recently, Apple added crash reporting for apps in the iOS and Mac
+App Stores to help app developers pinpoint top issues experienced
+by their users [5]. Crash reporting is not only being relied upon
+by traditional desktop platforms, but also by more recent mobile
+platforms.
+One of the most critical tasks in a crash reporting service is triag-
+ingsoftware crashes, i.e., grouping crashes that were likely caused
+by the same bug. Large services may receive millions of crash re-
+ports every day. It is not possible to have developers inspect more
+than a small fraction of them. Good triaging can cluster together
+a potentially large number of crash reports belonging to the same
+software bug and thus reduce the number of crash reports that have
+to be inspected. It can also help prioritize the most critical bugs by
+user impact (i.e., those bugs for which the largest numbers of crash
+reports arrive) and ﬁle them against the right software developers.
+Precise crash triaging is a hard problem. A single bug may man-
+ifest itself in a variety of ways and give rise to large numbers of
+dissimilar-looking crash reports. This difﬁculty is exacerbated by
+the limited information contained in a crash report. A typical report
+(or core dump or memory dump [45]) contains at most the con-
+text of the crash thread (stack and processor registers) and a subset
+of the machine’s memory contents at the moment of the crash. A
+variety of constraints ranging from minimizing overhead on cus-
+tomer machines to protecting customer privacy prevent software
+providers from including richer information in their reports. In par-
+ticular, there is no information about the program execution leading
+up to the crash. The sheer volume faced by large-scale crash report-
+ing services adds a further problem because there is usually a time
+budget for analyzing a crash.
+Given these challenges, crash reporting services have been lim-
+ited to triaging crashes by using stack traces in a “syntactic” way.
+Ubuntu [40] groups crashes by using a crash signature computed
+based on the top ﬁve functions on the stack of the crash thread (we
+will refer to it as “the stack” in the rest of this paper unless speci-
+ﬁed otherwise). Microsoft’s Windows Error Reporting (WER) ser-
+vice [15] uses a tool called !analyze (bang analyze [23]) to group
+crashes based on a blamed function identiﬁed on the stack. !analyze
+picks the top function as the blamed function by default, but uses a
+large whitelist of functions and modules and additional heuristics to
+pick a different function down the stack. Such triaging approaches
+do not consider the “semantics” of functions, that is, how they con-
+tribute to the crash. This signiﬁcantly limits their triaging accuracy
+2016 IEEE/ACM 38th IEEE International Conference on Software Engineering
+   820
+and the overall effectiveness of crash reporting services.
+In this paper, we present RETracer, the ﬁrst system to triage
+software crashes based on program semantics reconstructed from
+a memory dump. RETracer was designed to meet the requirements
+of large-scale crash reporting services. Conceptually, RETracer
+mimics developers which usually debug crashes by reversely an-
+alyzing the code and the stack to ﬁnd out how a bad value such
+as a corrupted pointer was passed. RETracer automates this de-
+bugging process by realizing binary-level backward taint analysis
+based only on memory dumps.
+Backward taint analysis begins with tainted data items (e.g., a
+corrupted pointer) at the end of an execution and analyzes instruc-
+tions reversely to propagate taint backwards and determine where
+the tainted data originated at an earlier time. It is straightforward to
+perform this analysis on a recorded execution trace [14, 8, 9]. How-
+ever, recording execution traces is not an option for crash triaging
+services because it imposes signiﬁcant tracing overhead during nor-
+mal execution [8].
+Backward taint analysis without an execution trace is challeng-
+ing. The machine state at an earlier time cannot be recovered com-
+pletely since most instructions are information destroying. For ex-
+ample, after executing XOR EAX, EAX, the original value of register
+EAXis lost. With an incomplete machine state, backward taint prop-
+agation may have to stop prematurely when the address of a tainted
+memory location cannot be recovered.
+RETracer is the ﬁrstsystem to successfully perform binary-level
+backward taint analysis without an execution trace for crash triag-
+ing. To recover memory addresses, it combines concrete reverse
+execution and static forward analysis to track register values.
+Given a backward data ﬂow graph inferred from the backward
+taint analysis, it is not obvious how to ﬁnd the blamed function.
+We design an intuitive algorithm to solve this problem. RETracer
+blames the function where the bad memory address was derived for
+the ﬁrst time. The intuition behind it is that the function that was
+the ﬁrst one to obtain a bad value should be the one to ensure the
+value’s correctness.
+We have developed RETracer into a working system for triaging
+crashes of x86 and x86-64 native code, and compared it with !an-
+alyze, the existing crash triaging tool used by WER. We manually
+analyzed crashes of 140 bugs ﬁxed in Microsoft Windows 8 and
+Ofﬁce 2013. RETracer correctly identiﬁed the blamed function for
+all but 22 bugs, while !analyze failed for 73 bugs. RETracer thus
+reduces the number of triage errors by two thirds. We evaluated
+RETracer on 3,000 randomly selected crashes and found that its
+median, average, and maximum run time is 1.1, 5.8, and 44.8 sec-
+onds. RETracer has been deployed as the main crash triaging sys-
+tem on WER. A study of the deployment data shows that RETracer
+is being used to analyze about half of the reported x86 and x86-64
+crashes in Microsoft’s software.
+In summary, we make the following contributions:
+We have designed a new approach to triaging crashes that
+performs backward taint analysis without requiring execu-
+tion traces and identiﬁes blamed functions based on back-
+ward data ﬂow graphs (Section 3).
+We have implemented RETracer for triaging crashes of x86
+and x86-64 native code (Section 4).
+We have compared RETracer with !analyze, the existing crash
+triaging tool used by WER, on 140 ﬁxed bugs and studied
+RETracer’s deployment on WER. (Section 5).2. OVERVIEW
+In this section, we present an overview of RETracer’s design and
+discuss its design choices.
+RETracer can analyze all crashes caused by access violations,
+except for those due to stack overﬂows (i.e., out of stack space),
+unloaded modules and bit ﬂips [29]. These three exceptions are not
+a serious limitation because there are effective solutions for each of
+them. For stack overﬂows, a straightforward solution is to blame
+the function that takes up the most stack space. For unloaded mod-
+ules, a straightforward solution is to blame the function that calls
+the unloaded module. A solution for detecting bit ﬂips was pro-
+posed in [29]. Crashes that are being analyzed by RETracer make
+up about half of the x86 and x86-64 crashes in Microsoft’s software
+(see Section 5).
+RETracer performs backward taint analysis to triage crashes. This
+essentially mimics how developers analyze crashes. The ﬁrst ques-
+tion developers often ask is where the corrupted pointer came from.
+To answer this question, they usually follow the code and the stack
+backward to ﬁnd out how the corrupted pointer was passed. The
+backward taint analysis in RETracer automates this debugging pro-
+cess.
+Similar to existing triaging solutions [15, 40], RETracer focuses
+on the stack of the crash thread: It will blame one of the func-
+tions on the stack. A common question is what happens if a crash
+involves multiple threads. The answer has two aspects. First, a
+large fraction of bugs involves only the crash thread. For exam-
+ple, an empirical study [36] on the ECLIPSE project showed that
+more than 60% of bugs were ﬁxed in a function on the crash stack.
+Second, the triaging goal of RETracer is to group crashes caused
+by the same bug together, which does not require ﬁnding the root
+cause. For example, assume function A in thread 1 writes a bad
+value to a pointer. Function B in thread 2 reads the bad pointer and
+dereferences it, causing an access violation. In this case, the root
+cause is function A. But if function B is the only one or one of a
+few functions that use the bad pointer, then grouping crashes based
+on function B meets the triaging goal.
+Backward data ﬂow analysis can, in principle, be performed on
+source code (e.g., [22, 37]) or on binaries. Source code analysis has
+a number of desirable properties, including being unencumbered by
+the complications of processor instruction sets. However, our only
+source of information about crashes are crash reports. The data
+they contain (CPU register values, values stored at raw virtual ad-
+dresses) can be consumed directly by binary-level analysis. While
+one could consider translating this information into a form that is
+amenable to source-level analysis, such translation would have to
+overcome a variety of complications. Registers and memory loca-
+tions in the crash report would have to be mapped to variables in the
+source code. The challenge is that there is no debug information for
+temporary variables. For example, given VarB = VarA->FieldB->FieldC,
+there is no debug information indicating in which register or stack
+location the value of VarA->FieldB is stored. Furthermore, compiler
+optimizations may make the mapping from machine state to source
+code even harder. Given these complications, we made the design
+choice to perform our analysis at the binary level.
+This choice has the additional beneﬁt of making RETracer inde-
+pendent of the original programming language. This allows us to
+use a single analysis engine to analyze crashes of both native code
+(e.g., compiled from C/C++) and jitted code (e.g., compiled from
+C# or JavaScript). In this paper, we focus on analyzing crashes of
+native code.
+Taint analysis assigns meta-data (taint) to data items (registers or
+memory locations). Given a sequence of instructions, and an initial
+set of tainted data items, taint analysis will propagate any taint as-
+8211f()
+2{
+3 T p;
+4 p.f = NULL; // RETracer blames this function!
+5 g(&p);
+6}
+7
+8g(T *q)
+9{
+10 int *t = q->f;
+11 h(t);
+12}
+13
+14h(int *r)
+15{
+16 *r = 0; // crash!!
+17}
+Listing 1: This sample code demonstrates how RETracer makes use
+of backward taint analysis to blame functions. The crash occurs
+in function h(line 16). RETracer blames function fbecause it
+originally sets the bad value to pointer r(line 4).
+sociated with the source operands of an instruction to its destination
+operand. Backward taint analysis begins with tainted data items at
+the end of an execution and tries to determine where the tainted
+data originated at an earlier time. It analyzes instructions reversely
+to propagate the taint backward. This technique has been applied to
+recorded execution traces [9], where the complete sequence of ex-
+ecuted instructions and a large amount of state that can be derived
+from it are available.
+RETracer is the ﬁrst system to perform binary-level backward
+taint analysis without execution traces. The input to RETracer is
+the memory dump of a crash, binaries of modules identiﬁed in the
+memory dump, and their debug symbols. On Windows, a binary is
+a PE ﬁle, and its debug symbols are stored in a corresponding PDB
+ﬁle. RETracer does not require the memory dump to be complete.
+Instead, it only requires the stack memory and the CPU context of
+the crash thread at the moment of crash. Additional memory infor-
+mation in the dump may improve its analysis but is not necessary.
+RETracer begins with the corrupted pointer that caused the crash
+and uses backward taint analysis to ﬁnd the program location(s)
+where the bad value originated. The limited amount of informa-
+tion in a memory dump (when compared to an execution trace) is
+a signiﬁcant complication that RETracer must overcome. The re-
+sult of the backward taint analysis is a backward data ﬂow graph
+that shows how the corrupted pointer was derived. RETracer ana-
+lyzes the graph to identify the blamed function where the corrupted
+pointer was derived for the ﬁrst time.
+RETracer’s backward taint analysis uses concrete addresses rather
+than symbolic expressions to represent memory locations. The
+main limitation of using concrete addresses is that taint cannot be
+propagated if the address of a tainted memory location cannot be
+recovered. The main limitation of using symbolic expressions is
+that taint will be propagated too far if the alias set of the symbolic
+expression of a tainted memory location is an over-approximation.
+In RETracer we choose concrete addresses over symbolic expres-
+sions because we would rather blame a function close to the crash
+than a totally irrelevant function. To recover concrete addresses of
+memory locations, RETracer combines concrete reverse execution
+with forward static analysis to track values of registers and memory
+locations.
+A simple example is shown in Listing 1. In this case, the crash
+occurs in function hat line 16. With its backward taint analysis,
+RETracer can ﬁnd out that the bad pointer rwas originally set infunction fat line 4. Therefore, RETracer blames function ffor
+this crash.
+3. DESIGN
+In this section, we describe the design of RETracer in detail.
+First, we will present the basic scheme of the backward taint anal-
+ysis. Then we will describe how we use static forward analysis
+to mitigate the problem of missing register values caused by ir-
+reversible instructions. Finally, we will present the algorithm for
+identifying blamed functions from backward data ﬂow graphs.
+RETracer’s analysis is performed at the binary level. We de-
+scribe the design in terms of a very simple assembly language. This
+allows us to describe RETracer without being encumbered by the
+idiosyncrasies of any concrete processor. Section 4 will describe
+how we implemented RETracer for x86-64 processors.
+A program in our language is a sequence of instructions of the
+formopcode dest,src, where opcode speciﬁes the instruc-
+tion type (e.g., mov orxor), and src anddest are the source
+and destination operands. An operand is an immediate (a constant),
+a processor register (numbered R0; R1; : : :), or a memory address
+speciﬁed as [Rb+cRi+d], where c2f0;1;2;4;8gis a constant,
+dis a constant displacement, RbandRiare arbitrary registers. We
+refer to Rbas the base register and to Rias the index register.
+3.1 Backward Taint Analysis
+For taint analysis, we need to answer two questions: how to in-
+troduce taint and how to propagate taint. We maintain taint infor-
+mation on both registers and concrete memory locations. For mem-
+ory locations, we keep the taint at byte granularity. For registers,
+we keep the taint at register granularity.
+Next we ﬁrst describe taint introduction, taint propagation, and
+concrete reverse execution. We then explain how the backward
+analysis is performed inside a function and across functions.
+3.1.1 Taint Introduction
+The crash report logs both the crash instruction and the access
+violation type (i.e., read, write, or execution). For write violations,
+we examine the destination operand of the crash instruction. If it
+is a memory operand, we taint its base and index registers because
+the base register may contain a corrupted pointer value, and the
+index register may contain a corrupted array index. For read viola-
+tions, we proceed similarly for the source operand. For execution
+violations, we check the caller to see if it was caused by calling a
+function pointer. If so, we taint the base and index registers of the
+memory operand for the function pointer.
+3.1.2 Taint Propagation
+Starting at the instruction that triggered the crash, we move back-
+ward, instruction by instruction. Section 3.1.5 will explain how we
+incorporate the program’s control ﬂow into this analysis. For each
+instruction, we propagate taint depending on the semantics of the
+instruction. By default, we ﬁrst check if the destination operand
+is tainted. If so, we ﬁrst untaint the destination operand and then
+taint the source operand. For example, the MOV instruction copies
+the value of its source operand to its destination operand and can
+be handled by the default rule. Section 4 contains examples of x86
+instructions that require more complex tainting rules.
+When propagating taint to registers, we do not require knowing
+their values. When propagating taint to memory locations, we must
+know their addresses. Even when the memory address is unknown,
+we always propagate taint to the base and index registers of the
+memory operand if they exist. By tainting these registers, we can
+track how the pointer to a corrupted value was derived recursively
+822and construct a backward data ﬂow graph of multiple dereference
+levels. In Section 3.2, we describe how we use such a backward
+data ﬂow graph to identify a function to blame for the crash.
+3.1.3 Concrete Reverse Execution
+To compute the address of a memory location, we need to know
+the values of the base and index registers of the memory operand.
+In RETracer, we perform concrete reverse execution to track val-
+ues of registers and memory locations. Similar to taint tracking, we
+keep values at register granularity for registers and at byte granu-
+larity for memory locations.
+We can think of an instruction as a function fsuch that dst=
+f(src)(e.g., MOV dst, src) or such that dst=f(src; dst) (e.g.,
+ADD dst, src). In the former case, the concrete reverse execution of
+the instructions attempts to compute the value of src=f 1(dst).
+This succeeds if we know the value of dstand if fis reversible
+(i.e., if f 1(dst)is a single value). In the latter case, we attempt to
+determine the value of dstbefore the instruction. This is possible
+if we know the values of srcand of dstafter the instruction and if
+fis reversible. In either case, if we can obtain the value, we update
+the register or memory location associated with the operand and
+proceed backwards to the next instruction.
+The problem is complicated by the fact that many instructions
+are irreversible. Examples include XORR0,R0and MOVR0, [R0].
+In these cases, we set the register or memory location’s value to be
+unknown. In cases like MOVR0, [R0], we also cannot propagate taint
+to the memory location [R0]because the value of R0is unknown.
+It is worth noting that instructions on stack and frame point-
+ers [43] are mostly reversible. This allows RETracer to track taint
+on stack memory locations almost completely. On the other hand,
+the problem of missing register values signiﬁcantly affects taint
+propagation to memory locations not controlled by stack or frame
+pointers. The next subsection describes how we use static forward
+analysis to mitigate this problem.
+3.1.4 Static Forward Analysis
+The key idea of our static forward analysis is to perform a binary
+analysis of individual functions to identify how register values are
+derived.
+MOVR0,R1
+MOVR0, [R0]
+In the above two-instruction example, our forward analysis will
+ﬁnd that, after executing the ﬁrst instruction, we establish the value
+relation thatR0has the same value as R1. When we perform back-
+ward analysis on the second instruction, we can use this value rela-
+tion to compute R0’s original value (assuming R1’s value is known)
+and propagating taint to [R0]. This lookup is done recursively. For
+example, if we do not know R1’s value, we will check if it can be
+computed from another register or memory location.
+This is similar to traditional use-def analysis. But there is an
+important difference. Our goal is to ﬁnd value relations that depend
+on the current register values.
+MOVR0,R1
+MOVR1,R2
+MOVR0, [R0]
+In the above three-instruction example, after executing the second
+instruction, we will invalidate all the value relations based on R1
+because its value is changed. We then add a new value relation for
+R1andR2. Thus, we will not use R1to recover R0’s value at
+the third instruction. In contrast, traditional use-def analysis would
+maintain that R0was deﬁned by R1(in the ﬁrst instruction).
+Our static forward analysis is conservative in the sense that we
+invalidate value relations with all memory locations if the desti-nation of a memory write cannot be decided. To decide the des-
+tination of a memory write to the stack, we track how the stack
+pointer is updated. Speciﬁcally, we use two symbolic expressions
+to represent the values of registers pointing to the stack. The ﬁrst
+symbolic expression is stack0 which represents the stack pointer’s
+value at the entry of a function. The second symbolic expression is
+stack1 which represents the stack pointer’s value after stack align-
+ment (e.g., to 8 bytes). We need the second symbolic expression
+because the effect of a stack alignment instruction cannot be deter-
+mined statically. In our static forward analysis, the stack pointer
+and other registers derived from it are all represented by stack0 or
+stack1 plus an offset.
+Another advantage of tracking registers based on stack0 andstack1
+is that we can directly tell if a register in a memory operand points
+to the stack. If so, we do not propagate taint to this register (since
+RETracer does not triage stack overﬂows). Without this, incorrect
+taint could eventually propagate to the stack pointer. While this
+problem could be ﬁxed, it would complicate our backward taint
+analysis.
+3.1.5 Intra-Procedural Analysis
+We have presented the basic ideas of backward taint analysis and
+static forward analysis. Next we describe how they are being done
+within a function. Given a function, we ﬁrst divide it into basic
+blocks and construct a control ﬂow graph.
+Static forward analysis is done only once, before we perform
+backward taint analysis on a function. Our goal is to compute the
+value relations for all registers before each instruction. For each
+block, we ﬁrst initialize the value relations by merging them from
+all its preceding blocks in the control ﬂow graph. Then we ana-
+lyze each instruction in the basic block to update the value relations
+as described in Section 3.1.4. We repeat this process by iterating
+through all blocks until the value relations converge. When we
+merge value relations from multiple blocks, we mark a register’s
+value to be invalid if its value relations have a conﬂict. This en-
+sures that the static forward analysis will converge.
+In the concrete reverse execution, we maintain the current values
+of registers and memory locations for every instruction. We start
+from the crash instruction in its function. We use the crash report
+to obtain initial values of registers and memory locations. Then, we
+execute backward from the crash instruction in its block. For each
+instruction, we update the concrete values of registers and memory
+locations as described in Section 3.1.3. We also leverage the value
+relations inferred from the static forward analysis to recover regis-
+ter values if necessary. For each block, we ﬁrst merge the values
+and taint from all its succeeding blocks in the control ﬂow graph. If
+the concrete values of a register or memory location do not agree,
+we set its value to unknown. We repeat this process by iterating
+through all blocks that are backward reachable from the crash in-
+struction until the values converge.
+If the block of the crash instruction is in a loop, the analysis
+above will merge values from multiple iterations. This may over-
+write the original values that led to the crash. To better capture
+these important values, we create a new block that contains the
+instructions up to the crash instruction in its block. We reverse exe-
+cute this new block and propagate the values to its preceding blocks
+only once at the beginning.
+In the backward taint analysis, we maintain the currently tainted
+registers and memory locations. We start from the crash instruc-
+tion in its function. As discussed in Section 3.1.1, we set the initial
+taint on the base and index registers of one of the operands of the
+crash instruction. Then, we execute backward from the crash in-
+struction in its block. For each instruction, we propagate the taint
+823as described in Section 3.1.2. For each block, we ﬁrst merge the
+taint from all its succeeding blocks in the control ﬂow graph. Since
+a register or memory location may be tainted at multiple places, we
+keep its taint as a setof program locations where it was tainted.
+When merging the taint of a register or memory location, we sim-
+ply update this set. We repeat this process by iterating through all
+blocks that are backward reachable from the crash instruction un-
+til the taint converges. We also apply the same optimization to the
+block of the crash instruction as in the concrete reverse execution
+to capture the original taint propagation right before the crash.
+After completing the analysis of the crash function, we use its
+values and taint at the function entry as the initial values and taint
+for its caller on the stack. Then we perform the backward taint
+analysis on the caller function from the call instruction where the
+caller calls the crash function. We apply the optimization described
+previously to the block of the call instruction to better capture the
+values and taint right before the function call. After we are done
+with this function, we continue the analysis to its caller on the stack.
+3.1.6 Inter-Procedural Analysis
+We have just described how we perform backward taint analysis
+and static forward analysis within a function. Next we present the
+details on how we handle function calls in these two analyses.
+Our static forward analysis is an intra-procedural analysis. We
+do not analyze callee functions in this analysis. Instead, given a call
+instruction, we invalidate value relations for volatile registers which
+can be modiﬁed by the callee based on the calling convention [44]
+as well as memory locations. We also update the stack pointer if the
+callee is responsible for cleaning up the stack under the function’s
+calling convention.
+Our backward taint analysis is inter-procedural. In addition to
+analyzing the functions along the stack, as described previously,
+we apply backward taint analysis to functions called by them. Our
+inter-procedural analysis is, by necessity, incomplete because we
+may not be able to ﬁnd the target functions for all indirect calls
+during reverse execution. Furthermore, the key difference between
+functions on the crash stack and those that are not is that the stacks
+of the latter functions are unavailable since they were already popped.
+Without the stack, it is difﬁcult to recover lost register values when
+they are “popped” off the stack at the end of typical functions. This
+means that we have limited ability to track memory taint in func-
+tions that are not on the crash stack.
+For these two reasons, we perform the backward taint analysis
+only for callee functions that either have a tainted return value or
+change the stack pointer (e.g., exception handling code). Before
+performing the backward taint analysis on a callee function, we run
+our static forward analysis on it. We begin the analysis of callee
+functions at their return instruction(s).
+For call instructions whose targets we do not analyze (because
+we could not ﬁnd the target or because the target does not meet our
+conditions), we check if its return value and parameters are tainted
+based on the function’s deﬁnition. Since, in general, we have no
+speciﬁcation for how a function may change its parameters, our
+parameter check is only an approximation. Speciﬁcally, we assume
+a callee function may modify the target data structure pointed to by
+a parameter and check if any memory covered by the data structure
+is tainted. If the return value or a parameter is tainted, we untaint it
+and mark that its value was set by the callee function.
+3.2 Blamed Function Identiﬁcation
+In this section, we describe how we construct a backward data
+ﬂow graph based on our backward taint analysis and how we iden-
+tify a blamed function based on this graph.
+Figure 1: A sample backward data ﬂow graph. Each node is a three
+tuple consisting of the frame level, the instruction’s address, and
+the tainted operand. Assignment edges are solid and dereference
+edges are dotted. The graph is simpliﬁed to improve readability.
+3.2.1 Backward Data Flow Graph
+A node in our backward data ﬂow graph is created when a reg-
+ister or memory location is tainted. A node is also created when
+the taint is stopped at a constant or a call to a callee function. To
+differentiate instances of the same registers and memory locations
+at different instructions or at different invocations of the same in-
+struction, we deﬁne a node to be a three tuple consisting of the
+frame level of the function on the stack, the instruction’s address,
+and either a register or memory location or constant or a symbol
+representing a call to a callee function. The crash function has the
+frame level of zero because it is at the top of the stack. When going
+down the stack, the frame level increases by one when moving by
+one frame. For a callee function that is not on the stack, we use the
+frame level of its caller function on the stack. A sample backward
+data ﬂow graph is shown in Figure 1.
+Our backward data ﬂow graph has two kinds of edges: assign-
+824ment anddereference. An assignment edge is added when we prop-
+agate taint from a destination operand to a source operand. A deref-
+erence edge is added when we propagate taint from a memory lo-
+cation to its base and index registers (i.e., the base memory address
+and the array index). Both assignment and dereference edges are
+directed. For assignment edges, the direction is from the destina-
+tion operand to the source operand. For dereference edges, the di-
+rection is from the memory location to the base and index registers.
+We add a special node (called the crash node) to the graph. We
+also add dereference edges from the crash node to the base and/or
+index registers which received the initial taint. We deﬁne the deref-
+erence level of a node to be the minimum number of dereference
+edges on any path from the crash node to this node. The crash
+node’s dereference level is 0.
+3.2.2 Blamed Function Identiﬁcation
+Our identiﬁcation algorithm works in two steps. The ﬁrst step is
+to identify nodes that have badvalues. The second step is to ﬁnd a
+blamed function that is the source of these bad values.
+For the ﬁrst step, we pick the nodes of the base and index regis-
+ters at the crash site to be the nodes of bad values by default. These
+are the nodes that are connected by dereference edges to the crash
+node. There is a single bad-value node [0,gdi32+f78d,{REG:RCX}] in
+Figure 1. We make two exceptions to this rule. One is related to
+array operations. The other is related to whitelisted modules.
+An array operation is usually realized by a compiler as [Rb+
+cRi+d], and we look for operands of this type. If the crash
+instruction does not have an index register and its base register (i.e.,
+the corrupted pointer) was derived from an array operation, we pick
+the nodes of the base and index registers of the array operation to
+be the nodes of bad values. The intuition behind this exception is
+that, if a corrupted pointer was obtained from an array access, a
+problem in the array access (due to a bad array base or a bad array
+index) is more likely than the array containing incorrect values.
+Weconditionally whitelist library modules such as ntdll.dll. On
+one hand, a crash in such a module is usually caused by a bug in its
+caller outside the module. On the other hand, simply ignoring func-
+tions from a whitelisted module is problematic because it prevents
+developers from detecting bugs in library modules. Such bugs often
+have high impact due to the wide use of library modules. Missing
+them may result in a large number of unresolved crashes.
+We solve this dilemma with the help of the backward data ﬂow
+graph. If all the nodes in the graph are from functions of whitelisted
+modules, the crash is likely due to a bug in a whitelisted module be-
+cause the caller outside the whitelisted modules did not pass a pa-
+rameter that is directly related to the crash. In this case, we handle
+the whitelisted modules as regular modules. Otherwise, we pick the
+nodes that are outside whitelisted modules and have the minimum
+dereference level to be the nodes of bad values. They essentially
+represent the tainted parameters passed to a whitelisted module.
+In the second step of our algorithm, we identify a blamed func-
+tion as follows. We ﬁrst identify nodes that are reachable from
+nodes of bad values by following only assignment edges. All these
+nodes are at the same dereference level. Then we pick the func-
+tion that contains such nodes and has the maximum frame level as
+the blamed function. The intuition behind this algorithm is that the
+function that was the ﬁrst one to obtain a bad value should be the
+one to ensure the value’s correctness.
+A bug ﬁx of a bad parameter in a call can either be done in the
+caller before passing it or in the callee before using it. For this
+type of bugs, our algorithm always blames the caller. We made this
+choice for two reasons. First, the majority of bug ﬁxes we have
+observed in practice are in the caller. Second, the call site in thecaller function reveals more information than the callee function.
+A developer can leverage the richer information to decide where
+the actual ﬁx should be.
+By default, we use the name of the blamed function and its mod-
+ule name for triaging. There is an exception. If our analysis stops
+at a stack frame for which we do not have symbol information, we
+do not have a function name. In this case, we only use the module
+name. This allows RETracer to correctly blame third-party mod-
+ules (that passed a wrong parameter) instead of correct ﬁrst-party
+code.
+In the example shown in Figure 1, RETracer correctly blames a
+function in the module mshtml.dll while the crash is in a function in
+another module (gdi32.dll) three frames above on the stack. The bad
+value was ﬁrst obtained from [3,mshtml.dll+6a7879,{MEM:(RSI+10)}].
+4. IMPLEMENTATION
+We have implemented RETracer for crashes of native x86 and
+x86-64 Windows binaries. RETracer consumes Windows crash
+dump (.dmp) ﬁles and is implemented as a WinDbg [24] exten-
+sion [33]. The prototype consists of roughly 66,000 lines of C and
+C++ code.
+RETracer does not support crashes caused by unhandled excep-
+tions and access violations caused by stack overﬂows, unloaded
+modules and bit ﬂips. It identiﬁes unhandled exceptions by simply
+checking the exception code. It identiﬁes stack overﬂows by check-
+ing if the stack pointer passes the stack limit. RETracer identiﬁes
+unloaded modules by checking if a stack frame is from an unloaded
+module. It relies on an existing implementation of [29] to detect bit
+ﬂips.
+RETracer uses Windows libraries (MSDIA and MSDIS) for ex-
+tracting debug information from Windows symbol (.pdb) ﬁles and
+for disassembling machine instructions in Windows portable exe-
+cutable (PE) ﬁles. MSDIA and MSDIS are released in Microsoft
+Visual Studio [25]. Given an offset in a PE ﬁle, RETracer imple-
+ments its own logic based on MSDIA and MSDIS to identify the
+function containing that offset, ﬁnd the code ranges of the func-
+tion, disassemble them into instructions, and construct a control
+ﬂow graph of basic blocks.
+RETracer currently relies on the debug information stored in
+PDB ﬁles to reliably disassemble binaries. There exist good dis-
+assemblers such as IDA [18] that can disassemble a binary with-
+out the debug information based on heuristics. Although perfect
+disassemly may not be achievable without the debug information,
+RETracer can potentially work well with such disassemblers if they
+can correctly disassemble most binaries. Such integration is for a
+future exploration.
+For each instruction, RETracer parses it into an intermediate rep-
+resentation that speciﬁes the opcode and the source and destination
+operands. RETracer can parse allx86/x86-64 instructions. This
+allows RETracer to apply its default operations in its analysis to all
+instructions. The default operation for the backward taint analysis
+is to clear the taint of the destination operand and propagate it to the
+source operand. The default operation for the concrete reverse exe-
+cution is to set the value of the destination operand to be unknown.
+The default operation in the forward static analysis is to invalidate
+all the value relations based on the destination operand.
+In Figure 2, we show the x86/x86-64 instructions that individu-
+ally handled by RETracer based on their special semantics. Recall
+that the main goal of RETracer is to recover how a corrupted pointer
+or array index was derived. This is why RETracer only applies the
+default operations to bit and ﬂoating-point instructions (e.g., SAL
+and FLD).
+Some instructions like CMOV are conditional. We handle such
+825Category Instructions
+Copy MOV, LEA, MOVSX, MOVZX, CMOV, MOVS
+Arithmetic ADD, SUB, MUL, DIV, INC, DEC, SBB
+Logic AND, OR, XOR, NEG
+Stack PUSH, POP, PUSHA, POPA, PUSHF, POPF
+Exchange XCHG, CMPXCHG
+Control CALL, RET
+Misc CLD, STD, SETcc
+Figure 2: Instructions individually handled by RETracer based on
+their special semantics.
+instructions in a way similar to branches. We assume both con-
+ditions are possible, analyze the instruction under each condition,
+and merge their results. In the case of CMOV, we take the following
+actions. For the backward taint analysis, we keep the taint of the
+destination operand and propagate the taint to the source operand
+if the destination operand is tainted. For the concrete reverse ex-
+ecution, we set the destination operand to be unknown and do not
+update the source operand. For the static forward analysis, we mark
+the destination operand’s value to be invalid.
+For function calls that follow the stdcall calling convention [44],
+we need to unwind the stack on behalf of the callee if we do not
+analyze it. This is critical for correctly keeping track of the stack.
+To unwind the stack, we need the call site information to know if we
+need to unwind the stack and, if so, how much we should adjust the
+stack pointer. However, PDB ﬁles do not contain this information
+forallindirect calls. To mitigate this problem, we developed the
+following heuristics to infer the stack size to unwind. First, for an
+indirect call to a function in a different module, we identify the
+module that implements the function and use that module’s PDB
+ﬁle to retrieve the function information. Second, for an indirect call
+to a virtual function, we construct the virtual function table based
+on the debug information in the PDB ﬁle, and use binary analysis
+to infer which function in the virtual function table is being called.
+Third, if both approaches fail, we analyze the PUSH instructions
+right before the indirect call to infer the stack size to unwind.
+Tail call [46] is a common compiler optimization to avoid adding
+a new stack frame to the call stack. The simple stack walk based
+on the frame pointers cannot recognize tail calls correctly. If tail
+calls are not recognized, RETracer’s backward analysis will miss
+the important data ﬂow of parameter passing before the jump to the
+called subroutine. In RETracer, we detect tail calls by checking
+if the callee function based on the call instruction in the caller is
+matched with the callee function on the stack. If not, we further
+check if the ﬁrst callee function has a JMPinstruction at the end of
+the function or the ﬁrst and second callee functions are contiguous
+(even the JMPinstruction is saved in this case). If so, we recognize
+it as a tail call and analyze the two callee functions together.
+In RETracer, we currently whitelist eleven Windows modules
+and all the functions in the namespace std since they are stati-
+cally linked into each module. This is far less than the hundreds
+of whitelisted modules and functions used by !analyze. More im-
+portantly, RETracer handles whitelists conditionally as described in
+Section 3.2.2, which allows us to catch rare bugs in the whitelisted
+modules.
+5. EV ALUATION
+In this section, we evaluate RETracer. We ﬁrst present the results
+on its accuracy. After presenting the results on its performance, we
+report results from its deployment on Windows Error Reporting
+(WER) [15] as well as two case studies.5.1 Accuracy
+5.1.1 Identiﬁed Blamed Functions
+To evaluate RETracer’s accuracy in identifying blamed functions,
+we searched for ﬁxed bugs to use the bug ﬁx as a ground truth.
+Weexhaustively searched the bug databases of Windows 8, Win-
+dows 8.1, and Ofﬁce 2013 and the database of WER to identify
+allﬁxed bugs with associated crash reports that meet the following
+conditions: (1) The crash was an access violation in native x86 or
+x86-64 code. (2) The crash was not caused by a stack overﬂow, an
+unloaded module or a bit ﬂip [29]. (3) The crash report as well as
+the PE and PDB ﬁles for the module in which the crash occurred are
+available. Conditions (1) and (2) restrict the search to the domain
+that our prototype is designed to handle. Condition (3) accounts for
+the fact that RETracer needs the crash report as well as the PE and
+PDB ﬁles to operate.
+Our search identiﬁed 140 bugs. This is only a small fraction of
+the total number of bugs in the databses we searched because our
+search only includes bugs that were ﬁled due to crash reports and
+that were ﬁxed. More importantly, WER retains crash reports only
+for a short period of time. PE and PDB ﬁles will also be missing
+if the crash occurred in a third-party module. Thus, condition (3)
+eliminates a very large fraction of the eligible bugs.
+Figure 3 shows the evaluation results for the 140 bugs. The ﬁgure
+also lists the number of different modules in which these bugs were
+ﬁxed. The large module count shows that these bugs cover a broad
+set of code bases. The total module count in Figure 3 is less than
+the sum of the line items due to overlap.
+We manually evaluated the correctness of the blamed functions
+identiﬁed by RETracer and !analyze for each of the 140 bugs using
+the following criterion. An identiﬁed blamed function is correct if
+the bug ﬁx modiﬁed the function or another member function of
+itsclass or its callee function. We take into account member func-
+tions in the same class because they are usually owned by the same
+developer. A bug ﬁled on the identiﬁed blamed function would
+have been sent to the same developer who made the bug ﬁx. We
+consider callee functions because caller functions reveal more in-
+formation from which a developer can decide to ﬁx the bug in the
+caller or callee.
+It is worth noting that !analyze handles a wider range of software
+failures than RETracer. For instance, !analyze analyzes program
+hangs. Our comparison between RETracer and !analyze is focused
+on the kind of crashes supported by RETracer.
+We list the number of bugs for which the identiﬁed blamed func-
+tions are either correct (by function orclass orcallee) or wrong in
+Figure 3. RETracer is signiﬁcantly more accurate than !analyze. It
+reduces the number of triage errors by two thirds. We also evalu-
+ated the impact of our static forward analysis by running RETracer
+without it. This conﬁguration made 36 triage errors, 9 (or 33%)
+more than full RETracer.
+We examined the 22 bugs for which RETracer failed to identify
+a correct function. For 11 of them, the bug ﬁxes are in functions
+that are not on the crash stack. Most of these 11 bug ﬁxes corrected
+errors in the global program logic. For 9 of the bugs, the ﬁxes are
+in functions below the identiﬁed function on the stack (i.e., higher
+frame levels). Higher dereference levels and loss of taint were the
+main reasons for RETracer’s failure in these cases. For the remain-
+ing two bugs, the ﬁxes are in functions above the function blamed
+by RETracer. In both cases, a pointer check was added right before
+the bad pointer dereference.
+In Figure 4, we show the histogram of the frame levels of func-
+tions blamed by !analyze and RETracer. The function at the top of
+a stack has frame level 0. We can see that !analyze blames the crash
+826Software #Bugs #Modules#Bugs (!analyze) #Bugs (RETracer)
+Function Class Callee Wrong Function Class Callee Wrong
+Windows 8 (user mode) 52 33 19 8 0 25 30 14 1 7
+Windows 8.1 (user mode) 47 33 19 1 0 27 33 5 3 6
+Ofﬁce 2013 21 10 8 2 0 11 13 3 1 4
+Windows 8 (kernel mode) 10 9 4 0 0 6 7 0 0 3
+Windows 8.1 (kernel mode) 10 9 5 1 0 4 6 2 0 2
+Total 140 83 55 12 0 73 89 24 5 22
+Figure 3: Accuracy based on ﬁxed bugs in different code bases. The counts under Class do not include bugs that are counted under Function
+orCallee.
+020406080100120
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15Number of Bugs
+Frame Level!analyze
+RETracer
+Figure 4: Histogram of the frame levels of blamed functions.
+01020304050
+1 6 11 16 21 26 31 36Number of Bugs
+Number of Edges
+Figure 5: Histogram of the shortest distance from the crash node to
+the blamed function in the backward data ﬂow graph.
+function (which is at the top of the stack) for 100 out of the 140 bugs
+we studied. On the other hand, RETracer blames a function that is
+down the stack for 88 bugs. For one bug, !analyze blames the 11th
+function (with frame level 10) on the stack because it whitelists
+ntdll.dll. This function is wrong. In contrast, RETracer correctly
+identiﬁes the 8th function on the stack.
+For three bugs, RETracer blames the 7th function on the stack.
+It is correct in all three cases. RETracer blames the 16th function
+on the stack for one bug. While this is correct in the sense that the
+corrupted pointer was returned from a call in the 16th function, it
+is not correct by our criterion as the developer chose to add a check
+right before dereferencing the potentially corrupted value.
+5.1.2 Backward Taint Analysis
+Next we evaluate how well RETracer can recover concrete mem-
+ory addresses in its backward taint analysis.
+In Figure 5, we show a histogram of the shortest distance from
+the crash node to the blamed function in the backward data ﬂow
+graph. The shortest distance is measured by the minimum number
+of edges from the crash node to any node in the blamed function.
+0102030405060708090
+1 2 3 4 5 6 7 8Number of Bugs
+Number of Tainted Memory OperandsFigure 6: Histogram of the number of memory operands in the
+shortest path from the crash node to the blamed function in the
+backward data ﬂow graph.
+operand type count
+constant 7
+global variable 16
+dynamic memory location 78
+call site 39
+Figure 7: Operand types of the ﬁnal nodes of 140 taint paths.
+We can see that, for the majority of the 140 bugs, RETracer needs
+to track the taint in less than 11 edges. We checked the two bugs
+for which RETracer tracks the taint in 20 and 36 edges. !analyze
+blames the wrong function for the ﬁrst bug and the correct func-
+tion for the second bug after ignoring four functions based on its
+whitelist. For both bugs, RETracer blames the correct function.
+Interestingly, for the second bug, RETracer reversely traverses 34
+of the 36 edges in whitelisted modules to ﬁnd that the corrupted
+pointer was passed from a module not in the whitelist.
+In Figure 6, we show the histogram of the number of memory
+operands in the shortest path from the crash node to the blamed
+function in the backward data ﬂow graph. Since the crash node
+itself is a memory operand, the number of memory operands is at
+least one. For the majority of the 140 bugs, RETracer needs to
+propagate taint over at most four memory operands. We checked
+the two bugs for which RETracer propagates taint over eight mem-
+ory operands. For both of them, !analyze is wrong and RETracer is
+correct.
+Next, we examine the taint paths from crash nodes to blamed
+functions and attempt to analyze why RETracer did not extend the
+paths beyond the blamed functions. The taint propagation paths
+may end at a constant, a global variable, a dynamic memory loca-
+tion, or a call site. The last one means that the tainted value was
+returned from a callee function that RETracer did not analyze.
+Figure 7 displays counts for the operand types of the ﬁnal nodes
+for the 140 bugs. For the seven bugs with constant operands, RETracer
+has found the actual end of the path. RETracer found the concrete
+memory address for 68 of the 78 bugs associated with dynamic
+82700.20.40.60.81
+0 10 20 30 40 50Cumulative Distribution
+Run Time (s)Figure 8: The cumulative distribution of RETracer’s run times over
+3,000 randomly picked crashes.
+memory locations. For these 68 bugs and the 16 global variable
+bugs, the taint path ended because RETracer did not observe any
+further write operations to the memory location. This can happen
+if the memory location was written to by another thread or in a
+function that completed on the crash thread before the crash and
+that RETracer did not analyze. The latter is also the explanation for
+the 39 bugs associated with call sites.
+We examined the ten bugs for which RETracer stopped the back-
+ward taint propagation at a dynamic memory location without ﬁnd-
+ing a concrete memory address. The values of the registers for
+computing the memory addresses were missing mainly for one of
+three reasons: branches (a register may have different values for
+different branches), self dereference (e.g., MOV EAX,[EAX]), and in-
+complete memory information (a register’s value is from a memory
+location whose value is not stored in the crash report).
+5.2 Performance
+To evaluate the performance of RETracer, we randomly picked
+3,000 crashes reported to WER in one day. Our experiments were
+performed on an HP Z420 workstation with a quad-core CPU at
+3.6GHz, 16GB RAM, and an OCZ-Vector150 480GB SSD.
+We show the distribution of run times over the 3,000 crashes
+in Figure 8. The median, average, and maximum run time is 1.1
+seconds, 5.8 seconds, and 44.8 seconds. The run time is at most 13
+seconds for 80% crashes, and at most 25 seconds for 99% crashes.
+5.3 Deployment on WER
+RETracer has been deployed on WER as the main crash triaging
+solution since February 2015. If RETracer can analyze a crash and
+return a blamed function, WER uses it for triaging. Otherwise,
+WER uses the output from !analyze for triaging.
+For a sample period of time, WER received a total of 590,282
+x86 and x86-64 crash reports in Microsoft’s software (i.e., the PE
+and PDB ﬁles for the crash module exist). 177,325 (30%) crash re-
+ports were for an unhandled exception that is not access violation.
+RETracer returned a blamed function for 285,288 (48%) crash re-
+ports. The rest of them were due to stack overﬂows, unloaded mod-
+ules or bit ﬂips. For the crashes for which RETracer found a blamed
+function, the function differed from !analyze’s function in 184,756
+cases (65%).
+Next we present two case studies from RETracer’s deployment.
+5.3.1 SRWLock
+With RETracer, we found that a top bug in x86-64 Internet Ex-
+plorer is in the function RtlpWakeSRWLock in the module ntdll.dll, the
+core user-level module in Windows. This bug was ignored pre-
+viously because ntdll.dll was in the whitelist of !analyze and othermodules on the crash stack were blamed for the crashes. Though
+ntdll.dll is in RETracer’s whitelist, RETracer still blames it because
+the nodes in the backward data ﬂow graph were all from ntdll.dll.
+After some investigation, we found that the root cause of the
+crashes was due to a wide-spread malware [1] not the code of SR-
+WLock [47]. When the malware tries to unload itself, it modiﬁes
+the return address on the stack to avoid the return to itself after its
+module win64cert.dll is unloaded. When manipulating the stack, the
+malware misaligns the stack by mistake. This causes the data struc-
+ture allocated on the stack by SRWLock to notbe aligned at the
+16-byte boundary. This may lead to a crash non-deterministically
+because SRWLock requires the data structure to be 16-byte aligned.
+The crash may happen on any thread that was using SRWLock
+when the malware was trying to unload itself because SRWLock
+uses a linked list to connect its data structures allocated on stacks.
+Therefore, before RETracer, millions of crashes caused by this mal-
+ware were wrongly scattered into a large number of groups and
+were treated as unsolvable. With RETracer, we were able to put
+all the crashes into one group correctly and revealed it as a top bug
+in x86-64 Internet Explorer. More importantly, the focus on SR-
+WLock led us to check stack alignment of all threads in the crash
+process and discover the root cause.
+5.3.2 NTFS
+With RETracer, we found a high impact bug in ntfs.sys in Win-
+dows 10 Preview. The root cause of the bug is that a pointer ﬁeld
+used in the crash function may be null and should be checked before
+being used for dereference. The driver ntfs.sys is the key ﬁle system
+driver in Windows. This bug affected a large number of Windows
+10’s beta users. The bug was previously ignored by !analyze be-
+cause the NTFS driver is in its whitelist. Instead, !analyze scattered
+the crashes into multiple groups by blaming the third-party drivers
+that called the NTFS driver.
+The NTFS driver is also in RETracer’s whitelist, but RETracer
+treated it as a regular module in this case because the backward data
+ﬂow was contained in the NTFS driver. This allowed RETracer to
+correctly put all the crashes into a single group under the crash
+function in NTFS. This raised the priority of the bug and led to the
+proper ﬁx.
+6. THREATS TO V ALIDITY
+Anexternal threat to validity is that our implementation and
+evaluation were focused on the Windows platform running on x86
+and x86-64 architectures. However, our design was general to oper-
+ating systems and machine instruction sets. So we expect RETracer
+to work on other architectures such as ARM and other operating
+systems such as Linux with reasonable engineering efforts.
+Aconstruct validity threat is that we deﬁne our blamed function
+to be correct if it was modiﬁed or it was in the same class as a func-
+tion that was modiﬁed in a bug ﬁx. This deﬁnition may not truly
+reﬂect the actual correctness. The ultimate criteria should be deter-
+mined by a developer that a blamed function is correct if it helps
+isolate and ﬁx the bug by grouping related crashes based on the
+blamed function. However, it is hard to ﬁnd the relevant developers
+to verify each bug. Therefore, we used bug ﬁxes as an objective
+approximation.
+Aninternal threat to validity is that we evaluated RETracer on
+140ﬁxed bugs. This data set may not be representative. It is possi-
+ble that we may have different results on open bugs. We made this
+choice mainly because we need the source code ﬁx as the ground
+truth. To mitigate this threat, we did an exhaustive search to ﬁnd all
+bugs that we can experiment with.
+8287. RELATED WORK
+There is a rich collection of literature on software debugging. In
+this section, we relate RETracer’s design to previous approaches in
+software debugging, including failure classiﬁcation, fault localiza-
+tion, and failure reproduction.
+7.1 Automated Failure Classiﬁcation
+The goal of failure classiﬁcation is to group failure reports of
+the same bug together. This is important for large-scale crash re-
+porting services, including Microsoft [15], Apple [6], Google [16],
+Adobe [2], Ubuntu [41], Mozilla [28], to prioritize bugs and vali-
+date their ﬁxes. Previous work has considered three different types
+of information that may be included in a failure report: memory
+dumps, execution logs and failure descriptions. We group our dis-
+cussion of previous work by these categories.
+Memory Dump. In practice, memory dumps are the main source
+of information used in failure classiﬁcation. In contrast to execu-
+tion logs, they do not entail overhead during regular execution. The
+main disadvantage of memory dumps lies in the limited informa-
+tion they contain. This line of work has focused on using the crash
+stack to group failures because it is easy to collect and useful for
+debugging [36].
+We have discussed the approaches used in WER [15] and in
+Ubuntu’s crash reporting service [41, 40]. Molnar et al. [27] pro-
+posed another kind of stack hash for aggregating crashes. The main
+limitation of stack hashes is that a ﬁxed stack level does not work
+well with all kinds of crashes. The choice of the crash function of
+!analyze can be treated as a stack hash of a single stack frame.
+Wuet al. [48] proposed to leverage information retrieval tech-
+niques to identify blamed functions for a crash. Another line of
+work [13, 21, 26] proposed to cluster crash reports based on the
+similarity of crash stacks. The main limitation of these approaches
+is that they require a training set and thus are not effective for newly
+added functions. Furthermore, they approximate a function’s rele-
+vance based on syntactic, indirect measures such as a function’s
+depth on the crash stack, which may not correctly reﬂect the func-
+tion’s involvement in a crash.
+The main advantage of RETracer over previous work is that it
+triages crashes based on an approximated execution history (the
+backward data ﬂow graph) without requiring execution logs. This
+enables it to achieve better triaging accuracy by leveraging function
+semantics as if an execution log were available.
+Execution Log. This line of work [30, 39, 11] leverages recorded
+execution logs and/or checkpoints to classify failures. Runtime
+recording provides much more information than memory dumps,
+but also introduces unacceptably high overhead on end-user ma-
+chines during normal operation.
+Failure Description. This line of work [4, 19] treats failure clas-
+siﬁcation as a text categorization problem. It relies on the bug de-
+scription manually written by various users to classify bugs. How-
+ever, in most realistic end-user scenarios, such descriptions are not
+available or not meaningful. In contrast, RETracer works directly
+on memory dumps that are automatically generated.
+7.2 Software Fault Localization
+Software fault localization is a technique that locates one or more
+possible root causes of a bug. The main difference between soft-
+ware fault localization and failure classiﬁcation is that the former
+focuses on ﬁnding the exact root causes while the latter focuses on
+grouping failures. There has been a large volume of research on
+software fault localization [52, 12, 32, 17, 31, 35]. Next we sum-
+marize previous work that is most relevant to RETracer in terms of
+backward analysis.Postmortem Symbolic Execution (PSE) [22] uses static back-
+ward data ﬂow analysis to reconstruct blamed execution traces from
+a failure site. PSE was the ﬁrst to use typestate [38] to analyze
+program failures. Thin slicing [37] is another backward analysis
+technique that is related to RETracer’s design. Unlike traditional
+slicing [42, 3] that requires all program statements for reaching a
+seed statement, thin slicing consists only of producer statements for
+the seed, i.e., those statements that help compute and copy a value
+to the seed.
+Unlike RETracer, these approaches do not analyze crash reports,
+but try to ﬁnd bugs by means of static analysis. They are not suit-
+able for triaging crashes in a large-scale crash reporting service.
+7.3 Failure Reproduction
+Reproducing failures is important for software debugging. Ex-
+isting failure reproduction techniques [20, 50, 34, 7, 10] cannot be
+directly used for failure classiﬁcation on practical services because
+of path explosion and their overhead on normal execution.
+Zamﬁr et al. [51] proposed reverse execution synthesis to ad-
+dress the limitation of path explosion faced by execution synthe-
+sis [50]. Instead of ﬁnding an input, reverse execution synthesis
+aims at constructing intermediate memory state near the failure site
+that can lead to the failure. It does not do instruction-level reverse
+execution as RETracer. Instead, it analyzes basic blocks backwards
+and uses forward symbolic execution to analyze each basic block.
+Evaluations of reverse execution synthesis on three small synthetic
+concurrency bugs are reported in [49]. It is not clear if it can scale
+to large programs for crash analysis and triaging.
+8. CONCLUSION
+We have presented RETracer, the ﬁrst system that triages crashes
+based on program semantics extracted from a memory dump. With-
+out requiring an execution trace, RETracer performs backward taint
+analysis to ﬁnd out how a bad value such as a corrupted pointer
+was derived and use it to identify a blamed function for triaging.
+It combines concrete reverse execution with static forward analysis
+to track concrete values of registers and memory locations for taint
+propagation. We have implemented RETracer and deployed it on
+Windows Error Reporting. Our experiments show that RETracer
+reduces triage errors by two thirds and triages crashes in just six
+seconds on average.
+9. ACKNOWLEDGMENTS
+We thank the anonymous reviewers for their helpful feedback.
+We are grateful to Graham McIntyre for his tremendous help and
+support in implementing and evaluating RETracer and deploying
+it into production. We thank Galen Hunt for introducing us to the
+triaging problem and giving us selﬂess help throughout the project.
+We thank Gloria Mainar-Ruiz for helping us collect bug informa-
+tion. We thank Reuben Olinsky for answering numerous ques-
+tions we had during development. We thank Andrew Baumann and
+Barry Bond for their help with the case studies. We thank the !ana-
+lyzeteam for helping us with the integration and deployment.
+10. REFERENCES
+[1] 411-spyware.com. Win64cert.dll.
+http://www.411-spyware.com/ﬁle-win64cert-dll.
+[2] Adobe Systems Inc. Adobe crash reporter.
+https://helpx.adobe.com/creative-suite/kb/
+changing-settings-crash-reporter.html.
+[3] H. Agrawal, J. Horgan, S. London, and W. Wong. Fault
+localization using execution slices and dataﬂow tests. In
+829Proceedings of the 16th International Symposium on
+Software Reliability Engineering (ISSRE), pages 143–151,
+1995.
+[4] J. Anvik, L. Hiew, and G. C. Murphy. Who should ﬁx this
+bug? In Proceedings of the 28th International Conference on
+Software Engineering (ICSE), pages 361–370, 2006.
+[5] Apple Inc. Crash logs in xcode 6.3 beta 2.
+https://developer.apple.com/news/?id=02232015d.
+[6] Apple Inc. Technical note TN2123: CrashReporter.
+https://developer.apple.com/library/mac/technotes/tn2004/
+tn2123.html.
+[7] S. Artzi, S. Kim, and M. D. Ernst. ReCrash: Making
+software failures reproducible by preserving object states. In
+Proceedings of the 22nd European Conference on
+Object-Oriented Programming (ECOOP), pages 542–565,
+2008.
+[8] S. Bhansali, W.-K. Chen, S. de Jong, A. Edwards, R. Murray,
+M. Drinic, D. Mihocka, and J. Chau. Framework for
+instruction-level tracing and analysis of program executions.
+InProceedings of the Second International Conference on
+Virtual Execution Environments (VEE), pages 154–163,
+2006.
+[9] BSDaemon. Dynamic program analysis and software
+exploitation: From the crash to the exploit code.
+http://phrack.org/issues/67/10.html.
+[10] Y . Cao, H. Zhang, and S. Ding. SymCrash: Selective
+recording for reproducing crashes. In Proceedings of the
+29th International Conference on Automated Software
+Engineering (ASE), pages 791–802, 2014.
+[11] Y . Chen, A. Groce, C. Zhang, W.-K. Wong, X. Fern, E. Eide,
+and J. Regehr. Taming compiler fuzzers. In Proceedings of
+the 34th ACM SIGPLAN Conference on Programming
+Language Design and Implementation (PLDI), pages
+197–208, 2013.
+[12] H. Cleve and A. Zeller. Locating causes of program failures.
+InProceedings of the 27th International Conference on
+Software Engineering (ICSE), pages 342–351, 2005.
+[13] Y . Dang, R. Wu, H. Zhang, D. Zhang, and P. Nobel.
+ReBucket: A method for clustering duplicate crash reports
+based on call stack similarity. In Proceedings of the 34th
+International Conference on Software Engineering (ICSE),
+2012.
+[14] GDB. Reverse debugging.
+http://www.gnu.org/software/gdb/news/reversible.html.
+[15] K. Glerum, K. Kinshumann, S. Greenberg, G. Aul,
+V . Orgovan, G. Nichols, D. Grant, G. Loihle, and G. Hunt.
+Debugging in the (very) large: ten years of implementation
+and experience. In Proceedings of the ACM SIGOPS 22nd
+Symposium on Operating Systems Principles (SOSP), pages
+103–116, 2009.
+[16] Google Inc. Chrome: Send usage statistics and crash reports.
+https://support.google.com/chrome/answer/96817?hl=en.
+[17] S. Hangal and M. Lam. Tracking down software bugs using
+automatic anomaly detection. In Proceedings of the 24th
+International Conference on Software Engineering (ICSE),
+pages 291–301, 2002.
+[18] Hex-Rays. IDA.
+https://www.hex-rays.com/products/ida/index.shtml.
+[19] N. Jalbert and W. Weimer. Automated duplicate detection for
+bug tracking systems. In Proceedings of the 38th IEEE
+International Conference on Dependable Systems and
+Networks (DSN), pages 52–61, 2008.[20] W. Jin and A. Orso. BugRedux: Reproducing ﬁeld failures
+for in-house debugging. In Proceedings of the 34th
+International Conference on Software Engineering (ICSE),
+2012.
+[21] S. Kim, T. Zimmermann, and N. Nagappan. Crash Graphs:
+An aggreated view of multiple crashes to improve crash
+triage. In Proceedings of the 41st International Conference
+on Dependable Systems and Networks (DSN), 2011.
+[22] R. Manevich, M. Sridharan, S. Adams, M. Das, and Z. Yang.
+PSE: Explaining program failures via postmortem static
+analysis. In Proceedings of the 12th ACM SIGSOFT 12th
+International Symposium on Foundations of Software
+Engineering (FSE), pages 63–72, 2004.
+[23] Microsoft. The !analyze extension.
+https://msdn.microsoft.com/en-us/library/windows/
+hardware/ff562112(v=vs.85).aspx.
+[24] Microsoft. Debugging tools for Windows.
+https://msdn.microsoft.com/en-us/library/windows/
+hardware/ff551063(v=vs.85).aspx.
+[25] Microsoft. Visual Studio. https://www.visualstudio.com/.
+[26] N. Modani, R. Gupta, G. Lohman, T. Syeda-Mahmood, and
+L. Mignet. Automatically identifying known software
+problems. In Proceedings of the 23rd International
+Conference on Data Engineering (ICDE), pages 433–441,
+2007.
+[27] D. Molnar, X. C. Li, and D. A. Wagner. Dynamic test
+generation to ﬁnd integer bugs in x86 binary linux programs.
+InProceedings of the 18th USENIX Security Symposium,
+pages 67–82, 2009.
+[28] Mozilla. Mozilla crash reporter. https://support.mozilla.org/
+en-US/kb/mozillacrashreporter?redirectlocale=en-US&
+redirectslug=Mozilla+Crash+Reporter.
+[29] E. B. Nightingale, J. R. Douceur, and V . Orgovan. Cycles,
+cells and platters: An empirical analysis of hardware failures
+on a million consumer PCs. In Proceedings of the Sixth
+European Conference on Computer Systems (EuroSys),
+pages 343–356, 2011.
+[30] A. Podgurski, D. Leon, P. Francis, W. Masri, M. Minch,
+J. Sun, and B. Wang. Automated support for classifying
+software failure reports. In Proceedings of the 25th
+International Conference on Software Engineering (ICSE),
+pages 465–475, 2003.
+[31] M. Renieres and S. Reiss. Fault localization with nearest
+neighbor queries. In Proceedings of the 18th IEEE
+International Conference on Automated Software
+Engineering (ASE), pages 30–39, 2003.
+[32] T. Reps, T. Ball, M. Das, and J. Larus. The use of program
+proﬁling for software maintenance with applications to the
+year 2000 problem. In Proceedings of the 6th European
+Software Engineering Conference, pages 432–449, 1997.
+[33] A. Richards. Writing a Debugging Tools for Windows
+extension. In MSDN Magazine, March 2011.
+[34] J. Robler, A. Zeller, G. Fraser, C. Zamﬁr, and G. Candea.
+Reconstructing core dumps. In Proceedings of the Sixth
+IEEE International Conference on Software Testing,
+Veriﬁcation and Validation (ICST), pages 114–123, 2013.
+[35] S. K. Sahoo, J. Criswell, C. Geigle, and V . Adve. Using
+likely invariants for automated software fault localization. In
+Proceedings of the 18th International Conference on
+Architectural Support for Programming Languages and
+Operating Systems (ASPLOS), pages 139–152, 2013.
+830[36] A. Schroter, N. Bettenburg, and R. Premraj. Do stack trace
+help developer ﬁx bugs? In Proceedings of the Seventh IEEE
+Working Conference on Mining Software Repositories
+(MSR), 2010.
+[37] M. Sridharan, S. J. Fink, and R. Bodik. Thin slicing. In
+Proceedings of the 28th ACM Conference on Programming
+Language Design and Implementation (PLDI), 2007.
+[38] R. E. Strom and S. Yemini. Typestate: A programming
+language concept for enhancing software reliability. IEEE
+Transactions on Software Engineering, 12(1):157–171, Jan.
+1986.
+[39] J. Tucek, S. Lu, C. Huang, S. Xanthos, and Y . Zhou. Triage:
+Diagnosing production run failures at the user’s site. In
+Proceedings of 21st ACM SIGOPS Symposium on Operating
+Systems Principles (SOSP), pages 131–144, 2007.
+[40] Ubuntu. Apport crash duplicates.
+https://wiki.ubuntu.com/ApportCrashDuplicates.
+[41] Ubuntu. Crash reporting.
+https://launchpad.net/ubuntu/+spec/crash-reporting.
+[42] M. Weiser. Programmers use slices when debugging.
+Communications of the ACM, 25(7):446–452, July 1982.
+[43] Wikipedia. Call stack.
+http://en.wikipedia.org/wiki/Call_stack.
+[44] Wikipedia. Calling convention.
+http://en.wikipedia.org/wiki/Calling_convention.[45] Wikipedia. Core dump.
+http://en.wikipedia.org/wiki/Core_dump.
+[46] Wikipeida. Tail Call. http://en.wikipedia.org/wiki/Tail_call.
+[47] Windows Dev Center. Slim reader/writer locks.
+https://msdn.microsoft.com/en-us/library/windows/desktop/
+aa904937(v=vs.85).aspx.
+[48] R. Wu, H. Zhang, S.-C. Cheung, and S. Kim. CrashLocator:
+Locating crashing faults based on crash stacks. In
+Proceedings of the 2014 International Symposium on
+Software Testing and Analysis (ISSTA), 2014.
+[49] C. Zamﬁr. Execution Synthesis: A Technique for Automating
+the Debugging of Software. PhD thesis, EPFL, 2013.
+[50] C. Zamﬁr and G. Candea. Execution synthesis: A technique
+for automated software debugging. In Proceedings of the
+Fifth European Conference on Computer Systems (EuroSys),
+pages 321–334, 2010.
+[51] C. Zamﬁr, B. Kasikci, J. Kinder, E. Bugnion, and G. Candea.
+Automated debugging for arbitrarily long executions. In
+Proceedings of the 14th USENIX Conference on Hot Topics
+in Operating Systems (HotOS), pages 20–20, 2013.
+[52] A. Zeller. Isolating cause-effect chains from computer
+programs. In Proceedings of the 10th ACM SIGSOFT
+Symposium on Foundations of Software Engineering (FSE),
+pages 1–10, 2002.
+831

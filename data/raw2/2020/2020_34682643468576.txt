@@ -1,0 +1,1273 @@
+Lightweightand ModularResource Leak Verification
+Martin
+Kellogg∗
+Universityof Washington,
+Seattle, USA
+kelloggm@cs.washington.eduNarges Shadab∗
+Universityof California,
+Riverside, USA
+nshad001@ucr.eduManuSridharan
+Universityof California,
+Riverside, USA
+manu@cs.ucr.eduMichael D.Ernst
+Universityof Washington,
+Seattle, USA
+mernst@cs.washington.edu
+ABSTRACT
+Aresourceleakoccurswhenaprogramallocatesaresource,suchas
+asocketorfilehandle,butfailstodeallocateit.Resourceleakscause
+resourcestarvation,slowdowns,andcrashes.Previoustechniquesto
+prevent resource leaks are either unsound, imprecise, inapplicable
+to existing code,slow,oracombination ofthese.
+Static detection of resource leaks requires checking that de-
+allocationmethodsarealwaysinvokedonrelevantobjectsbefore
+theybecomeunreachable.Ourkeyinsightisthatleakdetectioncan
+bereducedtoanaccumulationproblem,aclassoftypestateprob-
+lemsamenabletosoundandmodularcheckingwithouttheneed
+for a heavyweight, whole-program alias analysis. The precision of
+anaccumulation analysis can be improved bycomputingtargeted
+aliasing information, and we augmented our baseline checker with
+three such novel techniques: a lightweight ownership transfer sys-
+tem;aspecializedresourcealias analysis; and asystemtocreate a
+freshobligation when anon-final resourcefield is updated.
+Ourapproachoccupiesauniquesliceofthedesignspace:itis
+soundandrunsrelativelyquickly(takingminutesonprogramsthat
+astate-of-the-artapproachtookhourstoanalyze).Weimplemented
+our techniques for Java in an open-source tool called the Resource
+LeakChecker.TheResourceLeakCheckerrevealed49realresource
+leaks in widely-deployed software. It scales well, has a manageable
+false positive rate (comparable to the high-confidence resource
+leak analysisbuilt into the Eclipse IDE), and imposesonly a small
+annotation burden (1/1500 LoC) for developers.
+CCS CONCEPTS
+·Software andits engineering →Software verification.
+KEYWORDS
+Pluggable type systems, accumulation analysis, static analysis, type-
+state analysis, resource leaks
+ACM Reference Format:
+Martin Kellogg, Narges Shadab, Manu Sridharan, and Michael D. Ernst. 2021. 
+Lightweight and Modular Resource Leak Verification. In Proceedings of the
+29th ACM Joint European Software Engineering Conference and Symposium
+on the Foundations of Software Engineering (ESEC/FSE ’21), August 23ś28, 
+2021, Athens, Greece. ACM, New York, NY, USA, 12 pages. https://doi.org/
+10.1145/3468264.3468576
+∗Both authors contributed equally to this research.
+ESEC/FSE ’21, August 23ś28, 2021, Athens, Greece
+© 2021 Copyright held by the owner/author(s).
+ACM ISBN 978-1-4503-8562-6/21/08.
+https://doi.org/10.1145/3468264.34685761 INTRODUCTION
+A resource leak occurs when some finite resource managed by the
+programmer is not explicitly disposed of. In an unmanaged lan-
+guagelikeC,thatexplicitresourcemightbememory;inamanaged
+language like Java, it might be a file descriptor, a socket, or a data-
+baseconnection.Resourceleakscontinuetocauseseverefailures,
+even in modern, heavily-used Java applications [ 15]. This state-
+of-the-practice does not differ much from two decades ago [ 35].
+Microsoftengineersconsiderresourceleakstobeone ofthemost
+significant development challenges [ 22]. Preventing resource leaks
+remainsan urgent, difficult, open problem.
+Ideally,atoolfor preventing resourceleakswouldbe:
+•applicable to existing code withfew code changes,
+•sound,sothatundetectedresourceleaksdonotslipintothe
+program;
+•precise, so that developers are not bothered by excessive false
+positive warnings; and
+•fast,sothatitscalestoreal-worldprogramsanddevelopers
+can use itregularly.
+Extantapproachesfailatleastoneofthesecriteria.Language-based
+featuresmay not applyto alluses of resource variables:Java’s try-
+with-resourcesstatement[ 24],forexample,canonlycloseresource
+typesthatimplementthe java.lang.AutoCloseable interface,and
+cannot handle common resource usage patterns that span multiple
+procedures. Heuristic bug-finding tools for leaks, such as those
+built into Java IDEs including Eclipse [ 8] and IntelliJ IDEA [ 18],
+are fast and applicable to legacy code, butthey are unsound. Inter-
+procedural typestate or dataflow analyses [ 33,39] achieve more
+precise resultsÐthough they usually remain unsoundÐbut their
+whole-program analysis can require hours to analyze a large-scale
+Java program. Finally, ownership type systems [ 5] as employed in
+languageslike Rust[20] can preventnearly all resourceleaks(see
+section9.2), but using them would require a significant rewrite for
+alegacycodebase,asubstantial taskwhichis often infeasible.
+The goal of aleak detector for aJava-like language istoensure
+thatrequiredmethods(suchas close())arecalledonallrelevant
+objects; we deem this a must-call property. Verifying a must-call
+property requires checking that required methods (or must-call
+obligations ) have been called at any point where an object may
+become unreachable. A static verifier does this by computing an
+under-approximationofinvokedmethods.Ourkeyinsightisthat
+checkingofmust-callpropertiesisan accumulationproblem,and
+hence doesnot require heavyweightwhole-program analysis. Our
+contributionisaresourceleakverifierthatleveragesthisinsightto
+satisfyallfourrequirements:itisapplicable,sound,precise,andfast.
+Anaccumulationanalysis[ 19]isaspecial-caseoftypestateanal-
+ysis[29].Typestateanalysisattachesafinite-statemachine(FSM)
+toeachprogramelementofagiventype,andtransitionsthestateof
+181This work is licensed under a Creative Commons Attribution International 4.0 License.
+ESEC/FSE ’21, August 23–28, 2021,Athens,Greece MartinKellogg, NargesShadab,Manu Sridharan,andMichaelD. Ernst
+theFSMwheneverarelevantoperationisperformed.Inanaccumu-
+lationanalysis,theorderofoperationsperformedcannotchange
+what is subsequently permitted, and executing more operations
+cannotaddadditionalrestrictions.Unlikearbitrarytypestateanaly-
+ses,accumulationanalysescanbebuildinasound,modularfashion
+withoutanywhole-programaliasanalysis,improvingscalability
+andusability.
+Recent work [ 19] presented an accumulation analysis for ver-
+ifying that certain methods are invoked on each object before a
+specificcall(e.g., build()).Resourceleakcheckingissimilarinthat
+certain methods must be invoked on each object before it becomes
+unreachable.Anobjectbecomesunreachablewhenitsreferences
+go out of scope or are overwritten. By making an analogy between
+object-unreachability points and method calls, we show that re-
+source leak checking is an accumulation problem and hence is
+amenableto sound, modular,andlightweightanalysis.
+Therearetwokeychallengesforthisleak-checkingapproach.
+First, due to subtyping, the declared type of a reference may not
+accurately represent its must-call obligations; we devised a simple
+typesystemtosoundlycapturetheseobligations.Second,theap-
+proach is sound, but highly imprecise (more so than in previous
+work [19]) without targeted reasoning about aliasing. The most
+importantpatterns to handle are:
+•copyingofresourcesviaparameters andreturns,orstoringof
+resourcesinfinal fields (the RAIIpattern [ 30]);
+•wrappertypes,whichsharetheirmust-callobligationswith
+one oftheirfields; and,
+•storing resources in non-final fields, which might be lazily
+initializedorwritten more thanonce.
+Toaddressthisneed,weintroducedanintra-proceduraldataflow
+analysisforaliastracking,andextendeditwiththreesoundtech-
+niques to improve precision:
+•alightweightownershiptransfersystem.Thissystemindicates
+whichreferenceisresponsibleforresolvingamust-callobli-
+gation. Unliketypicalownershiptype systems,our approach
+does not impact the privilegesofnon-owning references.
+•resourcealiasing,forcaseswhenaresource’smust-callobli-
+gations can be resolved by closing one of multiple references.
+•a system for creating new obligations at locations other than
+theconstructor,whichallowsoursystemtohandlelazyini-
+tializationorre-initialization.
+Variants of some of these ideas exist in previous work. We bring
+them together in a general, modular manner, with full verification
+and the ability for programmers to easily extend checking to their
+owntypesandmust-callproperties.Ourapproachoccupiesanovel
+point in the design space for a leak detector: unlike most prior
+work,it issound;it isanorder ofmagnitudefasterthan state-of-
+the-art whole-program analyses; it has a false positive rate similar
+toastate-of-the-practiceheuristicbug-finder;and,thoughitdoes
+requiremanualannotationsfromtheprogrammer,itsannotation
+burden is reasonable: about 1 annotation for every 1,500 lines of
+non-comment,non-blank code.
+Our contributionsare:
+•the insight that the resource leak problem is an accumula-
+tion problem, and an analysis approach based on this fact
+(section2).•threeinnovationsthatimprovetheprecisionofouranalysis
+via targeted reasoning about aliasing: a lightweight owner-
+shiptransfersystem(section 3),alightweightresource-alias
+trackinganalysis(section 4),andasystemforhandlinglazy
+ormultiple initialization(section 5).
+•anopen-sourceimplementationforJava, calledtheResource
+LeakChecker (section 6).
+•an empirical evaluation: case studies on heavily-used Java
+programs (section 7.1), an ablation study that shows the con-
+tributions of each innovationto the Resource Leak Checker’s
+precision (section 7.2), and a comparison to other state-of-the-
+art approaches that demonstrates the unique strengths of our
+approach (section 7.3).
+2 LEAKDETECTIONVIAACCUMULATION
+This section presents a sound, modular, accumulation-based re-
+sourceleakchecker(łtheResourceLeakCheckerž).Sections 3ś5
+soundly enhance its precision.
+TheResourceLeakCheckeriscomposedofthreecooperating
+analyses:
+(1)atainttrackingtypesystem(section 2.2)computesaconserva-
+tiveoverapproximation of the set of methods that might need
+to be calledoneachexpressioninthe program.
+(2)an accumulation type system (section 2.3) computes a con-
+servative underapproximation ofthesetofmethodsthatare
+actually calledoneachexpressioninthe program.
+(3)a dataflow analysis (section 2.4) checks consistency of the
+resultsofthetwoabove-mentionedtypesystemsandprovides
+a platform for targeted alias reasoning. It issues an error if
+some method that might need to be called on an expression is
+not alwaysinvoked before the expressiongoes out ofscope
+orisoverwritten.
+2.1 Background on Pluggable Types
+Sections2.2and2.3describepluggabletypesystems [12]thatarelay-
+eredontopofthetypesystemofthehostlanguage.Typesinaplug-
+gabletypesystemarecomposedoftwoparts:a typequalifier and
+a base type. The type qualifier is the part of the type that is unique
+to the pluggable type system; the base type is a type from the host
+language. Our implementation is for Java (see section 6), so we use
+theJavasyntaxfortypequalifiers:ł @žbeforeatypeindicatesthatit
+is a type qualifier, and a type without ł @ž is a base type. This paper
+sometimes omits the basetype when itisobvious from context.
+Atype system checks programmer-written types. Oursystem
+requires the programmer to write types on method signatures,
+but within method bodies it uses flow-sensitive type refinement,
+adataflowanalysisthatperformstypeinference.Thispermitsan
+expressiontohavedifferenttypesondifferentlinesoftheprogram.
+2.2 A TypeSystemforMust-Call Obligations
+The Must Call type system tracks which methods might need to
+becalledonagiven expression.Thistype systemÐandourentire
+analysisÐisnotspecifictoresourceleaks.Anothersuchpropertyis
+that thebuild()method of a builder [ 13] should always be called.
+TheMustCalltypesystemsupportstwoqualifiers: @MustCall
+and@MustCallUnknown .The@MustCall qualifier’sargumentsare
+182LightweightandModularResource LeakVerification ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+Socket s = null;
+try {
+s = new Socket(myHost, myPort);
+} catch (Exception e) { // do nothing
+} finally {
+if (s != null) {
+s.close();
+}
+}
+Figure 1:Asafeuse ofa Socketresource.
+@MustCallUnknown =⊤
+@MustCall({"a", "b"})
+@MustCall({"a"}) @MustCall({"b"})
+@MustCall({})=⊥
+Figure 2: Part of the MustCall type hierarchy for represent-
+ing which methods must be called; the full hierarchy is a
+latticeofarbitrarysize.Ifanexpression’stypehasqualifier
+@MustCall({"a", "b"}) , then the methods ł až and łbž might
+need to be called before the expression is deallocated. Ar-
+rowsrepresentsubtypingrelationships.
+the methods that the annotated value must call. The declaration
+@MustCall({"a"}) Object obj means that before objis deallo-
+cated,obj.a()mightneedtobecalled.TheResourceLeakChecker
+conservatively requires all these methods to be called, and it issues
+awarning if they are not.
+Forexample,considerfig. 1.Theexpression nullhastype@Must-
+Call({}) ÐithasnoobligationstocallparticularmethodsÐso shas
+thattypeafteritsinitialization.The newexpressionhastype @Must-
+Call("close") , and therefore shas that type after the assignment.
+At the start of the finallyblock, where both values for sflow, the
+typeofsistheirleastupperbound,whichis @MustCall("close") .
+Partofthetypehierarchyappearsinfig. 2.Alltypesaresubtypes
+of@MustCallUnknown . The subtyping relationship for @MustCall
+type qualifiers is:
+A⊆B
+@MustCall(A)⊑@MustCall(B)
+Thedefaulttypequalifieris @MustCall({}) forbasetypeswithouta
+programmer-written type qualifier.1Our implementation provides
+JDKannotationswhichrequirethateveryobjectof Closeable type
+must have the close()method called before it is deallocated, with
+exceptionsfor typesthat do not have an underlyingresource, e.g.,
+ByteArrayOutputStream .
+2.3 A TypeSystemforCalledMethods
+The Called Methods type system tracks a conservative underap-
+proximation of whichmethods have been called onan expression.
+It is an extension of a similar system from prior work [ 19]. The
+primary difference in our version is that a method is considered
+calledevenifitthrowsanexceptionÐanecessityinJavabecause
+1Forunannotatedlocalvariabletypes,flow-sensitivetyperefinementinfersaqualifier.Algorithm 1 Finding unfulfilled @MustCall obligations in a
+method.Algorithm 2defineshelper functions.
+1:procedure FindMissedCalls (CFG)
+2://Dmapseachstatementstoasetofdataflowfactsreaching
+3://s.Eachfactisoftheform ⟨P,e⟩,wherePisasetofvariables
+4:// that must-alias e and e is anexpressionwithanonempty
+5:// must-callobligation.
+6:D←InitialObligations (CFG)
+7:whileDhas not reachedfixedpoint do
+8: fors∈CFG.statements ,⟨P,e⟩∈D(s)do
+9: ifsisexitthen
+10: report amust-call violation for e
+11: else if¬MCSatisfiedAfter (P,s)then
+12: kill←sassignsavariable ? {s.LHS}:∅
+13: дen←CreatesAlias(P,s)?{s.LHS}:∅
+14: N←(P−kill)∪дen
+15:∀t∈CFG.succ(s).D(t)←D(t)∪{⟨N,e⟩}
+16:procedure InitialObligations (CFG)
+17:D←{s/mapsto→∅|s∈CFG.statements}
+18:forp∈CFG.formals,t∈CFG.succ(CFG.entry)do
+19: ifHasObligation(p)then
+20: D(t)←D(t)∪{⟨{p},p⟩}
+21:fors∈CFG.statements of the form p = m(p1, p2, ...) do
+22:∀t∈CFG.succ(s).D(t)←D(t)∪FactsFromCall(s)
+23:returnD
+Algorithm 2 Helper functions for algorithm 1. Except for
+MCAfter andCMAfter , all functions will be replaced with more
+sophisticatedversionsinsections 3ś5.
+1://Does eintroduce amust-call obligationto check?
+2:procedure HasObligation (e)
+3:returnehas adeclared @MustCall type
+4://smustbeacall statement p =m(p1,p2,...)
+5:procedure FactsFromCall (s)
+6:p←s.LHS,c←s.RHS
+7:returnHasObligation(c)?{⟨{p},c⟩}:∅
+8://Isthemust-callobligationfor P satisfied after s?
+9:procedure MCSatisfiedAfter (P,s)
+10:return∃p∈P.MCAfter(p,s)⊆CMAfter(p,s)
+11://Does sintroduce amust-alias for avar in P?
+12:procedure CreatesAlias (P,s)
+13:return∃q∈P.sisof the form p = q
+14:procedure MCAfter (p,s)
+15:returnmethodsin @MustCall type ofpafters
+16:procedure CMAfter (p,s)
+17:returnmethodsin @CalledMethods type ofpafters
+theclose()methodin java.io.Closeable isspecifiedtopossibly
+throw an IOException . In the prior work, a method was only con-
+sidered łcalledž when it terminated successfully. The remainder of
+this section isabriefsummary of the prior work [ 19].
+The checker is an accumulation analysis whose accumulation
+qualifieris @CalledMethods .Thetype @CalledMethods( A) Object
+183ESEC/FSE ’21, August 23–28, 2021,Athens,Greece MartinKellogg, NargesShadab,Manu Sridharan,andMichaelD. Ernst
+representsanobjectonwhichthemethodsintheset Ahavedef-
+initelybeencalled;othermethodsnotin Amightalsohavebeen
+called.The subtyping ruleis:
+B⊆A
+@CalledMethods(A) ⊑@CalledMethods(B)
+The top type is @CalledMethods({}) . The qualifier @CalledMeth-
+odsBottom isasubtype ofevery @CalledMethods qualifier.
+Thanks to flow-sensitive type refinement, Called Methods types
+are inferred within method bodies. In fig. 1the type of sis initially
+@CalledMethods({}) ,butittransitionsto @CalledMethods("close")
+after the callto close.
+2.4 ConsistencyChecking
+Given@MustCall and@CalledMethods types, the Must Call Con-
+sistency Checker ensures that the @MustCall methods for each
+object are always invoked before it becomes unreachable, via an
+intra-proceduraldataflowanalysis.Weemploydataflowanalysisto
+enabletargetedreasoningaboutaliasing,crucialforprecision.Here,
+we present a simple, sound version of the analysis. Sections 3ś5
+describe sound enhancements to this approach.
+Language. For simplicity, we present theanalysis over a simple
+assignment language in three-address form. An expression ein
+the language is null, a variable p, a field read p.f, or a method
+callm(p1,p2,...) (constructorcallsaretreatedasmethodcalls).A
+statement stakesoneofthreeforms: p = e,whereeisanexpres-
+sion;p.f = p’ , for a field write; or return p . Methods are repre-
+sented byacontrol-flowgraph (CFG) where nodesare statements
+and edges indicate possible control flow. We elide control-flow
+predicates because the consistency checker ispath-insensitive.
+ForamethodCFG, CFG.statements isthestatements, CFG.formals
+istheformalparameters, CFG.entryisitsentrynode, CFG.exitis
+itsexitnode,and CFG.succisitssuccessorrelation.Forastatement
+softhe form p = e,s.LHS=pands.RHS=e.
+Pseudocode. Algorithm 1gives pseudocode for the basic version
+ofourchecker,withhelperfunctionsinalgorithm 2.Atahighlevel,
+the dataflow analysis computes a map Dfrom each statement s
+in a CFG to a set of facts of the form ⟨P,e⟩, wherePis a set of
+variables and eis an expression. The meaning of Dis as follows: if
+⟨P,e⟩∈D(s),thenehasadeclared @MustCall type,andallvariables
+inParemust aliases for the value of eat the program point before
+s. Computing a set of must aliases is useful since any must alias
+maybeusedtosatisfythemust-callobligationof e.UsingD,the
+analysis finds any ethat does not have its @MustCall obligation
+fulfilled,andreports an error.
+Algorithm 1proceeds as follows. Line 6invokesInitialObliga-
+tionstoinitialize D.Onlyformalparametersormethodcallscan
+introduceobligationstobechecked(readsoflocalvariablesorfields
+cannot).Thefixed-pointloopiteratesoverallfacts ⟨P,e⟩present
+in anyD(s)(our implementation uses a worklist for efficiency). If s
+istheexitnode(line 9),theobligationfor ehasnotbeensatisfied,
+and an error is reported. Otherwise, the algorithm checks if the
+obligation for eis satisfied after s(line11). For the basic checker,
+MCSatisfiedAfter inalgorithm 2checkswhetherthereissome
+p∈Psuch that after s, the set of methods in p’s@MustCall type
+are contained intheset ofmethods in its @CalledMethods type;ifs = new Socket(...); // 1
+if (...) {
+s = null; // 2
+} else {
+t = s; // 3
+close(t); // 4
+}{<{s, t}, e>}
+{<∅, e>}entry
+1: s = new Socket(…);
+2: s = null;3: t = s;
+4: close(t)
+exit{<{s}, e>}{<{s}, e>}∅
+∅
+Figure3:ExamplecodeandCFGforillustratingalgorithm 1.
+łežisłnew Socket(...) ž.Non-shadedfactsarecreatedby Ini-
+tialObligations , and shaded facts are propagated by the
+fixed-point loop.
+true,all@MustCall methodshavealreadybeeninvoked.Thischeck
+uses the inferred flow-sensitive @MustCall and@CalledMethods
+qualifiers describedinsections 2.2and2.3.
+Iftheobligationfor eisnotyetsatisfied,thealgorithmpropagates
+thefacttosuccessorswithanupdatedset Nofmustaliases. Nis
+computedinastandardgen-killstyleonlines 12ś14.Thekillset
+simply consists of whatever variable (if any) appears on the left-
+hand side of s. The gen set is computed by checking if screates
+anewmustaliasforsomevariablein P,usingthe CreatesAlias
+routine.Sinceouranalysisisaccumulation, CreatesAlias could
+simplyreturnfalsewithoutimpactingsoundness.Inalgorithm 2,
+CreatesAlias handles the case of a variable copy where the right-
+hand side is in P. (Section 4presents more sophisticated handling.)
+Finally, line 15propagates the new fact tosuccessors. The process
+continues until Dreaches afixedpoint.
+Example. To illustrate our analysis, fig. 3shows a simple pro-
+gram (irrelevant details elided) and its corresponding CFG. The
+CFG shows the dataflow facts propagated along each edge. For ini-
+tialization,statement1introducesthefact ⟨{s},e⟩(whereeisthe
+new Socket(...) call) toD(2)andD(3). At statement 2, sis killed,
+causing⟨∅,e⟩tobeaddedto D(exit).Thisleadstoanerrorbeingre-
+portedforstatement1,asthesocketisnotclosedonthispath.State-
+ment 3 creates a must alias tfors, causing⟨{s,t},e⟩to be added to
+D(4).Forstatement4, MCSatisfiedAfter ({s,t},close(t))holds,
+sonofacts are propagatedfrom 4to exit.
+3 LIGHTWEIGHTOWNERSHIP TRANSFER
+Section2describes a sound accumulation-based checker for re-
+source leaks. However, that checker often encounters false posi-
+tivesincaseswherean @MustCall obligationissatisfiedinanother
+procedure via parameter passing, return values, or object fields.
+Considerthe following code that safely closes a Socket:
+void example(String myHost, int myPort) {
+Socket s = new Socket(myHost, myPort);
+closeSocket(s);
+}
+void closeSocket(@Owning @MustCall("close") Socket t) {
+t.close();
+}
+184LightweightandModularResource LeakVerification ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+ThecloseSocket() routinetakesownershipofthesocketÐthat
+is, it takes responsibility for closing it. The checker described by
+section2wouldissueafalsepositiveonthiscode,becauseitwould
+warnwhen sgoes outofscope at the end of example() .
+Thissectiondescribesa lightweightownershiptransfer technique
+forreducingfalsepositivesinsuchcases.Programmerswriteanno-
+tationslike @Owningthattransferanobligationfromoneexpression
+to another. Programmer annotations cannotintroduce any checker
+unsoundness; at worst, incorrect @Owningannotations will cause
+falsepositivewarnings.UnlikeanownershiptypesystemlikeRust’s
+(seesection 9.2),lightweightownershiptransferimposesnorestric-
+tionsonwhatoperationscanbeperformedthroughanalias,and
+hence has aminimal impact onthe programming model.
+3.1 OwnershipTransfer
+@Owningisa declarationannotation,not atypequalifier;it canbe
+written on a declaration such as a parameter, return, field, etc., but
+not on a type. A pseudo-assignment to an @Owninglvalue trans-
+fers the right-hand side’s @MustCall obligation. More concretely,
+in the Must Call Consistency Checker (section 2.4), at a pseudo-
+assignmenttoanlvaluewithan @Owningannotation,theright-hand
+side’s@MustCall obligation istreatedas satisfied.
+TheMCSatisfiedAfter (P,s)andHasObligation(e)procedures
+ofalgorithm 2are enhancedfor ownershiptransfer as follows:
+procedure MCSatisfiedAfter (P,s)
+return∃p∈P.MCAfter(p,s)⊆CMAfter(p,s)
+∨(sisreturnp∧OwningReturn(CFG))
+∨PassedAsOwningParam (s,p)
+∨(sisq.f=p∧fis@Owning)
+procedure HasObligation (e)
+returnehasadeclared @MustCall typeand e’sdeclaration
+is@Owning
+procedure OwningReturn (CFG)
+returnCFG’sreturn declarationis @Owning
+procedure PassedAsOwningParam (s,p)
+returnspassespto an@Owningparameterofits callee
+Section3.2discusseschecking of @Owningfields.
+Constructor returns are always @Owning. The Resource Leak
+Checker’s default for unannotated method returns is @Owning, and
+for unannotated parameters and fields is @NotOwning . These as-
+sumptions coincide well with coding patterns we observed in prac-
+tice,reducingtheannotationburdenforprogrammers.Further,this
+treatmentofparameterandreturntypesensuressoundhandling
+ofunannotatedthird-partylibraries:anyobjectreturnedfromsuch
+a library is tracked by default, and the checker never assumes that
+passing an object to an unannotated library satisfies its obligations.
+3.2 Final OwningFields
+Additional class-level checking is required for @Owningfields, as
+the codesatisfying their @MustCall obligations usually spans mul-
+tipleprocedures.Thissectionhandlesfinalfields,2whichcannot
+be overwritten after initialization of the enclosing object. When
+2TheResourceLeakCheckertreatsallstaticfieldsasnon-owning,meaningthatno
+assignmenttoonecansatisfyamust-callobligation.Inourcasestudies,wedidnot
+observeanyassignmentsofexpressionswithnon-emptymust-callobligationstostatic
+fields.Weleavehandling owning static fields to futurework.checkingnon-finalfields,thecheckermustensurethatoverwriting
+the field issafe (see Section 5.1).
+Forfinalfields,ourcheckingenforcesthełresourceacquisition
+isinitialization (RAII)žprogrammingidiom[ 30].Somedestructor-
+like method d()must ensure the field’s @MustCall obligation is
+satisfied, and the enclosing class must have an @MustCall("d")
+obligation to ensure the destructoriscalled.
+More formally, consider a final @Owningfieldfdeclared in class
+C, wherefhas type @MustCall("m") . To modularly verify that
+f’s@MustCall obligation is satisfied, the Resource Leak Checker
+checksthe following conditions:
+(1)AllCobjects must have a type @MustCall("d") for some
+methodC.d().
+(2)C.d()mustalwaysinvoke this.f.m() ,therebysatisfying f’s
+@MustCall obligation.
+Condition 1 is checked by inspecting the @MustCall annotation on
+classC. Condition 2 is checked by requiring an appropriate @En-
+suresCalledMethods postcondition annotation on C.d(), which is
+then enforcedbythe CalledMethodsChecker (section 2.3).
+4 RESOURCE ALIASING
+Thissectionintroducesasound,lightweight,specializedmust-alias
+analysis that tracks resource alias setsÐsets of pointers that defi-
+nitely correspond to the same underlying system resource. Closing
+onealiasalsoclosestheothers.Thus,theResourceLeakChecker
+canavoidissuingfalsepositivewarningsaboutresourcesthathave
+already been closedthrougharesourcealias.
+4.1 WrapperTypes
+Javaprogramsextensivelyuse wrappertypes .Forexample,theJava
+BufferedOutputStream wrapperaddsbufferingtosomedelegate
+OutputStream , which may or may not represent a resource that
+needs closing. The wrapper’s close()method invokes close()on
+the delegate. Wrapper types introduce two additional complexities
+for@MustCall checking:
+(1) If adelegate has no @MustCall obligation, the corresponding
+wrapper objectshould alsohave noobligation.
+(2)Satisfyingtheobligationof eitherthewrappedobjectorthe
+wrapper objectissufficient.
+Forexample,ifa BufferedOutputStream bwrapsastreamwithno
+underlying resource (e.g., a ByteArrayOutputStream ),b’s@Must-
+Callobligationshouldbeempty,as bhasnoresourceofitsown.
+Bycontrast,if bwrapsastreammanagingaresource,likea File-
+OutputStream f,thenclose()mustbe invokedon eitherborf.
+Previousworkhasshownthatreasoningaboutwrappertypesis
+requiredto avoid excessive false positive andduplicate reports [ 8,
+33].Wrapper typesin earlierwork were handledwith hard-coded
+specifications of which library types are wrappers, and heuristic
+clustering to avoid duplicatereports for wrappers [ 33].
+Ourtechniquehandleswrappertypesmoregenerallybytracking
+resourcealiases .Tworeferences r1andr2areresourcealiasesif r1
+andr2are must-aliased pointers, or if satisfying r1’s@MustCall
+obligation alsosatisfies r2’sobligation andvice-versa.
+Introducingresourcealiases. ToindicatewhereanAPImethod
+createsaresource-aliasrelationshipbetweendistinctobjects,the
+185ESEC/FSE ’21, August 23–28, 2021,Athens,Greece MartinKellogg, NargesShadab,Manu Sridharan,andMichaelD. Ernst
+programmerwritesapairof @MustCallAlias qualifiers:oneona
+parameterofamethod,andanotheronitsreturntype.Forexample,
+one constructorof BufferedOutputStream is:
+@MustCallAlias BufferedOutputStream(@MustCallAlias Ou tputStream arg0);
+@MustCallAlias annotationsareverified,nottrusted;seesection 4.3.
+Atacallsitetoan @MustCallAlias method,therearetwoeffects.
+First,themust-calltypeofthemethodcall’sreturnvalueisthesame
+asthatofthe @MustCallAlias argument.Ifthetypeoftheargument
+hasnomust-callobligations(likea ByteArrayOutputStream ),the
+returnedwrapper has nomust-call obligations.
+Second,theMustCallConsistencyChecker(section 2.4)treats
+the@MustCallAlias parameterandreturnasaliases.Foroursec-
+tion2.4pseudocode,thisversionof CreatesAlias fromalgorithm 2
+handles resourcealiases:
+procedure CreatesAlias (P,s)
+return∃q∈P.sisofthe form p = q
+∨IsMustCallAliasParam (s,q)
+procedure IsMustCallAliasParam (s,p)
+returnspassespto an@MustCallAlias parameter of its
+callee
+4.2 BeyondWrapperTypes
+@MustCallAlias canalsobeemployedinscenariosbeyonddirect
+wrappertypes,acapabilitynotpresentinpreviousworkonresource
+leak detection. In certain cases, a resource gets shared between
+objects via an intermediate object that cannot directly close the
+resource. For example, java.io.RandomAccessFile (which must
+be closed) has a method getFd()that returns a FileDescriptor
+object for the file. This file descriptor cannot be closed directlyÐit
+has noclose()method. However, the descriptor can be passed
+to a wrapper stream such as FileOutputStream , which if closed
+satisfies the original must-call obligation. By adding @MustCall-
+Aliasannotationstothe getFd()method,ourtechniquecanverify
+code like the below(adaptedfrom Apache Hadoop[ 31]):
+RandomAccessFile file = new RandomAccessFile(myFile, "rw s");
+FileInputStream in = null;
+try {
+in = new FileInputStream(file.getFD());
+// do something with in
+in.close();
+} catch (IOException e){
+file.close();
+}
+Because the must-call obligation checker (section 2.2) treats@Must-
+CallAlias annotations polymorphically, regardless of the asso-
+ciated base type, the Resource Leak Checker can verify that the
+sameresourceisheldbythe RandomAccessFile andtheFileInput-
+Stream, even though it is passed via a class without a close()
+method.
+4.3 Verification of @MustCallAlias
+A pair of @MustCallAlias annotations on m’s return type and its
+parameter pcan be verifiedif eitherofthe following holds:
+(1)pispassedtoanothermethodorconstructorinan @MustCall-
+Aliasposition, and mreturns that method’s result, or the call
+isasuper()constructorcallannotatedwith @MustCallAlias .(2)pisstoredinan @Owningfieldoftheenclosingclass.( @Owning
+field verification isdescribedinsections 3.2and5.1.)
+These verification procedures permit a programmer to soundly
+specifyaresource-aliasingrelationshipintheirowncode,unlike
+prior work that reliedonahard-codedlistof wrapper types.
+5 CREATING NEW OBLIGATIONS
+Every constructor of a class that has must-call obligations im-
+plicitly createsobligations for thenewly-createdobject.However,
+non-constructor methods may also create obligations when re-
+assigningnon-finalowningfieldsorallocatingnewsystem-level
+resources. To handle such cases soundly, we introduce a method
+post-condition annotation, @CreatesMustCallFor , to indicate ex-
+pressionsfor whichan obligation iscreatedat acall.
+At each call-site of a method annotated as @CreatesMustCall-
+For(expr),theResourceLeakCheckerremovesanyinferredCalled
+Methodsinformationabout expr,revertingto @CalledMethods({}) .
+Whencheckingacalltoamethodannotatedas @CreatesMust-
+CallFor( expr),the Must Call Consistency Checker (1) treatsthe
+@MustCall obligation of exprassatisfied, and (2) creates a fresh
+obligation to check. We update the FactsFromCall andMCSatis-
+fiedAfter procedures of algorithm 2as follows ([...]stands for
+the casesshownpreviously,includingthoseinsection 3.1):
+procedure FactsFromCall (s)
+p←s.LHS,c←s.RHS
+return{⟨{pi},c⟩|pi∈CMCFTargets(c)}
+∪(HasObligation(c)?{⟨{p},c⟩}:∅)
+procedure MCSatisfiedAfter (P,s)
+return∃p∈P.[...]∨p∈CMCFTargets(s)
+procedure CMCFTargets (c)
+return{pi|pipassedtoan @CreatesMustCallFor targetfor
+c’scallee }
+Thischangeissound:thecheckercreatesanewobligationforcalls
+to@CreatesMustCallFor methods, and the must-call obligation
+checker(section 2.2)ensuresthe @MustCall typeforthetargetwill
+have asupersetof any methods present before the call. There is
+anexceptiontothischeck:ifan @CreatesMustCallFor methodis
+invoked within a method that has an @CreatesMustCallFor anno-
+tation with the same targetÐimposing the obligation on its callerÐ
+then the newobligation can be treatedas satisfiedimmediately.
+5.1 Non-Final,OwningFields
+@CreatesMustCallFor allows the Resource Leak Checker to verify
+uses of non-final fields that contain a resource, even if they are
+re-assigned.Considerthe following example:
+@MustCall("close") // sets default qual. for uses of Socket Container
+class SocketContainer {
+private @Owning Socket sock;
+public SocketContainer() { sock = ...; }
+void close() { sock.close() };
+@CreatesMustCallFor("this")
+void reconnect() {
+if (!sock.isClosed()) {
+sock.close();
+}
+sock = ...;
+}
+}
+186LightweightandModularResource LeakVerification ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+Table1:Verifyingtheabsenceofresourceleaks.Throughout,łLoCžislinesofnon-comment,non-blankJavacode.łResourcesž
+is the number of resources created by the program. łResource leaksž are true positive warnings. łFalse positivesž are where
+thetoolreportedapotentialleak,butmanualanalysisrevealedthatnoleakispossible.łAnnotationsžandłcodechangesžare
+thenumberofedits to program text;see section 7.1.2fordetails. łWall-clocktimežisthe medianoffive trials.
+Resource False Annota- Code Wall-clock
+LoC Resources leaks positives tions changes time
+apache/zookeeper:zookeeper-server 45,248 177 13 48 122 5 1m 24s
+apache/hadoop:hadoop-hdfs-project/hadoop-hdfs 151,595 365 23 49 117 13 16m21s
+apache/hbase:hbase-server,hbase-client 220,828 55 5 22 45 5 7m 45s
+plume-lib/plume-util 10,187 109 8 2 2 19 0m 15s
+Total 427,858 706 49 121 286 42 -
+In the lifetime of a SocketContainer object,sockmight be re-
+assigned arbitrarily manytimes: once at eachcall to reconnect() .
+Thiscodeissafe,however: reconnect() ensuresthat sockisclosed
+before re-assigning it.
+TheResourceLeakCheckermustenforcetwonewrulestoen-
+sure that re-assignments to non-final, owning fields like sockin
+the example above are sound:
+•any method that re-assigns a non-final, owning field of an
+objectmustbeannotatedwithan @CreatesMustCallFor an-
+notation that targets that object.
+•whenanon-final,owningfield fisre-assignedatstatement
+s, its inferred @MustCall obligation must be contained in its
+@CalledMethods type at the program pointbefore s.
+The first rule ensures that close()is called after the last call to
+reconnect() ,andthesecondruleensuresthat reconnect() safely
+closessockbefore re-assigning it. Because calling an @Creates-
+MustCallFor method like reconnect() resets local type inferece
+forcalledmethods,callsto closebeforethelastcallto reconnect()
+are disregarded.
+5.2 UnconnectedSockets
+@CreatesMustCallFor can also handle cases where object creation
+does not allocate a resource, but the object will allocate a resource
+later in its lifecycle. Consider the no-argument constructor to
+java.net.Socket . This constructor does not allocate an operating
+system-levelsocket,butinsteadjustcreatesthecontainerobject,
+which permits the programmer to e.g. set options which will be
+used when creating the physical socket. When such a Socketis
+created, it initially has no must-call obligation; it is only when the
+Socketis actually connected via a call to a method such as bind()
+orconnect() that the must-call obligation iscreated.
+If allSockets are treated as @MustCall({"close"}) , a false pos-
+itive would be reported in code such as the below, which operates
+on an unconnected socket (simplified from real code in Apache
+Zookeeper [ 32]):
+static Socket createSocket() {
+Socket sock = new Socket();
+sock.setSoTimeout(...);
+return sock;
+}
+The call to setSoTimeout can throw a SocketException if the
+socketisactuallyconnectedwhenitiscalled.Using @CreatesMust-
+CallFor,however,theResourceLeakCheckercansoundlyshowthatthissocketisnotconnected:thetypeoftheresultoftheno-
+argument constructor is @MustCall({}) , and@CreatesMustCall-
+Forannotationson the methods thatactually allocate the socketÐ
+connect() orbind()Ðenforcethatassoonasthesocketisopen,it
+istreatedas @MustCall("close") .
+6 IMPLEMENTATION
+We implemented the Resource Leak Checker on top of the Checker
+Framework [ 25], an industrial-strength framework for building
+pluggable type systems for Java. The checkers which propagate
+and infer @MustCall and@CalledMethods annotations are imple-
+menteddirectlyasCheckerFrameworktype-checkers.TheMust
+CallConsistencyChecker(algorithm 1)isimplementedasapost-
+analysis pass over the control-flow graph producedby the Checker
+Framework’s dataflow analysis, and is invoked when the other
+two checkers terminate. The framework provides the checkers
+withflow-sensitivelocaltypeinference,supportforJavagenerics
+andqualifierpolymorphism,andotherconveniences.Ourimple-
+mentation is open-source and distributed as part of the Checker
+Framework ( https://checkerframework.org/ ) from version3.15.0.
+7 EVALUATION
+Our evaluation has three parts:
+•case studies on open-source projects, which show that our
+approach is scalable and finds real resource leaks (section 7.1).
+•an evaluation of the importance of lightweight ownership,
+resourcealiasing,andobligation creation (section 7.2).
+•acomparison to previous leak detectors: botha heuristic bug
+finder andawhole-program analysis(section 7.3).
+All code and data for our experiments described in this section,
+includingtheResourceLeakChecker’simplementation,experimen-
+tal machinery, and annotated versions of our case study programs,
+are publiclyavailable at https://doi.org/10.5281/zenodo.4902321 .
+7.1 CaseStudies on Open-SourceProjects
+We selected 3 open-source projects that were analyzed by prior
+work [39]. For each, we selected and analyzed one or two modules
+withmanyusesofleakableresources.Weusedthelatestversionof
+thesourcecodethatwasavailablewhenwebegan.Wealsoanalyzed
+an open-source project maintained by one ofthe authors, to simu-
+latetheResourceLeakChecker’sexpectedusecase,wheretheuser
+isalready familiar withthe code underanalysis(see section 7.1.3).
+187ESEC/FSE ’21, August 23–28, 2021,Athens,Greece MartinKellogg, NargesShadab,Manu Sridharan,andMichaelD. Ernst
+public InputStream getInputStreamForSection(
+FileSummary.Section section, String compressionCodec)
+throws IOException {
+FileInputStream fin = new FileInputStream(filename);
+FileChannel channel = fin.getChannel();
+channel.position(section.getOffset());
+InputStream in = new BufferedInputStream(new LimitInputS tream(fin,
+section.getLength()));
+in = FSImageUtil.wrapInputStreamForCompression(conf,
+compressionCodec, in);
+return in;
+}
+Figure 4: A resource leak that the Resource Leak Checker
+foundinHadoop.Hadoop’sdevelopersmergedour fix[ 27].
+For each case study, our methodology was as follows. (1) We
+modifiedthebuildsystemtoruntheResourceLeakCheckeronthe
+module(s), analyzing uses of resource classes that are defined in
+theJDK.Italsoreportsthemaximumpossiblenumberofresources
+(references to JDK-defined classes with a non-empty @MustCall
+obligation) that could be leaked: each obligation at a formal pa-
+rameter or method call. (2) We manually annotated each program
+with must-call, called-methods, and ownership annotations (see
+section7.1.2). (3) We iteratively ran the analysis to correct our
+annotations. We measured the run time as the median of 5 trials
+on a machine running Ubuntu 20.04 with an Intel Core i7-10700
+CPUrunningat 2.90GHz and 64GiBofRAM.Ouranalysis isem-
+barrassingly parallel, but our implementation is single-threaded
+because javac is single-threaded. (4) We manually categorized each
+warning asrevealinga real resource leak (a truepositive) oras a
+false positive warning about safe code that our tool is unable to
+prove correct.At leasttwoauthorsagreedoneachcategorization.
+Table1summarizes the results. The Resource Leak Checker
+found multiple serious resource leaks in every program. The Re-
+sourceLeakChecker’soverallprecisiononthesecasestudiesis29%
+(49/170). Though there are more false positives than true positives,
+thenumberissmallenoughtobeexaminedbyasingledeveloper
+inafewhours.Theannotationsintheprogramarealsoabenefit:
+they express the programmer’s intent and, as machine-checked
+documentation, they cannotbecome out-of-date.
+Atthetimeofwriting,thedevelopersofthecasestudyprograms
+havevalidatedandacceptedpatchesfor16resourceleaksdiscov-
+eredbyourtool,includingatleastoneforeachproject.Nopatches
+we have submittedthis wayhave been rejected.
+7.1.1 TrueandFalsePositiveExamples. Thissectiongivesexamples
+ofwarnings reportedbythe ResourceLeakChecker.
+Figure4containscodefromHadoop.IfanIOerroroccursany
+timebetweentheallocationofthe FileInputStream inthefirstline
+ofthemethodandthe returnstatementattheendÐforexample,if
+channel.position(section.getOffset()) throwsan IOException ,
+as it is specified to doÐthen the only reference to the stream is
+lost. Hadoop’s developers assigned this issue a priority of łMajorž
+and accepted our patch [ 27]. One developer suggested using a try-
+with-resourcesstatementinsteadofourpatch(whichcatchesthe
+exceptionandclosesthestream),butwepointedoutthatthefile
+needsto remainopen if noerroroccurs sothat itcan be returned.Optional<ServerSocket> createServerSocket(...) {
+ServerSocket serverSocket;
+try {
+if (...) {
+serverSocket = new ServerSocket();
+serverSocket.setReuseAddress(true);
+serverSocket.bind(...);
+return Optional.of(serverSocket);
+}
+} catch (IOException e) {
+// log an error
+}
+return Optional.empty();
+}
+Figure 5: Code from the ZooKeeper case study that causes
+theResource Leak Checkerto issueafalsepositive.
+Table 2:The annotations we wroteinthe casestudies.
+Annotation Count
+@Owningand@NotOwning 98
+@EnsuresCalledMethods 54
+@MustCall 53
+@MustCallAlias 41
+@CreatesMustCallFor 40
+Total 286
+The most common reason for false positives(which caused 22%
+ofthefalsepositivesinourcasestudies)wasaknownbuginthe
+CheckerFramework’stypeinferencealgorithmforJavagenerics,
+whichtheChecker Frameworkdevelopersareworking tofix[ 23].
+The second most common reason (causing 15%) was a generic con-
+tainer object like java.util.Optional taking ownership of a re-
+source,suchastheexampleinfig. 5.Ourlightweightownershipsys-
+temdoesnotsupporttransferringownershiptogenericparameters,
+sotheResourceLeakCheckerissuesanerrorwhen Optional.of is
+returned. In this case, the use of the Optional class is unnecessary
+andcomplicatesthecode[ 9].IfOptional wasreplacedbyanullable
+Javareference,theResourceLeakCheckercouldverifythiscode.
+Futureworkshouldexpandthelightweightownershipsystemto
+support Javagenerics. The thirdmost common reason (causing8%)
+is nullness reasoning: some resource is closed only if it is non-null,
+butourcheckerexpectstheresourcetobeclosedoneverypath.Our
+checker handles simple comparisons with null(as in fig. 1), but fu-
+tureworkcouldincorporatemorecomplexnullnessreasoning[ 25].
+7.1.2 AnnotationsandCodeChanges. Wewroteaboutoneannota-
+tionper 1,500 linesofcode (table 2).
+We also made 42 small, semantics-preserving changes to the
+programstoreducefalsepositivesfromouranalysis.In19placesin
+plume-util,weadded anexplicit extendsbound toagenerictype.
+The Checker Framework uses different defaulting rules for implicit
+andexplicitupperbounds,andacommonpatterninthisbenchmark
+caused our checker to issue an error on uses of implicit bounds. In
+18 places, we made afield final;this allowsour checker toverify
+usage of the field without using the stricter rules for non-final
+owningfieldsgiveninsection 5.In9ofthosecases,wealsoremoved
+assignmentsof nulltothefieldafteritwasclosed;in1otherwe
+added an elseclause in the constructor that assigned the field a
+188LightweightandModularResource LeakVerification ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+Table 3: False positives in our case studies (łRLCž) and
+withoutlightweightownership(łw/oLOž),resourcealiasing
+(łw/oRAž), andobligationcreation (łw/oOCž).
+Project w/oLO w/oRA w/oOC RLC
+apache/zookeeper 117 158 54 48
+apache/hadoop 97 184 52 49
+apache/hbase 82 93 26 22
+plume-lib/plume-util 4 11 3 2
+Total 300 446 135 121
+nullvalue. In 3 places, we re-ordered two statements to remove
+an infeasible control-flow-graph edge. In 2 places, we extracted an
+expressionintoalocalvariable,permittingflow-sensitivereasoning
+ortargetingbyan @CreatesMustCallFor annotation.
+7.1.3 Simulating the UserExperience. To simulatethe experience
+ofatypicaluserwhounderstandsthecodebasebeinganalyzed,one
+author used the Resource Leak Checker to analyze plume-util, a
+10KLoC library he wrote 23 years ago. The process took about two
+hours,includingrunningthetool,writingannotations,andfixing
+the 8 resource leaks that the tool discovered. The annotations were
+valuableenoughthattheyarenowcommittedtothatcodebase,and
+theResourceLeakCheckerrunsinCItopreventtheintroductionof
+newresourceleaks.Thisexampleissuggestivethattheprogrammer
+effortto use our toolisreasonable.
+7.2 EvaluatingOurEnhancements
+Lightweight ownership (section 3), resource aliasing (section 4),
+andobligationcreation(section 5)reducefalsepositivewarnings
+andimprovetheResourceLeakChecker’sprecision.Toevaluate
+the contribution of each enhancement, we individually disabled
+eachfeature andre-ranthe experiments ofsection 7.1.
+Table3shows that each of lightweight ownership and resource
+aliasespreventsmorefalsepositivewarningsthanthetotalnumber
+of remaining false positives on each benchmark. The system for
+creating new obligations at points other than constructors reduces
+false positives by a smaller amount: non-final, owning field re-
+assignments are rare.
+7.3 Comparisonto OtherTools
+Our approach represents a novel point in the design space of re-
+sourceleakcheckers.Thissectioncomparesourapproachwithtwo
+othermodern toolsthat detectresourceleaks:
+•The analysis built into the Eclipse Compiler for Java (ecj),
+whichisthedefaultapproachfordetectingresourceleaksin
+the EclipseIDE [ 8]. We usedversion4.18.0.
+•Grapple [ 39], a state-of-the-art typestate checker that lever-
+ages whole-program alias analysis.
+In brief, both of the above tools are unsound and missed 87ś93%
+ofleaks.Bothtoolsneitherrequirenorpermituser-writtenspec-
+ifications, a plus in terms of ease of use but a minus in terms of
+documentation andflexibility.Eclipse isvery fast (nearly instanta-
+neous) but haslow precision(25% for high-confidence warnings,
+muchlowerifallwarningsareincluded).Grappleismoreprecise
+(50%precision),butanorderofmagnitudeslowerthantheResourceTable 4: Comparison of resource leak checking tools:
+Eclipse, Grapple, and the R esource L eak Checker. Recall
+is the ratio of reported leaks to all leaks present in the
+code, and precision is the ratio of true positive warnings
+to all tool warnings. Different tools were run on different
+versions of the case study programs. The number of leaks
+andtherecallarecomputedoverthecodethatiscommonto
+allversionsoftheprograms,sorecallisdirectlycomparable
+within rows. Precision is computed over the code version
+analyzed by each tool, so it may not be directly comparable
+within rows. Eclipse reports no high-confidence warnings
+forJDK typesinHBase.
+Recall Precision *
+Project leaks Ecl Gr RLC Ecl Gr RLC
+ZooKeeper 6 17% 17% 100% 33% 67% 21%
+HDFS 7 14% 0% 100% 20% 71% 32%
+HBase 2 0% 0% 100% - 35% 19%
+Total 15 13% 7% 100% 25% 50% 26%
+LeakChecker.TheResourceLeakCheckerhad100%recalland26%
+precision. Users canselect whichever tool matches their priorities.
+Tables4and5quantitativelycomparethetools.Ourcomparison
+uses parts of the 3 case study programs that Grapple was run on in
+the past;see section 7.3.2for details.
+7.3.1 Eclipse. The Eclipse analysis is a simple dataflow analysis
+augmentedwithheuristics.Sinceitistightlyintegratedwiththe
+compiler,itscaleswell andrunsquickly.Ithasheuristics forown-
+ership, resource wrappers, and resource-free closeables, among
+others; these are all hard-coded into the analysis and cannot be
+adjustedby the user.Itsupportstwolevels ofanalysis: detecting
+high-confidence resource leaks and detecting łpotentialž resource
+leaks(asuperset ofhigh-confidenceresourceleaks).
+WeranEclipse’sanalysisontheexactsamecodethatweranthe
+ResourceLeakCheckeronforsection 7.1(excludingtheplume-util
+case study). Table 4reports results for a subset of the code; this
+paragraph reports results for the full code. In łhigh-confidencež
+modeonthethreeprojects,Eclipsereports8warningsrelatedto
+classesdefinedintheJDK:2truepositives(thus,itmisses39real
+resourceleaks)and6falsepositives.Inłpotentialžleakmode,the
+analysisreportsmanymorewarnings.Thus,wetriagedonlythe
+180warningsaboutJDKclassesfromtheZooKeeperbenchmark.
+Amongthesewere3truepositives(itmissed10realresourceleaks)
+and 177 false positives (2% precision). The most common cause of
+falsepositiveswastheunchangeable,defaultownershiptransfer
+assumption at method returns, leading to a warning at each call
+that returns aresource-alias, such as Socket#getInputStream .
+7.3.2 Grapple. Grapple is a modern typestate-based resource leak
+analysis łdesigned to conduct precise and scalable checking of
+finite-state properties for very large codebasesž [ 39]. Grapple mod-
+els its alias and dataflow analyses as dynamic transitive-closure
+computationsovergraphs,anditleveragesnovelpathencodings
+andtechniquesfrompredecessor-systemGraspan[ 34]toachieve
+both context- and path-sensitivity. Grapple contains four checkers,
+ofwhich twocandetectresourceleaks.UnliketheResourceLeak
+189ESEC/FSE ’21, August 23–28, 2021,Athens,Greece MartinKellogg, NargesShadab,Manu Sridharan,andMichaelD. Ernst
+Table 5:Run timesofresource leak checkingtools.
+Project Eclipse Grapple ResourceLeakChecker
+ZooKeeper <5s 1h07m02s 1m 24s
+HDFS <5s 1h54m52s 16m21s
+HBase <5s 33h 51m59s 7m 45s
+Checker, Grapple is unsound, as it performs a fixed bounded un-
+rolling of loops to make path sensitivity tractable. The Resource
+Leak Checker reports violations of a user-supplied specification
+(whichtakesefforttowritebutprovidesdocumentationbenefits),
+soitcanensurethatalibraryiscorrectforallpossibleclients.By
+contrast, Grapple checks a library in the context of one specific
+client;itonlyreportsissuesinmethodsreachablefromentrypoints
+(like amain()method)inawhole-program callgraph [ 38].
+The Grappleauthors evaluatedtheir toolonearlier versionsof
+thefirstthreecasestudyprogramsinsection 7.1[39].Unfortunately,
+a direct comparison on our benchmark versions is not possible,
+because Grapple’s leakdetectorcurrently cannotbe run (byus or
+by the Grapple authors) due to library incompatibilities and bitrot
+intheimplementation. TheGrappleauthorsprovideduswiththe
+finite-state machine (FSM) specifications used in Grapple to detect
+resourceleaks,andalsodetailsofallwarningsissuedbyGrapple
+inthe versionsofthe benchmarks they analyzed.
+Weusedthefollowingmethodologytopermitahead-to-head
+comparison.Westartedwithallwarningsissuedbyeithertool.We
+disregarded any warning about code that is not present identically
+intheotherversionofthetargetprogram(duetorefactoring,added
+code,bugfixes,etc.).Wealsodisregardedwarningsaboutcodethat
+is not checked by both tools. For example, Grapple analyzed test
+code,butourexperimentsdidnotwriteannotationsintestcodenor
+type-check it. The remaining warnings pertain to resource leaks in
+identical code that both tools ought to report. For each remaining
+warning,wemanuallyidentifieditasatruepositive(arealresource
+leak) or a false positive (correct code, but the tool cannot deter-
+minethatfact).Table 4reportstheprecisionandrecallofEclipse,
+Grapple,andtheResourceLeakChecker.SomeofGrapple’sfalse
+positives are reports about types like java.io.StringWriter with
+no underlying resource thatmust be closed.(These reports were
+mis-classifiedastruepositivesin[ 39],whichisonereasonthenum-
+berstheredifferfromtable 4.)Grapple’sfalsenegativesmightbe
+duetoanalysisunsoundnessorgapsinAPImodeling(e.g.,Grapple
+does not include FSMspecifications for OutputStream classes).
+Grapple runs can take many hours (run times are from [ 39]),
+whereas the Resource Leak Checker runs in minutes (table 5). Fur-
+ther, Grapple is not modular, so if the user edits their program,
+Grapple must be re-run from scratch [ 38]. After a code edit, the
+ResourceLeakCheckeronlyneedstore-analyzemodifiedcode(and
+possiblyits dependents if the modifiedcode’sinterfacechanged).
+8 LIMITATIONSAND THREATS TO VALIDITY
+Likeanytoolthatanalyzessourcecode,theResourceLeakChecker
+onlygivesguaranteesforcodethatitchecks:theguaranteeexcludes
+native code, the implementation of unchecked libraries (such as
+theJDK),andcodegenerated dynamically or byotherannotation
+processorssuchas Lombok.ThoughtheCheckerFrameworkcanhandlereflectionsoundly[ 3],bydefault(andinourcasestudies)the
+ResourceLeakCheckercompromisesthisguaranteebyassuming
+thatobjectsreturnedbyreflectiveinvocationsdonotcarrymust-
+call obligations. (Users can customize this behavior.) Within the
+boundsofa user-writtenwarningsuppression,theResourceLeak
+Checkerassumesthat1)anyerrorsissuedcanbeignored,and2)
+allannotations written bythe programmer are correct.
+The Resource Leak Checker is sound with respect to specifi-
+cationsofwhichtypeshavea @MustCall obligationthatmustbe
+satisfied.WewrotesuchspecificationsfortheJavastandardlibrary,
+focusingonIO-relatedcodeinthe java.ioandjava.nio packages.
+Anymissingspecificationsof @MustCall obligationscouldleadthe
+ResourceLeakChecker to miss resourceleaks.
+The results of our experiments may not generalize, compromis-
+ing the external validity of the experimental results. The Resource
+LeakCheckermayproducemorefalsepositives,requiremoreanno-
+tations,orbemoredifficulttouseifappliedtootherprograms.Case
+studies on legacy code represents a worst case for a source code
+analysis tool. Using the Resource Leak Checker from the inception
+of a projectwould be easier, since programmers know their intent
+astheywritecodeandannotationscouldbewrittenalongwiththe
+code.Itwouldalsobemoreuseful,sinceitwouldguidetheprogram-
+mers to a better design that requires fewer annotations and has no
+resource leaks. The need for annotations could be viewed as a limi-
+tation of our approach. However, the annotations serve as concise
+documentation of properties relevant to resource leaksÐand un-
+liketraditional,natural-languagedocumentation,machine-checked
+annotations cannotbecome out-of-date.
+Likeanypracticalsystem,itispossiblethattheremightbede-
+fects in the implementation of the Resource Leak Checker or in
+the design of its analyses. We have mitigated this threat with code
+reviewand an extensive test suite:119 test classes containing 3,776
+linesofnon-comment,non-blankcode.Thistestsuiteispublicly
+available anddistributedwiththe ResourceLeak Checker.
+9 RELATED WORK
+Most prior work on resource leak detection either uses program
+analysis to detect leaks or adds language features to prevent them.
+Here we focusonthe mostrelevantwork from thesecategories.
+9.1 Analysis-BasedApproaches
+Static analysis. Tracker [33] performs inter-procedural dataflow
+analysistodetectresourceleaks,withvariousadditionalfeaturesto
+make the tool practical, including issue prioritization and handling
+of wrapper types. Tracker avoids whole-program alias analysis
+to improve scalability, instead using a local, access-path-based ap-
+proach.WhileTrackerscalestolargeprograms,itisdeliberately
+unsound,unlikethe ResourceLeak Checker.
+The Eclipse Compiler for Java includes a dataflow-based bug-
+finder for resource leaks [ 8]. Its analysis uses a fixed set of own-
+ershipheuristicsandafixedlistofwrapperclasses;unliketheRe-
+sourceLeakChecker,itisunsound.Itisveryfast.SimilaranalysesÐ
+withsimilartrade-offscomparedtotheResourceLeakCheckerÐ
+existin otherheuristicbug-findingtools, includingSpotBugs [ 28],
+PMD [26], and Infer [ 17]. Section 7.3.1experimentally evaluates
+the Eclipseanalysis.
+190LightweightandModularResource LeakVerification ESEC/FSE ’21, August 23–28, 2021,Athens,Greece
+Typestate analysis [ 11,29] can be used to find resource leaks.
+Grapple[39]isthemostrecentsystemtousethisapproach,leverag-
+ing a disk-based graph engine to achieve unprecedented scalability
+onasinglemachine.ComparedtotheResourceLeakChecker,Grap-
+pleismoreprecisebutsuffersfromunsoundnessandlongerrun
+times.Section 7.3.2gives amore detailedcomparison to Grapple.
+The CLOSER [ 7] automatically inserts Java code to dispose of
+resources whenthey are nolonger łlivež accordingto its dataflow
+analysis. Their approach requires an expensive alias analysis for
+soundness, as well as manually-provided aliasing specifications
+for linked libraries. The Resource Leak Checker uses accumulation
+analysis[ 10,19]toachievesoundnesswithouttheneedforawhole-
+program alias analysis.
+Dynamic analysis. Some approaches use dynamic analysis to
+ameliorateleaks.Resco[ 6]operatessimilarlytoagarbagecollector,
+tracking resources whose program elements have become unreach-
+able. When a given resource (such as file descriptors) is close to
+exhaustion, the runtime runs Resco to clean up any resources of
+thattypethatareunreachable.Withastaticapproachsuchasours,
+leaksare impossible andatoollike Rescoisunnecessary.
+Automatedtestgenerationcanalsobeusedtodetectresource
+leaks.Forexample,leaksinAndroidapplicationscanbefoundby
+repeatedlyrunningneutralÐi.e.eventuallyreturningtothesame
+stateÐGUIactions[ 36,37].Othertechniquesdetectcommonmisuse
+of the Android activity lifecycle [ 2]. Testing can only show the
+presence of failures, not the absence of defects; the Resource Leak
+Checker verifiesthat noresourceleaksare present.
+Datasetsandsurveys. TheDroidLeaksbenchmark[ 21]isaset
+ofAndroidappswithknownresourceleaks.Unfortunately,itin-
+cludesonlythecompiledapps.TheResourceLeakCheckerrunson
+source code, so we were unable to run the Resource Leak Checker
+on DroidLeaks. Ghanavati et al. [ 15] performed a detailed study
+of resource leaks and their repairs in Java projects, showing the
+pressing need for better tooling for resource leak prevention. In
+particular, their study showed that developers consider resource
+leaks to be an important problem, and that previous static analysis
+toolsareinsufficientforpreventingresourceleaks.Weplantoapply
+the ResourceLeakChecker to more programs from theirstudy.
+9.2 Language-BasedApproaches
+Ownership typesand Rust. Ownershiptypesystems [ 5] impose
+control over aliasing, which in turn enables guaranteeing other
+properties, like the absence of resource leaks. We do not discuss
+the vast literature on ownership type systems [ 5] here. Instead, we
+focusonownershiptypesinRust[ 20]asthemostpopularpractical
+example ofusing ownershipto preventresourceleaks.
+For a detailed overview of ownership in Rust, see chapter 4
+of[20];wegiveabriefoverviewhere.InRust,ownershipisusedto
+manage both memory and other resources. Every value associated
+witharesourcemusthavea uniqueowningpointer,andwhenan
+owning pointer’s lifetime ends, the value is łdropped,ž ensuring
+all resources are freed. Rust’s ownership type system statically
+preventsnotonlyresourceleaks,butalsootherimportantissueslike
+łdouble-freeždefects(releasingaresourcemorethanonce)andłuse-
+after-freež defects (using a resource after it has been released). But,this power comes with a cost; to enforce uniqueness, non-owning
+pointersmustbeinvalidatedafteranownershiptransferandcan
+no longer be used. Maintaining multiple usable pointers to a value
+requires use of language features like references and borrowing,
+andeven then, borrowedpointers have restrictedprivileges.
+TheResourceLeakCheckerhaslesspowerthanRust’sowner-
+shiptypes;it cannotpreventdouble-freeoruse-after-freedefects.
+But,theResourceLeakChecker’slightweightownershipannota-
+tions impose norestrictions on aliasing; they simply aid the tool
+inidentifyinghow a resource willbe closed.Lightweightowner-
+ship is better suited to preventing resource leaks in existing, large
+Java code bases; adapting such programs to use a full Rust-style
+ownershiptype systemwouldbe impractical.
+Other approaches. Java’s try-with-resources construct [ 24] was
+discussed in section 1. Java also provides finalizer methods [ 16,
+Chapter12],whichexecutebeforeanobjectisgarbage-collected,
+but they should not be used for resource management, as their
+executionmaybe delayedarbitrarily.
+Compensationstacks[ 35]generalizeC++destructorsandJava’s
+try-with-resources, to avoid resource leak problems in Java. While
+compensationstacksmakeresourceleakslesslikely,theydonot
+guaranteethatleakswillnotoccur,unliketheResourceLeakChecker.
+Previous work has performed modular typestate analysis for an-
+notatedJavaprograms[ 4]orproposedtypestate-orientedprogram-
+ming languages with modular typestate checking [ 1,14]. The type
+systemsoftheseapproachescanexpressarbitrarytypestateproper-
+ties, beyond what can be checked with the Resource Leak Checker.
+However,thesesystemsimposerestrictionsonaliasingandahigher
+typeannotationburdenthantheResourceLeakChecker,making
+adoption for existing code more challenging.
+10 CONCLUSION
+We have developed a new, sound, modular approach for detecting
+and preventing resource leaks in large-scale Java programs. The
+Resource Leak Checker consists of sound core analyses, built on
+the insight that leak checking is an accumulation problem, aug-
+mented by three new features to handle common aliasing patterns:
+lightweightownershiptransfer,resourcealiasing,andobligation
+creation bynon-constructormethods.
+The Resource Leak Checker discovered 49 resource leaks in
+heavily-used,heavily-testedJavacode.Itsanalysisspeedisanorder
+of magnitude faster than whole-program analysis, and its false
+positiverateissimilartoastate-of-the-practiceheuristicbug-finder.
+It reads and verifies user-written specifications; the annotation
+burden isabout1annotation per 1,500 linesof code.
+ACKNOWLEDGMENTS
+ThankstoRashmiMudduluru,BenKushigian,ChandrakanaNandi,
+andtheanonymousreviewersfortheircommentsonearlierver-
+sions of this paper. This research was supported in part by the
+National Science Foundation under grants CCF-2005889and CCF-
+2007024, agiftfrom Oracle Labs,andaGoogle Research Award.
+191ESEC/FSE ’21, August 23–28, 2021,Athens,Greece MartinKellogg, NargesShadab,Manu Sridharan,andMichaelD. Ernst
+REFERENCES
+[1]Jonathan Aldrich, Joshua Sunshine, Darpan Saini, and Zachary Sparks. 2009.
+Typestate-oriented programming.In OOPSLACompanion:Object-OrientedPro-
+gramming Systems,Languages, and Applications . Orlando, FL, USA,1015ś1022.
+[2]Domenico Amalfitano, Vincenzo Riccio, Porfirio Tramontana, and Anna Rita Fa-
+solino.2020. Domemorieshauntyou?Anautomatedblackboxtestingapproach
+for detecting memory leaks in android apps. IEEE Access 8 (2020), 12217ś12231.
+[3]PauloBarros,RenéJust,SuzanneMillstein,PaulVines,WernerDietl,Marcelo
+d’Amorim,andMichaelD.Ernst.2015. Staticanalysisofimplicitcontrolflow:
+Resolving Java reflection and Android intents. In ASE 2015: Proceedings of the
+30thAnnualInternationalConferenceonAutomatedSoftwareEngineering .Lincoln,
+NE,USA,669ś679.
+[4]KevinBierhoffandJonathanAldrich.2007. Modulartypestatecheckingofaliased
+objects. In OOPSLA2007, Object-Oriented ProgrammingSystems, Languages, and
+Applications . Montreal,Canada,301ś320.
+[5]Dave Clarke, Johan Östlund, Ilya Sergey, and Tobias Wrigstad. 2013. Ownership
+Types: A Survey. In Aliasing in Object-Oriented Programming. Types, Analysis
+and Verification . Springer, Berlin, Heidelberg.
+[6]ZiyingDai,XiaoguangMao,YanLei,XiaominWan,andKerongBen.2013. Resco:
+Automatic collection of leaked resources. IEICE TRANSACTIONS on Information
+and Systems 96,1 (2013), 28ś39.
+[7]IsilDillig,ThomasDillig,EranYahav,andSatishChandra.2008. TheCLOSER:
+automatingresourcemanagementinJava.In InternationalsymposiumonMemory
+management . 1ś10.
+[8]Eclipse developers. 2020. Avoiding resource leaks. https://help.eclipse.org/2020-
+12/index.jsp?topic=%2Forg.eclipse.jdt.doc.user%2Ftasks%2Ftask-avoiding_
+resource_leaks.htm&cp%3D1_3_9_3 . Accessed 3 February2021.
+[9]Michael D. Ernst. 2016. Nothing is better than the Optional type. https://homes.
+cs.washington.edu/~mernst/advice/nothing-is-better-than-optional.html .
+[10]ManuelFähndrichandK.RustanM.Leino.2003. HeapMonotonicTypestates.In
+IWACO 2003: International Workshop on Aliasing, Confinement and Ownership in
+object-orientedprogramming . Darmstadt, Germany.
+[11]Stephen J. Fink, Eran Yahav, Nurit Dor, G. Ramalingam, and Emmanuel Geay.
+2008. Effectivetypestateverificationinthepresenceofaliasing. ACMTOSEM 17,
+2,ArticleArticle9 (2008), 34pages.
+[12]Jeffrey S. Foster, Manuel Fähndrich, and Alexander Aiken. 1999. A theory of
+typequalifiers.In PLDI’99:ProceedingsoftheACMSIGPLAN’99Conferenceon
+Programming Language Design and Implementation . Atlanta, GA, USA, 192ś203.
+[13]Erich Gamma, Richard Helm, Ralph E. Johnson, and John Vlissides. 1995. Design
+Patterns. Addison-Wesley, Reading,MA.
+[14]RonaldGarcia,ÉricTanter,RogerWolff,andJonathanAldrich.2014. Foundations
+of Typestate-Oriented Programming. ACM Trans. Program. Lang. Syst. 36, 4
+(2014), 12:1ś44.
+[15]Mohammadreza Ghanavati, Diego Costa, Janos Seboek, David Lo, and Artur
+Andrzejak. 2020. Memory and resource leak defects and their repairs in Java
+projects. EmpiricalSoftwareEngineering 25,1 (2020), 678ś718.
+[16]James Gosling, Bill Joy, Guy L. Steele, Gilad Bracha, and Alex Buckley. 2014. The
+Java Language Specification, Java SE8 Edition . Addison-WesleyProfessional.
+[17]Infer developers. 2021. Resource leak in Java. https://fbinfer.com/docs/checkers-
+bug-types#resource-leak-in-java . Accessed 4 February2021.
+[18]JetBrains.2020.ListofJavaInspections. https://www.jetbrains.com/help/idea/list-
+of-java-inspections.html#resource-management . Accessed 5 February2021.
+[19]Martin Kellogg, Manli Ran, Manu Sridharan, Martin Schäf, and Michael D. Ernst.
+2020. VerifyingObjectConstruction.In ICSE2020, Proceedingsof the42nd Inter-
+nationalConference onSoftwareEngineering . Seoul, Korea.
+[20]Steve Klabnik and Carol Nichols. 2018. The Rust Programming Language .https:
+//doc.rust-lang.org/1.50.0/book/[21]YepangLiu,JueWang,LiliWei,ChangXu,Shing-ChiCheung,TianyongWu,Jun
+Yan,andJianZhang.2019. DroidLeaks:acomprehensivedatabaseofresource
+leaks in Android apps. EmpiricalSoftwareEngineering 24,6 (2019), 3435ś3483.
+[22]David Lo, Nachiappan Nagappan, and Thomas Zimmermann. 2015. How practi-
+tionersperceivetherelevanceofsoftwareengineeringresearch.In ESEC/FSE2015:
+The10thjointmeetingoftheEuropeanSoftwareEngineeringConference(ESEC)
+and the ACM SIGSOFT Symposium on the Foundations of Software Engineering
+(FSE). Bergamo, Italy.
+[23]Suzanne Millstein. 2016. Implement Java 8 type argument inference. https:
+//github.com/typetools/checker-framework/issues/979 . Accessed17April2020.
+[24]Oracle. 2020. The try-with-resources Statement (The Java Tutorials). https://
+docs.oracle.com/javase/tutorial/essential/exceptions/tryResourceClose.html . Ac-
+cessed 24February2021.
+[25]Matthew M. Papi, Mahmood Ali, Telmo Luis Correa Jr., Jeff H. Perkins, and
+MichaelD.Ernst.2008. PracticalpluggabletypesforJava.In ISSTA2008,Proceed-
+ingsofthe2008InternationalSymposiumonSoftwareTestingandAnalysis .Seattle,
+WA, USA,201ś212.
+[26]PMDdevelopers.2021. CloseResource. https://pmd.github.io/pmd-6.31.0/pmd_
+rules_java_errorprone.html#closeresource . Accessed 4 February2021.
+[27]NargesShadab.2021. HDFS-15791.PossibleResourceLeakinFSImageFormat-
+Protobuf. https://github.com/apache/hadoop/pull/2652 . Accessed 16June2021.
+[28]SpotBugsdevelopers.2021. OBL:Methodmayfailtocleanupstreamorresource.
+https://spotbugs.readthedocs.io/en/latest/bugDescriptions.html#obl-method-
+may-fail-to-clean-up-stream-or-resource-obl-unsatisfied-obligation . Accessed
+4 February2021.
+[29]RobertE. Strom and ShaulaYemini. 1986. Typestate: A programming language
+conceptforenhancingsoftwarereliability. IEEETSE SE-12,1(Jan.1986),157ś171.
+[30]BjarneStroustrup.1994. 16.5,ResourceManagement. In Thedesignandevolution
+ofC++. Pearson EducationIndia, 388ś389.
+[31]The Apache Hadoop developers. 2018. StorageInfo.java. https://github.com/
+apache/hadoop/blob/aa96f1871bfd858f9bac59cf2a81ec470da649af/hadoop-hdfs-
+project/hadoop-hdfs/src/main/java/org/apache/hadoop/hdfs/server/common/
+StorageInfo.java#L246 . Accessed 22February2021.
+[32]The Apache ZooKeeper developers. 2020. Learner.java. https://github.
+com/apache/zookeeper/blob/c42c8c94085ed1d94a22158fbdfe2945118a82bc/
+zookeeper-server/src/main/java/org/apache/zookeeper/server/quorum/
+Learner.java#L465 . Accessed 24February2021.
+[33]Emina Torlak and Satish Chandra.2010. Effective interprocedural resourceleak
+detection. In InternationalConference onSoftwareEngineering (ICSE) . 535ś544.
+[34]KaiWang,AftabHussain,ZhiqiangZuo,Guoqing(Harry)Xu,andArdalanAmiri
+Sani. 2017. Graspan: A Single-machine Disk-based Graph System for Interproce-
+duralStaticAnalysesofLarge-scaleSystemsCode.In ArchitecturalSupportfor
+ProgrammingLanguages and OperatingSystems(ASPLOS) . 389ś404.
+[35]WestleyWeimerandGeorgeCNecula.2004. Findingandpreventingrun-time
+errorhandlingmistakes.In Object-orientedprogramming,systems,languages,and
+applications (OOPSLA) . 419ś431.
+[36]HaoweiWu,YanWang,andAtanasRountev.2018. Sentinel:generatingGUItests
+forAndroidsensorleaks.In InternationalWorkshoponAutomationofSoftware
+Test(AST) . IEEE,27ś33.
+[37]Hailong Zhang, Haowei Wu, and Atanas Rountev. 2016. Automated test genera-
+tion for detection of leaks in Android applications. In International Workshop on
+AutomationofSoftwareTest(AST) . 64ś70.
+[38] ZhiqiangZuo. 2021. Personal communication.
+[39]Zhiqiang Zuo, John Thorpe, Yifei Wang, Qiuhong Pan, Shenming Lu, Kai Wang,
+GuoqingHarryXu,LinzhangWang,andXuandongLi. 2019. Grapple:Agraph
+systemforstaticfinite-statepropertycheckingoflarge-scalesystemscode.In
+EuroSys. 1ś17.
+192

@@ -1,0 +1,1320 @@
+CONFETTI: Amplifying Concolic Guidance for Fuzzers
+James Kukucka1, Luís Pina2, Paul Ammann1, and Jonathan Bell3
+1George Mason University, Fairfax, VA USA
+2University of Illinois Chicago, Chicago, Illinois USA
+3Northeastern University, Boston, MA USA
+jkukucka@gmu.edu,luispina@uic.edu,pammann@gmu.edu,j.bell@northeastern.edu
+Abstract
+Fuzztesting(fuzzing)allows developerstodetectbugsandvul-
+nerabilitiesincodebyautomaticallygeneratingdefect-revealing
+inputs. Most fuzzers operate by generating inputs for applications
+and mutating the bytes of those inputs, guiding the fuzzing pro-
+cesswithbranchcoveragefeedbackviainstrumentation.Whitebox
+guidance(e.g.,tainttrackingorconcolicexecution)issometimesin-tegratedwithcoverage-guidedfuzzingtohelpcovertricky-to-reachbranches that are guarded by complex conditions (so-called “magic
+values”). This integration typically takes the form of a targeted in-
+put mutation, e.g.,placing particular byte values at a specific offset
+of some input in order to cover a branch. However, these dynamic
+analysis techniques are not perfect in practice, which can result in
+thelossofimportantrelationshipsbetweeninputbytesandbranch
+predicates, thus reducing the effective power of the technique. We
+introduceanew,surprisinglysimple,buteffectivetechnique, global
+hinting, which allows the fuzzer to insert these interesting bytesnot only at a targeted position, but in any position of any input.
+We implemented this idea in Java, creating Confetti, which uses
+both targeted and global hints for fuzzing. In an empirical com-
+parisonwithtwobaselineapproaches,astate-of-the-artgreybox
+Java fuzzer and a version of Confetti without global hinting, we
+foundthatConfetticoversmorebranchesandfinds15previously
+unreportedbugs,including 9thatneitherbaseline couldfind.By
+conductingapost-mortemanalysisof Confetti’sexecution,we
+determined that global hinting was at least as effective at revealing
+new coverage as traditional, targeted hinting.
+ACM Reference Format: JamesKukucka,LuísPina,PaulAmmann,and
+JonathanBell.2022.CONFETTI:AmplifyingConcolicGuidanceforFuzzers.
+In44th International Conference on Software Engineering (ICSE ’22), May
+21–29, 2022, Pittsburgh, PA, USA. ACM, New York, NY, USA, 13 pages. https:
+//doi.org/10.1145/3510003.3510628
+1 Introduction
+Software is at the core of critical electronic systems. To avoid
+introducingfaults,whichcanleadtosignificanterrorsandsecurity
+vulnerabilities, developers test their applications before deploy-
+ment by generating diverse inputs that exercise as many behaviors
+as possible, attempting to catch bugs and vulnerabilities before
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+forprofitorcommercialadvantageandthatcopiesbearthisnoticeandthefullcitation
+onthe firstpage.Copyrights forcomponentsof thisworkowned byothersthan the
+author(s)mustbehonored.Abstractingwithcreditispermitted.Tocopyotherwise,or
+republish,topostonserversortoredistributetolists,requirespriorspecificpermission
+and/or a fee. Request permissions from permissions@acm.org.
+ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+© 2022 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 978-1-4503-9221-1/22/05...$15.00
+https://doi.org/10.1145/3510003.3510628theyescapetothewild.Unfortunately,manualtestingonlygoes
+sofartowardsgeneratingdiverse(andunexpected)inputs.Many
+recent advances in greybox fuzzing, such as the popular American
+FuzzyLop(AFL)[ 81],AFL++[ 38],libFuzzer[ 55],andhongfuzz[ 44],
+are based on coverage-guided fuzzing. Coverage-guided fuzzers use
+branch coverage as feedback to guide mutation of a set of manu-
+allyprovided“seed”inputstowardsnewinputsthatexplorenew
+programpaths.Thesefuzzersmightexecutethousandsofinputs
+persecond,butareunlikelytogenerateinputsthatsatisfyhighly
+constrained branches which require some so called “magic bytes”.
+Acomplementaryapproach, concolicexecution,discoversthose
+magic values by recording exactly which input bytes are used in
+which branches in the program’s execution). Then, with the aid of
+an SMT solver, the concolic execution engine generates inputs that
+forceadifferentbranchchoice[ 45,72,82].Priorworkhasobserved
+that full-blown concolic execution is often unnecessary to handle
+typicalmagicbytecomparisons,turninginsteadtodynamictaint
+tracking [ 33,40,69]. Dynamic taint tracking is an analysis that
+associates taint tags with values, and then propagates those tags
+duringprogramexecutionsuchthatwhenanewvalueisderived
+(through data flow) from a tainted value, that same taint tag is
+associated with the new value.
+Whiletainttracking-guidedfuzzerslikeVUzzer[ 69],Angora[ 33]
+and BuzzFuzz [ 40] have been shown to be more effective than a
+typical greybox fuzzer, we believe that they have only begun to
+leverage the power of taint tracking in fuzzing. In particular, taint
+trackingcanonlyguidethefuzzertoexplorebranchesforwhich
+thereisa dataflowrelationship betweenthebranchpredicateand
+the input bytes. Consider the code snippet in Listing 1, in which
+theinputstrings s1ands2arecomparedagainstsomeparticular
+string, with that comparison stored into a boolean variable.
+1public void magic(String s1, String s2){
+2boolean v1 = s1.equals( "abc");
+3boolean v2 = s2.equals(s1.c oncat("def"));
+4if( v 1& &v 2 )
+5throw new IllegalStateException(); //Bug
+6}
+Listing 1: Example code in which taint tags from inputs s1
+and s2do not flow to a branch that they indirectly control.
+Ideally, the taint tracking tool could report to the fuzzer that to
+cover the true side of the branch on line 4, the fuzzer must mutate
+s1ands2(and even better, to generate the concrete values abc
+andabcdef,respectively).However,thetainttrackingtoolwillnot
+report any relationship between the input and the branch on line 4
+because v1iscontrol-dependenton s1,butnotdata-dependent(and
+similarly,between s2andv2).Evenworse:whileinthisexample,
+thereisadataflowrelationshipbetweentheinputstrings s1and
+s2and the magic strings abcandabcdef, in real code, the taint
+4382022 IEEE/ACM 44th International Conference on Software Engineering (ICSE)ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell
+tags on s1ors2might also be lost through implicit flows. For
+example, one common pattern is to build a map from input strings
+to a tokenized representation of each string — if the same input
+string is encountered more than once, the parser returns the same
+tokenized version ofthe string, effectively losing trackof the input.
+Whilesomedynamictainttrackingtoolsdosupport“controlflow
+propagation,” which would detect this relationship, these analyses
+have too many false positives to be useful in practice [ 34,47]. How
+else can we help the fuzzer to explore this branch? One typical
+approach is to simply scrape the application binary for all strings,
+creating a dictionary of interesting strings to use when fuzzing
+(inthiscase, abcanddef).Unfortunately,thistrickonlyworksif
+the magic values are statically defined in the codebase — values
+generated dynamically will not be included in the dictionary. In
+this case, because s2must be the value abcdef, the dictionary will
+not help the fuzzer explore this branch.
+This paper presents Confetti, (CONcolic Fuzzer Employing
+Taint Tracking Information), a system that combines fuzzing with
+taint-trackingandconcolicexecution.Confettiamplifiesthereach
+of concolic guidance, allowing the fuzzer to effectively generate in-
+putsthatexplorebranchesliketheoneinListing1, andlonger,more
+complex examples where taint tags quickly become lost through
+implicit flows.Our keyinsight isthat theprecise targetingof past
+tainttracking-guidedgreyboxfuzzersunnecessarilyrestrictsthe
+fuzzer’s ability to reveal tricky-to-reach branches. As with state-
+of-the-art fuzzers, Confetti executes each input in its population
+with taint tracking, collecting constraints on the input bytes. Con-
+fetticangeneratenewcoverage-revealinginputsthroughconcolicexecution by negating and solving those constraints, in the style of
+existing work [33, 35, 63, 72, 79, 80].
+Confetti’snovelapproachtoguidethefuzzer, globalhinting,
+is based on the insight that although taint tags might be lost for
+parts of an input, magic values derived for otherparts of the input
+canbere-targeted andappliedelsewhere.When Confettifinds
+thatapartoftheinputflowsintoacomparisonwithadynamically
+computed value, Confetti records that value as a global hint. We
+createandevaluateanewfuzzingmutation,whichinsertsglobal
+hintsanywhere inanyinput — not only at the targeted location of
+the specific input from which the hint was derived.
+Weevaluatetheefficacyofthisnewmutationstrategy,consid-
+ering both system-level metrics (i.e., branches covered and bugs
+found)andunit-levelmetrics(i.e., mutationsuccessrate).Ourre-
+sults clearly demonstrate that global hinting is roughly as effective
+inrevealingnewcoverageastraditional,targetedhinting,andmost
+importantly, that this strategy reveals differentcoverage and bugs
+thatcould not be reported by using targeted hinting alone.I no u r
+evaluation, the baseline JQF-Zest fuzzer detected 11 bugs, whereas
+Confetti with only targeted hints detected 16, and Confetti
+with both global and targeted hints detected 25 bugs. Our open-
+source implementation of Confetti represents a significant im-
+provementinfuzzertechnologyforJVM-basedsoftware,providingbenefitstosoftwareengineeringresearchersinventingnewfuzzing
+approaches and to professional software engineers searching forbugs in their software. While our implementation is limited to asingle language (Java) and a single greybox fuzzer (Zest), we be-
+lievethatourresultsarecompellingenoughtohaveasignificantimpactonthefieldofsoftwareengineering,warrantingfuturework
+exploring global hinting in other fuzzing domains.
+The key contributions of this paper include:
+•Anewapproachtocombineconcolicexecutionandtainttracking
+with fuzzing: global hinting.
+•An open source implementation of Confetti for Java, whichcombines traditional, targeted hinting with our novel global
+hinting strategy [51, 52].
+•An evaluation of Confetti, demonstrating the efficacy of its
+novelglobal-hinting-basedguidanceoverabaselinestate-of-the-
+art greybox Java fuzzer (Zest), and against a baseline version of
+Confetti without global hinting.
+2 Background
+Before describing how Confetti effectively guides a greybox
+fuzzerusingwhiteboxinformation,wefirstbrieflysummarizegrey-boxfuzzing,andinparticular,parametricgreyboxfuzzing.ConsiderfuzzinganapplicationthattakesXMLfilesasinput.Figure1shows
+two fuzzing loops: one that represents the behavior of a traditional
+coverage-guidedfuzzerlikeAFL[ 81]orlibFuzzer[ 55](blueline),
+and one that represents the behavior of a parametric fuzzer like
+Crowbar[ 37],FuzzChick[ 53]orJQF-Zest[ 66](orangeline).The
+traditional fuzzer (blue) executes a loop, where it starts with some
+(well-formed) seed input, selected from a pool of seeds. The fuzzer
+thenusesa mutatortotransformthatinput(typicallyusinganevo-
+lutionary algorithm). Then, the fuzzer executes the new input and
+capturesbranchcoveragethatmaybiastheevolutionaryalgorithm
+(mutator)onfutureexecutionsofthefuzzingloop.Ifthenewinput
+isdeemed interesting —typicallydefinedasrevealingcoverageofa
+newbranch,orgreatlyincreasingthehitcountsofthosealready
+covered—thentheinputissavedintothefuzzer’spopulation,to
+be selected again later for further fuzzing.
+However,inthecaseofthetraditionalcoverage-guidedfuzzer
+(blue line), the mutator is unaware of the input syntax expected by
+the system under test, so most of the generated inputs are likely to
+haveashallowreachinthecode.Thatis,mostoftheseinputseither
+fail some early stage syntactic parsing (e.g., the XML fragment <
+xml><^xml> ),oratbest,findabuginthatsyntacticparser(perhaps
+<xml><^xml> causes a crash).
+System Under Test
+Semantic Logic
+Syntactic ParserMutator
+Parametric 
+GeneratorGuidance
+XCoverage
+Biases
+<xml>
+  <name>value</name></xml>name=value<xml></xml>0001Seeds
+Concrete 
+input:Parametric
+input:Concrete input:
+<xml><^xml>
+0011
+Figure 1: Comparing a fuzzing loop for a traditional
+coverage-guided fuzzer (blue) and parametric fuzzer (or-ange).
+The traditional fuzzer uses an evolutionary algorithm to
+mutate concrete program inputs directly. The parametric fuzzer
+mutates the parametric input — the sequence of decisions made by
+a generator function that ultimately creates concrete inputs.
+439CONFETTI: Amplifying Concolic Guidance for Fuzzers ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+In contrast, the parametric fuzzer (orange and green lines in Fig-
+ure 1) has a seed pool that consists of parametric inputs, which are
+thesequencesofdecisions madebytheparametricgeneratorthat
+result in some input. Whereas property-based testing tools employ
+randomgeneration,parametricfuzzersguidethegenerationofnew
+inputs by controlling each “random” decision made by the genera-
+tor. The parametric input 0001, in this example, represents the set
+of decisions made by the generator function to create the concrete
+input <xml></xml> .Theparametricfuzzeralsousesamutatorto
+transformaseedinput,butoperatesonthisparametricinput(or-
+angeline).Bymutatingparametricinputs,correspondingmutations
+occuratthe objectlevelandnotattheinputbytelevel.Aone-bit
+mutationto 0011mightresultinamoresemanticallyinteresting
+change tothe concrete input, creating <xml><name>value</name
+></xml> in the example. Hence, the key insight behind parametric
+fuzzing is that the structure of inputs is often more constraining
+thanthesetofvaluesinsertedintothatstructure.Priorexperiments
+show that parametricfuzzing is more effective whencompared to
+traditionalpropertytesting[ 53]andtotraditionalcoverage-guided
+fuzzing of Java programs [ 66]. Since we target Java applications,
+we chose to integrate Confetti with a parametric fuzzer.
+3 Confetti
+Confettigeneratescomplexinputsthatcanexposehiddenbugs
+in a program’s logic by using concolic execution and taint track-
+ing as forms of guidance for parametric fuzzing. The traditional
+approachtointegratewhiteboxguidancewithfuzzingistoprovidetargetedguidance,instructingthefuzzertoplaceparticularbytesat
+aparticularlocationinaparticularinput.Werefertoeachsuchsug-
+gestion as a “targeted hint.” Confetti employs targeted hints, but
+alsointroducesthenotionof globalhints,whichallowConfettito
+overcometheinadequaciesofdynamictainttracking.Althoughour
+approach is language-agnostic, we implement Confetti in Javaand target applications written in languages that target the JVM
+such as Java, Scala, Kotlin, Groovy, and Clojure.
+3.1 Example
+BeforeexaminingConfetti’sarchitectureindetail,shownin
+Figure 3, we provide a brief example to demonstrate how Con-
+fetti works in tandem with the fuzzer to generate concrete inputs
+that explore otherwise hard-to-reach code. Figure 2 shows Con-fetti’s hinting process to bias an example XML generator — in
+this example, it is the generateXML() function called in line 1. As
+statedpreviously,aparametricinputcanbethoughtofasaseriesofchoicesthataremade—wehavecolor-codeddistinctchoicepoints
+with the XML generator, along with their associated parametric
+inputandresulting,concretevalues.Function generateString isa
+black box that consumes a parametric input and generates a string.
+We present the minimalset of program executions that reaches
+line 6 — but in practice, Confetti applies a variety of mutators to
+support both targeted and non-targeted hints (described further in
+Section3.5).Initially,thegeneratorcreatesarandomseedinput( 1/circlecopyrt
+inFigure3)—Input#1,whichrandomlyselectsthestring“groupID”
+(perhaps from a dictionary), and the random boolean false. Being
+the first input of the fuzzing run, this is guaranteed to obtain new
+coverage—namelylines2and3.Thisinputisdeemed“interesting”
+by thefuzzer, asit leadsto increasedbranch coverage,and issent
+totheConfettiCoordinatorforwhiteboxanalysis( 2/circlecopyrtinFigure3).1 XMLDocument doc = parse(generateXML());
+2 if(!"expected" .equals(doc. element(0).name()))
+3    throw new Error();
+4 if(!"version" .equals(doc. element(0).attr( 0).name()))
+5    throw new Error();
+6 // interesting logic we want to fuzz follows bellow
+(b) Simple parametric XML tag generator that uses 4 random choicesString generateXML(){
+  String tagName = generateString();  if(generateBoolean())    return "<"+tagName+ " "+
+      generateString() + "='"+
+      generateString() + "'></"+tagName+ ">";
+  return "<"+tagName+ "></"+tagName+ ">";
+}(a) Example code to fuzz; the immediate goal is to pass both branches 
+(c) Visualization of Fuzzer Execution with hints. The first input is generated 
+randomly, later inputs are mutated by the fuzzer, or hinted by CONFETTI ( hint 
+underlined). CONFETTI generates hints from coverage-revealing inputs only.5
+“expected” true “version” “A”“groupID” false
+“package” false
+“expected” false
+“expected” true “groupID” “A”seed
+mutationhintmutationhint# Source Generator Choices
+New
+Coverage
+6
+7, 8
+912345Parametric Input
+0101101 0
+0101111 0
+1001011 0
+1001011 1011010 01101
+1001011 1011111 01101-
+Figure 2: Example Fuzzer Execution. A parametric fuzzer can
+easily create an input that is parsable by the black-box function on
+line 1, but may struggle to reach line 6 due to lines 2 and 4. As the
+parametric fuzzer records the sequence of random choices made
+in the generator (a), and mutates those choices to generate new
+inputs, Confetti proposes values for some of those choices, thus
+guiding fuzzer through these branches with ease.
+The Confetti Coordinator dispatches the input to a whitebox
+analysisprocess 3/circlecopyrttoperformtaint-trackingandcollectconstraints,
+which are 4/circlecopyrtreturned to the Confetti Coordinator, which 5/circlecopyrt
+negatesandsolvesthem, 6/circlecopyrtpossiblyresultinginnewparametric
+inputs. Meanwhile, 1/circlecopyrtthe fuzzer mutates inputs independently,
+changing “groupID” to “package” in Input #2.
+Oncethefuzzerdecidestomutateanewinput,itcontactsthe
+ConfettiCoordinatorforhints,whichthe 7/circlecopyrtConfettiCoordi-
+nator returns in the form of the modified parametric input derived
+from Input #1, hinting the first generated string should be “ex-
+pected”(derivedfromtainttrackingbetweentheinputstringand
+theString.equals call). With the hint, Input #3 results in new
+coverageonline4(anexceptionisthrownimmediatelyuponhit-
+ting line 4 due to the absence of attributes) — Input #3 is then sent
+to the Confetti Coordinator for whitebox analysis. Meanwhile,
+thefuzzermutatesInput#3into#4bychangingthebooleanchoice
+totrue, followed by a random string for an attribute name and
+value.Input#4resultsinnewcoverageonline5,andisalsosent
+to the Confetti Coordinator. Input #5 is generated in a similar
+manner to Input #3,using Confetti’s hint mechanism forstrings
+by instrumenting as the call to attrto obtain the hint “version.”
+While the parametric fuzzer couldcreate these inputs by chance, it
+becomes a certainty with Confetti.
+3.2 Architecture
+Figure3showsahigh-leveloverviewof Confetti’sarchitecture.
+Confetti consists of three key processes that run in coordination:
+(1)thefuzzer —responsibleforinputgenerationandexecutionof
+440ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell
+CONFETTI 
+CoordinatorWhitebox Analysis
+(Knarr)Greybox Fuzzer
+SMT Solver2 Interesting input 3 Analyze new input
+4 Constraints + taint flows
+5 Solve negated 
+constraints6New
+inputs7 New input(s) & hints for
+original input
+1Generate and 
+Execute Inputs
+Figure3:Overviewof Confetti’sapproachtoprovidewhiteboxhintingtoagreyboxfuzzer. Thefuzzerrepeatedlygeneratesand
+executes inputs, considering any hints that hit has received so far to guide its generation 1/circlecopyrt. For each input that the fuzzer creates that
+is deemed interesting for generating new coverage, it 2/circlecopyrtsends that newly generated input to the Confetti coordinator, which in turn
+3/circlecopyrtsends the newly generated input to the Knarr client in order to 4/circlecopyrtperform a whitebox analysis and collect constraints. If there are
+constraints,theConfetticoordinator 5/circlecopyrtnegatesconstraintsandsendsthemtotheSMTsolverto 6/circlecopyrtgeneratenewinputs.Regardlessofthe
+SMT result, the Confetti coordinator also extracts taint tracking-derived hints from string comparisons in the constraints. The coordinator
+7/circlecopyrtreturns the hints, and any new SMT-derived input(s) to the fuzzer, and the cycle continues.
+thetargetprogram, (2)theKnarrProcess —responsiblefordynamic
+taint trackingand constraintcollection on interestinginputs, and
+(3) the Confetti Coordinator — responsible for transmitting inputs
+between the two aforementioned processes and for using an SMT
+solver tofeedconcolic execution.This designhastwomainbene-
+fits.First,itusesseparateprocessesforcomponentsthatexecute
+the program under test with different (incompatible) instrumen-
+tations: collect taint and constraints (Knarr), or simple branch
+coverage(fuzzer).Second,itallowsthewhiteboxanalysistotake
+placewithoutdelayingthefuzzer,whichcontinuestomutateinputs
+unimpeded by constraint collection and analysis. The Confetti
+Coordinator thus acts as a broker for inputs being passed between
+Knarr and the fuzzer, receiving interesting inputs from the fuzzer
+andforwarding themto Knarrforfurther analysis.Similarly,the
+Confetti Coordinator manages constraints that are computed by
+Knarr, negating and solving them in the SMT solver.
+Similar to prior work such as Angora [33], the Confetti Coor-
+dinatorisnotnotifiedofeachmutation/executionthatthefuzzer
+performs, but instead only of each input that the fuzzer finds in-
+teresting (e.g., each input that reaches new coverage). Focusing on
+interestinginputshastwoimportantconsequences.First,Knarr
+executes a small number of inputs and does not lag behind thefuzzer. Second, this mitigates the path explosion problem since
+Knarr executes (concretely) paths known to reach new coverage,
+andthefuzzerultimatelyselectswhichhintstotake.Inthisway,
+Confetti leverages the speed of the fuzzer at generating inputs
+and the power of the whitebox analysis.
+Our implementation of Confetti extends the JQF+Zest para-
+metric fuzzer [ 64–66] and extends our Phosphor dynamic taint
+tracking engine [ 27,28] for constraint collection. Our prototype
+interfaces uses the Green library [ 75] as a bridge to constraint
+solvers,allowingittobeagnosticofthesolverused.Inpractice,we
+use the mature Z3 theorem prover [ 36], which worked well in our
+experiments. Future workmight consider other constraint solvers,
+perhaps using newer Java APIs like JavaSMT3 [23].
+3.3 Knarr: Collecting Whitebox Guidance
+Knarruses dynamictainttracking totracehoweachbyteofthe
+parametricinputflowsthroughthegeneratorintoageneratedcon-
+crete input, and then through the application under test. Dynamictaint tracking is an automated analysis that allows tools to taint
+somevariable(s),andthen,at anypointintheprogramexecution,
+identifyifavariableisderivedthroughdataflowfromthatoriginal,
+tainted input. Knarr instruments the system under test (including
+the generator that drives the application) to perform this analysis.
+RecallfromSection2thataparametricfuzzerrepresentseachin-
+putasaseriesofrandomchoicesconsumedbyageneratorprogram.
+Totaintthegeneratedinput,wemodifythefuzzertotainteachbyte
+oftheparametricinputthatisconsumedbythegenerator.Bydoing
+this, we are able to propagate taint tags through the parametric
+inputtotheconcretegeneratedinputandbeyond.Mostgenerators
+require no changes, the only modifications that Confetti may
+requiretothegeneratorareforstringgeneratorsthatselectinga
+randomitemfromapre-defineddictionary.Forexample,suchagen-
+erator might have logic along the lines of result = dict[choice
+% dict.length] , where choiceis a random integer and dictis
+a pre-defined list of strings. Confetti requires these generators to
+berewrittentocallahelperfunction,alongthelinesof result =
+ConfettiHelper.stringFromList(choice, dict) . This helper
+function will propagate the taint tag from choicetoresult(since
+array-indexing is an implicit flow), and will allow Confetti to
+decidetouseahint(whichmaynotbedefinedinthedictionary)
+or to choose an item from the dictionary.
+Knarr tracks taint tags for each variable, and for strings, tracks
+taint tags at a per-character level. Knarr tracks common stringoperations like
+equalsandstartsWith so that it can represent
+theseoperationstothesolver.Whenexecutingthegeneratorand
+theconcreteinput,Knarrrecordsthetainttagofvaluesusedin
+branch predicates. Knarr sends this data to the Confetti Coordi-
+nator, that can then connect individual bytes in a given parametric
+input to conditions guarding branch edges not yet covered.
+Instead of using a simple, traditional taint tag (of ‘tainted’ or
+‘nottainted’),Knarrenhancesthetainttrackingenginetobuildan
+abstract expression for each variable to use as the taint tag (again,
+a technique inspired by Angora [ 33]). For instance, given the code
+int x=y+z and assuming that yandzwere tainted inputs, an
+off-the-shelf taint tracking tool would typically set x’s taint tag to
+betheunionof yandz’stags.Instead,Knarrtrackstheabstract
+expression that generated the value (in this case, that 𝑥=𝑦+𝑧).
+In this way, x’s taint tag becomes the symbolic expression 𝑦+𝑧.
+441CONFETTI: Amplifying Concolic Guidance for Fuzzers ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+When a tainted input reaches a branch, the taint tag of the branch
+condition is then the complete symbolic expression that relates the
+parametric input byte to the branch condition.
+WhenKnarrdetectstainteddatabeingusedinabranch,itadds
+theconstraintsinthetainteddatatothecurrent pathcondition.The
+pathconditionisthustheconjunctionofalltheconstraintsobserved
+tocontrolbrancheswhileexecutingoneinput.Afterexecutingeach
+input,Knarrcollectsallconstraints inthecurrentpathcondition
+and sends them to the Confetti Coordinator, which uses those
+constraints to generate new inputs and hints for the fuzzer.
+3.4 Confetti Coordinator and Hints
+Using the constraints collected by Knarr, Confetti Coordi-
+nator derives three kinds of targeted hints: SMT solver-derived
+hints,stringcomparison-derivedhintsandcharactercomparison-
+derivedhints.ConfettiCoordinatorprovidesthesetothefuzzer
+as targeted hints, and as explained in the following section, thefuzzer will derive a set of global hints from these targeted hints.
+Confetti Coordinator leverages an SMT solver in the style of con-
+colic execution [42,71] in order to generate new inputs that are
+likelytorevealnewbranchcoverage.Whileinprinciple,Confetti
+Coordinatorcouldattempttonegateandsolvealluniquebranch
+conditionsinordertoattempttoexploreallpaths,inpracticewe
+foundthatconcolicexecutionwasmostusefultotargetbranches
+that could not be covered by the fuzzer. As Knarr executes inputs
+andcollectspathconstraints,ConfettiCoordinatorkeepstrack
+of which branches have not been fully explored.
+Confetti’s concolic execution thread works by first selecting a
+branchtotarget—onethatisnotfullycoveredandwhosepredicate
+includes at least one value from the input. Then, Confetti selects
+oneoftheinputsthatreachesthebranchandnegatestheconstraints
+applied by that branch’s predicate. Confetti drops constraintsfromthe inputthatoccurredafterthisbranchexecution, sinceit
+mightbeunsatisfiabletoretainthemwhilealsonegatingthetargetbranch’sconstraints.Then,ConfettiusesanSMTsolver(Z3[
+36])
+to generate a new parametric input that takes the other side of
+the branch. If satisfiable, the solution is then translated into a new,
+hinted input that can be immediately executed by the fuzzer. If
+thesolverdeemstheconstraintstobeunsatisfiable,ortimes-out,
+Confetti marks that combination of input and branch as “already
+tried” and moves on to the next target branch.
+After attempting to generate inputs for all uncovered branches
+once, Confetti loops around to try each uncovered branch again,
+this time picking a new input. Confetti records solver-related
+statistics:howoftenabranchwastargetedforsolvinghowoften
+each input was tried to solve for that branch, and the result of that
+solvercall.Somebranchesmayneverbesatisfiable,duetolimita-
+tions in constraint tracking or solving (e.g., usage of floating point
+operations), and perhaps become a waste of solver time. We found
+thatmostbranchesthatcouldbesolvedforwereoftensolvedon
+oneofthefirstfewinputsattempted,andaddedauser-configurable
+threshold to blacklist particular branches that repeatedly were not
+satisfiable, defaulting to 50 attempts.
+SinceConfetti’sgoalistoprovide guidance toafuzzer(andnot
+necessarily perform complete concolic execution), it also provides
+very lightweight, taint tracking derived hints to the fuzzer. Con-
+fettiextractscomparisonsbetweeninputvaluesandvariousstringvalues,regardlessofwhetherthosecomparisonscontrolbranches
+arecovered.Foreachofthesestringcomparisons,Confettipro-
+videsthefuzzerwithatargetedhinttosettherelevantbytesofthe
+input to the value that was compared to.
+SinceKnarrtrackstainttagsoneach character ofeachstring,
+itisalsopossibleforConfettitoderivehintsfromcomparisons
+between individual characters of strings. To mitigate the explosion
+ofhintsresultingfromsuggesting everypossiblecharacterthata
+given input is compared against, Confetti limits the total number
+of character hints suggested for each targeted branch to 10.
+3.5 Parametric Fuzzer Guidance
+Confetti’s core novelty over prior work is in how it inte-
+gratesthose results with the fuzzer. State-of-the-art fuzzers that
+integrateguidancefromdynamictainttrackingand/orpathcon-straint solving — like Angora [
+33], Driller [ 72], VUzzer [ 69] and
+others[35,63,79,80]—provide targetedguidancetothefuzzer.For
+instance, taint tracking might be used to determine which bytes of
+theinputcontrolbranchesthatarenotyetcovered,andthenthe
+fuzzer might be guided to generate a particular input to cover that
+branch.Confettiusesseveraltargetedhintingstrategiesbasedon
+prior work in addition to its novel, globalhinting strategy.
+When mutating an input, Confetti extends the fuzzer with
+the following new mutations: 1) Apply a single targeted hint, 2)
+Applymultipletargetedhints,simultaneously,or3)Performnormal
+mutation, which might apply global hints
+Targeted hints represent the state-of-the-art approach to inte-
+grate taint tracking and constraint solving with fuzzing: if Knarr
+determinesthatthereisaparticularvaluethatshouldbetriedat
+a particular positionin an input, then thatvalue is applied to that
+offset. Targeted hints are always applied withoutfurther mutation
+of the input, since the hints were collected on the original input
+beingmutated,anarbitrarychangetotheinputmightinvalidate
+the usefulness of those hints. When the fuzzer selects an inputformutation,andtherearetargetedhintsthathavenotyetbeen
+applied,withacoinflip,oneofthosetargetedhintsisapplied.Afteran input is selected for mutation repeatedly, eventually all targeted
+hintswillbetried,andthenthismutationwillnolongerbeavail-
+able for this input. If a single hint isn’t applied, then the fuzzer
+might apply multiple targeted hints simultaneously. In either case,
+Confetti inserts instructions in the input to use the hinted value,rather than whatever value would have otherwise been chosen by
+the generator at that targeted position.
+Each time that a targeted hint is applied to an input, that hint
+valueissavedinaglobalhintset,enablingConfetti’spowerful
+globalhintingmechanism.Thisglobalhintsettracksallstringsthat
+any input string was compared to during the fuzzing campaign. At
+anycallinthegeneratorthat couldconsumeatargetedhint,weadd
+a coin flip to determine whether the global hint set should be used,
+orthegenerator’snormallogicshouldbeused.Bymutatingthebits
+that control this decision, the fuzzer can control the application of
+global hints at each position. In our evaluation, we found that this
+seemingly simple strategy was very effective at generating new,
+coverage-revealing inputs and in revealing new bugs.
+A key aspect of Confetti’s hinting implementation is that it
+ensuresthathintsare inheritable :ifaninputwithtargetedorglobal
+hintsisdeemeduseful,saved,andfuzzedlater,assumingthatthe
+442ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell
+choices to generate those hinted values aren’t mutated, then the
+same hints will be applied in the same position. This allows thefuzzer to make progress towards generating increasingly morecomplex inputs by stacking multiple hints together. We did not
+perform any hyper-parameter tuning to optimize the probabilities
+ofapplyinghintsbasedontheiroverallperformance,althoughin
+Section 4.3 we report on the success rate of each mutation strategy.
+4 Evaluation
+In order to empirically evaluate Confetti and, in particular, its
+novel global hinting strategy, we measured its effectiveness across
+asuiteofbenchmarkprograms.Ourevaluationisprimarilyfocused
+on answering the following research questions:
+RQ1:How does Confetti compare to the baseline fuzzers in
+terms of branches explored?
+RQ2:Does Confetti find bugs that the baseline fuzzers cannot?
+RQ3:Howusefuliseachof Confetti’shintstrategiesfordiscov-
+ering new coverage-revealing inputs?
+RQ4:CaninputswithConfetti’sglobalhintsbereplacedwith
+statically derived values, and still yield the same coverage?
+WeevaluateConfettiincomparisontothestate-of-the-artpara-
+metricfuzzerJQF-Zest[ 66]andusethesamesuiteofbenchmark
+programs,giventhatwebuiltConfettiontopofJQF-Zest.Where
+possible, we used the latest version of the target software that still
+contained the bugs detected by JQF-Zest in the original work. Fol-
+lowing best practices, we study both Confetti’s ability to explore
+programbranches(e.g., coverage)incomparisontoJQF-Zest,and
+its ability to find new and previously-known bugs [50].
+In order to precisely evaluate the efficacy of Confetti’s global
+hintingstrategy,wealsoevaluateConfetti’scoverageandfault
+finding ability in comparison to a baseline Confetti 𝑡𝑔𝑡, which
+is exactly the same version of Confetti, but with global hints
+disabled.However,there maybea varietyof confoundingfactors
+thatalsoimpactConfetti 𝑡𝑔𝑡’soverallperformanceinthishead-
+to-head evaluation. For instance, the fuzzer’s scheduling algorithm
+(thatallocatesmutationtimetoandchoosesthemutationstoapply
+on inputs) likely interacts with factors that influence the coverage
+of each input — like hints. To isolate the impact of global hints, we
+also analyzed each of the coverage-revealing inputs that Confetti
+generated, looking to determine whether or not those inputs could
+have been generated without global hints.
+WeconductedallofourexperimentsonAmazon’sEC2infras-
+tructure, using “r5.xlarge” instances with 4 3.1Ghz Intel Xeon Plat-
+inum8000CPUsand32GBofRAM,runningUbuntu16.04“xenial”
+and JDK 1.8.0_241. Following best practices, we conducted each
+experimentfor24hoursandrepeatedthis20timesaveragingthe
+results [50]. The input generators used in our evaluation are exten-
+sionsoftheopensourceinputgeneratorsthatwerepublishedby
+theJQF-ZestauthorswithinJQFitself[ 64].Themodificationsmade
+to the generators for constrainttracking and hinting are minimal,
+amounting to approximately two lines of code in the XML docu-
+ment generator, approximately four lines of code in the JavaScript
+code generator, and approximately ten lines of code in the Java
+classfile generator.Wealsomodified theMavenpom.xml genera-
+tor—thecodeprovidedbytheJQF-Zestauthorswasmisconfigured,
+and hence unable to generate high-coverage pom.xml files. Ourmodification to the Maven pom.xml generator was merged intothe upstream codebase [ 26]. Otherwise, we used the generators as
+provided by the JQF-Zest authors without modification.
+4.1 RQ1: Evaluating Fuzzer Coverage
+Most fuzzers (including JQF-Zest and AFL) consider coverage of
+allcode,inboththeapplication’scodeanditslibraries,todetermine
+whichinputstosave,sinceaninputthatcoversnewlibrarycode
+might be “closer” to covering new application code. Following the
+methodology of Padhye et al.’s JQF-Zest [ 66], we analyze and
+report coverage overall, and also for application code specifically.
+Figure 4 visualizes the branch coverage of allcode (not only
+thesystemundertest)ofeachofthe20executionsofeachofthe
+benchmarkprogramsforeachfuzzerduringthedurationofeach
+24-hour campaign.The solidline representsthe averagecoverage
+across each of the 20 executions, and the shaded area represents
+thecompleterangeofcoverage.Wealsocalculatedthe totalbranch
+coverage for each fuzzer over all of its 20 runs, this time usingthestandardcodecoveragetoolJaCoCo[
+59],andreportingonly
+branches in the program under test covered by any input from any
+1500200025003000
+0 500 1000 1500
+(a) Apache Ant15002000
+0 500 1000 1500
+(b) Apache Maven
+500010000
+0 500 1000 1500
+(c) Google Closure20002500300035004000
+0 500 1000 1500
+(d) Mozilla Rhino
+1000125015001750
+0 500 1000 1500
+Campaign Time (minutes)Branch Probes Covered
+(e) Apache BCEL
+Figure 4: Rate of new branch discovery for each fuzzer,
+JQF-Zest shown in red, Confetti in blueand Confetti-
+NoGlobalHintsin black. The solid line shows the average cov-
+erageacrossall20runs,andtheshadedareashowstheentirerange.
+All charts have the same axis labels as BCEL.
+443CONFETTI: Amplifying Concolic Guidance for Fuzzers ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+Table 1: Summary of results for RQ1 and RQ2: branch coverage and bugs found. Coverage in this table includes onlycoverage of
+applicationcode(nolibrarycoverage).Totalbranchesshowsthenumberofbranchesconsidered;branchcoverageisshownaggregated
+acrossall20runsforConfetti,thebaselineJavafuzzerJQF-Zest,andConfetti 𝑡𝑔𝑡(Confettiwithtargetedhintsbutwithoutglobalhints).
+Total Branch Coverage Bugs Found
+Benchmark Program (Version) Total Branches Confetti JQF-Zest Confetti 𝑡𝑔𝑡Confetti JQF-Zest Confetti 𝑡𝑔𝑡
+Apache Ant [6] (1.10.2) 23,361 872 859 871 11 1
+Apache Maven [11] (3.5.2) 5,858 857 821 853 00 0
+Apache BCEL [10] (6.2) 6,220 1,421 1,361 1,423 52 3
+Google Closure [12] (20190415) 49,602 11,458 10,545 10,640 15 4 8
+Mozilla Rhino [19] (1.7.8) 25,035 3,744 3,757 3,534 44 4
+of the 20 runs. Table 1 shows the total branch coverage of each
+fuzzer, along with the number of branches considered for coverage.
+For all fuzzing targets, Confetti’s average branch coverage
+surpassedthatof Confetti 𝑡𝑔𝑡,whichsurpassedthatofJQF-Zest.
+Rhino’scomparisongraphismuchtighterthantheothergraphs,
+withagreatdealofvarianceforboth ConfettiandConfetti 𝑡𝑔𝑡
+whencomparedwiththatofJQF-Zest—andthemaximumcoverage
+ofJQF-ZestwasgreaterthanConfetti.DiggingdeeperintoRhino,
+wecanseefromTable1that,intotal,JQF-Zestexplored13more
+application branches than Confetti. This variance is likely due to
+theadditionalchoicesthatConfettiintroducesinthegenerators—
+namelybyincreasingthesizeoftheglobaldictionary,orbyhavingseveralhintstochoosefromattargetedbytepositions.Withfurther
+(andlonger)trials,wesuspectthatthisvariation(anddiversity)may
+helpConfettitoultimatelyachievehighercoveragethanJQF-Zest.
+We also believe that future work could improve the efficacy of the
+generator for Rhino. For Maven, BCEL and Closure, Confetti’s
+improvement in branch coverage over JQF-Zest was quite notable.
+It is interesting to note that in the case of coverage BCEL, our
+baseline without global hints (Confetti 𝑡𝑔𝑡) slightly outperformed
+Confetti. Howev er,ConfettioutperformedConfetti 𝑡𝑔𝑡both
+in terms of total coverage (Figure 4) and bugs found — supporting
+ourhypothesisthatglobalhintsareausefulstrategyforcombiningconcolicguidancewithgreyboxfuzzing.Webelievethelimitedvari-
+ability in BCEL is due to JQF-Zest’s Java class file generator, which
+wedeliberatelydidnotmodify.Inparticular,itgeneratesmethod
+bodieswithveryfewinstructions,greatlylimitingthechancesof
+exercising complex behavior in the target. Nonetheless, Confetti
+still outperforms JQF-Zest on this target, which shows that even
+with restrictive generators, Confetti still improves performance.
+4.2 RQ2: Bugs Found
+We analyzed each failure detected in all twenty, 24-hour runs,
+and reported each unique program crash as a bug in Table 2. In
+order tode-duplicate bugs, weutilize aheuristic ofexamining the
+first 5 lines in a stack trace to identify a unique bug, as well asmanual analysis after applying this heuristic. This methodology
+clusters more bugs together than prior work of stack hashing [ 50],
+as the higher levels of the stack tend to isolate the locality of aparticular bug. Using this methodology, we replicated the same
+10bugsthatPadhye etal.reportedinJQF-Zest(withevengreater
+frequencyinsomecases),plusoneadditionalbuginClosure,likelyfoundduetoperformanceimprovementsthatwemadetoJQF-Zest
+(described in Section 5).
+Ofthose11bugsthatJQF-Zestfound,Confettifoundallbutone
+initstwenty24-hourruns(IssueB1inthetable).Again,weattributethistoadditionalchoicesthatConfettiintroducesinthegenerator,
+which clearly can result in a diversity of paths explored. This is
+evident in BCEL particularly, as Confetti finds four additional
+bugsthatJQF-Zestdoes not.Theadditionofthesechoicesmakes
+bugsthatarerepeatablewithlowfrequencyevenlesslikelytobe
+triggered within a single run. We suspect that tuning the rate at
+whichhintsareselectedcouldincreasethelikelihoodthatConfetti
+detects bugs like this, but leave such investigation for future work.
+Ofthose25bugsthatConfettifound,16(64%)werepreviously
+unknown,theresthadbeenfoundpreviouslybyJQF-Zestorothers.
+Table 2 shows that, of the bugs that Confetti detects, there is
+a clear range of detectability, with some bugs detected on mostfuzzing runs, and four detected at the 5% (i.e., 1/20) level. This
+distribution supports our hypothesis that supplying global hints
+Table 2: Bug detectability rate, from 20 executions of each
+fuzzer.If multiple unique bugs had the same repeatability rates,
+they are included in the same row (C14, C15, and R1, R2, R3, R4).
+Unreferenced issues were not reproducible in latest version of soft-
+ware.IssuesreferencingJQF-Zest[ 66]werepreviouslyfoundand
+reported by the authors of JQF-Zest.
+Program Issue # JQF-Zest Confetti Confetti 𝑡𝑔𝑡
+ant A1 [66] 100 % 100% 100%
+bcel B1 [66] 100 % 0% 0%
+bcel B2 [66] 100 % 100% 100%bcel B3 [8] 0 % 40% 0%
+bcel B4 0 % 80% 0%
+bcel B5 [7] 0 % 100% 5%
+bcel B6 [9] 0 % 100% 20%
+closure C1 [66] 100% 100% 100%closure C2 [66] 90% 5% 85%closure C3 [66] 80% 45% 70%closure C4 [1, 2] 0% 95% 45%closure C5 [3] 0% 90% 15%closure C6 0% 5% 0%
+closure C7 [4] 0% 100% 20%closure C8 [17] 0% 100% 0%
+closure C9 [5] 15% 20% 15%closure C10 0% 100% 5%
+closure C11 [14–16] 0% 100% 0%
+closure C12 [13] 0% 35% 0%
+closure C13 0% 20% 0%
+closure C14,C15 0% 5% 0%
+rhino R(1-4) [66] 100% 100% 100%
+444ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell
+to the fuzzer can pay off: even though many of the hints tried at
+eachpositionofeachinputmaybeirrelevantfordetectingabug,
+someofthemdo.Giventhatthedesignofthefuzzeristoexecute
+as many inputs as quickly as possible, a diversity of hints can lead
+to a greater diversity in coverage, and a diversity in bugs found.
+Wefoundthat6ofthe16newlydiscoveredbugshadalreadybeen
+foundandpatchedinthemostrecentdevelopmentversionofthe
+respectivefuzzingtargets—anencouragingsignthatdevelopers
+care about the kinds of bugs that Confetti can find. We reported
+theremaining10bugstothedevelopers,andattimeofwriting4
+bugs in Closure have been fixed by developers and 3 have been
+acknowledged, 3 bugs in BCEL are awaiting acknowledgment. The
+ClosuredevelopersfoundthebugsdiscoveredbyConfettitobe
+quiteinteresting,andintheirinvestigationofIssueC11,founda
+separate(butrelated)bugthattheyhavealreadyfixed[ 18].Thisisa
+testamenttoConfetti’sabilitytofindtrulyunexpectedbehaviors,
+thereby revealing latent software errors, and contributing to the
+betterment of software quality. We describe several of the newly
+foundbugsheretoprovidesomemoreintuitionintoConfetti’s
+performance.
+Inmanycases,Confettifoundthesebugsthankstotainttrack-
+ing, finding special strings like arguments ,jscomp.reflectProp-
+ertyandgoog.reflect.objectProperty . It is likely that these
+strings would trigger these bugs in both the Confetti and Con-
+fetti 𝑡𝑔𝑡runs.ThisisshownintheresultsinTable2,inwhichthere
+are a subset of bugs that Confetti and Confetti 𝑡𝑔𝑡do find with
+similar frequency that JQF-Zest was not able to find (Issues C4, C5,
+C8).
+Bugs C4 and C5 are interesting, but technically could have also
+been detected at the same frequency if the strings arguments and
+goog.reflect.objectProperty were in the fuzzer’s dictionary.
+Issue C7 presents an example that could not be detected with a
+dictionary. $jscomp$ isusedasaninternalconstantthatClosure
+Compiler uses to construct internal aliases for arguments to func-
+tions.Bysupplyingboth inner$jscomp$1 andinnerasarguments
+to a function, the compiler throws an exception because it tries to
+constructamapofargumentnamesandif inner$jscomp$1 issup-
+pliedasthefirstargument,itwillfailtoinsertthesecondargument
+name,leadingtoa RuntimeException .Notethat,inthiscase,no
+dictionary-based approach could detect this bug, as the bug is only
+triggerediftwoargumentsarespecified,withthefirstargument
+matching the second argument, plus the suffix $jscomp$.
+Several bugs were detected only by Confetti’s global hint-
+ing strategy (C6, C8, C11-C15). For example, consider Issue C11,
+which Confetti was able to find in 100% of runs, while Con-
+fetti 𝑡𝑔𝑡and JQF-Zest were unable to find it. A simplified input ex-
+ercising this bug is (((goog$dom$TagName$$_88a).length) +=
+(this)))) . The string goog$dom$TagName$$_88a was extracted
+via taint tracking and added to the global dictionary. Later in
+the fuzzing run, the generator decided to use it as the left-handexpression of an addition assignment operator. During an opti-mization pass, the compiler is unable to satisfy the preconditionthat
+(((goog$dom$TagName$$_88a) .length) matches the type
+ofthisandthrowsanexception.Exercisingthisbugwouldnotbe
+possible without the decoupling of string hints to their respective
+parametric byte input positions. In Closure, this proves to be very
+successful in finding new bugs.In BCEL, global hints led to the discovery of two bugs that only
+Confettiwasabletofind(IssuesB3andB4).OfthebugsthatonlyConfetti and Confetti
+𝑡𝑔𝑡found (B5 and B6), Confetti was able
+to find them with 100% repeatability across the 20 experimental
+runs. This suggests that global hinting is a powerful technique for
+revealing bugs with a high rate of repeatability within BCEL.
+4.3 RQ3: Efficacy of Hint Strategies
+WhileConfettiruns,italsocollectsbasicstatisticsontheinputs
+generated:whichstrategieswereusedwhengeneratingeachinput,
+and which inputs were saved to the fuzzing population. Recall
+thatJQF-Zest,likemanyothergreyboxfuzzers,savesaninputto
+its population for later fuzzing if the input reveals new branchcoverage, or if it increases the hit count of a previously coveredbranch by an order of magnitude. Since inputs are derived from
+existing inputs, it’s possible that a single input has benefited from
+multiple hints, and multiple kinds of hints.
+The left side of Table 3 shows the total number of inputs gener-
+ated(acrossall20runs),alongwiththesuccessrateforthetargeted
+hint strategies (SMT, Char, String), for the global hint strategy, andoverall, for random mutation. Some observations from this portion
+ofthetablearethatSMTandCharmutationsarerelativelyeffective,thatis,theyareseveralordersofmagnitudegreaterintheirsuccess.
+However, despite this, these strategies are rarely employed com-pared to the other mutation strategies due to SMT solving beingexpensive and/or finding certain paths to be unsatisfiable, or in
+thecaseofCharhints,simplybeingencounteredinfewerplaces
+thanstringcomparisons.Theothermutationstrategies—String,
+Global and Random, generate several orders of magnitude more
+inputs, as they leverage the throughput of the underlying greybox
+fuzzing framework upon which Confetti is built. String mutation
+strategiesareparticularlyeffectiveinGoogleClosure,andGlobal
+mutationstrategiesareanorderofmagnitudemoresuccessfulin
+Closure than in any other target application.
+However, simply considering the success rate of each hint strat-
+egy does not adequately capture its overall efficacy. For example, if
+coverageisquicklysaturatedduring thefuzzingrun(aswefound
+inthecaseofMaven), nomutationstrategywillbesuccessful,since
+there is no new coverage to find. Success rates can also be mislead-
+ing because they do not capture how frequently a kind of hint isavailable to be tried (again, particularly notable for SMT inputs),
+nor how often a hint is inherited by multiple derived inputs.
+TherightsideofTable3presentsananalysisofeachoftheinputs
+thatweresavedbyConfetti.Thismetriccapturesbothhowoften
+a hint is available, and also how often a hint is inherited by a child
+input.Notethatsinceasingleinputmighthavemultiplehints(andmultiplekindsofhints),thesumofthenumberofsavedinputswith
+each form of hint may be greater than the total number of savedinputs (or fewer, in the case of Rhino, where some saved inputs
+hadnohints).Ofthetargetedhintstrategies,wecanseethatwhile
+SMT and Char targeted hints had the highest success rates, they
+are represented by only a relatively small proportion of the saved
+inputs. Since the fuzzer can generate and test inputs extremelyquickly, running up to several thousand inputs per second, it’spossible that inputs that couldhave been generated by the SMT
+solver were instead, first generated by chance, perhaps thanks to a
+differenthint.Thereisaninterestingexceptiontothisinthecase
+445CONFETTI: Amplifying Concolic Guidance for Fuzzers ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+Table 3: Hint information for each new saved (coverage-revealing or hit-count increasing) input, aggregated across 20 runs.
+Theleftsideshowsthesuccessrateofeachmutationstrategyincreatinginputsthatrevealnewcoverage.Eachsavedinputmighthave
+multiple hints; the right side reports on the number of saved inputs with each kind of hint (including inherited hints).
+Total # Inputs
+GeneratedSuccess Rate of Mutation Strategy Total # Inputs
+SavedWith Targeted Hints With Global
+Hints Program SMT Char String Global Random SMT Char String
+ant 948,781,594 0.56% 5.32% 0.0099% 0.0011% 0.0013% 12,808 36 354 6,713 8,703
+bcel 9,756,905,877 4.92% 7.47% 0.0107% 0.0003% 0.0003% 32,807 796 139 825 31,885
+closure 249,762,647 5.61% 4.99% 0.1482% 0.0565% 0.0492% 144,857 828 2,506 43,167 117,601
+maven 6,572,328,873 0.85% 3.22% 0.0015% 0.0004% 0.0004% 26,397 155 722 10,689 18,358
+rhino 1,838,661,632 1.03% 10.07% 0.0093% 0.0017% 0.0019% 38,119 480 2,112 5,072 24,375
+of BCEL, as the number of saved inputs for SMT targeted hints
+and String targeted hints are the same magnitude. BCEL is unique
+among the applications that we studied in that its input (Java class
+files)isaformatthatcontainsbothstrings andbinarydata.SMT-
+targetedhintsparticularlyexcelatcoveringnewbranchesthatrely
+on specific “magic” bytes, as opposed to strings.
+Perhapsthemostinterestingtakeawayfromthesestatisticsisthe
+enormousproportionofsavedinputsthatcontainglobalhints.This
+isencouragingevidencethatsupportsourhypothesisthatglobal
+hints are a useful form of guidance for fuzzers. However, simply
+becauseaninputwassavedwithaglobalhintdoesn’tmeanthat
+this input needed that hint in order to produce the same coverage
+(and be saved) — it is possible that the hint is coincidental to the
+coverage, and that another string could have also resulted in the
+same coverage. We investigate this idea in greater depth in RQ4.
+4.4 RQ4: Analysis of Inputs with Global Hints
+RQ1andRQ2showthatusingglobalhintscoversmorebranches
+andfindsmorebugs.RQ3showsthekindsofhintsininputsthat
+are saved (i.e., are coverage-revealing), showing that most of those
+savedinputsincludeglobalhints.However,itishardtoconclude
+thattheglobalhintsarenecessary:maybea randomly generated
+input could have revealed that same coverage — how do we know
+thattheglobalhintwasrelevanttorevealingthiscoverage?With
+RQ4,weRQ4examinethisconcerndirectly,studyingthelikelihood
+that a random fuzzer (that also benefits from targeted hints) could
+generate an input that reveals the same coverage as the input that
+CONFETTI generated using global hints.
+Foreachinput 𝐼acrossallofCONFETTI’srunsthatrevealednew
+coverage andhadglobalhints,wetooktheparentinput 𝑃(thatwas
+mutated by CONFETTI into 𝐼) and fuzzed it 1,000 times using both
+randomgenerationandtargetedhints,observingthecoverageof
+thoseinputs.1,000iterationsisanorderofmagnitudemorefuzzing
+iterationsthanZestwouldapplyinasinglecycle,whichwebelieve
+providesareasonableupper-boundofthelikelihoodofthefuzzer
+withoutglobalhintsgeneratinganinputthatrevealedthatsame
+coverage. If the fuzzed input never produces the same coverage,
+then we may have some confidence in the hypothesis that, for that
+input, global hints were necessary to achieve the same coverage.
+Thisallowsustodistinguishbetweenglobalhintsthatareclearly
+unnecessaryandthosethatmighthavebeenusefulforrevealing
+new behaviors during the fuzzing campaign.
+Table4showsthenumberandpercentageofsavedinputsthat
+haveglobalhintsthatcouldbereplicatedwithoutthoseglobalhintstrivially(onthefirsttry),eventuallywithinthe1,000runs,andneverwithin the 1,000 runs. On Ant, BCEL, Maven and Rhino, the major-
+ity of saved inputs can be replicated without global hints, trivially.
+Thisindicatesthat,intheseapplications,formostoftheglobal-hint-
+containing inputs that revealed new coverage, the global hint(s)
+were definitely not necessary to produce that same coverage. How-
+ever,wenotethatthesurvivinginputsinthe“Never"columnare
+still roughly comparable to the number of targeted hints shown in
+Table 3. This is perhaps evidence that global hints are at leastas
+effective ofa strategyas targetedhints inrevealing newcoverage.
+Closure is the one exception to this trend, in which over 98%
+ofsavedinputscannotbereplicatedwithoutglobalhints.Thisis
+likely due to the high rate of implicit flows within Closure itself. A
+commonpatternthatwefoundinClosureisthatalloccurrencesofthesameidentifiernameinaninputaremappedtothesameobject
+inside of the compiler — losing the precise mappings from eachoccurrence of that identifier in the input. Many of the bugs that
+only Confetti was able to find in Closure have similar properties.
+Our overall conclusion from this analysis is that Confetti’s novel
+combinationofbothglobalandtargetedhintsismoreeffectivethan
+using only targeted or only global hints.
+4.5 Data Availability
+OurartifactcontainsthesourcecodeanddependenciesforCon-
+fetti, our scripts to run experiments, our modifications to JQFand JaCoCo, and all data produced by our experiments [
+52]. To
+encourage re-use, Confetti is released under the BSD 2-clauselicense and our GitHub repository has a continuous integration
+workflow to run performance evaluations of pull requests [51].
+Table4:Post-mortemanalysisofallsavedinputswithglobal
+hints.For each input, we remove all global hints and attempt to
+replicate the same coverage by replacing the global hints with
+random strings from the fuzzer’s dictionary. We show the number
+ofthoseinputswithcoveragereplicabletrivially(onthefirsttry),
+eventually (within 1,000 tries), and never within those 1,000 tries.
+Saved Inputs Replicated Without Global Hints
+Program Trivially Eventually Never
+ant 6,664(76.57%) 125(1.44%) 1,914 (21.99%)bcel 16,714(52.42%) 1,440(4.52%) 13,731 (43.06%)closure 839 (0.71%) 668(0.57%) 116,094 (98.72%)maven 14,229(77.51%) 173(0.94%) 3,956 (21.55%)rhino 19,980(81.97%) 454(1.86%) 3,941 (16.17%)
+446ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell
+5 Discussion and Threats to Validity
+Reliablyevaluatingfuzzersisdifficult,sincetheprocessisnon-
+deterministic. We mitigated this risk by following best practices:
+we ran our experiment 20 times, and reported in Table 1 only bugs
+found at least once in those 20 runs [ 50]. Confetti might have
+different performance on other programs: we used a benchmark
+offuzzingtargetsusedbypriorwork[ 66].Ourtoolsanddataare
+available for others to replicate and expand on.
+While our approach should be language-agnostic, we have only
+implementedittargetingprogramsthatrunintheJVM.Webelieve
+that the Confetti’s approach could even be used for programs
+writteninC,asshownbyrecentsourcecodeinstrumentation-based
+approachestoconcolicexecution[ 68].Whilewearehopefulthat
+global hinting will be as significant of a hint strategy for other
+fuzzers (like AFL or libFuzzer), it is possible that there is hidden
+couplingbetweenthesuccessofglobalhintingandthedesignof
+the particular fuzzer that we extended (JQF-Zest). Like most other
+fuzzers,itwillbedifficulttoapplyConfettitostatefulapplications
+in which separate inputs are related. Pairing Confetti with a
+checkpoint-rollback system [ 29] could ensure high-fidelity fuzzing.
+Itisinterestingtoconsiderwhypriorgreyboxfuzzersthatlever-
+aged taint tracking or concolic execution used it only for targeted
+guidance. Onehypothesis is that, inother languages, itis difficult
+toidentifybytesthatareusedtorepresentstrings,versusbinary
+data. However, popular fuzzers AFL and libFuzzer both already
+leveragestatically-deriveddictionaries[ 20,54].Hence,perhapsitis
+more likely that our approach of global hinting simply hasn’t been
+tried yet, due to the concern that the global hint set would growto such a large size to become unmanageable. Our experimental
+results seem to support the idea that including more strings in the
+global hint set (including those that may not be useful) is more
+beneficial than only considering targeted hints. Even if our results
+do not generalize to other languages, we note that Confetti is theonlyconcolic-guidedJVM-basedfuzzer,andhenceourfindingsstillhaveasignificantimpactforanysoftwareengineersorresearchers
+interested in fuzzing JVM-based code.
+We did not carefully explore the configuration space for Con-
+fetti, and it is possible that its performance could increase or
+decreaseonsomeorallfuzzingtargetsbasedontunableparame-
+ters,suchasthefrequencyatwhichhintsareapplied.Webelieve
+that this could be interesting future work, but feel that such an
+evaluation is outside of the scope of this paper.
+Like JQF-Zest, Confetti assumes the availability of generators
+to exercise the programs under test. We do not see this as a signifi-
+cant limitation, however, due to the popularity of generator-based
+testingtoolslikeJQF[ 65],ScalaCheck[ 60]andJUnit-Quickcheck[ 46].
+Furthermore, our evaluation used only the pre-existing generators
+that were used in the original evaluation of JQF-Zest [ 66]. One
+hypothesis for the success of global hinting in our experimentsis that the pre-existing generators were overly restrictive in the
+values that they could generate, and global hints provided a means
+togeneratemorediverseinputs.Inthislight,Confettimightbe
+seen more as an approach to automatically improve the quality of
+existing generators, bypassing these restrictions. While we havenot yet been able to design an experiment to confirm this result,we now believe quite strongly that future research in fuzzing JVM-
+basedapplicationsshouldfocusoneitherapproachestoevaluate
+and improve developers’ existing generators and property tests, or
+to design new approaches that do not rely on those generators.
+While we have very carefully tested our prototype implemen-
+tation of Confetti, it is possible that our evaluation is affected
+by bugs that remain in Confetti or any of the other systems that
+we used (including JQF-Zest, JaCoCo and Phosphor). We analyzed
+thefuzzing resultsof both ConfettiandJQF-Zest quitecarefully,
+conducting thousands of short debugging runs, using JaCoCo to
+analyzethecoverage(orlackthereof)ofparticularbranches.We
+note that in addition to our own implementation bugs that we
+foundandpatchedinConfetti,wealsofoundseveralbugsinJQF-
+Zest and JaCoCo. For example: we found that JQF-Zest’s coverage
+implementation did not correctly distinguish between the multi-
+ple cases of a single switch statement, and was generally prone to
+frequent collisions, where multiple branches used the same cov-
+eragecounter.TheseissuesresultedinJQF-Zestdiscardingmany
+coverage-revealinginputs,ratherthansavingthemandmutating
+them further. Weimplemented a newbranch coverageinstrumen-
+tation and runtime for JQF-Zest that eliminated these collisions,
+while also improving the fuzzer’s execution speed by 7-10x. We
+used this enhanced coverage in our evaluation of JQF-Zest, and
+submittedthischangeasapullrequesttotheJQF-Zestmaintainers,
+who are excited to merge it in to their next release [25].
+As part of this JQF-Zest debugging, we also found a bug in Ja-
+CoCo that could cause branches to appear uncovered if the first
+statement enclosed by the branch was a method invocation which
+threwanexception.Tracingprecisebranchcoverageinthepres-
+enceofexceptionalflowrequiresplacingprobesbeforeandafter
+anyinstructionthatmightthrowanexception,whichcandecrease
+performance, and hence, this may not be desirable as a general
+feature.Afterconsiderablereflection,wedeterminedthatthisbe-
+havior was acceptable within the scope of what JaCoCo aims to
+detect, and did not submit these changes to the JaCoCo developers.
+However,ourbranchofJaCoCowiththepatchforthisissueisin
+our artifact [52].
+To help support future research and development of Confetti,
+JQF-Zest,andrelatedfuzzers,wehavecreatedandsharedaGitHub
+Actionsworkflowthatautomaticallyexecutestheentireevaluation
+that is described in this paper. We have found this workflow to be
+extremelyusefulinourdevelopment.Forexample:whendebugging
+amemoryleakinConfetti,wecouldeasilylaunchmanyparal-
+lel experiments,collect metrics, andcompare performance across
+branches. This workflow was also quite useful in our development
+of the faster, collision-free coverage implementation for JQF-Zest,
+whichallowedustoeasilycreateandshareperformanceevaluation
+results in our pull request [25].
+6 Related Work
+Inclassicdynamicsymbolicexecution,forinstance,asproposed
+byKLEE[ 32]orJPF-SE[ 22],programsareexecutedsymbolically,
+by a special-purpose interpreter. Concolic execution, executes a
+programconcretely,butusesruntimesupporttocollectpathcon-
+straintsastheyrelatetotheinput,thenlaternegatessomeofthese
+constraints, solves them using an SMT solver, and executes thenewly generated input [
+31,71]. Hybridizing concolic execution
+447CONFETTI: Amplifying Concolic Guidance for Fuzzers ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+andrandomtesting/fuzzingwasfirstproposedbyMajumdarand
+Sen[57].Thisworkshowedthatoncefuzzingsaturatescodecover-
+age, concolic testing can help to discover new program states that
+randomtestingdidn’totherwisefind.Morerecentworkhasalso
+exploredhybridizingconcolicexecutionwithfuzzing[ 61,62,74],
+but Confetti is the first work to use the global hinting strategy to
+integrate concolic guidance with fuzzing.
+Fuzzing parsers for well structured, human readable, input is
+challenging. One line of research aims to guide a fuzzers with a
+grammar that describes the input structure [ 41,43,67,77,78]. For
+instance,SkyFireusedgrammarstogeneratewellformedinputs
+as seeds for AFL [ 77], and Superion integrated the grammar with
+AFL [78]. Such input grammars are required to be context-free,
+whichlimitstheirapplicability. Toaddressthislimitation,previous
+work focused on learning tree models [ 67] or probabilistic context-
+sensitivegrammars[ 43]fromacorpusofvalidseeds.Incontrast,
+Confetti’s generators are small programs that can generate so-
+phisticatedinputs(e.g., anyvalidJavascriptprogram)withoutthe
+restrictions of context-free grammars.
+Manyothersystemsalsocombinesymbolicorconcolicexecu-
+tion with fuzzing [ 33,35,63,72,79,80]. Perhaps most similar to
+Confetti is Angora, which, like Confetti, also uses taint track-
+ing to collect path constraints [ 33]. Confetti differs from these
+prior systems in that it records strings generated by concolic ex-
+ecutionas globalhints,allowingthesemagicvaluestobeusedin
+elsewhere in the same or other inputs. In our evaluation, we found
+that this strategy accounted for most of the coverage-revealing
+inputs found by our fuzzer. These global hints are effectively a
+dynamicallygenerated fuzzingdictionary—fuzzerslikeAFL[ 81],
+libFuzzer[ 55]andJQF-Zest[ 66]allallowdeveloperstospecifya
+pre-defineddictionaryofstringsthatmightbeinterestingtouseinfuzzing.Inourevaluation,allfuzzerswereseededwithdictionaries
+by JQF-Zest’s original authors, providing a realistic representation
+of the dictionaries that a developer would create.
+Similarly, Confetti is not the first approach to combine taint
+trackingwithfuzzing.LikeConfetti,VUzzercombinestainttrack-
+ing with fuzzing in order to target the fuzzer and determine magic
+bytes [69]. BuzzFuzz uses taint tracking to identify which input
+bytes that flow into targeted branches, and then modifies thosebytes directly [
+40]. Similarly, TaintScope uses taint tracking to
+identify inputs that flow through checksum-like routines and at-
+temptstouseasymbolicrepresentationtoensurethatthefuzzed
+inputs still pass those checksums [ 80]. Again, Confetti differs
+from all of this prior work in that it also introduces the notion
+ofglobal hints,whichrepurposevaluesdetectedfromtainttrack-
+ing particular bytes of one input to be used when fuzzing otherinputs. There have also been numerous advancements in fuzzer
+seedselectionandscheduling,mostofwhicharecomplementary
+to Confetti, and combinations of the approaches could be studied
+in future work. For instance, directed greybox fuzzing guides a
+traditional greyboxfuzzer bycasting guidanceas anoptimization
+problem, and hence does not require whitebox guidance at all [ 30].
+Confetti ameliorates the implicit flow problem by loosening
+the coupling between values detected by taint tracking or con-
+colic execution and the part of a particular input where that magic
+value should be applied. Mathis et al.’s lFuzzer addresses tainttaglossthroughimplicitflowsininputtokenizationbyautomati-
+callyidentifyingroutinesthatparseinputcharactersintotokens
+and propagating taint tags along those conversions [ 58]. Like Con-
+fetti, lFuzzer also adds these tokens to a global dictionary to
+useinfuzzing.Inourevaluation,wefoundthatConfetti’shints
+revealed bugs in program logic aftertokenization and parsing,
+for instance, in the optimization phase of the Closure compiler
+—outsideofthetokenizationroutinesthatlFuzzerwouldtarget.
+Other taint-tracking-based fuzzersattempt toaddress theimplicit
+flow problem by inferring control dependencies between branches
+and input bytes, by comparing coverage results while mutatinginputs [
+34,39]. However, these systems can only detect that re-
+lationship afterthe fuzzer succeeds in covering the branch. We
+demonstratedthatConfetti’sglobalhintscanbeusedtoreveal
+branchesthatthefuzzercouldnototherwise.Futureworkmight
+combineConfettiwithheuristicsforselectivelypropagatingtaint
+tags through implicit flows [24, 49].
+WhilepopularfuzzerslikeAFLtargetx86binaries,thereremains
+aneedforfuzzerstargetinghigherlevellanguageslikeJava.Java
+PathFinder (JPF) [ 76] is a model checker for Java programs that
+usesacustom-builtinterpretertocollectandsolvepathconstraints
+in order to explore different program states. JPF has been a sig-nificant resource for the Java testing community, and has been
+extended in many ways to support various forms of dynamic sym-
+bolic execution [ 22,48,56]. Prior concolic execution tools for Java
+like JCute [ 70], CATG [ 73] and Cinger [ 21] used instrumentation-
+based approaches to track constraints in a limited subset of classes.
+In contrast, Confetti uses a dynamic taint tracking system totrack path constraints, and does so in all classes. To our best of
+ourknowledge,Confettiisthefirstsystemthatsupportsconcolic
+execution of real-world Java programs like those in our evaluation.
+7 Conclusion
+Confettiisaconcolic-guidedfuzzerforJVMsoftwarethatgen-
+erates inputs covering more branches and revealing more bugs
+than the existing state-of-the-art JVM fuzzer. Through our empiri-
+calstudies,wehaveidentifiedthatConfetti’snovel globalhinting
+mechanism yields a significant improvement in coverage and bug
+finding compared to the state-of-the-art approach of targeted hint-
+ing. Although we have only explored global hinting in the context
+of a single fuzzer (JQF-Zest) and a single language (Java), we be-
+lievethat thereis strongevidence thatthisapproach willbe quite
+successful inother fuzzing domains, too.Based on our analysisof
+thefailuresthatcouldbedetectedonlybyConfetti(andnotby
+thevariantwithoutglobalhints),wehaveastrongintuitionthat
+thesamekindsofprogrammingpatternsthatrestricttheefficacy
+of targeted hints in our experiments occur in other applicationsand languages, as well. We hope that our open-source release ofConfetti and its CI workflow will help to support the growingcommunity of practitioners and researchers engaged in fuzzing
+JVM-based software [51, 52].
+Acknowledgments
+We would like to thank Katherine Hough for valuable feedback
+on the design, implementation and debugging of Confetti, and
+RohanPadhye forassistancemergingour fixesintoJQF.This work
+was funded in part by NSF CCF-2100037 and NSF CNS-2100015.
+448ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell
+References
+[1]2019. Google Closure Issue Tracker Issue Number 3375. https://github.com/
+google/closure-compiler/issues/3375.
+[2]2019. Google Closure Issue Tracker Issue Number 3380. https://github.com/
+google/closure-compiler/issues/3380.
+[3]2019. Google Closure Issue Tracker Issue Number 3455. https://github.com/
+google/closure-compiler/issues/3455.
+[4]2020. Google Closure Issue Tracker Issue Number 3591. https://github.com/
+google/closure-compiler/issues/3591.
+[5]2020. Google Closure Issue Tracker Issue Number 3592. https://github.com/
+google/closure-compiler/issues/3592.
+[6] 2021. Apache Ant. https://ant.apache.org/.
+[7]2021. Apache BCEL Issue Tracker Issue Number 357. https://issues.apache.org/
+jira/projects/BCEL/issues/BCEL-357.
+[8]2021. Apache BCEL Issue Tracker Issue Number 358. https://issues.apache.org/
+jira/projects/BCEL/issues/BCEL-358.
+[9]2021. Apache BCEL Issue Tracker Issue Number 359. https://issues.apache.org/
+jira/projects/BCEL/issues/BCEL-359.
+[10]2021. ApacheCommonsByteCodeEngineeringLibrary. http://commons.apache.
+org/proper/commons-bcel/.
+[11] 2021. Apache Maven. http://maven.apache.org/.[12] 2021. Google Closure. https://developers.google.com/closure/compiler.[13]
+2021. Google Closure Issue Tracker Issue Number 3857. https://github.com/
+google/closure-compiler/issues/3857.
+[14]2021. Google Closure Issue Tracker Issue Number 3858. https://github.com/
+google/closure-compiler/issues/3858.
+[15]2021. Google Closure Issue Tracker Issue Number 3859. https://github.com/
+google/closure-compiler/issues/3859.
+[16]2021. Google Closure Issue Tracker Issue Number 3860. https://github.com/
+google/closure-compiler/issues/3860.
+[17]2021. Google Closure Issue Tracker Issue Number 3861. https://github.com/
+google/closure-compiler/issues/3861.
+[18]2021. Google Closure Issue Tracker Issue Number 3862. https://github.com/
+google/closure-compiler/issues/3862.
+[19]2021. Mozilla Rhino. https://developer.mozilla.org/en-US/docs/Mozilla/Projects/
+Rhino.
+[20]AFL Contributors. 2021. AFL Dictionaries. https://github.com/mirrorer/afl/blob/
+master/dictionaries/README.dictionaries.
+[21] Saswat Anand,MayurNaik,MaryJean Harrold,andHongseokYang.2012. Au-
+tomatedConcolicTestingofSmartphoneApps (FSE’12).AssociationforCom-
+puting Machinery, New York, NY, USA, Article Article 59, 11 pages. https:
+//doi.org/10.1145/2393596.2393666
+[22]SaswatAnand,CorinaS.Păsăreanu,andWillemVisser.2007. JPF-SE:ASymbolic
+Execution Extension to Java PathFinder (TACAS’07). Springer-Verlag, Berlin,
+Heidelberg, 134–138.
+[23]DanielBaier,DirkBeyer,andKarlheinzFriedberger.2021. JavaSMT3:Interacting
+withSMTSolversinJava.In ComputerAidedVerification,AlexandraSilvaand
+K. Rustan M. Leino (Eds.). Springer International Publishing, Cham, 195–208.
+[24]TaoBao,YunhuiZheng,ZhiqiangLin,XiangyuZhang,andDongyanXu.2010.
+StrictControlDependenceandItsEffectonDynamicInformationFlowAnalyses
+(ISSTA’10).ACM,NewYork,NY,USA,13–24. https://doi.org/10.1145/1831708.
+1831711
+[25]JonathanBell.2022. Faster,collision-freecoverageinstrumentation,PullRequest
+#171 on rohanpadhye/JQF. https://github.com/rohanpadhye/JQF/pull/171.
+[26]Jonathan Bell. 2022. Increase maximum depth of XML files generated for Maven,
+PullRequest#165onrohanpadhye/JQF. https://github.com/rohanpadhye/JQF/
+pull/165.
+[27]JonathanBellandGailKaiser.2014. Phosphor-GitHub. https://github.com/gmu-
+swe/phosphor.
+[28]Jonathan Bell and Gail Kaiser. 2014. Phosphor: Illuminating Dynamic Data
+Flow in Commodity JVMs (OOPSLA ’14). ACM, New York, NY, USA, 83–101.
+https://doi.org/10.1145/2660193.2660212
+[29]Jonathan Bell and Luís Pina. 2018. CROCHET: Checkpoint and Rollback viaLightweight Heap Traversal on Stock JVMs (ECOOP ’18). Schloss Dagstuhl–
+Leibniz-Zentrum fuer Informatik.
+[30]MarcelBöhme,Van-ThuanPham,Manh-DungNguyen,andAbhikRoychoudhury.2017. DirectedGreyboxFuzzing (CCS’17).ACM,NewYork,NY,USA,2329–2344.
+https://doi.org/10.1145/3133956.3134020
+[31]EllaBounimova,PatriceGodefroid,andDavidMolnar.2013. BillionsandBillions
+of Constraints: Whitebox Fuzz Testing in Production (ICSE ’13). IEEE Press,
+122–131.
+[32]Cristian Cadar, Daniel Dunbar, and Dawson Engler. 2008. KLEE: Unassisted and
+AutomaticGenerationofHigh-coverageTestsforComplexSystemsPrograms
+(OSDI’08). USENIX Association, Berkeley, CA, USA, 209–224. http://dl.acm.org/
+citation.cfm?id=1855741.1855756
+[33]P.ChenandH.Chen.2018. Angora:EfficientFuzzingbyPrincipledSearch.In
+2018 IEEE Symposium on Security and Privacy (SP). 711–725.[34]Peng Chen, Jianzhong Liu, and Hao Chen. 2019. Matryoshka: Fuzzing DeeplyNested Branches (CCS ’19). Association for Computing Machinery, New York,
+NY, USA, 499–513. https://doi.org/10.1145/3319535.3363225
+[35]Jaeseung Choi, Joonun Jang, Choongwoo Han, and Sang Kil Cha. 2019. Grey-Box Concolic Testing on Binary Code (ICSE ’19). IEEE Press, 736–747. https:
+//doi.org/10.1109/ICSE.2019.00082
+[36]LeonardoDeMouraandNikolajBjørner.2008. Z3:AnefficientSMTsolver.In
+InternationalconferenceonToolsandAlgorithmsfortheConstructionandAnalysis
+of Systems. Springer, 337–340.
+[37]Stephen Dolan. 2017. Property fuzzing for OCaml. https://github.com/stedolan/
+crowbar.
+[38]Andrea Fioraldi, Dominik Maier, Heiko Eibfeldt, and Marc Heuse. 2020. AFL++:
+Combiningincrementalstepsoffuzzingresearch.In 14thUSENIXWorkshopon
+Offensive Technologies (WOOT 20) .
+[39]Shuitao Gan, Chao Zhang, Peng Chen, Bodong Zhao, Xiaojun Qin, Dong Wu,and Zuoning Chen. 2020. GREYONE: Data Flow Sensitive Fuzzing. In 29th
+USENIXSecuritySymposium(USENIXSecurity20).USENIXAssociation,2577–
+2594. https://www.usenix.org/conference/usenixsecurity20/presentation/gan
+[40]VijayGanesh,TimLeek,andMartinRinard.2009.Taint-BasedDirectedWhiteboxFuzzing.In Proceedingsofthe31stInternationalConferenceonSoftwareEngineering
+(ICSE ’09). IEEE Computer Society, USA, 474–484. https://doi.org/10.1109/ICSE.
+2009.5070546
+[41]Patrice Godefroid, Adam Kiezun, and Michael Levin. 2008. Grammar-based
+WhiteboxFuzzing. Proceedings ofthe ACM SIGPLANConferenceon Programming
+LanguageDesignandImplementation(PLDI) 43,206–215. https://doi.org/10.1145/
+1379022.1375607
+[42]Patrice Godefroid, Nils Klarlund, and Koushik Sen. 2005. DART: Directed Auto-
+matedRandomTesting (PLDI’05).AssociationforComputingMachinery,New
+York, NY, USA, 213–223. https://doi.org/10.1145/1065010.1065036
+[43]PatriceGodefroid,HilaPeleg,andRishabhSingh.2017. Learn&Fuzz:Machine
+Learning for Input Fuzzing (ASE 2017). IEEE Press, 50–59.
+[44] Google. 2022. honggfuzz. https://honggfuzz.dev.
+[45]IstvanHaller,AsiaSlowinska,MatthiasNeugschwandtner,andHerbertBos.2013.
+Dowsing for Overflows: A Guided Fuzzer to Find Buffer Boundary Violations.
+In22nd USENIX Security Symposium (USENIX Security 13). USENIX Association,
+Washington, D.C., 49–64. https://www.usenix.org/conference/usenixsecurity13/
+technical-sessions/papers/haller
+[46]Paul R. Holser. 2010. junit-quickcheck: Property-based testing, JUnit-style. https:
+//github.com/pholser/junit-quickcheck.
+[47]KatherineHoughandJonathanBell.2021. APracticalApproachforDynamic
+TaintTrackingwithControl-FlowRelationships. ACMTrans.Softw.Eng.Methodol.
+31, 2, Article 26 (dec 2021), 43 pages. https://doi.org/10.1145/3485464
+[48]Karthick Jayaraman, David Harvison, and Vijay Ganesh. 2009. jFuzz: A Con-
+colicWhiteboxFuzzerforJava.In Proceedingsofthe1stNASAFormalMethods
+Symposium (NFM).
+[49]MinGyungKang,StephenMcCamant,PongsinPoosankam,andDawnXiaodong
+Song. 2011. DTA++: Dynamic Taint Analysis with Targeted Control-Flow Propa-
+gation. In NDSS.
+[50]GeorgeKlees,AndrewRuef,BenjiCooper,ShiyiWei,andMichaelHicks.2018.
+EvaluatingFuzzTesting (CCS’18).AssociationforComputingMachinery,New
+York, NY, USA, 2123–2138. https://doi.org/10.1145/3243734.3243804
+[51]James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell. 2019. CON-
+FETTI: Amplifying Concolic Guidance for Fuzzers. https://github.com/neu-
+se/CONFETTI.
+[52] James Kukucka, Luís Pina, Paul Ammann, and Jonathan Bell. 2022. CONFETTI:
+Amplifying Concolic Guidance for Fuzzers. https://doi.org/10.6084/m9.figshare.
+16563776
+[53]Leonidas Lampropoulos, Michael Hicks, and Benjamin C. Pierce. 2019. Coverage
+Guided,PropertyBasedTesting. Proc.ACMProgram.Lang. 3,OOPSLA,Article
+181 (Oct. 2019), 29 pages. https://doi.org/10.1145/3360607
+[54]libFuzzer Contributors. 2021. libFuzzer Tutorial. https://github.com/google/
+fuzzing/blob/master/tutorial/libFuzzerTutorial.md#dictionaries.
+[55]LLVM Project. 2019. libFuzzer - a library for coverage-guided fuzz testing. https:
+//llvm.org/docs/LibFuzzer.html.
+[56]Kasper Luckow, Marko Dimjašević, Dimitra Giannakopoulou, Falk Howar, MalteIsberner,TemesghenKahsai,ZvonimirRakamarić,andVishwanathRaman.2016.
+JDart: A Dynamic Symbolic Analysis Framework. In Tools and Algorithms for
+theConstructionandAnalysisofSystems.SpringerBerlinHeidelberg,442–459.
+https://doi.org/10.1007/978-3-662-49674-9_26
+[57]RupakMajumdarandKoushikSen.2007. HybridConcolicTesting.In Proceedings
+of the 29th International Conference on Software Engineering (ICSE ’07). IEEE
+Computer Society, USA, 416–426. https://doi.org/10.1109/ICSE.2007.41
+[58]Björn Mathis, Rahul Gopinath, and Andreas Zeller. 2020. Learning Input Tokens
+forEffectiveFuzzing (ISSTA2020).AssociationforComputingMachinery,New
+York, NY, USA, 2737. https://doi.org/10.1145/3395363.3397348
+[59]Mountainminds GmbH & Co. KG and Contributors. 2021. JaCoCo Java Code
+Coverage Library. http://www.eclemma.org/jacoco/.
+449CONFETTI: Amplifying Concolic Guidance for Fuzzers ICSE ’22, May 21–29, 2022, Pittsburgh, PA, USA
+[60]Rickard Nilsson. 2019. ScalaCheck: Property-based testing for Scala. https:
+//www.scalacheck.org.
+[61]Yannic Noller, Rody Kersten, and Corina S. Păsăreanu. 2018. Badger: Complexity
+Analysis with Fuzzing and Symbolic Execution (ISSTA 2018). Association for
+ComputingMachinery,NewYork,NY,USA,322–332. https://doi.org/10.1145/
+3213846.3213868
+[62]YannicNoller,CorinaS.Păsăreanu,MarcelBöhme,YouchengSun,HoangLam
+Nguyen, and Lars Grunske. 2020. HyDiff: Hybrid Differential Software Analysis
+(ICSE’20) .AssociationforComputingMachinery,NewYork,NY,USA,1273–1285.
+https://doi.org/10.1145/3377811.3380363
+[63]SaahilOgnawala,ThomasHutzelmann,EiriniPsallida,andAlexanderPretschner.
+2018. ImprovingFunctionCoveragewithMunch:AHybridFuzzingandDirected
+Symbolic Execution Approach (SAC ’18). Association for Computing Machinery,
+New York, NY, USA, 1475–1482. https://doi.org/10.1145/3167132.3167289
+[64]Rohan Padhye, Caroline Lemieux, and Koushik Sen. 2019. JQF + Zest: Coverage-
+guided semantic fuzzing for Java. https://github.com/rohanpadhye/JQF.
+[65]Rohan Padhye, Caroline Lemieux, and Koushik Sen. 2019. Jqf: Coverage-guided
+property-based testing in java. In Proceedings of the 28th ACM SIGSOFT Interna-
+tional Symposium on Software Testing and Analysis. 398–401.
+[66]Rohan Padhye, Caroline Lemieux, Koushik Sen, Mike Papadakis, and YvesLe Traon. 2019. Semantic fuzzing with zest. In Proceedings of the 28th ACM
+SIGSOFT International Symposium on Software Testing and Analysis. 329–340.
+[67]JibeshPatraandMichaelPradel.2016. Learningtofuzz:Application-independent
+fuzztestingwithprobabilistic,generativemodelsofinputdata. TUDarmstadt,
+Department of Computer Science, Tech. Rep. TUD-CS-2016-14664 (2016).
+[68]Sebastian Poeplau and Aurélien Francillon. 2020. Symbolic execution with
+SymCC: Don’t interpret, compile!. In 29th USENIX Security Symposium (USENIX
+Security20).USENIXAssociation,181–198. https://www.usenix.org/conference/
+usenixsecurity20/presentation/poeplau
+[69]SanjayRawat,VivekJain,AshishKumar,LucianCojocar,CristianoGiuffrida,and
+HerbertBos.2017. VUzzer:Application-awareEvolutionaryFuzzing.In NDSS.
+https://www.vusec.net/download/?t=papers/vuzzer_ndss17.pdf
+[70]Koushik Sen and Gul Agha. 2006. CUTE and jCUTE: Concolic Unit Testing and
+ExplicitPathModel-CheckingTools.In CAV,ThomasBallandRobertB.Jones
+(Eds.). 419–423.
+[71]Koushik Sen, Darko Marinov, and Gul Agha. 2005. CUTE: A Concolic Unit
+Testing Engine for C (ESEC/FSE-13). ACM, New York, NY, USA, 263–272. https:
+//doi.org/10.1145/1081706.1081750[72]NickStephens,JohnGrosen,ChristopherSalls,AndrewDutcher,RuoyuWang,
+Jacopo Corbetta, Yan Shoshitaishvili, Christopher Kruegel, and Giovanni Vi-
+gna. 2016. Driller: Augmenting Fuzzing Through Selective Symbolic Exe-cution. In 23rd Annual Network and Distributed System Security Symposium,
+NDSS2016,SanDiego,California,USA,February21-24,2016.TheInternetSoci-
+ety. http://wp.internetsociety.org/ndss/wp-content/uploads/sites/25/2017/09/
+driller-augmenting-fuzzing-through-selective-symbolic-execution.pdf
+[73]H.Tanno,X.Zhang,T.Hoshino,andK.Sen.2015. TesMaandCATG:Automated
+Test Generation Tools for Models of Enterprise Applications. In 2015 IEEE/ACM
+37th IEEE International Conference on Software Engineering, Vol. 2. 717–720.
+[74]Willem Visser and Jaco Geldenhuys. 2020. COASTAL: Combining Concolicand Fuzzing for Java (Competition Contribution). In Tools and Algorithms for
+theConstructionandAnalysisofSystems,ArminBiereandDavidParker(Eds.).
+Springer International Publishing, Cham, 373–377.
+[75]Willem Visser, Jaco Geldenhuys, and Matthew B. Dwyer. 2012. Green: Reducing,
+ReusingandRecyclingConstraintsinProgramAnalysis (FSE’12).Association
+for Computing Machinery, New York, NY, USA, Article 58, 11 pages. https:
+//doi.org/10.1145/2393596.2393665
+[76]Willem Visser, Klaus Havelund, Guillaume Brat, Seungjoon Park, and Flavio
+Lerda.2003. ModelCheckingPrograms. AutomatedSoftwareEngg. 10,2(April
+2003), 203–232. https://doi.org/10.1023/A:1022920129859
+[77]J. Wang, B. Chen, L. Wei, and Y. Liu. 2017. Skyfire: Data-Driven Seed GenerationforFuzzing.In 2017IEEESymposiumonSecurityandPrivacy(SP).579–594. https:
+//doi.org/10.1109/SP.2017.23
+[78]Junjie Wang, Bihuan Chen, Lei Wei, and Yang Liu. 2019. Superion: Grammar-
+Aware Greybox Fuzzing (ICSE ’19). IEEE Press, 724–735. https://doi.org/10.1109/
+ICSE.2019.00081
+[79]MingzheWang,JieLiang,YuanliangChen,YuJiang,XunJiao,HanLiu,Xibin
+Zhao,andJiaguangSun.2018. SAFL:IncreasingandAcceleratingTestingCov-
+eragewithSymbolicExecutionandGuidedFuzzing (ICSE’18).Associationfor
+Computing Machinery, New York, NY, USA, 61–64. https://doi.org/10.1145/
+3183440.3183494
+[80]Tielei Wang, Tao Wei, Guofei Gu, and Wei Zou. 2011. Checksum-Aware Fuzzing
+CombinedwithDynamicTaintAnalysisandSymbolicExecution. ACMTrans.
+Inf. Syst. Secur. 14, 2, Article Article 15 (Sept. 2011), 28 pages. https://doi.org/10.
+1145/2019599.2019600
+[81]Michal Zalewski. 2019. American Fuzzy Lop. http://lcamtuf.coredump.cx/afl/
+technical_details.txt.
+[82]LeiZhao,YueDuan,HengYin,andJifengXuan.2019. SendHardestProblems
+MyWay:ProbabilisticPathPrioritizationforHybridFuzzing.In Proceedings2019
+Network and Distributed System Security Symposium. Internet Society, San Diego,
+CA. https://doi.org/10.14722/ndss.2019.23504
+450

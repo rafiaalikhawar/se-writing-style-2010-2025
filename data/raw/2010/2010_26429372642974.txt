@@ -1,0 +1,1241 @@
+symMMU: Symbolically Executed Runtime Libraries for
+Symbolic
+Memory Access
+Anthony Romano
+ajromano@cs.stanford.eduDawson R. Engler
+engler@cs.stanford.edu
+Department of Computer Science
+Stanford University, Stanford, CA, USA
+ABSTRACT
+Symbolic execution calls for specialized address translation.
+Unlike a pointer on a traditional machine model, which cor-
+responds to a single address, a symbolic pointer may repre-
+sent multiple feasible addresses. A symbolic pointer deref-
+erence manipulates symbolic state, potentially submitting
+many theorem prover requests in the process. Hence, design
+and management of symbolic accesses critically aﬀects sym-
+bolic executor performance, complexity, and completeness.
+We demonstrate a symbolic execution extension, the sym-
+MMU, which separates access dispatch mechanism from pol-
+icy by servicingmemory accesseswith symbolicallyexecuted
+runtime software handlers. This runtime code concisely rep-
+resents access policies including pointer concretization, ad-
+dress forking, and symbolic indexing. These policies are
+competitive with a baseline hard-coded memory policy. Fur-
+thermore, the symMMU cleanly supports handlers for pro-
+ﬁling, heap analysis, and demand allocated symbolic buﬀers.
+In practice, the symMMU ﬂags hardware-validated bugs for
+over a thousand Linux program binaries.
+Categories and Subject Descriptors
+D.2.5 [Testing and Debugging ]: Symbolic Execution
+Keywords
+Access Faults; Cross-Checking; Heap Violations; Testing;
+Shadow Values; Symbolic Execution
+1. INTRODUCTION
+Symbolic execution is a popular technique for generating
+program test cases. These test cases represent interesting
+program features such as faults, vulnerabilities, or covered
+code. Generally symbolic executors explore a program by
+applying the target’s instructions to a mix of symbolic and
+concrete data. Symbolically executed instructions manipu-
+lateexpressions (e.g., 5, (x +4), (y+z−1)) as data. These
+expressions require semantics beyond a traditional concrete
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior speciﬁc permission
+and/or a fee. Request permissions from permissions@acm.org.
+ASE’14, September 15-19, 2014, Vasteras, Sweden.
+Copyright is held by the owner/author(s). Publication rights licensed to ACM.
+ACM 978-1-4503-3013-8/14/09 ...$15.00.
+http://dx.doi.org/10.1145/2642937.2642974.execution model. Notably, an executor must dispatch mem-
+ory accesses to both symbolic and concrete pointers.
+A memory access is symbolic if its address expression con-
+tains a variable. To illustrate, Figure 1 demonstrates some
+symbolic accesses in the C language. Under symbolic exe-
+cution, the function faccesses memory data with two sym-
+bolic addresses, s[w] ands[r], both covering all of the array
+s. Initially, sis zeroed. Assigning 1 to the symbolic s[w]
+makes all values in sdepend on wsince any element may
+absorb the symbolic write. The following symbolic read,
+s[r], returns an expression containing the symbolic read in-
+dexrand the symbolic write index w. Continuing to build
+onswith symbolic accesses creates large expressions which
+eventually overwhelm the executor’s satisﬁability solver.
+A large body of work discusses symbolic execution [2, 4, 5,
+13, 14, 17, 20, 27, 29] and related memory access techniques.
+All symbolic executors must handle symbolic accesses; some
+policy applies constraints, optimizations, or analysis on the
+access. Such policies are built into the executor and must
+contend with complicated low-level details. We claim access
+policy belongs in a symbolically executed runtime library.
+This paper presents a symMMU, a runtime memory ac-
+cessdispatcherforsymbolicexecution. AsymMMUreroutes
+accesses to a runtime library which evaluates symbolic state
+in situ. Runtime libraries meet desirable criteria:
+•Varietyof access policies, such as which addresses are
+accessed and how those accesses are structured, and
+analysis policies, such as heap violation checking and
+execution on demand allocated symbolic buﬀers.
+•Simplicity of implementation. Library code is short
+and core system changes are non-invasive.
+•Performance equaltoorbetterthanahard-codedsym-
+bolic executor memory access dispatcher.
+This system makes several advances over the current state
+of the art. At a design level, it cleanly separates mecha-
+nism (library call-out for memory accesses) and policy (li-
+brary implementation of access resolution); the symMMU
+supports six well-known symbolic access policies with few
+lines of code. To our knowledge the symMMU’s proﬁler,
+which symbolically tracks address hits, and heap analysis,
+which ﬁnds over a thousand heap violations, are the ﬁrst
+applications of symbolically executed shadow memory. Ad-
+ditionally, it is the ﬁrst system to test unmodiﬁed machine
+codelibrarieswithdemandallocatedsymbolicbuﬀers, which
+we use to ﬁnd functional diﬀerences among several distinct
+libcimplementations. Finally, results are tested indepen-
+dently of the symMMU to conﬁrm the symbolic execution
+247
+1chars [256] = {0, ... , 0 };
+2charf (void){
+3 int r = sym range(0 , 255);
+4 in
+t w = sym range(0 , 255);
+5 s
+[w] = 1;
+6 return s [ r ]; }
+Line New Expression
+1(0, ..., 0)
+5((if (= w 0) 1 0), ...,
+(if (=
+w 255) 1 0))
+6(read r
+((if (=
+w 0) 1 0), ...,
+(if (= w 255) 1 0))
+Figure 1: Symbolic memory access example code
+and its intermediate expressions.
+agrees with physical hardware; this produces thousands of
+high-conﬁdence faulting test cases by automatically pruning
+false positives.
+The rest of this paper is structured as follows. Section 2
+discusses background for memory accesses and symbolic ex-
+ecution. Section 3 describes the symMMU memory access
+dispatch mechanism in the context of a symbolic executor’s
+state memory subsystem. Section 4 continues by detailing
+several policies and analysis techniques supported by the
+symMMU system. Section 5 evaluates the implementation
+of the dispatch and policies with benchmarks and a large set
+of Linux programs. Finally, Section 6 concludes.
+2. BACKGROUND
+Thissectionprovidesbackgroundinformationonhandling
+memory accesses, symbolic execution systems, and a formal
+description of symbolic memory accesses.
+2.1 Related Work
+The symMMU touches a wide range of memory access
+translation topics. At a low level, address translation in
+hardware memory management units (MMUs) and operat-
+ing systems (virtual memory) have software controlled, ad-
+justable policies. For software testing, memory access in-
+strumentation plays an important role in dynamic analysis.
+Allsymbolicexecutorshandlesymbolicaccessesbutmemory
+subsystems and analysis specialization diﬀer across systems.
+Theusefulnessofsoftware-deﬁnedmemorytranslationhas
+long been acknowledged. RISC architectures, such as MIPS
+and SPARC, provide mechanisms for software translation
+lookaside buﬀer (TLB) handling; accesses fault into software
+handlers which map virtual addresses to physical addresses.
+Software TLBs have a large design space and varying per-
+formance characteristics [28]. Operating systems designers
+also recognize the importance of customization with virtual
+memory page-faults [1, 10]. The symMMU TLB mechanism
+(§3.3.4) shares a similar interface to software TLBs.
+Many dynamic program analysis algorithms rely on cus-
+tommemoryaccesshandling. Metadataforthesealgorithms
+isoftenstoredinshadowmemory[21, 32]. Thismetadatain-
+cludes lock sets [26], vector clocks [31], heap allocation [22],
+and information ﬂow [23]. Section 4.2 describes a symbolic
+extension of shadow memory for partial heap checking.
+The symMMU supports and extends prior work on sym-
+bolic execution. Despite its intrinsic capability to expresssymbolic policies, symbolically executed runtime code has
+primarily only modeled speciﬁc system environments [19,
+25], rather than core system functionality. Symbolic access
+policies include pointer concretization [13, 20] (§ 4.1.4), pri-
+oritized concretization [4] ( §4.1.6), symbolic indexing on ob-
+jects [2, 3] (§ 4.1.7), and variable creation [14, 29] ( §4.1.3).
+Another policy tags ﬂoating-point expressions to report er-
+rorsondereference[12]. Othersystemslazilyinitializeorde-
+mand allocate accesses on symbolic pointers [16, 24] ( §4.3).
+Woodpecker [6] can instrument accesses like a symMMU
+but only with built-in checkers. Likewise, FIE [7]’s memory
+smudging and special memory IO regions could be expressed
+as symMMU policies, but are built into the executor.
+2.2 Symbolic Execution and Memory Accesses
+A dynamic symbolic executor dispatches instructions to
+advance symbolic program states. Each state has an address
+space, data memory, and other resources. When an instruc-
+tion must dereference state memory for a load or store, the
+executor issues a memory access to a software memory man-
+agement unit that controls the state’s address space.
+A memory access is deﬁned by a 5-tuple ( S,s,w,i,v ). The
+access tuple consists of a state S(including its address space
+and constraints), a base pointer s, the access width win
+bytes, the access instruction i, and an optional write value
+v. The access width wand instruction iare single-valued
+concrete data. The write value vand pointer sare expres-
+sions which may be symbolic.
+Symbolic accesses require formal attention. Let a sym-
+bolic pointer sbe an element of the set of pointer-width ex-
+pressionsonbit-vectors. Accessinganaddressspacethrough
+sassumes the constraints of the issuing state S. When sis
+a symbolic pointer, p∈s[S] denotes pis a feasible concrete
+value for s(i.e., (= s p) is satisﬁable given Swithp∈N).
+Ifpfeasibly maps into S’s address space, then p∈ S. For a
+range of pointers [p,p +n), the subset relation [p,p +n)⊆ S
+is shorthand for the existence of a feasible solution for the
+conjunction p∈ S ∧...∧p+n−1∈ S.
+Any address not mapped in a state S’s address space is a
+bad address for S. Typically an access to a bad address is
+ﬂagged as an error with an accompanying test case. If the
+test raises a memory access fault under native execution,
+then the test models a true bug.
+Symbolic accesses invoke a satisﬁability solver to detect
+badaccesses. Theexecutorissuessolverqueriestodetermine
+whether a symbolic access is in S. An access (S ,s,w,i,v )
+belongs to exactly one of three categories:
+•Valid. No faults; p∈s[S] =⇒[p,p+w)∈ S.
+•Invalid. All faults; p∈s[S] =⇒[p,p+w)/ne}ationslash⊆ S.
+•Contingent. Some faults; ∃p1,p2∈s[S] where
+[p1,p1+n)⊆ S,[p2,p2+n)/ne}ationslash⊆ S.
+Contingent accesses tend to impose the most overhead.
+A complete symbolic executor ﬁnds all permissible accesses
+and generates at least one test case for a bad access. To
+ﬁnd non-faulting accesses, a solver call is submitted for ev-
+ery feasible memory object to check for pointer inclusion.
+Remaining feasible pointer values imply a bad access.
+3. A SYMBOLICALLY EXECUTED MMU
+This section outlines the design and implementation of a
+symMMU for klee-mc, a modiﬁed version of the klee[2]
+248Figure 2: A memory object shared among three
+state
+s, an object state shared between two states,
+and an unshared object state.
+symbolic executor. First, address space and state memory
+structures are given. Next, the symMMU’s dispatch mech-
+anism and interface are discussed.
+3.1 Symbolic Executor
+The symMMU implementation is based on several oﬀ-the-
+shelf components. The symbolic executor core is a modiﬁed
+kleeLLVM symbolic interpreter; a dynamic binary trans-
+lation (DBT) layer based on valgrind-3.9.0 [22] translates
+x86-64 machine code basic blocks into LLVM [18] functions.
+kleesymbolically executes these functions over a symbolic
+Linux system call model to generate test cases containing
+of variable assignments. The binary front-end allows for
+cross-checkingthesetestcasesagainsthardwareinSection5.
+Solver queries are submitted from kleeto the latest reposi-
+toryversionofSTP[11]throughitsSMTLIB1textinterface.
+3.2 Address Space Structures
+The symbolic executor stores target program information
+asacollectionofstates. Astaterepresentstheprocessimage
+of a partiallyexecuted path. The statememory organization
+is borrowed from kleeand is a typical design.
+Figure 2 illustrates the relationship among states, address
+spaces, and state data memory. A concrete address space
+structure maps 64-bit memory addresses to object pairs for
+each state. Object pairs consist of an object state and a
+memory object. An object state is a copy-on-write structure
+which holds the state’s memory data values. Every read
+and write accesses some object state. A memory object is
+an immutable structure which tracks the concrete address
+and length of an object state. The address space manages
+concrete addresses and lies below the symMMU; symbolic
+addresses require special policies which issue solver calls.
+3.3 Soft Handlers
+The symbolic executor dispatches memory data accesses
+through its memory management unit (MMU) subsystem.
+The original kleeinterpreter uses a hard-coded MMU that
+ﬁnds access violations, resolves concrete pointers, forks on
+multi-object pointers, and issues object-wide symbolically
+indexed accesses. Symbolic data and queries must be explic-
+itly managed in the executor, however, so augmenting such
+a policy is a delicate procedure. In contrast, the symMMU
+inklee-mc bypasses these details by forwarding memory
+accesses to symbolically executed runtime soft handlers.
+SymMMU soft handlers are selected by a command line
+argument. The executor loads a selected handler (written in
+C, compiled to LLVM intermediate representation bitcode)
+from a LLVM bitcode ﬁle. A handler translates either sym-
+bolic or concrete accesses; translating both symbolic and
+concrete accesses with the symMMU uses at least two sepa-
+ratehandlers. MultiplehandlerscanbeconﬁgurablystackedFigure 3: The symMMU pointer handling path.
+Table
+1: Trap functions for a handler mwith access
+bit-widths w={8,16,32,64,128}
+Soft Handlers Action
+mmu_init_m Initialization.
+mmu_cleanup_m Add ﬁnal constraints to test case.
+mmu_load_w _m(p)Load from pointer p.
+mmu_store_w _m(p, v)Storevinto pointer p.
+mmu_signal_m( p)Signalspwa s made symbolic.
+based on an input ﬁle; a handler passes control down the
+sta
+ck by calling executor-controlled function pointers.
+3.3.1 Library Interface
+The executor forwards accesses to a library-provided han-
+dler through a standardized function interface. Forwarding
+directs program state to handler bitcode with an implicit
+function call; the interface is listed in Table 1. For a handler
+m, the interface functionsare suﬃxed with mto distinguish
+a
+mong multiple handlers. The handler initializes internal
+structures with an optional function mmu_init which runs
+prior to executing the target program. Accesses forward to
+themmu_load_w andmmu_store_w functions based on the
+access width w. The handler deﬁnes mmu_cleanup to im-
+pose additional constraints on a state prior to generating its
+test case. When marking memory as symbolic, the executor
+notiﬁes the handler through mmu_signal. Special intrinsic
+functions(Table2)exposeexecutorresourcestothehandler;
+each intrinsic makes at most one solver call to minimize time
+spent in non-preemptible executor code.
+3.3.2 Access Forwarding
+Figure 3 shows the dispatch process for accessing mem-
+ory with a symMMU. When the executor evaluates a mem-
+ory access instruction, it issues an access to the pointer
+dispatcher. Whether the pointer is a concrete (i.e., nu-
+meric) constant or a symbolic expression determines the
+access path; the executor forwards the state to a handler
+depending on the instruction and pointer type. Symbolic
+addresses always forward to a symbolically executed run-
+time handler. Concrete addresses, if ignored or explicitly
+masked, follow a built-in fast-path.
+3.3.3 Concrete Addresses
+Some memory analysis policies, such as heap access check-
+ing, must track accesses on concrete pointers alongside sym-
+bolic pointers. However, concrete accesses are necessary to
+symbolically execute symMMU handler code, so care must
+be taken to avoid inﬁnite recursion. Concrete translation
+through the symMMU is temporarily disabled on concrete
+249Table 2: Runtime primitives for memory access
+Primitive Description
+klee_sym_hash(s ) Hash expression sto constant.
+klee_wide_load_w (s)Load with symbolic index s.
+klee_wide_store_w (s, v)Storevto symbolic index s.
+klee_enable_softmmu Enable concrete redirection.
+klee_tlb_ins(p ) Default accesses to object at p.
+klee_tlb_inv(p ) Drop defaulting on object at p.
+accesses to limit recursion. For each state, a translation en-
+a
+bled bit controls soft handler activation. If the bit is set,
+concrete accesses forward to the runtime. The translation
+enabled bit is unset upon entering the handler, forcing fast
+path translation for subsequent accesses. Prior to returning,
+the handler re-enables symMMU translation by setting the
+translation bit with the klee_enable_softmmu intrinsic.
+3.3.4 Translation Lookaside Buffer
+Calling handlers for every concrete access is slow. Fortu-
+nately, if most concrete accesses are irrelevant to the handler
+then the symMMU overhead is amortizable. On an irrele-
+vant access where the address’s entire memory object is ir-
+relevant, the handler inserts the range into a software TLB
+so subsequent accesses follow the concrete fast path.
+A runtime programmed TLB controls concrete fast-path
+forwarding. The concrete TLB maintains a ﬁxed number of
+address ranges to pass to the fast path. A concrete handler
+ignores accesses by registering address ranges with the TLB.
+The handler reclaims accesses by removing address ranges
+from the TLB. Each state has its own private TLB because
+state interleaving interferes with reproducing paths; ﬂushing
+a global TLB on state reschedule alters the instruction trace
+past the preemption point from extra TLB misses.
+4. ACCESS POLICIES AND ANALYSIS
+Our symMMU supports a variety of access policies. For
+symbolic accesses, such policies aﬀect solver overhead, state
+dilation, and testing completeness. Capturing all accesses
+lends itself to extending the executor with further analy-
+sis. Shadowed memory on accesses enables purely runtime
+controlled proﬁling and heap checking. Demand allocating
+memory buﬀers on access gives unconstrained execution.
+4.1 Symbolic Access Translation
+A symbolic access may resolve to multiple addresses. The
+choice of access policy inﬂuences the performance and com-
+pleteness of symbolic accesses. We consider two types of
+policies: partial and full. Partial policies transform pointers
+and check for properties, but only occasionally dispatch an
+access and must be stacked. Full policies, situated at the
+bottom of a handler stack, always dispatch an access.
+4.1.1 Range Checking
+A symbolic pointer spotentially generates many states
+because it may be unbound. Following through on every
+precise address where an unbound pointer access lands is
+expensive and usually uninformative; it suﬃces to know the
+setoffeasiblepointers {p|p∈s[S]}islarge. Rangechecking
+ﬁnds widely stray accesses; if sfeasibly exceeds a sensible
+distance(weuse256MB)fromsome p∈s[S], thentheaccess
+is ﬂagged, otherwise the access continues down the stack.MMUOPS SEXTERN(rangechk );
+#define MA XRANGE (( ptrdiff t)0x10000000)
+static int te stptrinvalid ( in tptrts)
+{intptr tp = klee getvalue (s );
+ptrdiff td = s−p ;
+return (s<0 x1000 ) |
+(d>MAXRANGE) |(−d>M AXRANGE); }
+uint8 tmmuload8rangechk( vo id∗s)
+{if( testptr invalid (( in tptrt)s ))
+kleeuerror (”bad range ! ”, ”ptr . err ”);
+return MM UOPSS(rangechk ). mo next−>
+moload8(s ); }
+Figure 4: Range checking handler for 8-bit loads.
+uint8 tmmuload8uniqptr( vo id∗s)
+{intptr tp, si = ( i ntptr t)s ;
+p = klee getvalue ( si ); /∗ge t p in s [S] ∗/
+kleeassume eq ( si , p); /∗bi nd s == p ∗/
+return ∗((u int8t∗)p);}
+Figure 5: Address concretization for 8-bit loads.
+Fig
+ure 4 lists an example partial symbolic 8-bit load soft-
+handler, mmu_load_8_rangechk, which checks the range of
+a symbolic pointer s. First, the handler issues a solver re-
+quest in testptr_invalid to ﬁnd a p∈s[S], then builds
+a symbolic range check for s. When scovers an extreme
+range, the state forks on the ifinto an out-of-range and an
+in-range state because testptr_invalid(s ) is feasibly both
+true and false. The out-of-range state is assumed to fault
+and is reported. The in-range state proceeds down the stack
+to the next handler via the function pointer mo_load_8.
+4.1.2 Constant Symbolic Pointer Resolution
+Concreteaccessesarecheaperthansymbolic. Ifthestate’s
+path constraints for a symbolic address to have exactly one
+solution, every future access can be concrete. When p1,p2∈
+s[S] =⇒p1=p2, constant symbolic pointer resolution
+replaces every swithp1and dispatches the concrete access.
+4.1.3 Create Variable
+Relaxing precise memory content can simplify symbolic
+access complexity with state overapproximation. In this
+case, reading from a symbolic pointer sreturns a fresh sym-
+bolic variable v. To reduce overhead, our implementation
+keeps a mapping from old symbolic pointers to their vari-
+ables. This policy is unsound (suppose ∀p∈s[S].v/ne}ationslash=∗p)
+but similar strategies appear elsewhere [7, 14, 29].
+4.1.4 Pointer Concretization
+A symbolic access on sisconcretized by choosing a single
+p∈s[S] to represent s. The executor calls its satisﬁability
+solver with the constraints for a state Sto resolve a con-
+crete value p∈s[S]. Adding the constraint (= s p) toS’s
+constraint set binds ptos; all subsequent accesses logically
+equivalent to sbecome logically equivalent to accesses to p.
+This incomplete policy misses every valid address p′∈s[S]
+wherep′/ne}ationslash=p, but it is fast, used in practice, and makes for
+straightforward policy discussion.
+Figure 5 lists an example full 8-bit load soft handler which
+concretizes the access pointer. An 8-bit symbolic load ac-
+cess enters through mmu_load_8_uniqptr. A concrete value
+p∈s[S] is retrieved with klee_get_value(s ) (the sole solver
+250query). Next, the handler binds ptosw ith the constraint
+(=p s) through klee_assume_eq(s,p ). Finally, the han-
+dler safely dereferences p(ifpis bad, it is detected on the
+concrete path) and returns the value to the target program.
+4.1.5 Fork on Address
+Forking a state for every p∈s[S] explores all feasible
+accesses. Instead of calling klee_get_value once (§4.1.4),
+forking on address loops until all feasible addresses are ex-
+hausted. Since each feasible address consumes a solver call
+and a new state, this policy is costly when |s[S]|is large.
+Boundingexploredfeasibleaddressesreducesoverheadbut
+sacriﬁces completeness. In order to shed some feasible ad-
+dress, the handler chooses addresses based on desirable run-
+time or program properties. We implemented two bounded
+policies in addition to complete forking: one caps the loop
+to limit state explosion and the other forks on minimum and
+maximum addresses to probe access boundaries.
+4.1.6 Prioritized Concretization
+Blindly concretizing a symbolic read access potentially
+overconstrains the fetched value. Prioritized concretization
+searches for feasible addresses p∈s[S] such that the value
+atpis symbolic. If there is such a p, thensis concretized
+top, and the symbolic value is returned.
+4.1.7 Fork on Objects
+The default kleepolicy (and similar policies [4, 9]) forks
+onfeasiblememoryobjects,issuingobject-wideaccessesover
+symbolic arrays. When a symbolic access falls within a spa-
+tially local region (e.g., a page), the access can be eﬃciently
+foldedintoanexpressionasinFigure1. Assumingthislocal-
+ity, forking for every feasible memory object with symbolic
+indexing reduces the total forked states.
+The fork-on-object policy forks a state for every memory
+object covered by a symbolic memory access at s. For every
+memory object, a wide memory access symbolically indexes
+the object state. Wide write accesses create large expres-
+sions containing update lists for the object at the time of
+write. Most memory objects are page-sized so our imple-
+mentation uses a faster and simpler forking algorithm than
+klee’s binary search. Objects are enumerated by forking
+on unique page pointers ( p&∼4095)∈(s&∼4095)[S]. If a
+feasible object is smaller than a page, the handler iterates
+over objects in order until the next page boundary. Wide ac-
+cessesareexplicitlyconstructed; thehandleruses klee_wide
+intrinsics to issue symbolically indexed accesses.
+4.1.8 If-Then-Else Reads
+Asymbolicindexedreadonanobjectstateleadstounnec-
+essary array overhead in the solver when the feasible pointer
+set size|s[S]|is much smaller than the object. If-then-else
+readstranslateanaccessintoanif-then-elseexpressionwhen
+the sets[S] is small. When the number of addresses is
+bounded by nforp1,...,pn∈s[S] andpi=pj=⇒i=j,
+the expression e1deﬁned by the recursive relation
+ei= (if(=s pi) (∗pi)ei+1), en= (∗pn)
+is returned by the dereference and the disjunction
+(=s p1)∨(=s p2)∨...∨(=s pn)
+joinsS’s path constraints when |s[S]|> nfor soundness.Figure 6: Retrieving a disjunction of shadow values
+for
+a symbolic address.
+4.2 Shadowing Memory
+A shadow memory analysis algorithm [22, 23, 26, 31]
+computes metadata from memory accesses and stores it to
+a mapping (the shadow memory) of addresses to features.
+SincethesymMMUcontrolsmemoryaccesses, shadowmem-
+oryisanaturalextension. Weuseashadowmemoryruntime
+library for two additions to the executor: memory proﬁl-
+ing and heap-checking. The proﬁler increments a per-word
+shadow counter for every access. The heap checker tracks
+program memory allocation status to detect heap violations.
+4.2.1 Runtime Structures
+Figure 6 illustrates the symMMU shadow memory struc-
+ture. Symbolic shadow memory is a map S:A→Vfrom
+addresses to shadow values. In the ﬁgure, a symbolic access
+on two feasible bytes at areturns a shadow expression S(a)
+representing shadow values for both feasible bytes in a single
+state. The hashed page number of aindexes into an array
+of page buckets. Each bucket holds a list of demand allo-
+cated shadow pages corresponding to pages of data memory.
+Retrieving S(a) uses a wide access so states only fork per
+shadowpage. Sincetheshadowmemorycodeisalibrary, the
+executor transparently handles all constraints and states.
+Analternativeshadowmemorydesign[21]usesatwo-level
+page table on 32-bit addresses. An address indexes the table
+throughtwo levels of indirectionto retrieve a shadowpage in
+constant time. In practice, the symMMU shadow memory
+buckets remain small so linear time overhead is negligible
+comparedtotheextralevelsofindirectionorauxiliarytables
+needed for 64-bit addresses. Likewise, memory objects are
+usually page-sized so wide accesses split into multiple states
+regardless of the data structure.
+4.2.2 Access Proﬁling
+Anaccessproﬁlercanhelpaprogrammerﬁndmemoryhot
+spots or understand cache behavior. We developed a proﬁler
+to count symbolic accesses on each address. The proﬁler
+keeps shadow counters for memory addresses on every state;
+every symbolic access increments a setof feasible counters.
+Unlike a traditional proﬁler, symbolic shadow state inﬂu-
+ences the proﬁler results. For instance, a complete symbolic
+bytestoreon s[S] ={p,p+1}touchestwomemorylocations,
+pandp+ 1. Storing to two feasible memory locations up-
+dates two shadow counters within a single state; the shadow
+251counters become symbolic via symbolic write. The proﬁler
+is
+free to choose any feasible counter value. In our imple-
+mentation, the proﬁler greedily increases memory coverage
+by choosing p∈s[S] whenS(p) = 0 and assuming S(x)>0
+on path termination (when feasible) for all addresses x.
+Proﬁling also demonstrates the importance of guarding
+against recursion. A symbolic access leads to a shadow
+counter update on multiple feasible shadow counters; the
+shadowcounteraddressissymbolic. Incrementingthecounter
+through a symbolic pointer triggers another proﬁling event
+in the software handler causing an inﬁnite loop. To prevent
+hanging, a ﬂag guards against proﬁler handler reentrance.
+4.2.3 Heap Checking
+Heap access violations are common errors in system pro-
+grams. A program accesses freed or uninitialized heap data
+with little immediate consequence but eventual state cor-
+ruption. Dynamic analysis algorithms [15, 22] detect these
+errors at the point of violation with shadow memory. The
+symMMU extends the memcheck algorithm [22] to binary
+symbolic execution with incomplete heap information.
+Symbolically processing heap memory accesses exploits
+pointer reach knowledge lost to concrete test cases. Al-
+though symbolically derived tests are compatible with tra-
+ditional heap violation detection algorithms [14], concrete
+testing alone leads to false negatives. Consider a read from
+abuﬀerb, initializeduptosome n, atasymbolicoﬀset i≤n.
+For a concrete test, imay be chosen such that b[i] is initial-
+ized (i < n ), missing the error. Under symbolic analysis b[i]
+is both initialized and uninitialized so the error is modeled.
+The heap checker models the heap as the program runs.
+A set of disjoint address ranges (heap blocks) [a,a +n)∈ H
+tracks a state’s current heap H. When a program allocates
+a heap block b, the checker adds btoH. If a pointer p∈s[S]
+is inH,∃b∈ H. p∈b, thensis a feasible heap address.
+An access is checked by observing the shadow value for
+each accessed byte address. Each byte is assigned two bits
+of shadow state representing its heap status. Each byte is
+assigned one of the following shadow values:
+•OK. Access is safe; may be a heap data.
+•UNINIT. Heap address with uninitialized data.
+•FREE. Former heap address.
+Figure 7 illustrates the ﬁnite state machine which man-
+ages the heap status. Initially, accesses default to OK; the
+tracked heap is set to empty. To avoid overhead from re-
+peatedly calling the symMMU, long, contiguous OKranges
+are inserted into the concrete address pass-through TLB.
+When the program acquires a pointer pthrough an alloca-
+tion function (e.g., malloc(n )), the heap checker intercepts
+the call, records the allocated block and marks the shadow
+memory for [p,p +n) asUNINIT. When pis deallocated with
+a callfree(p), the heap checker retrieves p’s length n, marks
+[p,p+n) asFREE, and drops the [p,p +n) record from H.
+The heap checker detects three heap violations:
+Dangling Accesses. An access to freed heap memory is
+a dangling access. This violates the heap discipline because
+all heap accesses from client code should reference allocated
+memory; if a program accesses freed memory, it may corrupt
+state or retrieve an unexpected value. A handler reports a
+danglingaccesswheneveranaccesshasa FREEshadowvalue.
+Uninitialized Reads. The contents of the heap are un-
+deﬁnedonallocation. Readsfromfreshlyallocateduninitial-
+ized memory produces undeﬁned behavior. If a read accessFigure 7: The memcheck shadow state machine.
+po
+inter maps to UNINIT, the heap checker produces a test
+case for an uninitialized read.
+Double Frees. Each heap allocation pairs with at most
+one deallocation. Deallocating memory twice consecutively
+causes the heap checker to terminate the state and report
+a double free. Early termination has a performance beneﬁt
+by skipping the double-free detection error path in libc.
+4.3 Unconstrained Pointers
+Unconstrained execution [8, 16, 24] tests functions with-
+outpathcontexttobypassthereachabilityproblem. Instead
+of trying to reach a speciﬁc function through a path from
+the beginning of a program, the symbolic executor jumps
+directly to the target function, lazily initializing pointer ar-
+guments with symbolic data. These unconstrained pointers
+initializeonﬁrstaccess, expandedasneeded, arerelocatable,
+and require no type information. We describe handlers writ-
+ten for the symMMU which manage unconstrained pointers.
+Unconstrained pointers are special symbolic pointers with
+no immediate concrete address that map to demand allo-
+cated memory. All pointers passed to a target function
+for unconstrained execution are unconstrained. To avoid
+false positives for memory access faults, the executor op-
+timistically assumes symbolic pointers are valid. Initially
+accessing an unconstrained symbolic pointer udemand allo-
+cates unconstrained memory buﬀers with symbolic data to
+backu. These buﬀers have concrete physical length, associ-
+ated with the allocated backing buﬀer, as well as a symbolic
+virtual length, based on precise observed range of access,
+which facilitates expansion. Subsequent accesses to ure-
+trieve the same data through a consistent translation map.
+The translationmap routes structurallydistinct, but seman-
+tically nearby, unconstrained pointers to the same buﬀer.
+Finally, unconstrained pointers resolve to concrete pointers
+to generate a test case.
+4.3.1 Translation Entries
+To make unconstrained accesses optimistic, rather than
+unbounded and contingent, the symMMU handlers must
+translate unconstrained pointers to buﬀers mapped into the
+state’s address space. Figure 8 shows the organization of
+this translation. From the top, unconstrained pointers map
+into atranslation table by expression hash. The translation
+table points to translation entries which each describe an
+unconstrained pointer’s demand allocated memory buﬀer.
+Thetranslationtablemapsunconstrainedpointerstotrans-
+lation entries by address expression hash. A hash func-
+tionh:E→ {0,1}64from expressions to 64-bit values
+maps a symbolic address uto the table for solverless lookup.
+Sinceuis symbolic, it must have some variable subexpres-
+sion (e.g., (select i a) reads the symbolic array aat in-
+dexi). The hash hfunction relies on the idea that dis-
+252Figure 8: Unconstrained pointer structures.
+tin
+ct variable subexpressions imply feasibly distinct point-
+ers. For example, u=(select 0 x) andu′=(select 4 x)
+giveh(u)/ne}ationslash=h(u′) because the values are feasibly unrelated.
+In contrast, (add 1 (select 0 x)) and(add 2 (select 0
+x))refer to one base symbolic pointer uand therefore hash
+equally; the diﬀerence is a small constant oﬀset.
+A translation entry deﬁnes a demand allocated buﬀer for
+an unconstrained pointer. The buﬀer centers around a pivot
+u, the unconstrained pointer of the ﬁrst access. The entry
+holds the buﬀer’s concrete pointer pand its current concrete
+radiusrc. For precise bounds, the entry tracks the minimum
+uminand maximum umaxaccess pointers. The diﬀerence
+between uminandumaxdeﬁnes a symbolic radius r. Taking
+all entries, the ith entry has a pivot uiand a symbolic radius
+ri. Pivots are ordered by entry, u0< u1< ... < u k, when
+resolving to concrete addresses on path termination.
+4.3.2 Demand Allocation
+Unconstrained demand allocation has two phases. First,
+an initial access to a distinct unconstrained pointer creates
+a translation entry and buﬀer around the pointer. Next,
+future accesses near the pointer expand the buﬀer keeping
+values and constraints from prior accesses.
+Buﬀer Initialization. An access to a new unconstrained
+pointeruallocates space so future accesses are consistent.
+First, the soft handler determines uis distinct and distant
+from previously accessed unconstrained pointers. Next, the
+handler creates a translation entry pivoted around uand
+allocates a buﬀer centered about u. Finally, the access is
+servicedthroughthebuﬀerandthetargetprogramproceeds.
+Ifuhas no translation, the runtime allocates an uncon-
+strained buﬀer. First, a translation entry keyed by h(u) is
+inserted into the table. A small initial buﬀer (16 bytes) ﬁlled
+with unconstrained symbolic data is allocated to a fresh
+translation entry. Subsequent accesses around uroute to
+the buﬀer through the access handlers.
+Buﬀer Expansion Suppose an access to a pointer u′
+based on an unconstrained pointer sexceeds the bounds
+of the initially allocated buﬀer. By the optimistic access
+policy, the buﬀer is extended when the distance from the
+buﬀer is reasonably short. There are two cases: the fast
+caseh(u′) =h(u) and the slow case h(u′)/ne}ationslash=h(u). The fast
+caseh(u′) =h(u) suﬃces to explain buﬀer extension; the
+h(u′)/ne}ationslash=h(u) case is handled in Section 4.3.3.
+Whenh(u′) =h(u), theruntimeusesthetranslationentry
+foru. When the distance between uandu′is less than the
+buﬀer radius, |u−u′|< rc, there is no need to extend the
+buﬀer. Otherwise, the buﬀer is copied to a new buﬀer witha radius of 2 rc; the buﬀer pointer and rcare updated in the
+translation entry to reﬂect the expansion.
+4.3.3 Aliasing
+Two unconstrained pointers uiandujmay map to the
+same buﬀer, |ui−uj|< ri, but hash unequally, h(ui)/ne}ationslash=
+h(uj). Having distinct translation entries for uiandujpo-
+tentiallyassignsmultiplevaluestooneaddress. Thisisalias-
+ing; we outline our method for eﬃciently resolving aliases.
+An access to an unconstrained pointer uwith an untrans-
+lated hash h(u) undergoes alias resolution before acquiring
+a translation entry. First, the pointer uis tested for inclu-
+sion in the unconstrainedarena [UC MIN,UCMAX) with an and
+ma
+sk; ifuis unconstrained, then UCMIN≤u <UCMAXis
+s
+atisﬁable. Next, the runtime tests translation entry inclu-
+sion feasibility to resolve the entry for u. Inclusion testing
+relies on the pivot ordering u0< ... < u nand entry ordering
+[ui−ri,ui+ri)<[uj−rj,uj+rj) wheni < j. Hence,
+k= argmin
+i(u′≤ui+ri) implies u′∈[uk−rk,uk+rk). If
+kexists, the runtime updates the translation table to point
+h(u) to the entry for h(uk). Inclusion testing may accrue
+additional aliases by forking new states where ui−ri≤
+u′< ui+rifori > k. If there is no feasible entry, h(uk) is
+assigned its own translation entry.
+4.3.4 Concrete Address Assignment
+A dereferenced unconstrained pointer eventually binds to
+a concrete address. The runtime postpones address assign-
+ment by translating unconstrained pointers to a backing
+buﬀer on the ﬂy. To produce a concrete test case, the run-
+time uses the solver to assign concrete addresses to pointers.
+Premature address assignment unnecessarily constrains
+unconstrained pointers, masking otherwise feasible paths.
+Considerthe memcpylibrarycallwhichcopiesvaluesin mem-
+ory from a pointer u1to a non-overlapping location starting
+at pointer u2. A na¨ıvememcpyloads a byte from u1, stores
+it tou2, then increments each pointer. However, this imple-
+mentation has needless overhead; multi-byte accesses reduce
+the total iterations by at least half. Such multi-byte accesses
+incur additional cost for unaligned addresses. Hence a fast
+memcpyuses distinct code depending on the alignment (i.e.,
+the lower bits) of u1andu2. Eagerly assigning concrete
+addresses to u1andu2drops the unaligned corner cases.
+The pivots u0,...,unare assigned concrete addresses on
+path termination. The handlers control assignment by or-
+dering pivots at time of ﬁrst access and bounding addresses
+within the unconstrained arena [UC MIN,UCMAX]. For the
+b
+ase case u0, the constraints UCMIN≤u0−r0an du0+r0<
+UCMAXhold. In general, inserting the kth pivotuktakes the
+constraints uk−1+rk−1< uk−rkanduk+rk<UCMAX. A
+c
+leanup handler minimizes rkto keep buﬀer sizes small.
+5. EV ALUATION
+This section evaluates the symMMU against the criteria
+set in Section 1. Simplicity of the symMMU is quantiﬁed
+in terms of the implementation’s total lines of code. Dis-
+patch microbenchmarks and a comparison of discovered ac-
+cess faults on Linux programs demonstrate the symMMU’s
+performanceiscompetitivewithabuilt-inhard-codedMMU.
+Policy microbenchmarks, heap checking on programs, and
+unconstrainedexecutiononlibrariesshowthesymMMUﬂex-
+ibly supports a useful variety of access and analysis policies.
+253Table 3: Lines of code for MMU components
+MMU Component LoC.
+Interpreter
+Built-in KLEE MMU 373
+Built-in SymMMU 340
+Instrumented SymMMU 227
+Shared MMU Code 368
+Runtime
+Range Checking 35
+Constant Symbolic Resolution 20
+Pointer Concretization 19
+Fork on Address 17
+Prioritized Concretization 32
+Fork on Objects 38
+If-Then-Else Reads 37
+Create Variable 26
+Shadow Memory 390
+Access Proﬁler 71
+Heap Checker 371
+Unconstrained Pointers 251
+5.1 Implementation Complexity
+Fig
+ure3showstheamountofcodeforeachMMUtoquan-
+tify relative implementation complexity. The line counts
+were calculated with SLOCcount [30] on the relevant source
+ﬁles. The table is split between executor code (C++ com-
+piled to binary) and runtime code (C compiled to LLVM
+bitcode). Of note, the baseline kleeMMU (373 lines) needs
+slightly more code than the symMMU (340 lines) implemen-
+tation, suggesting the symMMU is simpler to implement.
+5.2 Dispatch Mechanism
+The design of the symMMU dispatch mechanism strongly
+inﬂuences its performance. We use a microbenchmark to
+comparethebuilt-insymMMUwithinstrumentationtoshow
+explicitsupportforasymMMUiscompetitivewiththebase-
+linekleeMMU and superior to instruction rewriting. Fur-
+thermore, weﬁndtheconcreteTLBimprovessymMMUper-
+formance on concrete workloads with low overhead.
+5.2.1 Access Instrumentation
+We compared concrete access overhead among the base-
+linekleeMMU, the interpreter symMMU, and an instru-
+mented symMMU. The instrumented symMMU replaces all
+target program loads and stores with runtime function calls
+which partition accesses as concrete or symbolic and forward
+to the appropriate handler. Each MMU was benchmarked
+withstrcpyon 4096 bytes, repeated 10,000 times in a pro-
+gram. The baseline MMU and built-in symMMU issued the
+same number of LLVM instructions and used equal time.
+The instrumented symMMU issued 2 .3×as many instruc-
+tions and took 1 .8×longer to complete; calling a handler on
+every program memory access is costly. Instrumentation is
+relatively slower so we only use the built-in symMMU.
+5.2.2 TLB
+To measure the cost of concrete symMMU handling, we
+compared the performance among the fast path, na ¨ıve han-
+dling, and TLB assistance using the benchmark from Sec-
+tion 5.2.1. The concrete symMMU policy passes every con- 0.01 0.1 1 10 100
+indexrindexstpcpystrcasecmpstrcatstrchrstrcmpstrcollstrcpystrcspnstrdupstrfrystrlenstrncasecmpstrncatstrncmpstrncpystrpbrkstrrchrstrspnstrstrstrtokstrxfrmTests over BaselineTest Cases Generated by SymMMU over Baseline KLEE
+Concrete
+ForkAddr
+PrConcrete
+ForkObj
+ITE
+CreateVar
+KLEE
+Figure 9: String microbenchmark testing speed-up.
+cr
+ete address to the built-in fast path and the TLB is set
+to 128 entries. Without TLB support, the benchmark used
+1.9×as many instructions and 1 .5×as much time as the
+baseline MMU without concrete symMMU support. With
+TLB support, the benchmark dispatched 1 .2×as many in-
+structionsandused1.1 ×asmuchtimeasthebaselineMMU.
+5.3 Policy Microbenchmarks
+A set of access intensive microbenchmarks measure the
+diﬀerence among symMMU policies and the baseline klee
+MMU. Each microbenchmark is compiled from C and sym-
+bolically executes one of 23 standard libcstring functions
+for ﬁve minutes. Policy performance is ranked by generated
+tests over the baseline kleeMMU (i.e., test case speedup).
+The benchmarks frequently access symbolic string buﬀers,
+stressing the MMU. A symbolic buﬀer bspans two pages in
+length (8192 bytes) to highlightforking on the fork by object
+policy. Two symbolic integers model oﬀsets ∆ 1and ∆ 2into
+b, another symbolic integer models string length (e.g., for
+strncpy). Two pointers p1andp2, withpk=b+(∆k%(k∗
+PAGESIZE)), givetwoin-boundfeasiblyoverlappingpointers
+w
+hich are passed into the string function.
+Figure 9 shows the test results. A majority of benchmarks
+generate more tests than baseline (88 more, 48 fewer). Con-
+servatively, most symMMU policies are no worse at com-
+pleting paths than the baseline kleepolicy. One exception
+is ITE (§ 4.1.8) which submits many solver queries for fea-
+sible addresses before constructing an iteexpression. On
+the other hand, pointer concretization, which should pro-
+duce few tests, sometimes outperforms baseline. To explain,
+the baseline forks all feasible states at once for a symbolic
+access, issuing many queries. By contrast, the symMMU
+forks in the runtime so expensive accesses are preempted.
+The inconsistent performance among policies and functions
+demonstrates the importance of policy variety since no one
+simple policy is best.
+5.4 Memory Faults in Linux Programs
+TojudgetheeﬀectivenessofthesymMMUatscale, weran
+12508 64-bit Linux programs taken from Fedora 20 for ﬁve
+minutes each under the symbolic executor to ﬁnd memory
+access violation test cases. These test inputs cause access
+faults in unmodiﬁed third party programs.
+Table 4 shows the number of programs and test cases
+found by the symMMU to have memory errors using the
+254Table 4: Access faults found with symMMU
+Error Type Programs Tests
+Range Test 92439
+Symbolic Load 83147
+Symbolic Store 3946
+Concrete Load 8521308
+Concrete Store 425641
+Total 13892589
+ 0.1 1 10 100 1000
+ 1  4  16  64  256  1024 0 500 1000 1500 2000 2500 3000 3500Time (s)
+Total Queries
+Shadowed Symbolically Accessed SitesSymbolic Sites versus Time and Queries for Profiler Benchmark
+Time
+Queries
+Figure 10: Proﬁler benchmark performance.
+kle
+epolicy (§4.1.7) binned by stack trace. To be sure the
+results were true positives, the table results were conﬁrmed
+at the binary translation level through a test replay program
+based on the LLVM JIT. For comparison, the standard klee
+MMU ﬂagged 2252 tests (1751 conﬁrmed) whereas the sym-
+MMU ﬂagged 2667 tests (2589 conﬁrmed); by Welch’s t-test,
+the symMMU ﬁnds more faults than the hard-coded klee
+MMU with conﬁdence (p < 0.005). Two reasons explain the
+kleeMMU’s extra false positives: ﬁrst, the kleeMMU is
+poorly tested (a few hundred LLVM bitcode programs), and
+second, the kleeMMU is intricate and diﬃcult to get right.
+Similarly, the symMMU pass issued 2 .1×solver queries over
+thekleeMMU pass; symMMU queries tend to solve faster.
+5.5 Proﬁler
+Figure 10 illustrates the symbolic proﬁler’s cost for a sim-
+ple benchmark. The benchmark program tests the proﬁler
+coverage policy by looping over an array awithnelements,
+writing 1 to a[s[i]] where sis an array of symbolics; s’s
+assignment controls which elements of aare updated. The
+shadow memory’s granularity is conﬁgured to have a shadow
+word for each element in a. Complete coverage of aimpliess
+contains all values between 0 and n−1; the proﬁler imposes
+these constraints on s. For overhead, total solver queries
+grows linearly with respect to n. Time for the benchmark
+exponentially rises with n, peaking at 338 seconds for 1024
+elements; at 2048 elements, solver performance completely
+deteriorates and the benchmark times out after 30 minutes.
+5.6 Heap Violations
+The symbolic executor produces a concrete test case for
+every heap violation it ﬁnds. Since a test could be a false
+positive (e.g., from bugs in the tool), it is important to au-
+tomatically detect true positives. Unlike access faults, heap
+violationsareinvisibletohardware. SAGE[14], forinstance,Table 5: symMMU-derived Heap Violations
+Type TestsCode Sites Programs
+Double Free 56 43 33
+Dangling Access 405 147 46
+Uninitialized Read 1195 94 230
+Total 1656 240 267
+tapebuffered read (
+((char∗) shorthdr) + 6,
+indes ,sizeof ∗s horthdr−6);
+filehdr−>cnamesize = short hdr−>cnamesize ;
+filehdr−>cname = ( ch ar∗)xmalloc (
+filehdr−>cnamesize );
+cpiosafernamesuffix ( file hdr .c name , . . . ) ;
+char∗p = safer namesuffix (name, . . . ) ;
+sizetprefix len=FILE SYSTEM PREFIX LEN(
+filename );
+Figure 11: A tortuous heap read violation in cpio.
+ha
+s special support to force crashes on heap violations. To
+conﬁrm errors without the luxury of faults, the replay sys-
+tem feeds test cases with system call logs into an unmodiﬁed
+third-party heap analysis tool, valgrind [22] memcheck.
+Replaying test cases under valgrind works through a com-
+bination of ptraceand iterative system call realignment.
+The valgrind process runs the target program but is con-
+trolledbythetestreplayprocesswiththeoperatingsystem’s
+ptracefacility. The replay process intercepts valgrind’s sys-
+tem calls; a call is dispatched natively or intercepted and
+replayed. Two system models must be reconciled: test cases
+use precise system call logs whereas valgrind rewrites and
+inserts system calls. On interception, if the requested sys-
+temcallmatchestheheadofthesystemcalllog, thevalgrind
+process absorbs the log’s side eﬀects. Otherwise, the call for-
+wards to the operating system. The system call log initially
+synchronizes with valgrind by ignoring the ﬁrst nsystem
+calls. The value nis found by successively incrementing n
+to maximize the number of replayed system calls.
+We checked 1919 Linux programs from the host machine’s
+(x86-64 Gentoo) {/,/usr/}{bin,sbin}/ directories, sym-
+bolically interpreted for ﬁve minutes. Binaries were taken
+from the host machine because valgrind is sensitive to its
+host conﬁguration. Table 5 lists valgrind-conﬁrmed heap vi-
+olations by number of tests, code sites (to control for faulty
+libraries), and programs (to control for noisy programs). In
+total14247violationswere ﬂaggedin 761programs; valgrind
+conﬁrmed 11.6% of these tests. Valgrind and the executor
+may disagree for several reasons: neither are bug-free, sys-
+tem calls fail to align, and diﬀering memory layouts interfere
+with system call replay. Regardless, cross-checking with a
+third-party tool strengthens evidence of legitimate bugs.
+Figure 11 illustrates the complexity of errors found by
+the heap checker. This pared-down example from cpio-
+2.11spans three ﬁles; it reads a buﬀer length (c_namesize)
+from input ( short_hdr), allocates a buﬀer c_name, passes it
+around, then reads the data. If c_namesize is 0,prefix_len
+relies on uninitialized data, leading to undeﬁned behavior.
+5.7 Unconstrained Pointers
+Explicitly modeling data structures for testing function
+arguments is tedious. Demand allocation on unconstrained
+255pointers derives argument structure automatically. We eval-
+u
+ate symMMU unconstrained pointers on bare functions by
+symbolically generating test inputs for functions in several
+compiled libcimplementations. These tests directly trans-
+late to C sources which serve as native test ﬁxtures. Replay-
+ing the tests across libraries reveals implementation diﬀer-
+ences and fundamental bugs.
+5.7.1 Generating libc Inputs
+TestinputswerederivedbysymbolicallyexecutingCstan-
+dard library ( libc) libraries with unconstrained pointers.
+We tested functions from four up-to-date libcimplemen-
+tations: newlib-2.1.0, musl-1.1.0, uclibc-0.9.33.2, and glibc-
+2.19. Functions were symbolically executed by marking the
+register ﬁle symbolic and jumping to the function; root un-
+constrained pointers are demand allocated on dereference
+of a symbolic register. Each function was allotted a max-
+imum of ﬁve minutes of symbolic execution computation
+time and 200 test cases. Since we intend to ﬁnd diﬀerences
+between supposedly equivalent implementations, only func-
+tions shared by at least two libraries were evaluated. In total
+667 functions shared among at least two libraries exhibited
+unconstrained demand allocations.
+5.7.2 C Test Cases
+To run unconstrained test cases natively, test cases are
+ﬁrst converted into C code. The unconstrained buﬀer infor-
+mation is translated to a C source ﬁle then compiled into a
+binary program. The binary dynamically loads the library
+and runs the target function with the test input.
+The C test ﬁxture programs operate as follows:
+1 Declare initial data from unconstrained buﬀers.
+2 Allocate memory buﬀers at given addresses.
+3 Copy initialization data into buﬀers.
+4 Load target function pointer from shared library.
+5 Call target function with symbolic register arguments.
+6 Print buﬀer contents and function return value.
+Every C test case assigns unconstrained buﬀer data to
+physical locations in the test process. Every non-alias trans-
+lation entry has an unconstraineddescriptor structure which
+stored in an array of entries. The descriptor includes the
+buﬀer contents and length, the start of the buﬀer , the base
+of the memory segment to allocate and its length in pages.
+Following the target function call, test results come from
+two parts of the process state: the return value and the in-
+put buﬀers. If a function returns a value that can be deref-
+erenced, the value is translated to a ﬁxed constant to con-
+servatively avoid mismatches from diﬀering addresses across
+libraries. Whena functionmutatesitsarguments, thevalues
+from the input buﬀers soundly reﬂect the updates.
+5.7.3libc Differences
+Replaying the unconstrained buﬀers through the libraries
+revealed many implementation diﬀerences. The system de-
+tects subtle bugs in uncommon, but standard, cases which
+rely on pointer arguments. Complete bulk results suggest
+manypotentiallyserious(althoughoftenbenign)mismatches.
+Figure 12 shows an example broken edge case detected
+with symMMU unconstrained pointers. The ﬁgure lists a
+simpliﬁed internet host address parser adapted from the
+musllibrary which converts an IPv4 numbers-and-dots no-
+tation string (s) to a network byte order integer address (d).
+During symbolic execution, the unconstrained buﬀer ﬁlls inunsigned long a[ 16] = {0};
+for( i=0; i <4 ; i++) {
+a[ i ] = strtoul (s , &z , 0);
+if(z==s | |(∗z &&∗z != ’ . ’) ||! isdigit ( ∗s ))
+return −1;
+if(!∗z ) break;
+s=z+1; }
+switch ( i ){
+case0: a [1] = a [0] & 0 xffffff ; a [0] > >= 24;
+case1: a [2] = a [1] & 0 xffff ; a [1] > >= 16;
+case2: a [3] = a [2] & 0xff ;a [2] > >= 8;}
+for( i=0; i <4 ; i++) {
+if(a[ i ]>2 55)return −1;
+((char∗) &d)[ i ] = a[ i ]; }
+Figure 12: Simpliﬁed IP address parser from musl.
+Table
+6: Mismatches against glibcinvolving uncon-
+strained pointers
+Library Mismatched Functions % Total Tested
+musl 86 25%
+newlib 45 30%
+uclibc 32 8%
+Total 117 24%
+the contents for swith symbolic values. The code works for
+four numeric parts (e.g., 127.0.0.1) but misinterprets other
+valid addresses. For example, the class C address ”1.1”con-
+verts to0x01000001 instead of the expected address 0x0101.
+Table 6 summarizes the mismatches with glibcusing un-
+constrained pointers. We were careful to exclude functions
+which rely on volatile system state, use structures with un-
+deﬁned width (e.g., stdioﬁle functions), return no value,
+or always crashed. The percentage of mismatching func-
+tions is considerable given our conservative analysis. One
+interestingclassofdiﬀerencesreﬂectsarcanespecializedcon-
+ﬁguration details. For instance, glibc’s timezone support
+causesnewlibandmuslto drift several hours when comput-
+ingmktime(uClibc crashes, lacking /etc/TZ). Furthermore,
+inconsistent locale handling across libraries contributes to
+mismatched wide character data.
+6. CONCLUSION
+This paper introduced symbolic execution with symbol-
+ically executed memory accesses through a symMMU. By
+separating memory access policy from the dispatch mech-
+anism, we have implemented a variety of access policies
+and memory analysis algorithms with minimal eﬀort. Mi-
+crobenchmarks demonstrate the importance of access policy
+for symbolic executor performance. Large scale comparative
+results indicate the symMMU ﬁnds more access faults with
+fewer false positives than a traditional built-in access dis-
+patcher. Overall, this work suggests that forwarding mem-
+ory accesses to a symbolically executed runtime is a beneﬁ-
+cial design choice in a symbolic executor.
+Acknowledgments
+This research was partially supported by DARPA award
+HR0011-12-2-009 and the DARPA Clean-slate design of Re-
+silient, Adaptive, Secure Hosts (CRASH) program under
+contractN66001-10-2-4089. Theopinionsinthispaperdon’t
+necessarily represent DARPA or oﬃcial US policy.
+2567. REFERENCES
+[1
+] M. Aron, Y. Park, T. Jaeger, J. Liedtke,
+K. Elphinstone, and L. Deller. The SawMill
+Framework for Virtual Memory Diversity. In Proc. of
+the 2001 Australian Computer Systems Architecture
+Conf., ACSAC 2001, pages 3–10, 2001.
+[2] C. Cadar, D. Dunbar, and D. Engler. KLEE:
+Unassisted and Automatic Generation of
+High-coverage Tests for Complex Systems Programs.
+InProc. of the 8th USENIX Conf. on Operating
+Systems Design and Implementation, OSDI’08, pages
+209–224, 2008.
+[3] C. Cadar, V. Ganesh, P. M. Pawlowski, D. L. Dill,
+and D. R. Engler. EXE: Automatically Generating
+Inputs of Death. In Proc. of the 13th ACM Conf. on
+Computer and Communications Security , CCS ’06,
+pages 322–335, 2006.
+[4] S. K. Cha, T. Avgerinos, A. Rebert, and D. Brumley.
+Unleashing Mayhem on Binary Code. In IEEE
+Symposium on Security and Privacy, pages 380–394,
+2012.
+[5] V. Chipounov, V. Kuznetsov, and G. Candea. S2E: A
+Platform for In-vivo Multi-path Analysis of Software
+Systems. In Proc. of the 16th Int’l Conf. on
+Architectural Support for Programming Languages and
+Operating Systems , ASPLOS ’11, pages 265–278, 2011.
+[6] H. Cui, G. Hu, J. Wu, and J. Yang. Verifying Systems
+Rules Using Rule-directed Symbolic Execution. In
+Proc. of the 18th Int’l Conf. on Architectural Support
+for Programming Languages and Operating Systems ,
+ASPLOS ’13, pages 329–342, 2013.
+[7] D. Davidson, B. Moench, T. Ristenpart, and S. Jha.
+FIE on Firmware: Finding Vulnerabilities in
+Embedded Systems Using Symbolic Execution. In
+Proc. of the 22th USENIX Security Symposium,
+USENIX Security ’13, pages 463–478, 2013.
+[8] X. Deng, J. Lee, and Robby. Eﬃcient and Formal
+Generalized Symbolic Execution. Automated Software
+Engg., 19(3):233–301, Sept. 2012.
+[9] B. Elkarablieh, P. Godefroid, and M. Y. Levin. Precise
+Pointer Reasoning for Dynamic Test Generation. In
+Proc. of the 18th Int’l Symposium on Software Testing
+and Analysis , ISSTA ’09, pages 129–140, 2009.
+[10] D. R. Engler, S. K. Gupta, and M. F. Kaashoek.
+AVM: Application-level Virtual Memory. In Proc. of
+the 5th Workshop on Hot Topics in Operating
+Systems, HotOS-V, pages 72–77, May 1995.
+[11] V. Ganesh and D. L. Dill. A Decision Procedure for
+Bit-Vectors and Arrays. In Proc. of the 19th Int’l
+Conf. on Computer Aided Veriﬁcation, CAV’07, July
+2007.
+[12] P. Godefroid and J. Kinder. Proving Memory Safety
+of Floating-point Computations by Combining Static
+and Dynamic Program Analysis. In Proc. of the 19th
+Int’l Symposium on Software Testing and Analysis,
+ISSTA ’10, pages 1–12, 2010.
+[13] P. Godefroid, N. Klarlund, and K. Sen. DART:
+Directed Automated Random Testing. In Proc. of the
+2005 ACM SIGPLAN Conf. on Programming
+Language Design and Implementation, PLDI ’05,
+pages 213–223, Jun 2005.
+[14] P. Godefroid, M. Y. Levin, and D. Molnar. Automated
+Whitebox Fuzz Testing. In Proc. of the Network and
+Distributed System Security Symposium, NDSS’08.
+[15] R. Hastings and B. Joyce. Purify: Fast detection of
+memory leaks and access errors. In Proc. of the
+Winter 1992 USENIX Conf. , pages 125–138, 1991.
+[16] S. Khurshid, C. S. P˘ as˘ areanu, and W. Visser.
+Generalized Symbolic Execution for Model Checking
+and Testing. In Proc. of the 9th Int’l Conf. on Tools
+and Algorithms for the Construction and Analysis of
+Systems, TACAS’03, pages 553–568, 2003.[17] J. C. King. Symbolic Execution and Program Testing.
+Communications of the ACM, 19:385–394, July 1976.
+[18] C. Lattner and V. Adve. LLVM: A Compilation
+Framework for Lifelong Program Analysis &
+Transformation. In Proc. of the Int’l Symposium on
+Code Generation and Optimization: Feedback-directed
+and Runtime Optimization, CGO’04, March 2004.
+[19] G. Li, I. Ghosh, and S. P. Rajan. KLOVER: A
+Symbolic Execution and Automatic Test Generation
+Tool for C++ Programs. In Proc. of the 23rd Int’l
+Conf. on Computer Aided Veriﬁcation, CAV’11, pages
+609–615, 2011.
+[20] L. Martignoni, S. McCamant, P. Poosankam, D. Song,
+and P. Maniatis. Path-exploration Lifting: Hi-Fi Tests
+for Lo-Fi Emulators. In Proc. of the 17th Int’l Conf.
+on Architectural Support for Programming Languages
+and Operating Systems , ASPLOS ’12, pages 337–348,
+2012.
+[21] N. Nethercote and J. Seward. How to Shadow Every
+Byte of Memory Used by a Program. In Proc. of the
+3rd Int’l Conf. on Virtual Execution Environments,
+VEE ’07, pages 65–74, 2007.
+[22] N. Nethercote and J. Seward. Valgrind: A Framework
+for Heavyweight Dynamic Binary Instrumentation. In
+Proc. of the 2007 ACM SIGPLAN Conf. on
+Programming Language Design and Implementation,
+PLDI ’07, pages 89–100, 2007.
+[23] J. Newsome and D. Song. Dynamic Taint Analysis for
+Automatic Detection, Analysis, and Signature
+Generation of Exploits on Commodity Software. In
+Proc. of the Network and Distributed System Security
+Symposium, NDSS’05, 2005.
+[24] D. A. Ramos and D. R. Engler. Practical, Low-eﬀort
+Equivalence Veriﬁcation of Real Code. In Proc. of the
+23rd Int’l Conf. on Computer Aided Veriﬁcation,
+CAV’11, pages 669–685, 2011.
+[25] R. Sasnauskas, O. Landsiedel, M. H. Alizai, C. Weise,
+S. Kowalewski, and K. Wehrle. KleeNet: Discovering
+Insidious Interaction Bugs in Wireless Sensor
+Networks Before Deployment. In IPSN’10: Proc. of
+the 9th ACM/IEEE Int’l Conf. on Information
+Processing in Sensor Networks , April 2010.
+[26] S. Savage, M. Burrows, G. Nelson, P. Sobalvarro, and
+T. Anderson. Eraser: A Dynamic Data Race Detector
+for Multithreaded Programs. ACM Transactions on
+Computer Systems , 15(4):391–411, Nov. 1997.
+[27] K. Sen, D. Marinov, and G. Agha. CUTE: A Concolic
+Unit Testing Engine for C. In Proc. of the 13th ACM
+SIGSOFT Int’l Symposium on Foundations of
+Software Engineering (ESEC/FSE-13) , pages 263–272,
+Sept. 2005.
+[28] R. Uhlig, D. Nagle, T. Stanley, T. Mudge, S. Sechrest,
+and R. Brown. Design tradeoﬀs for software-managed
+TLBs. In ACM Transactions on Computer Systems ,
+pages 27–38, 1993.
+[29] T. Wang, T. Wei, Z. Lin, and W. Zou. IntScope:
+Automatically Detecting Integer Overﬂow
+Vulnerability in X86 Binary Using Symbolic
+Execution. In Proc. of the Network and Distributed
+System Security Symposium, NDSS’09, 2009.
+[30] D. A. Wheeler. SLOCcount, 2009.
+[31] Y. Yu, T. Rodeheﬀer, and W. Chen. RaceTrack:
+Eﬃcient Detection of Data Race Conditions via
+Adaptive Tracking. In SOSP ’05: Proc. of the 20th
+ACM Symposium on Operating Systems Principles ,
+pages 221–234, 2005.
+[32] Q. Zhao, D. Bruening, and S. Amarasinghe. Umbra:
+Eﬃcient and Scalable Memory Shadowing. In Proc. of
+the 8th Annual IEEE/ACM Int’l Symposium on Code
+Generation and Optimization, CGO ’10, pages 22–31,
+2010.
+257

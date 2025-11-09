@@ -1,0 +1,1306 @@
+Cachetor: Detecting Cacheable Data to Remove Bloat
+Khanh Nguyen and Guoqing Xu
+University of California, Irvine, CA, USA
+{khanhtn1, guoqingx}@ics.uci.edu
+ABSTRACT
+Modern object-oriented software commonly suffers from run time
+bloat that signiﬁcantly affects its performance and scalab ility. Stud-
+ies have shown that one important pattern of bloat is the work re-
+peatedly done to compute the same data values. Very often the
+cost of computation is very high and it is thus beneﬁcial to me m-
+oize the invariant data values for later use. While this is a c om-
+mon practice in real-world development, manually ﬁnding in variant
+data values is a daunting task during development and tuning . To
+help the developers quickly ﬁnd such optimization opportun ities for
+performance improvement, we propose a novel run-time proﬁl ing
+tool, called Cachetor, which uses a combination of dynamic depen-
+dence proﬁling and value proﬁling to identify and report operations
+that keep generating identical data values. The major chall enge in
+the design of Cachetor is that both dependence and value proﬁ l-
+ing are extremely expensive techniques that cannot scale to large,
+real-world applications for which optimizations are impor tant. To
+overcome this challenge, we propose a series of novel abstra ctions
+that are applied to run-time instruction instances during p roﬁling,
+yielding signiﬁcantly improved analysis time and scalabil ity. We
+have implemented Cachetor in Jikes Research Virtual Machin e and
+evaluated it on a set of 14 large Java applications. Our exper imen-
+tal results suggest that Cachetor is effective in exposing c aching
+opportunities and substantial performance gains can be ach ieved
+by modifying a program to cache the reported data.
+Categories and Subject Descriptors
+D.2.4 [ Software Engineering ]: Metrics— Performance measures ;
+D.2.5 [ Software Engineering ]: Testing and Debugging— Debug-
+ging aids
+General Terms
+Performance, Reliability, Experimentation
+Keywords
+Runtime bloat, performance optimization, cacheable data, dynamic
+dependence analysis
+Permission to make digital or hard copies of all or part of thi s work for
+personal or classroom use is granted without fee provided th at copies are
+not made or distributed for proﬁt or commercial advantage an d that copies
+bear this notice and the full citation on the ﬁrst page. To cop y otherwise, to
+republish, to post on servers or to redistribute to lists, re quires prior speciﬁc
+permission and/or a fee.
+ESEC/FSE ’13 August 18-26,2013 Saint Petersburg, Russia
+Copyright 13 ACM 978-1-4503-2237-9/13/08 ...$5.00.1. INTRODUCTION
+Many applications suffer from chronic runtime bloat—exces sive
+memory usage and run-time work to accomplish simple tasks—
+that signiﬁcantly affects scalability and performance. Ou r experi-
+ence with dozens of large-scale, real-world applications [ 33, 35,
+36, 37] shows that a very important source of runtime bloat is the
+work repeatedly done to compute identical data values—if th e com-
+putation is expensive, signiﬁcant performance improvemen t can
+be achieved by memoizing1these values and avoiding computing
+them many times. In fact, caching important data (instead of re-
+computing them) is already a well-known programming practi ce.
+For example, in the white paper “WebSphere Application Serv er
+Development Best Practices for Performance and Scalabilit y” [3],
+four of the eighteen best practices are instructions to avoi d repeated
+creation of identical objects. While ﬁnding and caching ide ntical
+data values is critical to the performance of many large-sca le soft-
+ware systems, the task is notoriously challenging for progr ammers
+to achieve during development and tuning. A large, long-run ning
+program may contain millions of instructions, and each inst ruction
+may be executed for an extremely large number of times and pro -
+duce a sea of data values. It would be extremely difﬁcult, if n ot
+impossible, to ﬁnd identical run-time data values and under stand
+how to cache them without appropriate tool support.
+Motivation To illustrate, consider the following code example,
+adapted from sunflow2, an open-source image rendering system.
+float []fValues = {0,1.0,2.3,1.0,1.0,3.4,1.0,1.0,
+. . . ,1.0};
+int[]iValues =new int [fValues .length] ;
+for (int i= 0; i <fValues .length; i++){
+iValues [i] =Float.floatToIntBits (fValues [i]);
+}
+This simple program encodes each ﬂoat value in array fValues
+using a bit array (represented by an Integer), which can then be
+stored in an Integer array. In this example, most of the value s in
+fValues are1.0, and it is unnecessary to invoke method Float .
+floatToIntBits (which is quite expensive) to compute the bit
+array for each of them. The program would run more efﬁciently
+ifFloat.floatToIntBits can be invoked the ﬁrst time 1.0
+is seen , and the result can be cached and reused for its future
+occurrences. However, this information may not be availabl e to
+the programmer during development, as fValues may be a dynam-
+ically computed array whose content is unknown at compile ti me,
+or the fact that most of its elements are the same is speciﬁc to a
+certain kind of input image being processed. As a result, it i s neces-
+sary to develop techniques and tools that can help the progra mmer
+1Terms “memoize” and “cache” are used interchangeably.
+2http://sunﬂow.sourceforge.net/.Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for proﬁt or commercial advantage and that copies bear this notice and the full citation
+on the ﬁrst page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior speciﬁc permission and/or a
+fee. Request permissions from Permissions@acm.org.
+ESEC/FSE’13 , August 18–26, 2013, Saint Petersburg, Russia
+Copyright 2013 ACM 978-1-4503-2237-9/13/08...$15.00
+http://dx.doi.org/10.1145/2491411.2491416
+268Figure 1: An overview of Cachetor.
+ﬁnd such missed optimization opportunities (e.g., report m ethod
+floatToIntBits is frequently executed with the same input
+and produces the same output), especially in a situation whe re a
+signiﬁcant performance issue is observed and tuning must be un-
+dertaken to make the application reach its performance goal .
+Our proposal In this paper, we propose a dynamic analysis
+tool, called Cachetor , that proﬁles large-scale applications to pin-
+point cacheable data values and operations producing these val-
+ues. Cachetor has three major components, which are illustr ated
+in Figure 1. At the lowest level of the tool is an instruction- level
+cacheable value detector called I-Cachetor , which identiﬁes (byte-
+code) instructions whose executions produce identical (pr imitive-
+typed) values. Finding only instructions that always produ ce the
+same values may signiﬁcantly limit the amount of optimizati on op-
+portunities that can be detected. To improve usefulness, we pro-
+pose to compute a cacheability measurement for each instruction,
+that captures the percentage of the most frequently-occurr ing value
+among all values produced by the instruction. For example, a l-
+though the call instruction that invokes floatToIntBits does
+not always return the same value, this instruction has a high CM
+and will thus be recognized by the developer during inspecti on.
+I-Cachetor is of limited usefulness by itself—it is often no t pos-
+sible to cache values produced by speciﬁc instructions. We d evelop
+two higher-level detectors, namely D-Cachetor andM-Cachetor ,
+that detect data structures containing identical values and method
+calls producing identical values, respectively, to help develop ers un-
+derstand and ﬁx inefﬁciencies at a logical level. D-Cacheto r queries
+I-Cachetor for the CMs of the heap store instructions that wr ite into
+a data structure and aggregate these instruction-level CMs to com-
+pute the CM of the data structure. M-Cachetor focuses on the v alue
+returned from each call site: it queries I-Cachetor for the C M of
+the call instruction if the return value is of primitive type , or, other-
+wise, queries D-Cachetor for the CM of the returned object, s o as
+to compute the CM of the call site. Eventually, allocation si tes and
+method calls are ranked based on their respective CMs and the lists
+are reported to the developer for manual inspection.
+Fixing problems reported by Cachetor Because Cachetor re-
+lates optimization opportunities with high-level program entities,
+the reported problems can be easily understood and ﬁxed. For ex-
+ample, D-Cachetor reports allocation sites that create ide ntical ob-
+jects and data structures. To ﬁx the reported problems, one m ay
+create a singleton pattern for such an allocation site to enf orce the
+use of one single instance throughout the execution, or deve lop a
+clone method in its class to directly copy values between the ob-
+jects instead of re-computing the (same) values from the scr atch.
+As another example, M-Cachetor reports call sites whose exe cu-
+tions always produce the same results. One may easily create a
+(static or instance) ﬁeld and cache the result of such a call s ite in the
+ﬁeld, so that the frequent invocation of the method can be avo ided.Technical challenges and our solution The biggest challenge
+that stands in the way of implementing Cachetor is how to ﬁnd
+these identical data values in a scalable way so that Cachetor can
+be applied to large, real-world applications. In particula r, the im-
+plementation of I-Cachetor requires the comparison of run- time
+values produced by different executions of the same instruc tion.
+To do this, a natural idea is to perform whole-program value pro-
+ﬁling [10], which records run-time values for all instruction exe -
+cutions. These values are compared ofﬂine to identify cache able
+instructions. In addition, in order to compute data-struct ure-level
+CMs, a dynamic dependence analysis may be needed to understand
+which data structure an instruction may write into at run tim e. How-
+ever, both whole-program value proﬁling and dependence ana lysis
+are extremely expensive techniques that cannot scale to rea l-world
+applications. To improve the practicality of our analysis, we pro-
+pose a novel approach that combines value proﬁling with dyna mic
+dependence analysis in a way so that they mutually improve th e
+scalability of each other. Speciﬁcally, we use distinct val ues pro-
+duced at run time to abstract dependence graph nodes, yieldi ng a
+value-abstracted dynamic dependence graph . This graph contains
+the value information necessary for our analysis, and yet is much
+smaller and easier to compute than a regular dynamic depende nce
+graph. We then propose a series of further abstractions base d on
+this dependence analysis to scale Cachetor to the real world .
+We have implemented this combined dependence and value pro-
+ﬁling technique in Jikes Research Virtual Machine [16], and then
+built the three detectors based on the abstract representat ion. An
+evaluation of the tool on a set of 14 large-scale Java applica tions
+shows that Cachetor incurs an overall 201.96 ×running time over-
+head and 1.98 ×space overhead. While these overheads are very
+large, they have not prevented us from collecting any run-ti me data
+for real-world applications. In fact, it could have been imp ossible
+to implement such a heavyweight analysis on real-world appl ica-
+tions (such as those in the DaCapo benchmark set [7]) without the
+proposed abstractions. We have carefully inspected the ana lysis
+reports; ﬁxing the reported problems has led to signiﬁcant p erfor-
+mance improvements for many large-scale applications. Thi s expe-
+rience is described in the ﬁve case studies in Section 5.
+The major contributions of the paper are:
+•A novel approach that uses distinct values to abstract instr uc-
+tion instances and dependence relationships, leading to si g-
+niﬁcantly increased efﬁciency;
+•Three cacheability detectors that are built on top of the val ue-
+abstracted dependence graph to ﬁnd caching opportunities;
+•An implementation of Cachetor in Jikes Research Virtual
+Machine;
+•An evaluation of Cachetor on a set of large Java applications
+that shows (1) Cachetor incurs a high but acceptable over-
+head and (2) large optimization opportunities can be quickl y
+found from Cachetor’s reports. These initial results sugge st
+that Cachetor is useful in practice in helping developers ﬁn d
+caching opportunities, and our combined dependence and
+value proﬁling may be employed to improve the efﬁciency
+of a variety of dynamic analysis techniques.
+2. V ALUE-ABSTRACTED DYNAMIC
+DEPENDENCE ANALYSIS
+The naive implementation of either dynamic dependence anal y-
+sis or value proﬁling cannot scale to large, real-world appl ications
+for which optimizations are important. To overcome this sca lability
+challenge, we propose a novel technique, called value-abstracted
+269201
+22121
+15  int f(int i, int[] arr) {
+16      int j = 1;
+17      int k = 0;
+18      int p = arr[i];
+19      if(k < 4) {
+20          j = j * p;
+21          k = k + 1;
+22      } return j; 
+23  }1  int[] input = new int[6];
+2  input[0] = 1; 
+3  input[1] = 2;
+4  input[2] = 1;
+5  input[3] = 1;
+6  input[4] = 1;
+7  input[5] = 5;
+8  int i = 0;
+9  if(i < intput.length){
+10   int result = f(i, input); 
+11   print(result);
+12   i = i + 1; 
+13   goto 9; 
+14 } 1011
+4
+4161801
+1
+20232
+10161121
+1
+20441
+51 61
+1
+122016208
+111
+1
+(a) A simple program(b) Part of the value-abstracted dynamic 
+dependence graph 122
+123
+1241
+1
+1181
+16182
+41
+1 1 1
+22161
+1
+Figure 2: An example of value-abstracted data dependence gr aph.
+dependence analysis , that uses distinct run-time values an instruc-
+tion produces to deﬁne a set of equivalence classes to abstra ct de-
+pendence graph nodes (i.e., instruction instances), leadi ng to signif-
+icantly reduced analysis time and space consumption.
+2.1 Value-Abstracted Dependence Graph
+To formally deﬁne the abstraction, we ﬁrst give our deﬁnitio n
+of dynamic dependence graph. Since our goal is to detect cach ing
+opportunities, we are interested only in data dependence.
+Deﬁnition 1 (Dynamic Data Dependence Graph) A dynamic data
+dependence graph ( N,E) has node set N ⊆ S × I , where each
+node is a static instruction ( ∈ S) annotated with a natural number
+i(∈ I), representing the i-th execution of this instruction. An edge
+sj
+1→sk
+2(s1, s2∈ S andj, k∈ I) shows that the j-th execution
+of instruction s1writes a (heap or stack) location that is then used
+by the k-th execution of s2, without an intervening write to that lo-
+cation. If an instruction accesses a heap location through v.f, the
+reference value in stack location vis also considered to be used.
+While Cachetor works on the low-level JVM intermediate rep-
+resentation, the discussion of the algorithms uses a three- address-
+code representation of the program (e.g., an assignment a=bor a
+computation a=b+c). We will use terms statement and instruc-
+tion interchangeably, both meaning a statement in the three -address-
+code representation. We divide the static instruction set SintoSP
+andSR, which contain instructions that process primitive-typed
+and reference-typed data, respectively. The ﬁrst step of ou r analy-
+sis targets SP, because we are interested in ﬁnding instructions that
+produce identical primitive-typed values. SRwill be considered in
+the next stage when the cacheability information of instruc tions in
+SPneeds to be aggregated to compute the cacheability informat ion
+for objects and data structures (in D-Cachetor).
+For an instruction s∈ SP , we use Vsto denote the set of distinct
+values that the instances of sproduce at run time. We use each
+value v∈ V sas an identiﬁer to determine an equivalence class
+including a set of instances of sthat produce the same value v.
+The deﬁnition of the value-abstracted dependence graph is g iven as
+follows:
+Deﬁnition 2 (Value-Abstracted Data Dependence Graph) A
+value-abstracted data dependence graph ( N′,E′) has node set
+N′⊆ SP × V , where each node is a pair of a static instruction
+s∈ SP and a value v∈ V s(represented as sv), denoting the set
+of instances of sthat produce the same value v. An edge sw
+1→sx
+2
+(s1, s2∈ SP andw, x∈ V ) shows that an instance of s1thatproduces a value wwrites a location that is used by an instance of
+s2that produces a value x, without an intervening write to that lo-
+cation. If an instruction accesses a heap location through v.f, the
+reference value in stack location vis also considered to be used.
+In the value-abstracted dependence graph, instances of an i n-
+struction that produce the same run-time value are merged an d rep-
+resented by a single node. The advantage of developing such a n
+abstraction is two-fold: (1) the number of distinct values p roduced
+by an instruction is often much smaller than the total number of
+executions of the instruction; this is especially true for ( cacheable)
+instructions that frequently produce identical values, le ading to re-
+duced dependence graph size and proﬁling cost; (2) the merge d
+nodes and edges are very likely to represent computation pat hs that
+ultimately produce the same results; maintaining one singl e copy
+of the path would often sufﬁce to help us understand how these re-
+sults are computed; computation paths leading to different results
+are still distinguished.
+Example To illustrate, consider the example in Figure 2. Part
+(a) shows a simple program where each integer in the array input
+is passed into function f, which simply computes the integer to
+the power of 4 (i.e., arr[i]4). Note that among the six integers
+ininput , four of them are 1, and hence, it is highly beneﬁcial
+to cache and reuse the result of function ffor the speciﬁc input
+value 1. Shown in Figure 2 (b) is an important part of the value -
+abstracted dependence graph for the program execution. Eac h edge
+in the graph is annotated with the number of occurrences of th e de-
+pendence relationship the edge represents during executio n. Each
+node in Figure 2 (b) is a static instruction annotated with a ( dis-
+tinct) value it produces. The static instruction is represe nted by its
+line number in the program. The left part of the value-abstra cted
+dependence graph combines the computations for i= 0, 2, 3, and 4
+(i.e.,input [i] = 1)—for these four input values, all instructions ex-
+cept those at line 8 and 12 produce the same output value 1. Edg es
+annotated with high frequencies represent common computat ions
+that may be reused to improve performance. Dependence relat ion-
+ships for i= 1 (i.e., input [i] = 2) are shown in the right part, where
+each dependence edge occurs only once. Dependence relation ships
+fori= 5 are similar to those for i= 2 and are thus omitted from the
+ﬁgure.
+While using distinct values to abstract dynamic dependence graph
+can signiﬁcantly reduce the graph size and the proﬁling cost , the
+numbers of distinct values can be very large for some instruc tions,
+such as those that increase loop variables (e.g., line 12 in F igure 2).
+Because each instance of such an instruction produces a diff erent
+270value, its instances can never be merged. In addition, the ex ecution
+frequency of the instruction depends completely on the numb er of
+loop iterations, which is input-sensitive andunbounded , and thus,
+it can still be difﬁcult to collect the value-abstracted dep endence
+graph for large-scale, long-running applications.
+Our experience shows that key to developing a scalable dynam ic
+analysis is to statically bound the amount of information to be col-
+lected dynamically . In other words, the size of the proﬁle should
+have an upper bound before the execution; it cannot depend on
+dynamic behaviors of the program. In Cachetor, we propose to fur-
+ther limit the number of equivalence classes for each instru ction to
+a ﬁxed number k, so that at most kdependence graph nodes can
+be recorded regardless of how many times the instruction is e xe-
+cuted. To do this, we deﬁne a hash function h(v) =v%kthat uses
+a simple modulo operation to map each distinct run-time valu ev
+produced by the instruction into an integer in the set [0, k). Ifvis
+a ﬂoating point value, it is cast to an integer before the hash func-
+tion is performed. This abstraction results in a hash-value -based
+dependence graph, deﬁned as follows:
+Deﬁnition 3 (Hash-Value-Abstracted Data Dependence Graph )
+A hash-value-abstracted data dependence graph ( N′′,E′′) has node
+setN′′⊆ SP × [0, k), where each node is a pair of a static in-
+struction s∈ SP and an integer m∈[0, k)(represented as sm),
+denoting the set of instances of swhose results are mapped to the
+same number mby the hash function h. An edge sm1
+1→sm2
+2
+(s1, s2∈ SP andm1, m2∈[0, k)) shows that an instance of s1
+whose result is mapped to m1writes a location that is used by an
+instance of s2whose result is mapped to m2without an interven-
+ing write to that location. If an instruction accesses a heap location
+through v.f, the reference value in stack location vis also consid-
+ered to be used.
+Note that the hash-value-abstracted dependence graph is a lossy
+representation , where the parameter kdeﬁnes a tradeoff framework
+between analysis precision and scalability. kcan be provided by
+the user as a tuning parameter to ﬁnd the sweetspot for a parti cular
+program. We associate a frequency count with each graph node ,
+representing the number of instruction instances that are m apped
+to the node. It is clear to see that instructions whose execut ions
+are dominated by one graph node are more likely to create iden ti-
+cal values than those whose execution frequencies are thinl y spread
+among multiple nodes. In our experiments, we have evaluated Ca-
+chetor using different k’s. We ﬁnd that (1) a prime number pre-
+serves more information than a composite number and (2) a rel a-
+tively small number can often be very effective to distingui sh truly
+cacheable instructions from those that are not. Details of o ur evalu-
+ation can be found in Section 5.
+2.2 Adding Calling Context Abstraction
+In order to compute cacheability for an object (in D-Cacheto r),
+we need to aggregate the cacheability information for instr uctions
+that write into the object. A common abstraction for modelin g a
+heap object is its allocation site. However, using only allo cation
+sites to aggregate run-time information can cause signiﬁca nt impre-
+cision, leading to reduced usefulness of the tool. This is es pecially
+true for large-scale object-oriented applications that ma ke heavy
+use of data structures. For example, each HashMap has an inte r-
+nal entry array and all these array objects are created by the same
+allocation site. Failing to distinguish array objects base d on the
+HashMap objects they belong to would cause all HashMaps to ha ve
+similar cacheability measurements.
+Object contexts [23] have been widely used in static analysi s to
+distinguish objects that belong to different data structur es. An ob-ject context is represented by a chain of allocation sites of the re-
+ceiver objects for the method invocations on the call stack. We
+propose to add object contexts into the dependence graph so t hat
+instructions that write into different data structures can be distin-
+guished and the cacheability of an instruction can be approp riately
+attributed to the cacheability of the data structure that th e instruc-
+tion writes into. Details about the cacheability computati on will be
+discussed shortly in the next section.
+It can be extremely expensive to record a chain of allocation sites
+for each dependence graph node. To solve the problem, we enco de
+an object context into a probabilistic unique value . An encoding
+function proposed in [8] is adapted to perform this computat ion:
+ci= 3 * ci−1+ai, where aiis the i-th allocation site ID in the
+chain and ci−1is the probabilistic context value computed for the
+chain preﬁx with length i- 1. While simple, this function exhibits
+very small context conﬂict rate, as demonstrated in [8]. Sim ilarly
+to the handling of distinct values, we bound the number of obj ect
+contexts allowed for each instruction with a user-deﬁned pa rameter
+k′, and map each context cito a number in [0, k′) using the same
+hash function ci%k′. Note that this modeling is performed for both
+instructions that manipulate primitive-typed values (i.e .,SP) and
+those that manipulate objects (i.e., SR). The addition of object
+contexts results in a new dependence graph, which we refer to as
+value-and-context (VC)-abstracted data dependence graph : each
+instruction s∈ SP has a pair annotation /angbracketleftm, n/angbracketright, where mis a hash
+value∈[0, k)andnis a hash context ∈[0, k′); each instruction
+s∈ SR has only one (context) annotation n∈[0, k′). The VC-
+abstracted data dependence graph is deﬁned as follows:
+Deﬁnition 4 (VC-Abstracted Data Dependence Graph) A VC-
+abstracted data dependence graph ( N′′′,E′′′) has node set N′′′⊆
+SP × [0, k)×[0, k′)∪ SR × [0, k′), where each node is either
+a triple s/angbracketleftm,n/angbracketright
+1 (s1∈ SP ,m∈[0, k),n∈[0, k′)) , denoting
+the set of instances of s1whose results are mapped to the same
+number mand whose object contexts are mapped to the same num-
+bern, or a pair sn
+2(s2∈ SR ,n∈[0, k′)), denoting the set of
+instances of s2whose object contexts are mapped to the same num-
+bern. Each edge can have one of the three forms: sn1
+1→sn2
+2,
+s/angbracketleftm1,n1/angbracketright
+1 →s/angbracketleftm2,n2/angbracketright
+2 , orsn1
+1→s/angbracketleftm,n2/angbracketright
+2 . The ﬁrst two forms rep-
+resent the propagation of a reference-typed and a primitive -typed
+value, respectively. The third form represents a pointer de referenc-
+ing operation.
+Cachetor proﬁles a program execution to compute a VC-abstra cted
+data dependence graph. This graph will be used by a series of of-
+ﬂine analyses discussed in the next section to compute cacheability
+measurements and rank data structures/call sites. The proﬁ ling de-
+tails can be found in Section 4.
+3. CACHEABILITY COMPUTATION
+This section presents three ofﬂine analyses that take a VC-
+abstracted dependence graph as input and compute cacheabil ity
+measurements (CM) for instructions, data structures, and c all sites.
+These measurements are subsequently used to rank the corres pond-
+ing program entities to facilitate user inspection.
+3.1 Computing Instruction Cacheability Mea-
+surements
+The ﬁrst analysis, I-Cachetor, computes CMs for static inst ruc-
+tions. The higher CM an instruction has, the more identical v alues
+the instruction produces during execution. As discussed in Sec-
+tion 2.1, each dependence graph node s/angbracketleftm,n/angbracketrightis associated with an
+execution frequency count, recording the number of instruc tion in-
+stances that are merged into this node. Using freqm,n
+sto represent
+271the frequency associated with node s/angbracketleftm,n/angbracketright, we give the deﬁnition
+of the instruction CM as follows:
+Deﬁnition 5 (Instruction Cacheability Measurement (ICM)) For
+each static instruction s∈ SP , its ICM is deﬁned as
+ICM s= Avg 0≤n<k′Max0≤m<k(freq/angbracketleftm,n/angbracketright
+s )
+Sum0≤m<k(freq/angbracketleftm,n/angbracketright
+s )
+over all VC-abstracted data dependence graph nodes of the fo rm
+s/angbracketleftm,n/angbracketright.
+ICM is computed only for instructions that manipulate primi tive-
+typed data. For each VC-abstracted dependence graph node s/angbracketleftm,n/angbracketright,
+we ﬁrst ﬁx its context slot n, and compute a ratio between the maxi-
+mum of the frequencies and their sum over the nodes with diffe rent
+hash values m. The ICM of sis ﬁnally computed as the average
+of these ratios for all contexts n. It is clear to see that1
+k≤ICM s
+≤1. If the instruction always produces the same value during ex e-
+cution, its ICM is 1. On the other hand, if the values the instr uction
+produces are spread evenly in the khash value slots, its ICM is1
+k.
+ICM is not particularly useful by itself, because it can be ve ry
+difﬁcult, if not impossible, for the developer to cache the v alue
+of a particular instruction in the program. To further impro ve Ca-
+chetor’s usefulness, we develop two high-level cacheabili ty detec-
+tors to help the developer make sense of the heap and executio n
+information at a high, logical level. ICM will be used later b y the
+two detectors to compute high-level CMs.
+3.2 Computing Data Structure Cacheability
+Measurements
+The second ofﬂine analysis, D-Cachetor, aggregates ICMs fo r
+instructions that write into a data structure to compute dat a struc-
+ture cacheability measurements (DCMs). Speciﬁcally, we co m-
+pute a DCM for each allocation site , summarizing the likelihood
+of the run-time data structures created by the allocation si te con-
+taining identical data values. We ﬁnd that focusing on alloc ation
+sites achieves the right balance between the amount of optim ization
+opportunities that can be detected and the difﬁculty of deve loping
+ﬁxes. For example, if an allocation site has a 100% CM, we may
+simply cache and reuse one single instance for it. Optimizat ion
+opportunities can still be found for allocation sites with s maller
+CMs—although their objects are not entirely identical, the y may
+contain identical ﬁelds, which may be cached for improved pe rfor-
+mance.
+Note that simply ranking allocation sites based on their exe cution
+frequencies cannot reveal caching opportunities. For exam ple, in a
+typical large application, the most frequently executed al location
+site is the one in HashMap.put that keeps creating Map$Entry
+objects to store newly-added keys and values. Objects creat ed by
+this allocation site are not reusable at all. Hence, it is nec essary to
+develop new metrics for allocation sites in our framework.
+A data structure often contains multiple levels of objects, and
+hence, we ﬁrst consider the computation of cacheability mea sure-
+ments for individual objects (i.e., OCMs). OCMs are aggrega ted
+later based on the reference relationships among objects to form the
+DCM of a data structure. To compute the OCM for an allocation
+siteo, we focus on heap store instructions that access primitive-
+typed data only. Reference-typed stores will be considered later
+when OCMs are aggregated.
+The OCM computation starts with inspecting each allocation site
+of the form o:a=newA. As the allocation site accesses a
+reference-typed variable, it belongs to the instruction se t∈ SR
+and has a total of k′nodes in the VC-abstracted dependence graph.
+Each node is of the form on, where nis a hash context valuea.f = b<3,5>a = c2(a) A simple program
+b = d<4,3>...
+pointer dependence
+value dependenceh = c3
+h.g = 10<4,1>h.t = p5p = new P2
+p.q = 20<2,3>1 C c = new C();
+2 C a = c;
+3 int b = d;
+4 a.f = b;5 P p = new P();
+6 p.q = 20;
+7 C h = c;
+8 h.g = 10;
+9 h.t = p;
+c = new C1
+(b) Its dependence graph
+Figure 3: An example program, and its value and pointer de-
+pendence.
+∈[0, k′). The analysis traverses the VC-abstracted dependence
+graph starting from each such node ﬁnd a set of nodes of the for m
+s:a.f=b/angbracketleftm,n′/angbracketrightsuch that s∈ SP andapoints to an object
+created at on. This can be done by distinguishing pointer depen-
+dence andvalue dependence in the dependence graph. A pointer de-
+pendence relationship occurs between an instruction insta nce that
+deﬁnes a pointer variable and a subsequent (load or store) in struc-
+tion instance that dereferences this pointer. A value depen dence
+relationship occurs between an instruction instance that w rites a
+value into a (stack or heap) location and a subsequent instru ction
+instance that reads the value from the location. Figure 3 sho ws a
+simple program and its dependence graph. These two dependen ce
+relationships are represented by dashed arrows and solid ar rows, re-
+spectively. Note that nodes that have pair annotations and t hat have
+single (context) annotations in Figure 3 (b) represent inst ruction in-
+stances manipulating primitive-typed and reference-type d values,
+respectively. Suppose Figure 3 (a) shows an inlined program—
+those statements are originally located in different metho ds. Hence,
+different statements may have different context encoding i n Fig-
+ure 3 (b).
+In order to ﬁnd the set of nodes that write into an object cre-
+ated by an allocation site, we perform a depth-ﬁrst traversa l from
+each node onrepresenting the allocation site. During the traver-
+sal, we are interested in such a pointer dependence edge ethateis
+reachable from ononly through value dependence edges. In other
+words, no other pointer dependence edge exists between eand the
+root node on. Clearly, the target node of erepresents an instruc-
+tion instance that reads/writes an object of the allocation siteon.
+Among these (target) nodes, we are interested only in those t hat
+write primitive-typed values into the object. This subset o f nodes is
+referred to as the object writing instruction set (OWIS) for the allo-
+cation site node on. The OWIS for node c=newC1in Figure 3
+includes, for example, a.f = b/angbracketleft3,5/angbracketrightandh.g = 10/angbracketleft4,1/angbracketright. Note
+that node h.t=p5writes a reference into an object created by c=
+newC1(i.e., it has a single context annotation), and thus, is not
+considered in the OCM computation. Now we give the deﬁnition
+ofon’s object cacheability measurement:
+Deﬁnition 6 (Object Cacheability Measurement (OCM)) For each
+allocation site node on, o∈ SR , its OCM is deﬁned as
+OCM on= Avg s∈OWISICM s,OWIS
+272Algorithm 1: Finding allocation site nodes that belong to the
+same data structure.
+Input : VC-abstracted data dependence graph g, selection ratio r
+Output : Map<Node, Set<Node> > dsMap
+1Set<Node> visited←∅ // Alloc site nodes that have been visited
+2foreach Alloc Site Node oningdo
+3 List<Node> allocList←{on}
+4 Set<Node> ds←{on}
+5dsMap←dsMap∪{/an}bracketle{ton,ds/an}bracketri}ht}
+6 whileallocList/ne}ationslash=∅do
+7 Alloc Site Node pc←removeTop (allocList )
+8 ifpc∈visited then
+9 continue
+10 visited←visited∪{pc}
+11 List<Node> reachedNodes←{pc}
+12 whilereachedNodes/ne}ationslash=∅do
+13 Nodeqd←removeTop (reachedNodes )
+14 foreach outgoing edge eof node qddo
+15 ifeis a pointer dep edge and target (e)writes a reference
+value then
+16 Nodere←target (e)
+17 foreach incoming edge e′of node redo
+18 ife′is a value dependence edge then
+19 /*traverse backward*/
+20 Alloc Site Node
+o′n′←backwardTraverse (e′)
+21 /*if the difference between the OCMs of on
+ando′n′are≤r*/
+22 if|OCMo′n′−OCMon|
+OCMon≤rthen
+23 ds←ds∪{o′n′}
+24 allocList←allocList∪{o′n′}
+25 else if eis a value dep edge and target (e)writes a
+reference value then
+26 reachedNodes←
+reachedNodes∪{target (e)}
+27returndsMap
+where OWIS is the object writing instruction set for node on, and
+ICM s,OWIS denotes the ICM of the instruction scomputed over
+the nodes in OWIS.
+The OCM of an allocation site node is determined by the ICMs
+of the instructions that write primitive-typed values into the objects
+created by the allocation site. However, the ICM for an instr uction
+used here is computed over the nodes in the OWIS of on, while
+the ICM in Deﬁnition 5 is computed over all nodes for the instr uc-
+tion. Because a static instruction may write into objects cr eated by
+different allocation sites during execution, its graph nod es that are
+unreachable from onare not considered towards the computation
+ofon’s OCM.
+DCM computation The OCM computation considers only the
+primitive-typed values contained in an object. In order to ﬁ nd large
+optimization opportunities, we compute DCMs for data struc tures
+by considering reference-typed store instructions and agg regating
+OCMs of the objects connected by such instructions. For each allo-
+cation site node on, the DCM computation ﬁrst identiﬁes other al-
+location site nodes pcthat belong to the same logical data structure
+rooted at on. This can be done by traversing the dependence graph
+from each node onand transitively following pointer dependence
+edges. Algorithm 1 describes the details of such a traversal . The
+algorithm takes as input a VC-abstracted dependence graph a nd a
+selection ratio r∈[0,1], and eventually computes a map dsMap
+that contains, for each allocation site node in the graph (e. g.,on),a set of allocation site nodes (e.g., dsat line 4) that may belong to
+the same logical data structure.
+Initially, dscontains one single element on(line 4), and more
+allocation site nodes will be gradually added into dsas the data
+structure is being discovered by the analysis. allocList is a list of
+allocation site nodes that have been identiﬁed as part of the data
+structure. These nodes need further inspection to ﬁnd those that are
+transitively reachable from them. In the beginning of the an alysis,
+allocList has one node on(line 3). Lines 6–26 show a worklist-
+based iterative process to discover the data structure. Eac h iteration
+of the process retrieves an allocation site node pcfromallocList
+and attempts to ﬁnd allocation site nodes that are reference d bypc.
+This is achieved by performing a breath-ﬁrst traversal of th e graph
+starting from node pc(lines 12–24). For each node qdreached
+during the traversal (line 13), the algorithm inspects each of its out-
+going edges. If an outgoing edge eis a value dependence edge that
+propagates a reference value (lines 25–26), the target node ofeis
+added into list reachedNodes for further inspection. We are par-
+ticularly interested in pointer dependence edges whose tar get is a
+store node writing a reference value (lines 15–24), such as h.t=p5
+in Figure 3, because such an edge can lead the analysis to ﬁnd a llo-
+cation sites that are referenced bypc.
+Once such a pointer dependence edge is found, lines 17–24 tra -
+verse backward the dependence graph, starting from the targ et (re)
+of the edge. This backward traversal follows only value depe n-
+dence edges until it reaches an allocation site node o′n′(line 20),
+which is the creation point of the object that ﬂows to re. It is impor-
+tant to note that we add o′n′into the data structure set dsonly when
+the OCM of o′n′and the OCM of the root of the data structure on
+are close enough (i.e., their difference is ≤the given selection ratio
+r). In other words, we select objects that have similar cachea bil-
+ity measurements to form a data structure so that the develop er can
+easily ﬁnd and ﬁx problems related to the data structure.
+Example We use the simple example in Figure 3 to illustrate
+how the algorithm works. In order to identify the data struct ure
+rooted at the node c=newC1, our analysis traverses the graph
+until it reaches a pointer dependence edge whose target node (i.e.,
+h.t=p5) is a heap store writing a reference value. Next, Lines 15–
+24 in Algorithm 1 traverse backward the dependence graph sta rt-
+ing from h.t=p5, following only value dependence edges. This
+traversal leads up to the allocation site node p=newP2. There ex-
+ists a “reference” relationship between this node and node c=new
+C1. The OCMs of these two nodes are then compared (against
+the selection ratio r) to determine whether p=newP2should be
+included in the data structure set of c=newC1.
+Using DS onto represent the set of allocation nodes discovered
+by Algorithm 1 for the root note on, we give the deﬁnition of DCM
+as follows. Note that onitself is also included in DS on.
+Deﬁnition 7 (Data Structure Cacheability Measurement (DCM ))
+For each allocation site node on, its DCM is deﬁned as
+DCM on= Avgpd∈DSonOCMpd
+whereOCMpdis the object cacheability measurement for the allo-
+cation site node pd, as deﬁned in Deﬁnition 6.
+Eventually, allocation site nodes are ranked based on their DCMs
+and the ranked list is reported to the user for manual inspect ion.
+When Cachetor reports an allocation site node on, it reports not
+onlyonitself but also the data structure DS oncomputed by Algo-
+rithm 1. This would make it easier for the developer to unders tand
+the problem and develop the ﬁx to cache the (invariant part) o f the
+273data structure. Note that different graph nodes for the same static
+allocation site are reported separately based on their DCMs . The al-
+location site may be cacheable only under certain calling co ntexts;
+reporting them separately (instead of combining them using an av-
+erage) would potentially reveal more optimization opportu nities.
+3.3 Computing Call Site Cacheability
+Measurements
+The third ofﬂine analysis, M-Cachetor, computes cacheabil ity
+measurements for call sites. Our target is call sites that ha ve val-
+ues returned from the callees. We are not interested in those that
+do not bring values back, because it is often unclear how to av oid
+re-executing such calls. Given a call site of the form a=f(. . .), its
+call site cacheability measurement (CCM) is determined by w hether
+aalways receives identical values. It is computed by either q uery-
+ing I-Cachetor for the ICM of the instruction (if ais a primitive-
+typed variable) or querying D-Cachetor for the DCM(s) of the al-
+location site(s) that create the objects acan point to. Formally, we
+give the deﬁnition of CCM as follows.
+Deﬁnition 8 (Call Site Cacheability Measurement (CCM)) For
+each call site c:a=f(. . .), its CCM is deﬁned as
+CCM c=(
+ICM c a is a primitive-typed var
+Avgon∈Alloc(a)DCM onotherwise
+where Alloc( a) is a set of allocation site nodes such that the objects
+created at these allocation sites may ﬂow to a.
+The set of allocation site nodes ( Alloc (a)) can be obtained by
+traversing backward the dependence graph from the call site (into
+the callee) and following only value-dependence edges. Thi s pro-
+cess is similar to what lines 18–24 do in Algorithm 1. Note tha t
+to compute CCM for a call site, we consider only whether the ca ll
+returns identical values, regardless of its arguments. Thi s deﬁni-
+tion may potentially expose more optimization opportuniti es—if
+the call produces the same output under different inputs, th ere may
+be some repeated computation inside the method that can be re used
+for increased efﬁciency. Eventually, call sites are ranked based on
+their CCMs and then reported to the user.
+Another important optimizability measurement is the execu tion
+frequency of each allocation/call site. To take this into ac count,
+we take the top 100 allocation/call sites from their respect ive lists
+(ranked based on the DCMs and CCMs), and re-rank them based
+on their frequencies. These newly ranked lists contain info rmation
+regarding not only cacheability but also execution “hotnes s”; the
+developer could thus focus her effort on ﬁxing problems with allo-
+cation/call sites that are both cacheable and frequently ex ecuted.
+4. DEPENDENCE GRAPH PROFILING
+We have implemented Cachetor in the Jikes Research Virtual M a-
+chine (RVM) version 3.1.1 [16]. JikesRVM contains two Just- In-
+Time (JIT) compilers: a baseline compiler that directly tra nslates
+Java bytecode into Assembly code, and an optimizing compile r that
+recompiles and optimizes hot methods for improved performa nce.
+The Cachetor instrumentation is performed on the high-leve l inter-
+mediate representation (HIR) generated by the optimizing c ompiler,
+and thus it runs in the optimizing-compiler-only mode.
+As the parameters k(i.e., the number of value slots) and k′(i.e.,
+the number of context slots) are determined by the user befor e the
+execution, all dependence graph nodes can be created at the c om-
+pile time. Speciﬁcally, we inspect each HIR instruction dur ing the
+compilation; if the instruction manipulates primitive-ty ped data, weallocate an k×k′array and each slot of the array represents a graph
+node for the instruction; if the instruction manipulates re ferences,
+we only need to create an array of k′slots. We use a shadow mem-
+oryto perform the dependence graph proﬁling. For each memory
+location lin the program, we maintain a shadow location l′that
+keeps track of the address of the graph node that represents t he
+instruction instance that last writes into l. Iflis a stack variable,
+l′is simply a new (32-bit) variable in the same method stack. To
+shadow heap locations, we introduce an additional (32-bit) ﬁeld for
+each existing ﬁeld in each class. To shadow an array with sslots,
+we modify the object allocator in the JikesRVM in a way so that
+an additional space of s∗4bytes is allocated and appended to the
+space of the array upon its creation.
+At each instruction that reads locations l1, l2, . . . , l nand writes
+location l0, our instrumentation code adds dependence graph edges
+in the following three steps: (1) the current (encoded) call ing con-
+text and the value in l0are retrieved. These values are used to deter-
+mine which dependence graph node nthis particular instance of the
+instruction should be mapped to; (2) values contained in the shadow
+locations of l′
+1, l′
+2, . . . , l′
+nare retrieved. These values correspond to
+(the addresses of) the dependence graph nodes that last writ e into
+l1, l2, . . . , l n, respectively; (3) we add a dependence graph edge
+between each node contained in l′
+iand node n, representing a de-
+pendence relationship. The address of nis then written into the
+shadow location l′
+0; this address will be retrieved later when another
+instruction uses l0. Eventually, if the instruction does a pointer def-
+erence on li, the edge connecting l′
+iandnis annotated with pointer
+dependence; otherwise, it is annotated with value dependen ce.
+We create a tracking stack to propagate tracking informatio n be-
+tween callers and callees. In addition, instrumentation co de is in-
+serted before each call site and in the beginning of each meth od
+in order to calculate object contexts. When a method is execu ted,
+its current object context is stored in a local variable, whi ch will
+be retrieved and used later to determine dependence graph no des.
+It is important to note that Cachetor is thread-safe. We coll ect a
+VC-abstracted dependence graph per thread and eventually c om-
+bine these graphs to compute various CMs.
+5. EV ALUATION
+We have applied Cachetor to a set of 14 real-world programs,
+from both the DaCapo benchmark set [7] and the Java Grande
+benchmark set [2]. We are not aware of any publicly available tool
+that can provide similar diagnostic information to serve as basis for
+comparison. Therefore, in this section, we describe the ove rhead
+measurements and our experiences with ﬁnding and ﬁxing perf or-
+mance problems using Cachetor.
+All programs were executed with their large workloads. Expe r-
+imental results were obtained on a quad-core machine with In tel
+Xeon E5620 2.40 GHz processor, running Linux 2.6.18. The max i-
+mal heap size was 4GB.
+5.1 Overhead Measurements
+Table 1 shows our overhead measurements. The parameters k
+andk′used to obtain the data are both 11. It appears that 11 is
+the largest prime number to which our benchmarks can scale. I n-
+creasing either kork′to 13 causes some programs to run out of
+memory. Due to space limitations, we report only the worst-c ase
+performance measurements (for k=k′= 11 ). Using a smaller k
+ork′will signiﬁcantly reduce the time and space overheads. User
+may use kandk′as tuning parameters to ﬁnd the balance point be-
+tween the precision of the report and the scalability of the a nalysis.
+Section (a) reports the characteristics of 14 benchmarks in term of
+the size of their VC-abstracted graphs (i.e., number of node s and
+274Table 1: Our benchmarks, the characteristics of their VC-ab stracted graphs, and the overhead measurements.
+Program (a) Graph characteristics (b) Time overhead (c) Space overhead
+#Nodes #Edges #Classes #Methods T0(s) T1(s) TO (×)S0(MB) S1(MB) SO (×)
+antlr 333212 1217324 121 1297 13.48 7654.49 566.90 42.69 426.40 8.99
+bloat 339295 371854 252 1780 69.42 2765.86 38.84 119.74 199.64 0.67
+fop 188947 85003 671 2581 2.05 40.51 18.80 82.47 135.79 0.65
+hsqldb 77484 16317 140 1126 10.50 45.81 3.36 295.06 457.40 0.55
+luindex 122914 69281 118 652 13.79 3967.88 286.78 50.12 123.74 1.47
+lusearch 109549 35726 110 549 5.52 935.25 168.41 67.91 179.90 1.65
+pmd 201069 107503 391 2298 20.24 6438.53 317.09 96.54 174.71 0.81
+xalan 246202 122172 353 2192 16.07 1016.12 62.23 169.43 226.77 0.34
+avrora 541244 545131 377 1132 29.75 5332.26 178.24 91.70 254.46 1.77
+sunﬂow 419705 1131193 140 537 53.22 12447.50 232.88 82.08 336.80 3.10
+euler 62656 3821 8 38 14.11 3637.41 256.79 34.02 81.74 1.40
+moldyn 20350 19761 13 76 33.36 8451.03 252.33 14.49 27.49 0.90
+montecarlo 12749 14105 18 106 20.90 3088.01 146.75 549.81 824.77 0.50
+raytracer 13464 252030 16 67 42.99 12852.51 297.97 12.56 74.76 4.95
+GeoMean 201.96 1.98
+edges) and source code (i.e., number of classes and methods t hat
+are executed and instrumented by Cachetor).
+Section (b) and (c) of the table report the overheads of Cache tor.
+The running time measured for our tool (column T 1) includes both
+the actual execution time and the time for the ofﬂine analyse s, which
+occur before the JVM exits. On average, the tool incurs a 201. 96×
+overhead in execution time. The additional peak memory cons ump-
+tion is 1.98 ×larger than that of the original program across all
+benchmarks. This is due to the extra space for memory shadowi ng
+as well as the VC-abstracted graph. While both time and space over-
+head of our tool are too high for production executions, they may be
+acceptable for performance tuning and debugging. In additi on, the
+high overhead has not prevented us from collecting data from real-
+world applications. This paper focuses on the demonstratio n of the
+usefulness of the technique, and future work may consider va rious
+optimization techniques, such as sampling and selective pr oﬁling
+of certain suspicious areas, to reduce Cachetor’s overhead s.
+5.2 Case Studies
+We have inspected the analysis reports for all the benchmark s in
+Table 1. This section describes our studies on ﬁve of them: mon-
+tecarlo ,raytracer ,euler ,bloat andxalan . It takes us 2 weeks to
+conduct the studies. We choose to report our experience with these
+benchmarks partly because they contain interesting (repre sentative)
+coding patterns leading to repeated computations of identi cal data
+values, and partly because large performance improvements have
+been seen after the implementation of ﬁxes (e.g., 98.7% spac e re-
+duction for montecarlo and 20.5% running time reduction for eu-
+ler). These reports were generated under the same analysis conﬁ g-
+uration and 30% was chosen to be the selection ratio r(described
+in Algorithm 1). We have compared the analysis reports gener ated
+under three different r(i.e., 10%, 30% and 50%), and ﬁnd that r
+= 30% appears to be a balance point between the amount of opti-
+mization opportunities that can be found and the difﬁculty o f devel-
+oping ﬁxes. While r= 10% identiﬁes truly optimizable data struc-
+tures, the size of each reported data structure is very small . On the
+other hand, r= 50% identiﬁes large data structures which are often
+mixes of optimizable and non-optimizable parts of the heap. Even
+though Jikes RVM is the platform on which Cachetor was imple-
+mented and the reports were generated, the performance stat istics
+before and after the ﬁxes were collected using Java Hotspot 6 4-bit
+Server VM build 1.6.0_27. Hence, the performance improveme nts
+we have achieved are beyond the compiler optimizations even in
+a commercial JVM. In order to avoid compilation costs and exe -cution noises, each application is run 5 times and the median s are
+compared and reported.
+montecarlo is a ﬁnancial simulation tool included in the Java
+Grande benchmark suite [2]. It uses Monte Carlo techniques t o
+price products derived from the price of an underlying asset . The
+simulation generates 60,000 sample time series with the sam e mean
+and ﬂuctuation as a series of historical data. The top two all oca-
+tion sites from D-Cachetor’s report are located at lines 184 and 185
+of classAppDemo . These allocation sites create seed objects and
+header objects, respectively, in order to construct a Task , which is
+then saved into a list. After carefully inspecting the code, we ﬁnd
+that we are actually able to implement a singleton pattern fo r these
+allocation sites—the list contains identical tasks, and he nce, one
+single instance of the task would sufﬁce for the execution. E ven
+though the DCMs are relatively low because only part of the ob -
+jects contains identical values, the next three allocation sites are
+located inside loops and their executions create objects wi th com-
+pletely disjoint lifetimes. To optimize, we hoist these sit es out of
+the loops and create a clone when required.
+Many call sites reported by M-Cachetor have high CCMs (1.0).
+Among the top are call sites at line 155 of method getResult
+and line 104 of setInitAllTasks in the class PriceStock .
+These calls return exactly the same objects every time they a re exe-
+cuted. In addition, the returned objects are used only as tem porary
+objects that carry multiple values from the callees to the ca llers.
+We cache these objects into static ﬁelds to avoid re-invokin g these
+calls. Further investigation of method getResult reveals that
+there is even no need for this method to create an object to hol d
+data. Originally the program stores all the returned data in to a list
+and wait to compute the ﬁnal price. We eliminate the list and c om-
+pute the ﬁnal price on the ﬂy every time a new result is returne d.
+After implementing these ﬁxes, we have seen a 98.7% reductio n
+in the peak memory consumption (from 507268KB to 6320KB), a
+70.0% reduction in the number of garbage collection runs (fr om
+10 to 3), a 89.2% reduction in the time spent on GC (from 461ms
+to 50ms), and a 12.1% reduction in the total running time (fro m
+12.146s to 10.678s). Each Java Grande benchmark reports an “ ef-
+ﬁciency” measurement based on a certain performance metric . For
+montecarlo , the ﬁxed version has gained a 12.5% improvement ac-
+cording to its own efﬁciency measurement.
+raytracer is a Java Grande benchmark that measures the perfor-
+mance of a 3D ray tracer. The scene contains 64 spheres and is
+rendered at a resolution of 500 ×500 pixels. Out of the top four
+allocation sites reported by D-Cachetor, two sites are loca ted in
+275methodshade . We inspect the code and ﬁnd that objects created
+at the allocation site at line 337 always contain the same dat a and
+are discarded after the method returns. The other allocatio n site is
+located at line 335; even though its DCM is 1, we cannot develo p
+a ﬁx for it—objects created by this site are returned by metho d
+shade , which is a recursive method. The recursion prevents us
+from caching an instance of the allocation site in a ﬁeld.
+We additionally ﬁnd that many allocation sites in the report cre-
+ate large numbers of objects of type Vec, each of which stores the
+results of certain computations in a method and is then retur ned
+to the caller of the method. While the DCMs of these allocatio n
+sites are not very high (i.e., only certain ﬁelds of the objec ts con-
+tain identical values), we manage to reuse one Vec instance across
+all these allocation sites and reset its content if necessar y. We also
+ﬁnd that in class Sphere , objects referenced by its ﬁeld Vec b
+always have the same data content, because the ﬁeld is comple tely
+unused after being initialized. Thus, we remove this ﬁeld fr om the
+class. All these ﬁxes have led to a 19.1% reduction in the runn ing
+time (from 18.595s to 15.034s), a 33.3% reduction in the numb er
+of GC runs (15 to 10), and a 30.2% reduction in the GC time (39ms
+to 27ms). The benchmark-speciﬁc “efﬁciency” (i.e., the num ber
+of pixels per second) is improved by 20.3%, from 13453.95 to
+16179.14. Only a 1.2% reduction is seen in the peak memory con -
+sumption.
+euler is a Java Grande benchmark that solves the time-dependent
+Euler equations for the ﬂow from a channel employing a struc-
+tured, irregular 96 ×384 mesh. The top allocation site reported by
+D-Cachetor is at line 158 of class Tunnel , initializing a matrix
+with elements typed Statevector . This allocation site has a 1.0
+DCM. After inspecting the code, we realize that immediately after
+this initialization point, the element of this matrix is rep laced by
+anotherStatevector object created in method calculate-
+Damping . Hence, we can safely remove this allocation site. The
+matrix element replacement leads us to inspect the method
+calculateDamping . In this method, three Statevector ob-
+jects are used as value containers for computations and die a fter
+the method returns. While these three allocations sites do n ot have
+very high DCMs (i.e., only around 0.57), we come up with a ﬁx by
+creating three static ﬁelds, one for each allocation site to cache its
+instance. A similar ﬁx is employed for three Vector2 objects in
+methodcalculateDummyCells .
+The report of M-Cachetor reveals more optimization opportu ni-
+ties. Among the top call sites are those that invoke method svect
+of classStatevector .svect returns aStatevector object
+that may be saved in the matrix created in class Tunnel mentioned
+above. These calls are located inside a loop, and thus they cr eate
+large numbers of objects at run time. We develop a ﬁx that make s
+svect return one single Statevector object and create a clone
+only when it receives different values or is assigned to the m atrix.
+Altogether these ﬁxes have reduced the running time from 5.3 44s
+to 4.246s (20.5%), number of GC runs from 5 to 3 (40.0%) and
+the GC time from 46ms to 25ms (44.8%). No signiﬁcant reduc-
+tion is seen in the peak memory consumption. There is a 27.9%
+“efﬁciency” improvement after the ﬁxes are implemented.
+bloat is a Java byte-code optimizer and analysis tool. The re-
+port of D-Cachetor points to the heavy use of the visitor patt ern—
+many of the top allocation sites are related to visitor class es such
+asTreeVisitor andComponentVisitor .bloat declares
+a visitor class for each program entity and creates an object of
+the class to visit each entity object. We ﬁnd that these visit or ob-
+jects contain the same auxiliary data and their lifetimes ar e com-
+pletely disjoint. To optimize, we manually implement the si ngle-
+ton pattern for each visitor class and use a single visitor ob jectto visit all program entities of the same type. Cachetor also re-
+ports that many allocation sites frequently create constan t arrays,
+such as those at lines 1365 and 1400 of class Tree , lines 1658
+and 1644 of class CodeGenerator , lines 330 and 336 of class
+TypeInferenceVisitor , and line 131 of class SSAGraph .
+These arrays contain offset values and serve no other purpos es.
+Hence, we can safely cache these arrays into static ﬁelds. Th e
+running time and the peak memory consumption are reduced by
+13.1% (from 26239ms to 22809ms) and 12.6% (from 177286KB
+to 154933KB), respectively. No signiﬁcant reduction is see n in the
+number of GC runs and total GC time.
+xalan is an XSLT processor for transforming XML documents.
+The top allocation sites on D-Cachetor’s report are at lines 191
+and 440 of class NodeSequence , where the content of a newly-
+createdNodeVector object is only used to initialize another ob-
+ject. Lines 862 and 865 of class XPathContext createNode-
+Vector objects whose content are always the same are also among
+the top results. We ﬁx the problems by using static ﬁelds to ca che
+the instances of NodeVector created by these allocation sites.
+The same ﬁx can be applied to the allocation site at line 721 of
+classSAX2DTM . We also inspect call sites that have high CCMs
+from M-Cachetor’s report. As these calls have very simple in puts,
+we perform lightweight proﬁling to understand what the freq uent
+inputs and outputs are for them. Then we cache these frequent in-
+puts and outputs into a HashMap; upon the execution of the cal l
+site, we ﬁrst query the HashMap to see if the input of the call i s in
+the map. If it is, the result is directly retrieved and used; o therwise,
+the call still needs to be executed. These ﬁxes have resulted in a
+5.2% reduction in the running time (from 8321ms to 7889ms). N o
+reduction is seen in the memory consumption.
+Table 2: Numbers of false positives identiﬁed in the reports of
+D-Cachetor andM-Cachetor .
+Program D-Cachetor M-Cachetor
+bloat 1 4
+xalan 4 3
+euler 1 (6) 7 (19)
+montecarlo 2 (9) 6 (17)
+raytracer 3 (13) 4 (17)
+5.3 False Positives
+Table 2 lists the numbers of false positives identiﬁed among the
+top 20 allocations sites in the reports of D-Cachetor and M-C achetor.
+If the total number of reported allocation/call sites is sma ller than
+20, that number is shown in parentheses. An allocation/call site is
+classiﬁed as a false positive if either (a) it is clearly not c acheable
+or (b) we could not develop a ﬁx to cache the data. Based on
+our studies, we have identiﬁed the following four sources of false
+positives. The ﬁrst source is the handling of ﬂoating point v alues.
+Casting ﬂoating point values into integers before applying the hash
+function causes Cachetor to mistakenly classify different run-time
+values into the same slot. Future work may develop a lossless en-
+coding for ﬂoating point values, using, for example, the IEE E 754
+ﬂoating-point “single format” bit layout [1].
+The second source of false positives is the context-sensiti ve re-
+porting of allocation sites. Associating calling contexts with in-
+structions is extremely important for Cachetor to distingu ish ob-
+jects based on their logical data structures. However, repo rting
+cacheability of allocation sites separately for different contexts makes
+it difﬁcult for the developer to understand and ﬁx problems. This is
+the case especially if the DCMs of an allocation site differ s igniﬁ-
+cantly under different contexts. Future work may address th is prob-
+276lem by recording richer calling context information which w ould
+allow the user to recover a context from the encoded number.
+The third source is the missing of the actual values that are f re-
+quently produced in our analysis reports. For example, M-Ca chetor
+reports call sites with high CCMs, but fails to provide infor mation
+regarding what the frequent inputs and outputs are for the ca ll sites.
+The developer has to do additional proﬁling to understand th ese
+values in order to develop ﬁxes. While some extra effort is ne eded
+to ﬁnd such frequent input and output values, this proﬁling i s very
+lightweight and can be quickly implemented. We implement su ch
+proﬁling for almost every call site we inspect, and the burde n of
+time is negligible.
+Eventually, value hashing may give rise to false positives. In
+D-Cachetor’s report for montecarlo , we have found a few alloca-
+tion sites that have high DCMs but do not really contain ident ical
+values. One example is an allocation site that creates seed o bjects.
+Our code inspection reveals that a seed object is created bas ed on
+a sequence of numbers, each of which is a multiple of 11. This
+hard-coded number 11 is coincidentally the same as the value of
+kwe chose, causing instruction instances producing differe nt val-
+ues to be mapped into the same slot. However, hashing-induce d
+false positives are not common and montecarlo is the only program
+where such misclassiﬁcation was found. Future work may alle viate
+the problem by comparing the reports generated under differ entks,
+and selecting only the common (top) allocation sites.
+6. RELATED WORK
+Software bloat analysis Dufour et al. propose dynamic met-
+rics for Java [12], which provide insights by quantifying ru ntime
+bloat. Mitchell et al. [25] structure behavior according to the ﬂow
+of information, though using a manual technique. Their aim i s to
+allow programmers to place judgments on whether certain cla sses
+of computations are excessive. Their follow-up work [24] in tro-
+duces a way to ﬁnd data structures that consume excessive amo unts
+of memory. Work by Dufour et al. ﬁnds excessive use of tempo-
+rary data structures [13, 14] and summarizes the shape of the se
+structures. In contrast to the purely dynamic approximatio n intro-
+duced in our work, they employ a blended escape analysis, whi ch
+applies static analysis to a region of dynamically collecte d calling
+structure with observed performance problem. By approxima ting
+object effective lifetimes, the analysis has been shown to b e useful
+in classifying the usage of newly created objects in the prob lematic
+program region.
+Object Equality Proﬁling (OEP) [22] is a run-time technique that
+discovers opportunities for replacing a set of equivalent o bject in-
+stances with a single representative object to save space. J OLT [30]
+is a VM-based tool that uses a new metric to quantify object churn
+and identify regions that make heavy use of temporary object s, in
+order to guide aggressive method inlining. Work by Xu et al. [35,
+36, 37, 38, 34] ﬁnds copy- and container-related inefﬁcienc ies. Jin
+et al. from [17] studies performance bugs in real-world software
+systems. These bugs are analyzed to extract efﬁciency rules , which
+are then applied to detect problems in other applications. R ecent
+work by Nistor et al. [26] detects performance problems using sim-
+ilar memory-access patterns. Xu [33] proposes a technique t o ﬁnd
+reusable data structures. The technique gives a three-leve l reusabil-
+ity deﬁnition, and encodes instances, shapes, and data cont ent of
+run-time data structures to ﬁnd optimization opportunitie s. Unlike
+all the existing work on performance problem detection, Cac hetor
+is the ﬁrst attempt to use an abstracted dynamic dependence g raph
+to ﬁnd caching opportunities.
+Control- and data-based proﬁling Proﬁling techniques have
+been proposed for various optimization and software engine eringtasks: These techniques include dynamic dependence proﬁle s [4],
+control ﬂow proﬁles [6], and value proﬁles [10]. Research fr om [20,
+45] studies the compressed representations of control ﬂow t races.
+Value predictors [9] are proposed to compress value proﬁles , which
+can be used to perform various kinds of tasks such as code spec ial-
+ization [10], data compression [46], value encoding [39] an d value
+speculation [21]. Research from [11] proposes a technique t o com-
+press an address proﬁle, which is used to help prefetch data [ 15]
+and to ﬁnd cache conscious data layouts [28]. Zhang and Gupta
+propose whole execution traces [42] that include complete data in-
+formation of an execution, to enable the mining of behavior t hat re-
+quires understanding of relationships among various proﬁl es. Am-
+mons et al. [5] develops a dynamic analysis tool to explore calling
+context trees in order to ﬁnd performance bottlenecks. Srin ivas
+et al. [31] use a dynamic analysis technique that identiﬁes impor-
+tant program components, also by inspecting calling contex t trees.
+Chameleon [29] is a dynamic analysis tool that proﬁles conta iner
+behaviors to provide advice as to the choices of appropriate con-
+tainers. The work in [27] proposes object ownership proﬁlin g to
+detect memory leaks in Java programs.
+Dynamic dependence analysis and slicing Since ﬁrst being
+proposed by Korel and Laski [18], dynamic slicing has inspir ed a
+large body of work on efﬁciently computing slices and on appl ica-
+tions to a variety of software engineering tasks. A general d escrip-
+tion of slicing technology and challenges can be found in Tip ’s sur-
+vey [32] and Krinke’s thesis [19]. The work by Zhang et al. [40,
+41, 43] has considerably improved the state of the art in dyna mic
+slicing. The work from [44] is more related to our work in that the
+proposed event-based slicing approach uses pre-deﬁned eve nts to
+merge dependence graph nodes. However, this work targets au to-
+mated program debugging, whereas the goal of the proposed wo rk
+is to ﬁnd caching opportunities to improve performance.
+7. CONCLUSIONS
+This paper presents a novel dynamic analysis tool, called Ca -
+chetor, that proﬁles a program to help the developer ﬁnd cach ing
+opportunities for improved performance. Cachetor contain s three
+different cacheable data detectors: I-Cachetor, D-Cachet or, and M-
+Cachetor, that ﬁnd cacheable data at the instruction-, data -structure-
+, and call-site-level, respectively. To make Cachetor scal e to real-
+world programs, we develop a novel dynamic technique that co m-
+bines value proﬁling and dynamic dependence analysis in a no vel
+way so that distinct values are used to abstract instruction instances.
+Based on the abstracted dependence graph, we develop three o f-
+ﬂine analyses to compute cacheability measurements that wi ll be
+used by the three detectors to generate analysis report. We h ave
+implemented Cachetor on JikesRVM and evaluated it on a set of 14
+large-scale, real-world applications. Our experimental r esults show
+that the overhead of Cachetor is large but acceptable, and la rge op-
+timization opportunities can be quickly found by inspectin g its re-
+ports.
+8. ACKNOWLEDGMENTS
+We thank Kathryn McKinley for her helpful comments on an
+early draft of this paper. We would also like to thank the anon y-
+mous reviewers for their constructive comments.
+9. REFERENCES
+[1] IEEE standard 754 ﬂoating-point.
+http://steve.hollasch.net/cgindex/coding/ieeeﬂoat.h tml.
+[2] The Java Grande benchmark suite.
+http://www2.epcc.ed.ac.uk/computing/research_activi ties/
+277java_grande/index_ 1.html.
+[3] Websphere application server development best practic es for
+performance and scalability.
+http://www-3.ibm.com/software/
+webservers/appserv/ws_bestpractices.pdf.
+[4] H. Agrawal and J. R. Horgan. Dynamic program slicing. In
+PLDI , pages 246–256, 1990.
+[5] G. Ammons, J.-D. Choi, M. Gupta, and N. Swamy. Finding
+and removing performance bottlenecks in large systems. In
+ECOOP , pages 172–196, 2004.
+[6] T. Ball and J. Larus. Efﬁcient path proﬁling. In MICRO ,
+pages 46–57, 1996.
+[7] S. M. Blackburn, R. Garner, C. Hoffman, A. M. Khan, K. S.
+McKinley, R. Bentzur, A. Diwan, D. Feinberg, D. Frampton,
+S. Z. Guyer, M. Hirzel, A. Hosking, M. Jump, H. Lee,
+J. E. B. Moss, A. Phansalkar, D. Stefanovi ´c, T. VanDrunen,
+D. von Dincklage, and B. Wiedermann. The DaCapo
+benchmarks: Java benchmarking development and analysis.
+InOOPSLA , pages 169–190, 2006.
+[8] M. D. Bond and K. S. McKinley. Probabilistic calling
+context. In OOPSLA , pages 97–112, 2007.
+[9] M. Burtscher and M. Jeeradit. Compressing extended
+program traces using value predictors. In PACT , pages
+159–169, 2003.
+[10] B. Calder, P. Feller, and A. Eustace. Value proﬁling. In
+MICRO , pages 259–269, 1997.
+[11] T. M. Chilimbi. Efﬁcient representations and abstract ions for
+quantifying and exploiting data reference locality. In PLDI ,
+pages 191–202, 2001.
+[12] B. Dufour, K. Driesen, L. Hendren, and C. Verbrugge.
+Dynamic metrics for Java. In OOPSLA , pages 149–168,
+2003.
+[13] B. Dufour, B. G. Ryder, and G. Sevitsky. Blended analysi s
+for performance understanding of framework-based
+applications. In ISSTA , pages 118–128, 2007.
+[14] B. Dufour, B. G. Ryder, and G. Sevitsky. A scalable
+technique for characterizing the usage of temporaries in
+framework-intensive Java applications. In FSE, pages 59–70,
+2008.
+[15] Q. Jacobson, E. Rotenberg, and J. E. Smith. Path-based n ext
+trace prediction. In MICRO , pages 14–23, 1997.
+[16] Jikes Research Virtual Machine .
+http://jikesrvm.org .
+[17] G. Jin, L. Song, X. Shi, J. Scherpelz, and S. Lu.
+Understanding and detecting real-world performance bugs.
+InPLDI , pages 77–88, 2012.
+[18] B. Korel and J. Laski. Dynamic slicing of computer
+programs. Journal of Systems and Software , 13(3):187–195,
+1990.
+[19] J. Krinke. Advanced Slicing of Sequential and Concurrent
+Programs . PhD thesis, University of Passau, 2003.
+[20] J. Larus. Whole program paths. In PLDI , pages 259–269,
+1999.
+[21] M. H. Lipasti and J. P. Shen. Exceeding the dataﬂow limit
+via value prediction. In MICRO , pages 226–237, 1996.
+[22] D. Marinov and R. O’Callahan. Object equality proﬁling . In
+OOPSLA , pages 313–325, 2003.
+[23] A. Milanova, A. Rountev, and B. G. Ryder. Parameterized
+object sensitivity for points-to analysis for Java. TOSEM ,
+14(1):1–41, 2005.[24] N. Mitchell and G. Sevitsky. The causes of bloat, the lim its
+of health. OOPSLA , pages 245–260, 2007.
+[25] N. Mitchell, G. Sevitsky, and H. Srinivasan. Modeling
+runtime behavior in framework-based applications. In
+ECOOP , pages 429–451, 2006.
+[26] A. Nistor, L. Song, D. Marinov, and S. Lu. Toddler:
+Detecting performance problems via similar memory-access
+patterns. In ICSE , 2013. to appear.
+[27] D. Rayside and L. Mendel. Object ownership proﬁling: A
+technique for ﬁnding and ﬁxing memory leaks. In ASE,
+pages 194–203, 2007.
+[28] S. Rubin, R. Bodik, and T. Chilimbi. An efﬁcient
+proﬁle-analysis framework for data-layout optimizations . In
+POPL , pages 140–153, 2002.
+[29] O. Shacham, M. Vechev, and E. Yahav. Chameleon: Adaptiv e
+selection of collections. In PLDI , pages 408–418, 2009.
+[30] A. Shankar, M. Arnold, and R. Bodik. JOLT: Lightweight
+dynamic analysis and removal of object churn. In OOPSLA ,
+pages 127–142, 2008.
+[31] K. Srinivas and H. Srinivasan. Summarizing applicatio n
+performance from a component perspective. In FSE, pages
+136–145, 2005.
+[32] F. Tip. A survey of program slicing techniques. Journal of
+Programming Languages , 3:121–189, 1995.
+[33] G. Xu. Finding reusable data structures. In OOPSLA , pages
+1017–1034, 2012.
+[34] G. Xu. CoCo: Sound and adaptive replacement of Java
+collections. In ECOOP , pages 1–26, 2013.
+[35] G. Xu, M. Arnold, N. Mitchell, A. Rountev, E. Schonberg,
+and G. Sevitsky. Finding low-utility data structures. In PLDI ,
+pages 174–186, 2010.
+[36] G. Xu, M. Arnold, N. Mitchell, A. Rountev, and G. Sevitsk y.
+Go with the ﬂow: Proﬁling copies to ﬁnd runtime bloat. In
+PLDI , pages 419–430, 2009.
+[37] G. Xu and A. Rountev. Detecting inefﬁciently-used
+containers to avoid bloat. In PLDI , pages 160–173, 2010.
+[38] G. Xu, D. Yan, and A. Rountev. Static detection of
+loop-invariant data structures. In ECOOP , pages 738–763,
+2012.
+[39] J. Yang and R. Gupta. Frequent value locality and its
+applications. TOPLAS , 1(1):79–105, 2002.
+[40] X. Zhang, N. Gupta, and R. Gupta. Pruning dynamic slices
+with conﬁdence. In PLDI , pages 169–180, 2006.
+[41] X. Zhang and R. Gupta. Cost effective dynamic program
+slicing. In PLDI , pages 94–106, 2004.
+[42] X. Zhang and R. Gupta. Whole execution traces. In MICRO ,
+pages 105–116, 2004.
+[43] X. Zhang, R. Gupta, and Y . Zhang. Precise dynamic slicin g
+algorithms. In ICSE , pages 319–329, 2003.
+[44] X. Zhang, S. Tallam, and R. Gupta. Dynamic slicing long
+running programs through execution fast forwarding. In FSE,
+pages 81–91, 2006.
+[45] Y . Zhang and R. Gupta. Timestamped whole program path
+representation and its applications. In PLDI , pages 180–190,
+2001.
+[46] Y . Zhang and R. Gupta. Data compression transformation s
+for dynamically allocated data structures. In CC, pages
+14–28, 2002.
+278

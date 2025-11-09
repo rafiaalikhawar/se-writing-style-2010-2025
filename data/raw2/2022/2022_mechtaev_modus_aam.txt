@@ -1,0 +1,1182 @@
+Modus: A Datalog Dialect for Building Container Images
+Chris Tomy∗
+University College London
+United Kingdom
+chris.tomy.19@ucl.ac.ukTingmao Wang∗
+University College London
+United Kingdom
+tingmao.wang.19@ucl.ac.uk
+Earl T. Barr
+University College London
+United Kingdom
+e.barr@ucl.ac.ukSergey Mechtaev
+University College London
+United Kingdom
+s.mechtaev@ucl.ac.uk
+ABSTRACT
+Containers help share and deploy software by packaging it with all
+its dependencies. Tools, like Docker or Kubernetes, spawn contain-
+ers from images as specified by a build system’s language, such as
+Dockerfile. A build system takes many parameters to build an im-
+age, including OS and application versions. These build parameters
+can interact: setting one can restrict another. Dockerfile lacks sup-
+port for reifying and constraining these interactions, thus forcing
+developers to write a build script per workflow. As a result, develop-
+ers have resorted to creating ad hoc solutions such as templates or
+domain-specific frameworks that harm performance and complicate
+maintenance because they are verbose and mix languages.
+To address this problem, we introduce Modus, a Datalog dialect
+for building container images. Modus’ key insight is that container
+definitions naturally map to proof trees of Horn clauses. In these
+trees, container configurations correspond to logical facts, build
+instructions correspond to logic rules, and the build tree is computed
+as the minimal proof of the Datalog query specifying the target
+image. Modus relies on Datalog’s expressivity to specify complex
+workflows with concision and facilitate automatic parallelisation.
+We evaluated Modus by porting build systems of 6 popular
+Docker Hub images to Modus. Modus reduced the code size by
+20.1% compared to the used ad hoc solutions, while imposing a
+negligible performance overhead, preserving the original image
+size and image efficiency. We also provide a detailed analysis of
+porting OpenJDK image build system to Modus.
+CCS CONCEPTS
+•Theory of computation →Constraint and logic program-
+ming ;•Software and its engineering →Virtual machines ;
+Domain specific languages .
+∗Both authors contributed equally to this research.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than ACM
+must be honored. Abstracting with credit is permitted. To copy otherwise, or republish,
+to post on servers or to redistribute to lists, requires prior specific permission and/or a
+fee. Request permissions from permissions@acm.org.
+ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+©2022 Association for Computing Machinery.
+ACM ISBN 978-1-4503-9413-0/22/11. . . $15.00
+https://doi.org/10.1145/3540250.3549133KEYWORDS
+Container, Build system, Docker, Datalog
+ACM Reference Format:
+Chris Tomy, Tingmao Wang, Earl T. Barr, and Sergey Mechtaev. 2022.
+Modus: A Datalog Dialect for Building Container Images. In Proceedings of
+the 30th ACM Joint European Software Engineering Conference and Sympo-
+sium on the Foundations of Software Engineering (ESEC/FSE ’22), November
+14–18, 2022, Singapore, Singapore. ACM, New York, NY, USA, 12 pages.
+https://doi.org/10.1145/3540250.3549133
+1 INTRODUCTION
+Software sharing and deployment are hard because they impose the
+necessity of managing versions, dependencies, and execution envi-
+ronments. Containers, such as Docker containers [ 28], can package
+software with all its dependencies, simplifying sharing and deploy-
+ment without considerable performance overhead. Containers are
+widely used in cloud computing [ 30], continuous integration/deliv-
+ery [ 28], and reproducible research [ 12]. Containers are spawned
+from images, filesystem snapshots accompanied by configuration
+files. Images consist of layers that store changes to the underlying
+filesystem, such as file additions, modifications and deletions, that
+are combined in runtime using a union mount filesystem.
+Container images are constructed by executing instructions writ-
+ten in a build system’s language, the most popular of which is
+Dockerfile [ 4]. Dockerfiles describe a sequence of instructions, or a
+directed acyclic graph (DAG) of instructions in the case of multi-
+stage builds [ 3], that run shell commands, copy local files or files
+from other images into the constructed image, or set image proper-
+ties defined in the OCI specification such as the working directory.
+The layered design of container images enables software reuse in
+the form of building images on top of other images. Public container
+registries, such as Docker Hub [2], store more than 500 000 public
+image repositories comprising over 2 million layers [41].
+Since most software is configurable and evolving, container im-
+ages are intrinsically parameterised. Image parameters include soft-
+ware versions, configuration parameters, and compilation flags. For
+example, the official image python:3.9.6-alpine3.13 is parame-
+terised with the version 3.9.6 of Python interpreter, as well the name
+and the version of the Linux distribution, Alpine 3.13. These param-
+eters can, and often do, depend on and interact with each other and
+these interactions determine how images are built. For example,
+installing an older version of Python on a newer Linux distribution
+may require executing extra instructions to add appropriate soft-
+ware repositories. Dockerfiles do not express dependencies betweenESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore Chris Tomy, Tingmao Wang, Earl T. Barr, Sergey Mechtaev
+parameters and the build logic. For example, Dockerfile specifies
+build parameters only as global variables that are used as arguments
+for build instructions, but does not permit using parameter values
+to control the sequence of executed instructions.
+Dockerfile’s lack of expressiveness forces developers to create
+ad hoc solutions specific to their domains. In this paper, we consider
+the problem of packaging popular software into containers. Open-
+JDK [ 9], the most popular implementation of Java, is distributed in
+multiple versions that are updated independently, with different
+sets of features enabled, and is built for different platforms. Because
+of the limitations of Dockerfiles, the official OpenJDK Docker im-
+ages [ 24] use a templating approach that generates Dockerfile via a
+combination of shell scripts and templates written in awk[11] and
+jq[7]. The reliance on ad hoc solutions, such as awk/jqtemplates
+causes maintenance problems. First, developers must learn multiple
+languages or frameworks to maintain the build definitions. Second,
+such build definitions are verbose.
+To address the limitations of Dockerfiles, we propose Modus,
+a logic programming language for building container images. Its
+key insight is that an image build can be reduced to the problem of
+solving a set of Horn clauses, logical formulas in the form f(x 1,...,x𝑛
+) :- g(y 1,...,y𝑚),...,h(z 1,...,z𝑙). In Modus, images and layers are
+represented as logical facts, e.g.the image python:3.9.6-alpine3
+.13is represented as python("3.9.6","alpine","3.13") . Build
+instructions correspond to logic rules; the build DAG is computed
+as the minimal proof of the fact representing the target image from
+truthful facts representing existing images. Expressing build rules
+as Horn clauses leads to concise build definitions, allows users to
+define the same build workflows as defined in ad hoc Dockerfile
+templates, and enables automatic build parallelisation.
+Horn clauses admit various semantics. Modus is a dialect of
+Datalog [ 17], a specific kind of Horn clauses, in which the com-
+putation of minimal proofs is decidable. When designing Modus,
+we judiciously chose a set of Datalog extensions that better model
+the domain of container builds. Broadly, these extensions fall into
+four categories. First, we extended Datalog with operators that im-
+plement container-related operations and domain-specific builtin
+predicates. Second, string manipulations, such as variable expan-
+sion, are crucial for defining container builds. However, a naïve
+addition of string manipulations to Datalog makes it undecidable.
+To address this problem, we adapted stratified construction [ 13] to
+tractably support string operations. Third, Dockerfiles allow users
+to specify arbitrary parameters when launching a target’s build.
+In Modus, the target is specified as a goal of a Datalog program,
+however the standard Datalog requires that all constants used in
+the goal are explicitly defined in the Datalog program. This require-
+ment is impractical because of the large or even unknown number
+of possible configuration options in complex builds. To address
+this usability limitation, we implemented an approach that permits
+passing arbitrary build parameters through the goal of a Datalog
+program without compromising the program’s safety.
+To evaluate Modus, we ported build systems of 6 popular Docker
+Hub projects from Dockerfile templates into Modusfiles . Modus
+captured all Linux build scenarios, while reducing the code size by
+20.1% with a negligible performance overhead. We also provide a
+detailed analysis of porting OpenJDK build system into Modus.
+The contributions of this work are the following:•We propose a novel application of Datalog, the definition of
+container image builds, where images and layers are repre-
+sented as facts, build instruction as clauses, and build trees
+are minimal proofs of facts representing target images;
+•We design and implement Modus, a dialect of Datalog for
+container build definitions with a set of judiciously chosen
+Datalog extensions;
+•Our evaluation of Modus on popular Docker Hub images
+shows that it concisely expresses build scenarios for real-
+world software with negligible overhead.
+Modus is released at https://modus-continens.com. All code,
+scripts and data necessary to reproduce this work are available at
+https://zenodo.org/record/7088613.
+2 OVERVIEW
+Modus formalises a container build as a query to a deductive data-
+base. This helps to define build instructions in a more concise and
+intuitive way than using Dockerfiles, the most widely used ap-
+proach. This section explains Dockerfile’s lack of expressiveness,
+and the disadvantages of this problem’s popular workaround, the
+templating approach. It also shows how Modus expresses container
+image builds in Datalog, and how it reduces code size and build
+time when packaging real world projects.
+2.1 Inexpressivity of Dockerfiles
+Assume we would like to package an application compiled with
+GCC and GNU Make. A typical Dockerfile follows:
+FROM gcc:bullseye AS bullseye_dev_release
+COPY . /app/
+RUN cd /app/ && make
+It defines a build stage called bullseye_dev_release that repre-
+sents a container image. This image is built on top of a public image
+gcc:bullseye with GCC installed on Debian Bullseye, by copying
+app’s source into the container via COPY , then compiling it with RUN.
+These instructions add filesystem layers on top of gcc:bullseye .
+During development, it is typical to build a debug target of an
+application since it provides additional information about failures.
+Assume that the command make debug compiles a debug target of
+our application. There are two approaches to add a debug target
+into Dockerfile that we refer to as the duplication approach and the
+scripting approach. The duplication approach copies the code of
+bullseye_dev_release to create the stage bullseye_dev_debug
+and replaces make withmake debug . The scripting approach in-
+vokes an embedded shell script that processes a Dockerfile argu-
+ment controlling the target:
+FROM gcc:bullseye AS bullseye_dev_combined
+ARG TARGET
+COPY . /app/
+RUN if [ "$TARGET" = "debug" ] ; then \
+cd /app/ && make debug ; \
+else \
+cd /app/ && make ; fi
+In this example, the shell script dynamically chooses the command
+to execute based on the value of the variable TARGET .
+Although the second approach might appear to be superior since
+it avoids duplication, it has several disadvantages. First, it cannotModus: A Datalog Dialect for Building Container Images ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+app(base, "dev", target) :-
+dev_image(base),
+copy(".", "/app/"),
+make(target).
+dev_image("alpine") :-
+from("alpine"),
+run("apk add gcc make").
+dev_image("bullseye") :- from("gcc:bullseye").
+app(base, "prod", "release") :-
+prod_image(base),
+app(base, "dev", "release")::copy("/app", "/app").
+prod_image("alpine") :- from("alpine").
+prod_image("bullseye") :- from("debian:bullseye-slim").
+make("debug") :- run("cd /app/ && make debug").
+make("release") :- run("cd /app/ && make").
+Figure 1: Modusfile defining the image appparameterised
+with base image, build mode, and compilation target.
+be applied to any instructions other than RUN, since other instruc-
+tions, such as COPY , cannot be expressed as shell scripts. Second,
+using embedded scripts makes re-building images slower because
+of ineffective caching: the build system has to invalidate all cached
+layers following an ARGcommand if the value of ARGchanges, even
+if the commands executed and the data copied do not change. Fi-
+nally, embedded scripts interfere with layer management: they may
+enforce a particular placement of RUNs inducing a granularity of
+layers that does not coincide with one intended by the developer.
+Software is often packaged for different base Linux distributions.
+Adding another base, say, Alpine, may require executing additional
+commands, e.g.installing GCC and GNU Make with apk add gcc
+make . Considering the disadvantages of the scripting approach,
+we resort to the duplication approach and add two build stages:
+FROM alpine AS alpine_dev_release
+RUN apk add gcc make
+COPY . /app/
+RUN cd /app/ && make
+andalpine_dev_debug defined in a similar fashion.
+The images * _dev_ * are not designed for production since they
+contain redundant files such as the installed compiler and build
+system. Redundant files increase both image size and attack sur-
+face [ 1,36]. A solution to this problem is multi-stage builds [ 3],i.e.
+copying the compiled program into a slim image from an auxiliary
+container using the COPY --from command, to build a production
+mode as shown below for Debian slim:
+FROM debian:bullseye-slim AS bullseye_prod_release
+COPY --from=bullseye_dev_release /app/ /app/
+When building bullseye_prod_release , Docker constructs and
+executes a build directed acyclic graph (build DAG) in Figure 2a.
+Since Alpine and Debian use different implementations of the
+C standard library (libc), binaries cannot be copied across them,
+which introduces a dependency between the base of the production
+image, e.g.debian:bullseye-slim , and the stage used for compi-
+lation, e.g.bullseye_dev_release . Dockerfile cannot express this
+dependency, which forces us to duplicate bullseye_prod_release
+COPY --from=bullseye_dev_release /app/ /app/
+FROM debian:bullseye-slim
+RUN cd /app/ && make
+FROM gcc:11-bullseyeCOPY . /app/
+“bullseye_prod_release” image
+“bullseye_dev_release” image
+(a) Build DAG for the target bullseye_prod_release .
+app(“bullseye”, “prod”, “release”)
+prod_image(“bullseye”)
+from(“debian:bullseye-slim”)
+(
+app(“bullseye”, “prod”, “release”)
+dev_image(“bullseye”)
+from(“gcc:bullseye”)
+copy(“.”, “/app/”)
+make(“release”)
+run(“cd /app/ && make”)
+)::copy(“/app/”, “/app/”)
+(b) Proof tree for the goal app("bullseye", "prod", "release")
+Figure 2: Build DAG and corresponding proof tree.
+to create a stage alpine_prod_release that copies binaries from
+alpine_dev_release into the base image alpine .
+In summary, Dockerfile’s lack of expressiveness forced us to
+create four duplicates of the development stages and two duplicates
+of the production stages, which is a code smell [35].
+2.2 Build Instructions as Datalog Rules
+The key intuition of Modus is that build instructions can be repre-
+sented as a set of particular Horn clauses, formulas in the form
+img(x 1, ...,x𝑚) :- img 𝑏𝑎𝑠𝑒(y1, ...,y𝑘), l 1(t1, ...,tℎ), ...,l𝑛(z1, ...,z𝑔)
+that can be interpreted as “the image imgis constructed from the
+base image img𝑏𝑎𝑠𝑒 by adding the layers l1,...,l𝑛”.
+Figure 1 shows a program written in our implementation of Horn
+clauses, a Datalog dialect Modus, that concisely expresses all build
+scenarios from Section 2.1. In this example, the image predicate app(
+base, mode, target) represents the target image. This predicate
+is defined using two rules, for the development mode "dev" and
+for the production mode "prod" . The rule for the development
+mode selects the base image using the image predicate dev_image ,
+copies the files into the container using the builtin predicate copy ,
+and builds the program using the layer predicate make . Themake
+predicate is a layer predicate, because it is defined using the builtin
+layer predicate run. The rule for the production mode copies bi-
+naries from the development image using the operator::copy . In
+Modus, operators are not part of the logical inference. Instead, they
+implement container-specific functionality such as copying files
+between containers or setting image properties.
+Compared to the Dockerfile (Section 2.1), the Modusfile (Figure 1)
+involves no code duplication — each instruction, such as copying
+files to the container or running compilation, appears exactly once.ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore Chris Tomy, Tingmao Wang, Earl T. Barr, Sergey Mechtaev
+{{
+if is_alpine then (
+-}}
+FROM alpine:{{ alpine_version }}
+RUN apk add --no-cache java-cacerts
+ENV JAVA_HOME /opt/openjdk-{{ env.version }}
+{{
+) elif is_oracle then (
+-}}
+FROM oraclelinux:{{ oracle_version }}-slim
+RUN set -eux; \
+{{ if oracle_version == "7" then ( -}}
+yum install -y \
+{{ ) else ( -}}
+microdnf install \
+{{ ) end -}}
+Figure 3: A fragment of Dockerfile template for OpenJDK.
+To build an image from a Modusfile, the user has to specify a
+goal. For example, the goal app("bullseye","prod","release")
+would build a production image of the appon Debian Bullseye. The
+build DAG for this image is computed as a minimal proof of the
+fact representing the goal from facts representing existing images.
+Figure 2a shows such tree computed for app("bullseye","prod
+","release") . Notice that, modulo auxiliary predicates make and
+prod_image , this proof tree contains exactly the instructions from
+the build DAG of the image bullseye_prod_release in Figure 2a.
+Modus can build multiple images at once, in parallel. For example,
+if the user specifies the goal app(base,"prod","release") , where
+base is a variable, Modus automatically deduces that it needs to
+build the images app("bullseye","prod","release") andapp
+("alpine","prod","release") , and builds them in parallel.
+2.3 Code Size and Build Efficiency
+The lack of Dockerfile’s expressiveness described in Section 2.1 has
+motivated developers to adapt an alternative solution, to generate
+Dockerfiles from templates, which we refer to as the templating
+approach . As of March 2022, 17 out of 25 most popular projects in
+Docker Hub [2] use the templating approach.
+We illustrate the templating approach using the build system for
+the widely-used official OpenJDK images. OpenJDK uses a combina-
+tion of several string processing tools, jqfor the JSON processing
+andgawk for advanced string processing [ 11], to define Dockerfile
+templates, from which it generates 40 Dockerfile instances for dif-
+ferent OpenJDK configurations. Each configuration is identified by
+the tuple of the Java version, the Java type (JDK or JRE), and the
+base Linux distribution, e.g.("8", "jdk", "oraclelinux7") .
+Each OpenJDK configuration requires executing a different set of
+instructions to build an image. The instructions are selected based
+on configuration parameters in a Dockerfile template, a fragment
+of which is shown in Figure 3. This template mixes three languages:
+{{and-}}are handled by a gawk script, expressions such as if
+oracle_version == "7" then are fromjq’s query language, and
+RUNandFROM instructions are from Dockerfile’s syntax.base_image(MAJOR_VERSION, VARIANT, JAVA_HOME, ...) :-
+(
+is_alpine(VARIANT, ALPINE_VERSION),
+from(f"alpine:${ALPINE_VERSION}"),
+...
+;
+is_oracle(VARIANT, ORACLE_VERSION),
+oracle_commands(INSTALLER, CLEANER,
+ORACLE_VERSION),
+from(f"oraclelinux:${ORACLE_VERSION}-slim"),
+...
+openjdk_setup(MAJOR_VERSION, VERSION, ...) :-
+openjdk_config(MAJOR_VERSION, VERSION, ...),
+base_image(MAJOR_VERSION, VARIANT, ...),
+(
+run(BASE_SETUP_COMMAND),
+locale(VARIANT, LANG),
+(a) A fragment of Modusfile for building OpenJDK.
+openjdk_setup(“8”, “8u322”, “jdk”, . . . )
+openjdk_config(“8”, “8u322”, “jdk”, . . . )
+(
+base_image(“8”, “oraclelinux7”, . . . )
+is_oracle(“oraclelinux7”, “7”)
+oracle_commands(“yum install -y”, . . . )
+from(“oraclelinux:7-slim”)
+)::append_path(“/usr/java/openjdk-8/bin”)
+. . .
+(
+run(“set -eux; yum install -y gzip . . . ”)
+locale(“oraclelinux7”, “en_US.UTF-8”)
+. . .
+(b) A proof tree fragment for openjdk("8", "jdk", "oraclelinux7")
+Figure 4: A build DAG and the corresponding proof tree.
+The templating approach as used by OpenJDK has several disad-
+vantages. First, it complicates maintenance, since it requires sup-
+porting an ad hoc templating frameworks that mix several lan-
+guages. Second, string processing tools are inefficient, and Docker-
+file generation can take a noticable portion of the build time. Finally,
+string processing scripts are error-prone and hard to debug.
+Modus concisely describes OpenJDK’s build scenarios without
+using external tools. OpenJDK images are represented via image
+predicate openjdk(MAJOR_VERSION, JAVA_TYPE, VARIANT) . Fig-
+ure 4a shows a fragment of Modusfile corresponding to the template
+in Figure 3. It shows that Modus enables abstraction , since it al-
+lows extracting reusable parts of the build logic, such as selecting
+the base image via the predicate base_image . When launching a
+build, Modus generates proof trees for the specified goals. Figure 4b
+shows a fragment of the proof tree for the goal openjdk("8", "jdk
+", "oraclelinux7") . This proof tree corresponds to the concrete
+Dockerfile generated by the template, and builds an identical image.
+Using Modus enabled us to reduce the code size of OpenJDK
+container build system by 47.6% and reduce build time by 40.6%
+compared to the templating approach. Our case study on OpenJDK
+images is described in more details in Section 6.Modus: A Datalog Dialect for Building Container Images ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+3 BACKGROUND
+Modus is a Datalog dialect specialised for container builds via a set
+of extensions. It uses BuildKit [ 8] to build images from proof trees.
+3.1 Datalog
+A Datalog program consists of a finite set of rules and facts. Rules are
+Horn clauses in the form L0:-L 1,...,L𝑛, where each L𝑖is a literal p(
+t1,...,t𝑛)such that pis a predicate symbol and t𝑖are terms. A term
+is either a constant or a variable. We denote variables and predicate
+symbols using alphanumeric strings with optional underscores, e.g.
+foo_bar , and constants using quoted strings, e.g."foobar" . The
+left side of a clause is its head; the right-hand side is its body.
+Datalog imposes structural restrictions on its rules. First, each
+predicate symbol has to be applied to the same number of argu-
+ments, which defines its arity. Second, each Datalog program has
+to satisfy the following safety conditions that ensure the set of all
+facts that can be derived from a Datalog program is finite:
+Definition 3.1 (Safety Conditions). The following structural con-
+straints should hold: (1) each fact is ground (has no variables) and
+(2) a variable that occurs in the rule’s head must occur in its body.
+Variables that occur in the head of a rule and also in the body of the
+same rule are called grounded. Variables that occur only in the head
+of a rule but not in the body are called non-grounded. A ground
+substitution 𝜃≜{𝑥1/𝑐1,...,𝑥 𝑛/𝑐𝑛}is a mapping from variables to
+constants. We denote an application of the substitution 𝜃to the
+termtast𝜃, and to the literal LasL𝜃.
+In the proof-theoretic interpretation of Datalog, the meaning
+of a program is defined as the set of all facts that can be inferred
+from the program. For a given rule L0:- L 1,...,L𝑛and a set of
+ground facts F1,...,F𝑛, we say that F0can be inferred in one step
+fromF1,...,F𝑛if there is a substitution 𝜃such that for any 𝑖∈0..𝑛,
+F𝑖=L𝑖𝜃. We refer to this as elementary production principle (EPP).
+A ground fact 𝐹can be inferred from a program 𝑃if either𝐹∈𝑃
+or𝐹can be inferred by applying EPP a finite number of times. The
+sequence of applications of EPP used to infer a fact 𝐹from𝑃forms
+a proof of𝐹from𝑃. A proof can be represented using a proof tree.
+Definition 3.2 (Proof Tree). For a given Datalog program 𝑃and a
+ground fact𝐹, a proof tree of 𝐹from𝑃is the tree(𝐹,𝑅,𝜃,{𝑡1,...,𝑡 𝑛})
+such that𝑛=0iff𝐹∈𝑃, otherwise 𝑅≜L0:- L 1,...,L𝑛is a rule
+from𝑃,𝐹=L0𝜃, and𝑡𝑖are proof trees of L𝑖𝜃.
+Consider a Datalog program defining graph reachability:
+reach(n, n) :- node(n).
+reach(n1, n2) :- arc(n1, n3), reach(n3, n2).
+and truthful facts: node("1") ,node("2") ,node("3") ,arc("1","2")
+andarc("2","3") . Then, a proof tree of the fact reach("1","3")
+can be visualised as follows:
+reach(“1, “3”)
+arc(“1”, “2”)
+reach(“2”, “3”)
+arc(“2”, “3”)
+reach(“3”, “3”)
+node(“3”)Datalog allows specifying a goal to select a subset of its outputs
+that are subsumed by the goal. For example, the fact f("a","a")
+is subsumed by the goal f(x,x) , butf("a","b") is not.
+3.2 Container Images and Dockerfiles
+Containers, a form of OS-level virtualisation, are spawned from
+images, filesystem snapshots accompanied by configuration files.
+LetFbe a set of all filesystems, trees of files with their contents.
+Filesystems are defined recursively, that is a subtree of a filesystem
+𝐹under the path 𝑝denoted as subtree(F,p)is also a filesystem. Fhost
+is the filesystem of the host OS. Container images, as standardised
+by The Open Container Initiative (OCI) [ 21] have layered design.
+A layer is typically stored as a delta for two filesystems, but to
+abstract over filesystem implementations we define a layer 𝐿non-
+constructively as a pair of filesystems (𝐹1,𝐹2). A container image
+𝐼≜[𝐿1,...,𝐿 𝑛]is a stack of layers such that for each 𝑖, if𝐿𝑖=
+(𝐹1,𝐹2)and𝐿𝑖+1=(𝐹3,𝐹4), then𝐹2=𝐹3. We denote the set of all
+images asI. We assume that images can be referenced by their
+identifiers using the function image _by_ref:ID→𝐼. The runtime
+semantics of images is a function [[...]]:I→F that is usually
+computed dynamically using a union mount filesystem, such as
+OverlayFS [ 15]. To abstract away irrelevant implementation details,
+we define this semantics as simply the top filesystem on the stack,
+that is[[𝐼]]≜snd(peek(𝐼)).
+Two common operations performed on images are runandcopy .
+The operation run:Scripts→I→I takes a script 𝑠and an image 𝐼,
+executes𝑠on the filesystem[[𝐼]]resulting in a new filesystem 𝐹, and
+returns an image that is obtained by appending the layer ([[𝐼]],𝐹)
+to𝐼. The operation copy :!F×Paths→I→I takes a filesystem 𝐹, a
+path𝑝and an image 𝐼, and returns an image obtained by adding
+the layer containing 𝐹under the path 𝑝on top of𝐼.
+Dockerfile is a widely-used format for specifying container im-
+age builds. Dockerfiles define build stages , each of which con-
+sists of a single FROM idinstruction specifying the base image
+𝐼base≜image _by_ref(id), followed by a sequence of 𝑛instructions.
+Each𝑖-th instruction corresponds to a function 𝑓𝑖:I→I . If this
+instruction is RUN script , then𝑓𝑖≜run(script). If this instruction is
+COPY src dst , then𝑓𝑖≜copy(subtree(Fhost,src),dst). The seman-
+tics of the build stage is the image (𝑓𝑛◦...◦𝑓1)(𝐼base). Dockerfiles
+also support instructions that set image properties such as WORKDIR
+that sets the current working directory, but such instructions do
+not create new layers.
+4 THE MODUS LANGUAGE
+This section introduces the syntax and semantics of Modus, de-
+scribes and motivates Datalog’s extensions of that it implements.
+4.1 Syntax & Semantics
+Modus’ syntax is based on Datalog’s syntax given in Section 3.1.
+Modus extends this syntax via the notion of predicate kind . Modus
+has three kinds of predicates: image predicates, layer predicates, and
+logic predicates. Image predicates correspond to container images.
+An image predicate is either the built-in predicate from that refers
+to an existing image by name or it is defined in a rule
+i1(x1, ...,x𝑚) :- i 2(y1, ...,y𝑘), l 1(t1, ...,tℎ), ...,l𝑛(z1, ...,z𝑔)ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore Chris Tomy, Tingmao Wang, Earl T. Barr, Sergey Mechtaev
+build _image(𝐹,_,_,{𝑡1,...,𝑡 𝑛})=
+if𝑛=0then
+match𝐹with
+|from(id)→image _by_ref(id)
+else
+let𝐼base=build _image(𝑡1)in
+let𝑓𝑖=build _layer(𝑡𝑖)for𝑖∈[2,𝑛]in
+(𝑓𝑛◦...◦𝑓2)(𝐼𝑏𝑎𝑠𝑒)
+build _layer(𝐹,_,_,{𝑡1,...,𝑡 𝑛})=
+if𝑛=0then
+match𝐹with
+|run(s)→run(𝑠)
+|copy(src, dest) →copy(subtree(Fhost,src),dest)
+else
+let𝑓𝑖=build _layer(𝑡𝑖)for𝑖∈[1,𝑛]in
+𝑓𝑛◦...◦𝑓1
+Figure 5: Building images from proof trees.
+wherei1andi2are image predicates, and l𝑖are zero or more
+layer predicates. Layer predicates describe image layers. A layer
+predicate is either runandcopy or a predicate defined in a rule
+l1(x1, ...,x𝑚) :- l 2(t1, ...,tℎ), ...,l𝑛(z1, ...,z𝑔)
+wherel𝑖are layer predicates. Logic predicates are predicates that do
+not represent any container-related entities; they define build logic.
+Logic predicate can be defined through other logic predicates, and
+can appear in any part of rules’ bodies. For example, the program
+in Figure 1 defines image predicates app,dev_image ,prod_image
+and a layer predicate make .
+The semantics of a Modus program is a mapping from goals to
+sets of images. For a given program 𝑃and a goal𝐺, Modus computes
+all facts that can be inferred from 𝑃and are subsumed by 𝐺, then
+constructs a proof tree for each fact. A fact corresponds to the built
+image, and its proof tree is the recipe to build the image. Since
+there can be multiple proof trees for a given fact, we choose the
+minimal tree w.r.t. the number of layers, as it naturally optimises the
+resulting image size and build time. Multiple minimal proofs may
+exist. For example, the program f :- p. f :- q. p. q. provides
+multiples way to derive the goal f. In this case, Modus picks one
+deterministically based on an implementation-defined ordering.
+Given a proof tree (𝐹,𝑅,𝜃,{𝑡1,...,𝑡 𝑛}), Modus builds an image
+that can be defined using the function build _image :ProofTrees→
+Igiven in Figure 5. This function implements a top-down proof tree
+traversal, which visits tree nodes from left to right, converts them
+to the layer building functions, and then applies the composition
+of these functions to the base image. Note that this algorithm as-
+sumes that the proof tree is stripped of logic predicates. An efficient
+implementation of build _image is discussed in Section 4.3.
+4.2 Extensions
+Implementations of Datalog often contain domain-specific exten-
+sions, e.g.to facilitate implementation of program analysers [ 26].
+Modus is the first Datalog implementation designed for containerimage builds, and we judiciously chose a set of extension to help
+modeling this new domain.
+4.2.1 Built-in Predicates and Operators. To facilitate definition of
+image builds, we introduced a library of built-in predicates. Apart
+from the predicates from ,run, andcopy described above, we intro-
+duce predicates for defining conditions on the input parameters.
+Notably, the semver_* predicates define software version compari-
+son as per the SemVer specification [ 10]. For example, the following
+fact is true: semver_lt("1.0.3","1.1.0") , whereltmeans <.
+The key difficulty of adding built-in predicates to Datalog is that
+built-in predicates such as semver_lt are infinite relations, which
+require special handling to retain Datalog’s decidability. We used
+the standard approach [ 16] to support built-in predicates: we defer
+the evaluation of a built-in predicate until all arguments of this
+predicate are bound to constants.
+Some container-specific operations are inconvenient to express
+using predicates. For example, in multi-stage builds [ 3], files are
+copied from a temporary image to the current image. Since images
+are identified with literals, an operation expressing multi-stage
+build would need to take a literal as an argument. However, Datalog
+does not permit applying predicates to literals. To address this, we
+introduce operators that use the syntax literal::operator(t
+1,...,t 𝑛). A notable example of an operator is ::copy that is
+needed to implement multi-stage builds. Formally, the semantics
+of::copy are defined by adding the following rule in the match
+statement of the function build _layer in Figure 5:
+|literal::copy(src, dest) →
+copy(subtree([[build _image(literal,_,_,∅)]],src),dest)
+An example usage of ::copy is given in Section 2.2.
+4.2.2 String Manipulation & Stratified Construction. String manipu-
+lations are often used in container builds systems to parse/construct
+configuration options. String manipulations are enabled in Modus
+via the built-in predicate string_concat(A, B, C) that states that
+𝐶is the concatenation of 𝐴and𝐵. Modus also introduces Python-
+like formatted strings that are defined through string_concat . For
+example, foo(f"a${x}") is equivalent to string_concat("a",
+x, y), foo(y) , whereyis a fresh variable.
+A naïve incorporation of string_concat(A, B, C) into Data-
+log makes it possible to generate strings of arbitrary length, making
+evaluating Datalog programs intractable. To address this problem,
+we adapted stratified construction [ 13] to forbid Modus programs
+that involve recursive predicates that depend on arguments of
+string_concat , in the spirit of stratified negation [ 16]. As a result,
+each Modus program can apply string_concat only up to a pre-
+defined number of times, which is independent of the input. This
+limitation did not impose any obstacles when porting realistic build
+systems presented in Section 5.
+4.2.3 Non-grounded Variables. Datalog’s safety conditions (Defini-
+tion 3.1) require that each variable that occurs in the rule’s head
+must occur in its body. When using built-in predicates, this variable
+should also be an argument of a non-built-in predicate in the body.
+This condition can be naturally satisfied in Datalog’s traditional ap-
+plications such as program analysis, where all constants are presentModus: A Datalog Dialect for Building Container Images ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+in the database. In contrast, this restriction in inconvenient for
+container builds as the following example demonstrates:
+app(cflags) :-
+from("gcc:latest"),
+copy(".", "."),
+run(f"gcc ${cflags} test.c -o test").
+The variable cflags is not grounded, as it only appears as an ar-
+gument of a built-in predicate, so this is an invalid Datalog pro-
+gram. Dockerfiles allow users to specify arbitrary parameters when
+launching a target’s build, such as the -gflag. However, GCC ac-
+cepts a large number of flags, so it would impractical to list all
+accepted flags in the Modus program. Instead, it would be natural
+to allow users to use this program to build the goal app("-g") ,
+since the argument of runcan then be inferred from the goal.
+To enable such usage scenarios, we relaxed the safety conditions
+by allowing user-defined predicates with non-grounded variables.
+At the same time, we introduced the new restriction that, during
+evaluation, we defer the evaluation of these predicates until all of
+their arguments are bound to constants, following the handling of
+built-in predicates in Section 4.2.1. Doing so enabled us to support
+the usage scenario above without sacrificing Datalog’s safety.
+4.3 Implementation
+To generate proof trees for a given goal, we implemented a custom,
+top-down Datalog solver based on SLD resolution [ 16] that 1) sup-
+ports our library of built-in predicates described in Section 4.2.1,
+2) handles non-grounded variables in a non-standard way as ex-
+plained in Section 4.2.3, and 3) generates proofs that minimise the
+number of layers required to build a given image.
+To build images from proof trees, Modus uses BuildKit [ 8] as
+the backend. BuildKit provides an intermediate representation LLB,
+which is described by BuildKit’s developers as “LLB is to Dockerfile
+what LLVM IR is to C”. LLB is a DAG, where a node either refers
+to existing image, or corresponds to runorcopy operation. To
+implement the function build _image , Modus translates the proof
+tree into LLB and executes it with BuildKit. This approach has
+several advantages. First, BuildKit automatically parallelises the
+build. Second, it provides automatic caching, i.e.it tracks changes
+to the filesystem and shell commands, and only re-builds layers
+and images that are affected by these changes.
+Currently, BuildKit does not support build graphs with multiple
+output. To overcome this problem, when building multiple images,
+we construct a dummy image and attach the target images as chil-
+dren to this dummy image. Although this workaround enables us to
+build multiple images in parallel, BuildKit’s API does not currently
+give us direct access these child images after they are built. Instead,
+we must redundantly call the build system. This cost is especially
+noticeable, since these calls can only start after all builds are fin-
+ished, preventing Modus from maximally exploiting parallelism.
+We refer to this redundant step as exporting . This step is not an
+essential part of Modus’ build process, but a workaround over the
+current limitations of BuildKit’s API.Table 1: Corpus Descriptive Statistics.
+Project Templating Method Outputs
+Ubuntu bash 6
+Redis sed + awk 9
+Nginx sed 8
+NodeJS sed + awk 32
+MySQL awk + jq 4
+Traefik envsubst 4
+5 EVALUATION ON DOCKER HUB IMAGES
+We now show that, for a corpus of six popular Docker projects,
+Modus reduces the overall size of code used to build images by an
+average of 20.1%, with a negligible performance overhead.
+To build our corpus, we considered images as ranked by Docker
+Hub “Suggested” filter, which closely follows downloads, and se-
+lected the first six which used different sequences of commands for
+templating. Under this rule, selecting MySQL filtered out Python
+and PostgreSQL. We also intended to rule out projects that either
+do not use parameters in their tags or build only one container
+image, as the focus of Modus is on parameterised builds, but we did
+not need to employ this filter. We have no reason to believe that
+this selection process introduces bias with respect to the object of
+our study — namely, builds conditioned on parameters. Using pop-
+ular examples is common practice in empirical work. Any project
+considering Modus would do so to adopt Modus’ feature set pre-
+cisely because Modus promises to help them speed or ease the
+maintenance of their build.
+Porting each project to Modus requires understanding the exist-
+ing build and, in turn, substantial manual effort. The six projects
+we selected collectively cover an interesting subdomain of the con-
+tainer build system space. Table 1 summarises our corpus.
+5.1 Modus’ Code Reduction
+We now quantify and compare the size of the build systems of our
+corpus to their Modus ports. Our key finding is that Modus reduces
+build code size by 20.1%, on average, over our corpus in lines of code,
+by reducing repetition and avoiding scripting. We measure code size
+after normalising the code by stripping comments, whitespace, and
+“stop words”, i.e.the Cooked 2normalisation described in Section 6.2.
+Table 2 shows our code reduction results, calculated in two ways.
+Table 2a only counts the Dockerfile templates, not scripts that
+use them to generate Dockerfiles, in the Templating columns and
+only Modusfiles in the Modus columns. To the counts in Table 2a,
+Table 2b adds the sizes of all templates and scripts used to build
+the images in the Templating columns, and any scripts needed to
+generate version lists (but not templating) in the Modus columns.
+We present both tables because the definition of build code is not
+well established. One view is that a build system consists only of
+the Dockerfile and Modufiles. Another view is that a build system
+includes all the version fetching and templating scripts. Further
+complicating matters is the fact that some of these scripts may
+additionally perform tasks unrelated to building their project. Thus,
+we present these two tables to establish lower and upper bounds
+on the true size of each project’s build system.ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore Chris Tomy, Tingmao Wang, Earl T. Barr, Sergey Mechtaev
+In Table 2a, the Ubuntu project does not use templates, but a bash
+script that prints its Dockerfiles, so we did not report its template
+sizes. The Nginx project’s templating script contains most of its
+build logic, written in bash, and it simply writes results into its
+templates. The script manipulates strings and constructs sets of
+packages to install, inserted into the Dockerfile in the form of a
+space-separated string that get passed to apt. Porting this logic
+into a Modusfile substantially reduces the build code needed from
+169 lines of bash script to 58 lines of Modusfile (ignoring docker
+build instructions in either case). This accounts for the swing in
+the results for Nginx across Table 2a and Table 2b.
+Modus reduces build system code size by 20.1% on average in
+lines and 21.5% reduction in words.
+Modus owes this result to its expressivity. In Section 6, we use a
+case study to illustrate how it achieves these savings in detail.
+5.2 Modus Build Time
+We now compare our corpus’ build systems to their Modus ports.
+These experiments were performed on AWS’ c5.2xlarge , which, at
+the time of writing, had 8 CPUs, 16 GiB RAM, 10 Gbps bandwidth,
+and an SSD disk with 8000 IOPS. We used Modus v0.1.11 to build
+our Modusfile, and used the BuildKit mode of docker build and
+GNU parallel [38] to build our corpus’ Dockerfiles. Some projects
+build images for platforms other than x86_64, but we only ran our
+tests on a x86_64 VM, not for other architectures. Despite this,
+our Modusfiles include code to build other architectures, when a
+project in our corpus does, to ensure a fair code size comparison.
+We exclude the redundant export step discussed in Section 4.3 from
+our results, since it is a workaround for BuildKit API limitations.
+Exporting averages 4.78 sacross our corpus. When BuildKit exposes
+an appropriate API, this overhead will disappear.
+Table 3 shows our results. Each of the 𝜇column is an average of
+64 runs. The CI columns is the 95% confidence interval for the true
+average. In both table, we did not include time taken to pull base
+images, e.g.alpine ordebian , because (1) Docker Hub request
+limits meant that we could not do a fresh pull for each run; and 2)
+the time taken to pull images depends on network conditions and
+CPU speed (for extraction), two problems Modus does not address.
+Modus increases average total build times by 0.6%, showing
+that Modus reduces build code size with negligible overhead.
+Modus’ implementation is not yet optimised, but still it achieves
+this negligible overhead. Even including the low and input-independent
+overhead of the BuildKit workaround (Section 4.3), developers can
+safely adopt Modus today to take advantage of its concision.
+5.3 Validating Modus-Built Images
+Since our Modusfiles are direct translation of our corpus’ existing
+build systems, we expect Modus images to closely match the Dock-
+erfile images in terms of image size, and also space efficiency, which
+is measured with a well-known Docker image analyzer known as
+dive [22]. The space efficiency score is a heuristic that penalises
+wasted space. Roughly, it is the sum of the size of all visible files in
+the final image over the total image size. Our results shows that,
+on average, our image efficiency score is 0.15% higher than theawk
+12 3
+4script
+jq
+CD/CI
+buildDockerfile
+templates
+40 images
+Update
+script
+40
+Dockerfilesjq queryDocker’s OpenJDK build system
+versions.json
+ Source URLs
+Figure 6: DOBS build steps to produce OpenJDK images.
+Dockerfile counterpart. In the worse case, our efficiency score is
+not more than 0.05% lower. The average difference in image size
+is1.01 MiB (0.4%) and the maximum difference is 3.96 MiB (3.6%).
+We also ran simple smoke tests that runs the entry executable with
+flags to print its version on each image produced: all Modus images
+passed this test.
+6 CASE STUDY: OPENJDK
+We conducted a case study to detail how we port build systems
+to Modus and to explain how Modus’ expressivity allows it to
+define build systems with concision. We chose to study the official
+image packaging for OpenJDK because 1) Docker maintains it and
+2) it outputs 40 images [ 24], at the time of writing, which is above
+32.1, the average number of images produced by the top five (by
+GitHub stars) build systems maintained by Docker. We first describe
+OpenJDK’s current build system and how we manually ported it,
+while taking care to produce an equivalent Modus build. The Modus
+port is concise, using 47.6% fewer words than OpenJDK’s official
+build, and fast, achieving a total build-time speedup of 40.6%.
+6.1 Porting OpenJDK’s Build to Modus
+The existing OpenJDK packaging uses a templating approach to
+handle parameter interactions. Figure 6 presents the workflow of
+Docker’s OpenJDK build system (DOBS). The build system accepts
+two inputs: Dockerfile templates and OpenJDK source URLs. Step
+1 updates the version data by checking known sources of OpenJDK
+and generates the file versions.json . In step 2, awk, an advanced
+string processing tool [ 11], processes the Dockerfile templates, gen-
+erating an appropriate jq[7] expression according to the code
+within template delimiters '{{'and'}}'. In step 3, jqgenerates
+Dockerfile instances by applying the expression constructed at step
+2 toversions.json (in step 3). A CI service performs step 4, taking
+the Dockerfiles from step 3 and building 40 OCI images.
+To port a build system to Modus, one needs to identify its parame-
+ters, re-encode into Modus’ data format and translate its conditional
+logic into rules. We ported the subset of DOBS that generates Linux
+images. Examining DOBS’ source, we learned that the directory
+structure1containing DOBS’ Dockerfiles encodes the parameters
+that DOBS uses to identify an image: major application version, Java
+type, and base image variant. These triples, in turn, index DOBS’
+JSON versions file [ 24] where we found the additional parameters
+needed to build the image2: full version, AMD64 binary URL, and
+ARM64 binary URL. Modus’ primary data format is a set of Modus
+facts, which are essentially tuples. We manually inspected both the
+1For example, consider https://github.com/docker-library/openjdk/tree/master/19/jdk/
+alpine3.14.
+2We omit parameters that do not relate to the image build itself, such as checksums.Modus: A Datalog Dialect for Building Container Images ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+Table 2: Normalised code size for our corpus (Table 1).
+(a) Modusfile and Dockerfile templates only.
+Templating Modus
+Project CR Words Bytes CR Words Bytes
+mysql 162 600 6398 176 (+08.6%) 586 ( -02.3%) 7041 (+10.1%)
+nginx 170 668 6155 209 (+22.9%) 786 (+17.7%) 8168 (+32.7%)
+node 202 843 8080 165 ( -18.3%) 584 ( -30.7%) 6480 ( -19.8%)
+redis 161 645 6232 161 (+00.0%) 590 ( -08.5%) 6187 ( -00.7%)
+traefik 72 194 2993 52 ( -27.8%) 142 ( -26.8%) 2335 ( -22.0%)
+ubuntu n/a 61 ( n/a ) 191 ( n/a ) 2553 ( n/a )(b) Including version fetching (for both) and templating scripts.
+Templating Modus
+Project CR Words Bytes CR Words Bytes
+mysql 318 1081 11022 316 (-00.6%) 1012 (-06.4%) 11357 (+03.0%)
+nginx 292 907 9069 209 (-28.4%) 786 (-13.3%) 8168 ( -09.9%)
+node 664 2134 19122 569 (-14.3%) 1683 (-21.1%) 15414 ( -19.4%)
+redis 244 952 8577 207 (-15.2%) 773 (-18.8%) 7657 ( -10.7%)
+traefik 105 302 3938 52 (-50.5%) 142 (-53.0%) 2335 ( -40.7%)
+ubuntu 78 254 2533 69 (-11.5%) 212 (-16.5%) 2688 (+06.1%)
+Table 3: Build time for each project in our corpus (Table 1).
+(a)modus build and parallel docker build only.
+Project Dockerfiles (s) Modus (s)
+𝜇 CI 𝜇 CI
+mysql 66.57 66.02–67.12 68.34 68.10–68.57
+nginx 23.08 23.04–23.12 26.45 26.40–26.51
+node 108.95 108.51–109.39 83.30 82.26–84.33
+redis 199.85 199.77–199.94 202.19 199.77–204.61
+traefik 9.02 8.73–9.32 8.91 8.43–9.38
+ubuntu 7.86 7.81–7.91 12.25 12.16–12.34(b) Including version fetching (for both) and templating scripts.
+Project Dockerfiles (s) Modus (s)
+𝜇 CI 𝜇 CI
+mysql 69.52 68.96–70.07 69.67 69.42–69.92
+nginx 23.15 23.11–23.18 26.45 26.40–26.51
+node 109.99 109.55–110.44 88.20 87.14–89.25
+redis 200.87 200.71–201.04 203.35 200.92–205.78
+traefik 9.06 8.76–9.35 8.91 8.43–9.38
+ubuntu 11.23 11.12–11.34 12.28 12.19–12.37
+existing JSON version data [ 24] and templated Dockerfile [ 24] to
+learn how to convert the JSON data into Modus facts. For simplic-
+ity, each fact that we generate for our build system includes all of
+the parameters. We manually examined each conditional block in
+DOBS and wrote an equivalent Modus rule.
+To ensure correctness of our port, after each implementation
+of a Modus rule, we built images that correspond to those new
+branches of logic and used dive [ 22] to compare the operations
+performed in each layer with the corresponding DOBS image. We
+contend that this development process established a close mapping
+between our linux.Modusfile and their Dockerfile-linux.template ; the
+interested reader can build and examine the relevant artefacts using
+https://zenodo.org/record/7088613 to confirm.
+A simple metric that can act as a heuristic for correctness is the
+difference in image size , so we set up a CI that computes this for every
+OpenJDK image we build. The average difference in size is 0.38MB .
+For comparison, the largest OpenJDK image is currently 675MB3.
+We spot-checked five uniformly chosen images by tarballing the
+filesystems and then running pkgdiff [31] on them to determine
+whether these differences are data or executables. All the differences
+we inspected were in data, like log files.
+6.2 Modus Concisely Builds OpenJDK
+Modus’ expressivity makes it more concise than Docker’s OpenJDK
+build system (DOBS). We quantify its concision, show that this
+concision and readability comes for free: the efficiency of the images
+that Modus builds match those produced by DOBS.
+3This is openjdk:19-jdk-bullseye [24].Table 4: Modus builds OpenJDK images with 47.6% less
+words.
+Templating Modus
+Variant CR Words Bytes CR Words Bytes
+Raw 549 2209 16109 267 (-51.4%) 869 (-60.7%) 10389 (-35.5%)
+Cooked 1441 1556 10626 246 (-44.2%) 750 (-51.8%) 9607 (-9.6%)
+Cooked 2403 1326 9642 244 (-39.5%) 695 (-47.6%) 7645 (-20.7%)
+Table 4 displays the statistics of raw, unedited files, as well as
+two variants, Cooked 1and Cooked 24. Cooked 1removes comments
+and empty lines to de-emphasise formatting conventions. Cooked 2
+removes further tokens that are analogous to stop words, like de-
+limiters. In particular, we remove templating delimiters such as }},
+and we replace whitespace chains defined by [ \t]\+ with a single
+space to balance out different indentation choices. As with white-
+space, we remove these tokens in an effort to make the comparison
+more fair and centered on tokens with more semantic content.
+On OpenJDK, Modus achieves a reduction of 47.6% words and
+20.7% bytes, using the Cooked 2code normalisation.
+These size reductions provide evidence that Modus can make
+build systems more maintainable. Much of Modus’ concision is a re-
+sult of its constructs and built-in operators to handle conditionally
+selecting instructions. In addition to concision, Modus constructs
+enhance readability. With templating, readability often breaks down
+when using nested conditional syntax like in the DOBS templated
+4The script that implements these variants can be found here, https://zenodo.org/
+record/7088613 at openjdk-images-case-study/benchmark-scripts/code_size.shESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore Chris Tomy, Tingmao Wang, Earl T. Barr, Sergey Mechtaev
+Table 5: Average build time results for OpenJDK images over
+10 runs.𝜇𝑡is the average time to perform template process-
+ing to construct parameter-specific Dockerfiles.
+Approach 𝜇(s)𝜇+𝜇𝑡(s)
+OpenJDK
+DockerfilesSequential 516.3 637.4
+Parallel 119.8 240.9
+Manual Optim. 276.7 397.8
+ModusTotal 143.1 143.1
+Exporting 18.0 N/A
+Dockerfile (Figure 3). In this case, it is often tricky to work out
+scopes. Such cases force developers to skim through an entire tem-
+plated Dockerfile to understand its behaviour. The use of a rule,
+such as in Figure 4a, explicitly restricts the scope of variables and
+nested expressions provide a convenient yet readable alternative to
+the nested conditionals found in DOBS’ templated Dockerfile. In
+this way, Modus lends itself to more readable and reusable code.
+Another Modus feature that promotes concision is its ::merge
+operator. Applied to a group of literals, e.g.(l1,l2)::merge , this
+operator squashes all runandcopy commands into a single com-
+mand during build DAG construction, which results in a single layer
+built. We used dive [22] (Section 6.1) to estimate the efficiency of
+an image. DOBS’ images achieve image efficiency (above 95%), but
+at a cost to their readability and separability. To avoid recording
+redundant modifications in the layer diffs and bloating the image
+size, nearly a half of the DOBS Dockerfile is a single RUNlayer [ 24].
+Using::merge as in our linux.Modusfile5, meant that we did
+not need to pack operations into a single command. We extracted
+the steps of the build into logical rules and merged them, resulting
+in the following efficiency scores:
+•DOBS OpenJDK images: average efficiency of 98.8% .
+•Modus OpenJDK images: average efficiency of 98.9% .
+Modus’::merge operator does not affect build time, but opti-
+mises image size. From the code quality point of view, it facilitates
+the best of both worlds: the readability of separating code sections
+without the inefficiency of more layers recording more diffs.
+6.3 Modus Quickly Builds OpenJDK
+This section compares the build time of Docker’s Official build sys-
+tem (DOBS) with our port using Modus. It shows that Modus scales
+to builds that output a large number of images. We used the same
+experiment setup as in Section 5.2, with docker-library/openjdk and
+modus-continens/openjdk-images-case-study revisions as found
+in https://zenodo.org/record/7088613. DOBS uses separate GitHub
+CI/CD workflows [ 24] to build the image, while in our experiment
+we (again) used GNU Parallel to build all Dockerfiles at once.
+Table 5 presents the results. We included the build time with
+and without template processing since this can vary with differ-
+ent template engines. DOBS performs some duplicate copying of
+binaries. The manual optimisation approach is our attempt to opti-
+mise DOBS to fix this problem using Docker’s builder pattern [ 3],
+5Found at lines 246–252 of openjdk-images-case-study/linux.Modusfile, in our repro-
+duction package, https://zenodo.org/record/7088613.where a shell script separately builds and copies binaries6. The
+exporting step in the final row of Table 5 is a subset of the time
+required to perform the image builds that could be reduced with
+future optimizations. We performed 𝑛=10runs of each approach
+and computed the sample mean. Template processing (steps 2 and
+3 in Figure 6) was run separately with 𝑛=10runs leading to a
+sample mean of 𝜇𝑡=121.1𝑠. Since template processing is necessary
+to output images, Modus outperforms every DOBS approach when
+accounting for template processing time. Specifically, Modus’s total
+build time is lower than the expected total time with templating,
+𝜇+𝜇𝑡, as143.1𝑠is less than Sequential ( 637.4𝑠), Parallel ( 240.9𝑠),
+and our Manual Optimization ( 397.8𝑠).
+Modus achieves a 40.6% speed-up over OpenJDK’s official
+build system, when including Dockerfile generation.
+This impressive speed-up runs counter to the results reported
+in Section 5, where we report a negligible slow-down. This speed-
+up is partly a result of Modus being able to quickly perform SLD
+resolution (Section 3), so it avoids slow template processing. DOBS’
+template processing is notably slow; this is due to their awk script
+(step 2 of Figure 6) relying on inefficient user-defined functions [ 25].
+In fact,𝜇𝑡>𝜇𝑝where𝜇𝑝is the mean time to solely build the images
+in parallel so DOBS’ template processing setup is a significant factor
+in their total build time. Furthermore, the expected time without the
+exporting step performed by Modus is 143.1−18.0=125.1seconds,
+which indicates potential for Modus to outperform even step 4
+(Figure 6) in isolation. The results for our manual optimization
+from Table 5 suggest that this copying incurs a further penalty
+that outweighs any benefit from avoiding the extra network calls
+fetching duplicate binaries. This motivates the use of a system like
+Modus over shell scripts or ad hoc optimizations.
+7 RELATED WORK
+Works relevant to Modus include container build systems, build
+systems based on logic programming, and Datalog implementations
+and extensions.
+Container Build Systems. The most popular container build sys-
+tem, which is distributed with Docker, uses Dockerfiles [ 4] as the
+build definition language. In Dockerfile, build parameters must ei-
+ther be hard-coded or set as global variables; users have limited
+ability to describe how interactions of these parameters affect the
+build workflow. This leads to substantial code duplication. As a
+result, developers resort to developing ad hoc Dockerfile templat-
+ing frameworks, as in Official OpenJDK images [ 24] maintained by
+Docker. These frameworks are cumbersome, as they typically mix
+several string processing languages, and still verbose. Earthly [ 5]
+extends Dockerfiles with additional constructs. Since its conditional
+statements are evaluated during the build process, the branches
+taken are not known in advance and therefore Earthly does not
+automatically parallelise builds with such conditional instructions.
+Buildah [ 20] embeds build instructions into a shell script and there-
+fore it does not parallelise builds, since shell scripts, as Turing-
+complete programs, cannot be automatically parallelised. Nix [ 19]
+and Guix [ 6,18] are functional package managers that can also be
+6Found at openjdk-images-case-study/openjdk/build.sh in our reproduction package,
+https://zenodo.org/record/7088613.Modus: A Datalog Dialect for Building Container Images ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore
+used to build containers. In order to package software with Nix or
+Guix, all dependencies must also be packaged by these managers.
+Compared to these systems, Modus substantially reduced the code
+size, enables automatic build parallelisation due to its static build
+DAG construction with Datalog, and is package manager agnostic.
+Build Systems Based on Logic Programming. Biomake [ 23] and
+Prom [ 27] are build systems [ 29] based on Prolog [ 14]. They both
+extend the capabilities of make [ 37] and therefore are 1) designed to
+model file dependencies, 2) Turing complete, i.e.allow expressing
+non-terminating computations, and 3) non-declarative, i.e.the suc-
+cess of evaluation depends on the order of literals in clause bodies.
+Modus is designed to model a new domain of container images,
+which differ from a traditional filesystem by their layered design
+(Section 3.2). Since Modus is a Datalog dialect, it is 1) not Turing-
+complete, which guarantees that computations of the build DAG
+for each target terminate, and 2) declarative, which allows the de-
+veloper to arbitrarily order image layers without being constrained
+by the Horn clause evaluation strategy.
+Datalog Implementations and Extensions. Although Datalog is a
+precisely defined fragment of Horn clauses, its numerous imple-
+mentations [ 26,32–34] implement different sets of non-standard
+features, called extensions, that are chosen to better model the ap-
+plication domains. To the best of our knowledge, our work is the
+first that applies Datalog, and logic programming in general, to the
+domain of container image builds. Modus, as many other Datalog
+implementation, supports built-in predicates. Although we used
+the standard approach [ 16] to support them, the set of predicates is
+different. Specifically, Modus implements container-related predi-
+cates, such as from andrun(Section 4). As explained in Section 4.2.3,
+Modus allows using rules with non-grounded variables. DES [ 33]
+also allows rules with non-grounded variables, but, since it is imple-
+mented in Prolog, the semantics of such rules is different. DES may
+return literals with uninitialised variables as outputs. In Modus, all
+variables must be initialised, since all build parameters must be con-
+crete to build an image. Thus, we implemented a custom approach
+for handling non-grounded variables, discussed in Section 4.2.3.
+Most Datalog implementations are designed as query languages,
+so their semantics is defined via the facts they infer. In contrast,
+Modus’ semantics is defined via proof trees, and it searches not for
+arbitrary, but minimal, proof trees. Previously, minimal proof trees
+were used to assist in debugging Datalog programs [ 40]. Modus
+implements advanced support for string manipulation using the
+predicate string_concat and adapts stratified construction [ 13] to
+ensure the tractability of solving string constraints. Although strat-
+ified construction limits the number of concatenation applications
+during evaluation, this restriction can potentially be lifted by, for
+example, implementing a generalized sequence transducer [13].
+8 CONCLUSION
+This paper introduces Modus, a novel application of logic program-
+ming to building container images. The key intuition of Modus
+is that proofs of Horn clauses naturally map to container image
+builds and therefore Horn clauses, more specifically a decidable
+fragment of Horn clauses called Datalog, is a suitable formalism
+for container image build definitions. When designing Modus, weidentified several Datalog’s extensions, including domain-specific
+built-in predicates and operators, non-grounded variables, and ad-
+vanced string manipulations, that facilitate image build definitions.
+An evaluation on popular Docker Hub projects revealed that Modus
+substantially reduced the code size of container image build sys-
+tems while introducing only a negligible performance overhead,
+preserved the original image size and image efficiency.
+9 DATA AVAILABILITY STATEMENT
+Modus is released at https://modus-continens.com. All code, scripts
+and data necessary to reproduce this work are available in a reusable
+artifact [39].
+REFERENCES
+[1]2021. Best practices for scanning images. https://docs.docker.com/develop/scan-
+images/. Accessed: 2022-03-17.
+[2] 2021. The Docker Hub. https://hub.docker.com/. Accessed: 2021-08-19.
+[3]2021. Docker Multi-stage Build. https://docs.docker.com/develop/develop-
+images/multistage-build/. Accessed: 2021-08-19.
+[4]2021. The Dockerfile Reference. https://docs.docker.com/engine/reference/
+builder/. Accessed: 2021-08-19.
+[5] 2021. The Earthly build system. https://earthly.dev/. Accessed: 2021-08-19.
+[6]2021. The GNU Guix package manager. https://guix.gnu.org/. Accessed: 2021-
+08-19.
+[7]2021. JQ command-line JSON processor. https://stedolan.github.io/jq/. Accessed:
+2021-08-19.
+[8]2021. moby/buildkit: Concurrent, cache-efficient, and Dockerfile-agnostic builder
+toolkit. https://github.com/moby/buildkit. Accessed: 2021-11-18.
+[9]2021. The OpenJDK implementation of Java. https://openjdk.java.net/. Accessed:
+2021-08-19.
+[10] 2021. SemVer specification. https://semver.org/. Accessed: 2022-03-17.
+[11] Alfred V Aho, Brian W Kernighan, and Peter J Weinberger. 1979. Awk—a pattern
+scanning and processing language. Software: Practice and Experience 9, 4 (1979),
+267–279.
+[12] Carl Boettiger. 2015. An introduction to Docker for reproducible research. ACM
+SIGOPS Operating Systems Review 49, 1 (2015), 71–79.
+[13] Anthony Bonner and Giansalvatore Mecca. 1998. Sequences, datalog, and trans-
+ducers. J. Comput. System Sci. 57, 3 (1998), 234–259.
+[14] Ivan Bratko. 2001. Prolog programming for artificial intelligence . Pearson educa-
+tion.
+[15] Neil Brown and collaborators. 2021. The OverlayFS filesystem. https://www.
+kernel.org/doc/html/latest/filesystems/overlayfs.html. Accessed: 2021-08-19.
+[16] Stefano Ceri, Georg Gottlob, and Letizia Tanca. 2012. Logic programming and
+databases . Springer Science & Business Media.
+[17] Stefano Ceri, Georg Gottlob, Letizia Tanca, et al .1989. What you always wanted
+to know about Datalog(and never dared to ask). IEEE transactions on knowledge
+and data engineering 1, 1 (1989), 146–166.
+[18] Ludovic Courtès. 2013. Functional package management with guix. arXiv preprint
+arXiv:1305.4584 (2013).
+[19] Eelco Dolstra and Andres Löh. 2008. NixOS: A purely functional Linux dis-
+tribution. In Proceedings of the 13th ACM SIGPLAN international conference on
+Functional programming . 367–378.
+[20] Open Repository for Container Tools. 2021. The Buildah build system. https:
+//buildah.io/. Accessed: 2021-08-19.
+[21] The Linux Foundation. 2021. Open Container Initiative. https://opencontainers.
+org/. Accessed: 2021-08-19.
+[22] Alex Goodman and collaborators. 2021. Dive, a tool for exploring each layer in
+an image. https://github.com/wagoodman/dive. Accessed: 2022-03-04.
+[23] Ian H Holmes and Christopher J Mungall. 2017. BioMake: a GNU make-
+compatible utility for declarative workflow management. Bioinformatics 33,
+21 (2017), 3502–3504.
+[24] Docker Official Images. 2021. Docker Official Image packaging for Java. https:
+//github.com/docker-library/openjdk. Accessed: 2021-08-19.
+[25] Docker Official Images. 2021. jq-template.awk. https://github.com/docker-
+library/bashbrew/blob/b2cbaa3678ffbce7c0d90be5a518c1ec068011b5/scripts/jq-
+template.awk. Accessed: 2022-02-25.
+[26] Herbert Jordan, Bernhard Scholz, and Pavle Subotić. 2016. Soufflé: On synthesis
+of program analyzers. In International Conference on Computer Aided Verification .
+Springer, 422–430.
+[27] Thilo Kielmann. 1991. PROM: A flexible, PROLOG-based make tool . Technical
+Report. Citeseer.ESEC/FSE ’22, November 14–18, 2022, Singapore, Singapore Chris Tomy, Tingmao Wang, Earl T. Barr, Sergey Mechtaev
+[28] Dirk Merkel et al .2014. Docker: lightweight linux containers for consistent
+development and deployment. Linux journal 2014, 239 (2014), 2.
+[29] Andrey Mokhov, Neil Mitchell, and Simon Peyton Jones. 2018. Build systems à la
+carte. Proceedings of the ACM on Programming Languages 2, ICFP (2018), 1–29.
+[30] Claus Pahl, Antonio Brogi, Jacopo Soldani, and Pooyan Jamshidi. 2017. Cloud
+container technologies: a state-of-the-art review. IEEE Transactions on Cloud
+Computing 7, 3 (2017), 677–692.
+[31] Andrey Ponomarenko. 2021. pkgdiff. https://lvc.github.io/pkgdiff/. Accessed:
+2022-03-16.
+[32] Leonid Ryzhyk and Mihai Budiu. 2019. Differential Datalog. Datalog 2 (2019),
+4–5.
+[33] Fernando Sáenz-Pérez. 2011. DES: A deductive database system. Electronic notes
+in theoretical computer science 271 (2011), 63–78.
+[34] Jiwon Seo, Stephen Guo, and Monica S Lam. 2013. SociaLite: Datalog extensions
+for efficient social network analysis. In 2013 IEEE 29th International Conference
+on Data Engineering (ICDE) . IEEE, 278–289.
+[35] Abdullah Sheneamer and Jugal Kalita. 2016. A survey of software clone detection
+techniques. International Journal of Computer Applications 137, 10 (2016), 1–21.[36] Rui Shu, Xiaohui Gu, and William Enck. 2017. A study of security vulnerabilities
+on docker hub. In Proceedings of the Seventh ACM on Conference on Data and
+Application Security and Privacy . 269–280.
+[37] Richard M Stallman and Roland McGrath. 1991. GNU Make-A Program for
+Directing Recompilation. (1991).
+[38] Ole Tange et al .2011. Gnu parallel — the command-line power tool. The USENIX
+Magazine 36 (2011), 42–47.
+[39] Chris Tomy, Tingmao Wang, Earl Barr, and Sergey Mechtaev. 2022. Modus: A
+Datalog Dialect for Building Container Images. (Sep 2022). https://doi.org/10.
+5281/zenodo.7088613
+[40] David Zhao, Pavle Subotić, and Bernhard Scholz. 2020. Debugging large-scale
+datalog: A scalable provenance evaluation strategy. ACM Transactions on Pro-
+gramming Languages and Systems (TOPLAS) 42, 2 (2020), 1–35.
+[41] Nannan Zhao, Vasily Tarasov, Hadeel Albahar, Ali Anwar, Lukas Rupprecht,
+Dimitrios Skourtis, Amit S Warke, Mohamed Mohamed, and Ali R Butt. 2019.
+Large-scale analysis of the docker hub dataset. In 2019 IEEE International Confer-
+ence on Cluster Computing (CLUSTER) . IEEE, 1–10.

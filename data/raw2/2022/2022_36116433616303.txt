@@ -1,0 +1,1159 @@
+OOM-Guard: Towards Improving the Ergonomics of Rust OOM
+Handling via a Reservation-Based Approach
+Chengjun Chen
+Fudan University
+Shanghai, China
+Ant Group
+Hangzhou, China
+cjchen20@fudan.edu.cnZhicong Zhang
+Fudan University
+Shanghai, China
+zhicongzhang21@m.fudan.edu.cnHongliang Tian
+Ant Group
+Hangzhou, China
+tate.thl@antgroup.com
+Shoumeng Yan
+Ant Group
+Hangzhou, China
+shoumeng.ysm@antgroup.comHui Xu∗
+Fudan University
+Shanghai, China
+xuh@fudan.edu.cn
+ABSTRACT
+Out of memory (OOM) is an exceptional system state where any
+further memory allocation requests may fail. Such allocation fail-
+ures would crash the process or system if not handled properly,
+and they may also lead to an inconsistent program state that can-
+not be recovered easily. Current mechanisms for preventing such
+hazards highly rely on the manual effort of the programmers them-
+selves. This paper studies the OOM issues of Rust, which is an
+emerging system programming language that stresses the impor-
+tance of memory safety but still lacks handy mechanisms to handle
+OOM well. Even worse, Rust employs an infallible mode of mem-
+ory allocations by default. As a result, the program written by
+Rust would simply abort itself when OOM occurs. Such crashes
+would lead to critical robustness issues for services or modules of
+operating systems. We propose OOM-Guard, a handy approach
+for Rust programmers to handle OOM. OOM-Guard is by nature
+a reservation-based approach that aims to convert the handlings
+for many possible failed memory allocations into handlings for a
+smaller number of reservations. In order to achieve efficient reser-
+vation, OOM-Guard incorporates a subtle cost analysis algorithm
+based on static analysis and a proxy allocator. We then apply OOM-
+Guard to two well-known Rust projects, Bento and rCore. Results
+show that OOM-Guard can largely reduce developers’ efforts for
+handling OOM and incurs trivial overhead in both memory space
+and execution time.
+CCS CONCEPTS
+•Software and its engineering →Software reliability .
+∗Corresponding author.
+Permission to make digital or hard copies of all or part of this work for personal or
+classroom use is granted without fee provided that copies are not made or distributed
+for profit or commercial advantage and that copies bear this notice and the full citation
+on the first page. Copyrights for components of this work owned by others than the
+author(s) must be honored. Abstracting with credit is permitted. To copy otherwise, or
+republish, to post on servers or to redistribute to lists, requires prior specific permission
+and/or a fee. Request permissions from permissions@acm.org.
+ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA
+©2023 Copyright held by the owner/author(s). Publication rights licensed to ACM.
+ACM ISBN 979-8-4007-0327-0/23/12. . . $15.00
+https://doi.org/10.1145/3611643.3616303KEYWORDS
+Out Of Memory, Static Analysis, Reservation, Software Reliability
+ACM Reference Format:
+Chengjun Chen, Zhicong Zhang, Hongliang Tian, Shoumeng Yan, and Hui
+Xu. 2023. OOM-Guard: Towards Improving the Ergonomics of Rust OOM
+Handling via a Reservation-Based Approach. In Proceedings of the 31st
+ACM Joint European Software Engineering Conference and Symposium on the
+Foundations of Software Engineering (ESEC/FSE ’23), December 3–9, 2023, San
+Francisco, CA, USA. ACM, New York, NY, USA, 12 pages. https://doi.org/10.
+1145/3611643.3616303
+1 INTRODUCTION
+Out of memory (OOM) is a hazardous state where the system can-
+not allocate new memory. Programs suffering OOM may result in
+aborting, data corruption and even catastrophic system crashes [ 8].
+Nevertheless, handling allocation failures remains a challenging
+issue for software developers [ 19,33,43,46]. On one hand, the code
+snippets with OOM risks may widely exist in a project, but they
+are often insufficiently tested because OOM is rarely triggered in
+practice [ 13]. On the other hand, the OOM handling code itself may
+require additional memory space and suffer a second OOM [14].
+This work studies the OOM issue of an emerging programming
+language, Rust. Rust has attracted many system developers due
+to its advantages in memory safety and efficiency. Different from
+C/C++ APIs that either return null or throw exceptions when OOM
+occurs, the stable version of Rust does not expose any interfaces of
+OOM handling to developers. One major reason is that it is not easy
+for developers to handle OOM well. Therefore, Rust APIs employ an
+infallible mode for memory allocation by default that simply aborts
+the program if suffering OOM. However, the drawback is obvious,
+i.e.,developers lose their flexibility to design programs that can
+handle or survive OOM. The flaw is unacceptable for critical servers
+or operating systems that have little tolerance for crashes [1].
+An intuitive way to help Rust escape this predicament is to
+expose fallible APIs for memory allocation. Actually, the idea has
+already been proposed recently and is under development in nightly
+Rust [ 1]. Nevertheless, it suffers from critical limitations because
+developers should at least face similar challenges as traditional
+C/C++ developers. Even worse, any inappropriate implementation
+of the OOM handling code may lead to undefined behaviors and
+733
+ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA Chengjun Chen, Zhicong Zhang, Hongliang Tian, Shoumeng Yan, and Hui Xu
+undermine the memory safety of Rust. Another idea is to reserve
+sufficient memory space in the program entry or the beginning of
+some critical code regions, e.g.,based on banker’s algorithm [ 17].
+Such a mechanism can prevent the program from suffering OOM
+when executing a snippet of critical code. However, there is still
+a critical problem to be addressed, i.e.,how to estimate the least
+required memory space for executing the code? The problem is
+generally undecidable [4].
+Our paper proposes a novel reservation-based approach for
+handling OOM, namely OOM-Guard. Via OOM-Guard, develop-
+ers can selectively annotate any function that should be spared
+from crashes caused by OOM, and our approach then automati-
+cally infers and reserves the amount of memory required by the
+function. The core components of OOM-Guard include a memory
+cost analyzer and a proxy allocator. The cost analyzer can extract
+the parameterized memory cost expression of a function based on
+static analysis. While encountering code snippets that cannot be an-
+alyzed ( e.g.,implicit bounded loops or dynamic trait function calls),
+we employ a multi-level reservation mechanism. OOM-Guard can
+identify these situations and inform developers to make further
+annotations to reserve memory spaces for them separately, e.g.,
+making an extra reservation for each iteration or recursion during
+execution. OOM-Guard automatically inserts memory reservation
+code based on the cost expression at the beginning of the function
+through macro expansion. All subsequent memory allocation and
+deallocation operations of the function will be handled by the proxy
+allocator during runtime. In this way, OOM-Guard can guarantee
+that the OOM is only possible to occur in reservation instructions
+and release developers from handling the OOM risk of all allocation
+sites.
+In the experiment study, we evaluate the effectiveness of OOM-
+Guard with two real-world Rust systems with infallible allocations,
+Bento and rCore. We first modify these systems to the OOM-Guard
+version and study the usability of our approach. Results show that
+compared to the fallible mode promoted by nightly Rust, developers
+only need to modify less than 1/5 lines of code. Our further pressure
+test shows that the OOM-Guard version is resilient to OOM. Besides,
+we also study the cost analysis accuracy and overall performance
+of our approach. Results show that the average peak memory usage
+overheads are both less than 10% for Bento and rCore, and the
+average overhead of execution time is 3% for Bento and 5% for
+rCore.
+We summarize the contribution of this paper as follows.
+•This paper serves as the first attempt to study the OOM prob-
+lem of Rust caused by its infallible mode. In comparison with
+the fallible model promoted by nightly Rust, our proposed
+approach should be more convenient to developers and less
+error-prone.
+•Our approach incorporates a set of subtle designs, especially
+an accurate memory cost analyzer and a proxy allocator.
+For cost expression depending on conditional branches, we
+mainly retain the cost expression by detecting ordinal rela-
+tionships. If we overestimate the cost due to the absence of
+an ordinal relationship, our proxy allocator can still avoid
+memory waste by reusing the overestimated memory blocks.
+Figure 1: Sample method of Rust slice with implicit memory
+allocation from official Rustdoc1
+Experimental results with real-world systems show our ap-
+proach is efficient in both peak memory usage and execution
+time.
+•We implement OOM-Guard as an semi-automated toolchain.
+Our implementation consists of over 6000 lines of Rust and
+C++ code. We believe it would be useful to facilitate the
+community toward solving OOM-related problems.
+2 BACKGROUND
+This section presents the challenges of OOM handling and tech-
+niques adopted by Rust in handling OOM.
+2.1 Challenges of OOM Handling
+OOM is a situation where the newly requested memory cannot be
+allocated by the system. In general, processes suffering OOM would
+lead to an exceptional process state that should be carefully handled.
+However, since triggering OOM requires an extreme system state
+of low memory, such allocation failures are sometimes ignored
+or mishandled in practice [ 18,26,29,30,46]. For example, CVE-
+2021-1917, 2020-19722, 2020-19729, 2020-19718, 2019-13238, and
+2017-13135 are all OOM bugs missing allocation failure handling,
+which may lead to NULL pointer dereference; CVE-2020-35521, 2018-
+7587, 2018-21027, and 2020-26952 are another type of OOM bugs
+with mishandled allocation failures which may result in unexpected
+abort during recovery.
+Handling OOM is challenging for developers because there could
+be many allocation sites in a program. Besides obvious memory
+allocations ( e.g.,malloc() in C or new() in C++), there are also
+other implicit allocation sites. For example, the push method of
+vector may dynamically adjust the reserved memory space for
+the container. Furthermore, some allocation sites can hardly be
+noticed unless developers read the code carefully. For example, the
+sort (Figure 1) and sort_by methods of Rust slice all require
+temporary storage half the size of a slice. Such allocation failures
+are often ignored by developers.
+To release developers from tedious OOM handling work and mit-
+igate OOM risks, “too small to fail”[ 13,15] is a promising solution
+adopted by Linux. Such a mechanism aims at no failure for small
+memory allocation requests. Linux approaches the objective via an
+over-commit [ 44] and OOM killer mechanism. The over-commit
+mechanism does not actually allocate the physical memory until
+1https://doc.rust-lang.org/std/primitive.slice.html
+734OOM-Guard: Towards Improving the Ergonomics of Rust OOM Handling via a Reservation-Based Approach ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA
+the program accesses the newly allocated memory space. There-
+fore, the allocation request is always successful as long as there are
+available memory address spaces, e.g.,up to 248or 128T for X86-64.
+If the physical memory is not enough, the OOM killer will select
+one process to kill based on a fitness evaluation mechanism to free
+memory. However, the side effect is also obvious. For example, the
+OOM killer sometimes kills innocent processes, and attackers may
+leverage the mechanism to attack other processes running on the
+same computer. Besides, this mechanism is subject to deadlocks in a
+low-memory situation which may lead to a full system lockup [ 14].
+Therefore, “too small to fail” is not a silver bullet for OOM and gets
+complained about a lot in history [13].
+2.2 Techniques of OOM Handling in Rust
+2.2.1 Infallible Allocation. Rust by default employs infallible al-
+location, i.e.,the allocation error is not exposed or observable to
+developers. For example, the push method of Vecinvolves mem-
+ory allocations. If there’s no enough capacity in the Vec,push will
+allocate new space twice the original capacity. But users of push
+cannot know if the allocation fails. Instead, push directly aborts the
+program within its implementation. Since the low-level memory
+allocation method __rust_alloc() is an unsafe method, mishan-
+dling OOM may cause memory-safety bugs. Therefore, such an
+infallible mode is beneficial to the memory-safety purpose of Rust.
+Informally, an infallible heap allocation function is one of the
+following three types.
+•It is a function defined by Rust’s alloc crate2that involves
+heap memory allocations and causes panics when the alloca-
+tion fails, such as Vec::push() ,Box::new() , and Arc::new() .
+•It is a user-specified function that involves heap memory
+allocations and causes panic when the allocations fail.
+•It is a function that may invoke infallible heap allocation
+functions.
+2.2.2 Fallible Allocation. Recently, nightly Rust adds new fallible
+allocation APIs to its standard libraries, e.g.,try_push() [1] that
+returns a Result object for handling. Nevertheless, manually trans-
+ferring existing infallible code to fallible code with these APIs is
+labor-intensive and error-prone.
+For example, Figure 2a, 2b demonstrates the usage of fallible
+allocation APIs for the bread() function from Bento. The original
+version employs three infallible allocation functions Arc::new() ,
+ArrWrapper::new() andHashmap::insert() .
+To transfer bread to fallible mode, developers need to rewrite
+these called functions into fallible mode functions try_new() and
+try_insert() . As shown in Figure 2a, this also requires develop-
+ers to modify all functions recursively in the call chains of bread ,
+including the function signature and corresponding callsites. The
+developer then needs to make sure allocation failures in any allo-
+cation site in the call chain be handled carefully hence they can
+propagate to the upper-level bread recursively. Finally, they get a
+fallible bread which will return a BentoError generated based on
+another newly added From() method when encountering OOM.
+As shown in this example, even translating a single function
+from infallible mode to fallible may involve dozens of lines of code
+2https://doc.rust-lang.org/alloc/index.htmlmodification. Furthermore, it is challenging to implement a correct
+and safe failure-handling routine [ 20]. In this example, generating
+an error message with String::from() still needs additional heap
+memory and may result in a second OOM.
+3 OVERVIEW OF OOM-GUARD
+3.1 Objective of OOM-Guard
+Although Rust defaults memory allocations to the infallible mode,
+some software applications may still prefer the fallible mode. For
+example, Rust RFC-2116[ 1] mentions infallible mode as an inappro-
+priate approach for embedded systems and garbage collectors, and
+other applications like Gecko (browser engine) also prefer fallible
+mode when implementing some features due to user experience
+considerations. In order to meet the need of memory allocation fail-
+ure handling while mitigating the risk of OOM handling errors, we
+propose OOM-Guard. OOM-Guard is a semi-automated mechanism
+that can help Rust programmers transfer infallible code snippets
+to fallible mode handily and safely. In this way, it can improve the
+ergonomics of OOM handling in Rust programs.
+3.2 Approach Overview
+OOM-Guard approaches the goal via reserving sufficient memory
+for infallible allocations to guarantee their success. In this way,
+when developers employ fallible mode to a target function, they
+only need to enable OOM-Guard and handle reservations for it
+instead of transferring all infallible allocations in the call chain into
+fallible mode.
+Figure 3 overviews the major process of OOM-Guard. Develop-
+ers or OOM-Guard users may select candidate functions to protect
+based on their needs and annotate the function with OOM-Guard
+macro. Subsequently, the program can achieve the anticipated func-
+tionality through two rounds of compilation with the assistance
+of OOM-Guard. First, OOM-Guard performs automated memory
+cost analysis on the target functions based on the results generated
+from the first round of compilation, obtaining their memory cost
+expressions. During the second round of compilation, the annotated
+procedural macros will be expanded and generate the correspond-
+ing reserved statements by parsing these expressions.
+For example, Figure 2c shows how developers can use OOM-
+Guard to fix the previous OOM issue of Figure 2b. Developers
+mainly need to add a #[oom_guard] procedure macro [ 2] before
+thebread() function, which can parse the source code and be auto-
+matically expanded to insert code snippets for memory reservation
+during compilation. If the reservation succeeds, all subsequent
+allocations will be based on the reserved memory. This can be
+achieved via another macro #[global_allocator] that specifies
+a new proxy allocator as the global allocator for the program. If
+the reservation fails, the allocation failures can be captured and
+handled by the function’s caller through the returned Result (also
+need an implementation of the From() method like Figure 2b for
+the used error type). Thus, OOM-Guard turns bread into the fallible
+mode with a simple annotation and only requires the developer to
+handle the reservation failures. As shown in Figure 2a, it is obvious
+that the revision requires fewer changes of code than the manual
+modification.
+735ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA Chengjun Chen, Zhicong Zhang, Hongliang Tian, Shoumeng Yan, and Hui Xu
+bread Arc::<ArrWrapper>::new
+ArrWrapper::new
+HashMap::insert hashbrown::insertalloc_aligned_vecBox::new __rust_alloc ……
+……
+……
+……caller
+Functions that need to modify 
+signature if modifying manually 
+Functions that need to modify 
+signature if with OOM-Guard
+Callsites that need to be 
+handled if modifying manually 
+Callsites that need to be 
+handled if with OOM-Guardfninsert(& self , k: K, v: V) {
+self .base.insert(k, v);
+}fntry_insert(& self , k: K, v: V) 
+­>Result<_, AllocError>{
+self .base.try_insert(k, v)?
+//callsite should be modified accordingly }Modify signatureExample
+(a) The usability comparison between OOM-Guard and existing fallible mode.
++implFrom<TryReserveError >forBentoError {
++fnfrom(err: TryReserveError )->BentoError {
++ BentoError ::alloc_fail (String::from (“..Error_Message ”))
++//need allocation, second OOM may occur
++}
++}
+fnbread(&self,bno:u64)->Result<BufferHead ,BentoError >{
+...//allocation -free instructions
+-letbh_buf=ArrWrapper ::new(...)?; //allocation
+-letnew_arc =Arc::new( bh_buf); //allocation
+-cache_lock.insert (bno,Arc::downgrade(& new_arc));
+//cache_lock is a Hashmap and need allocation when expending
++letbh_buf=ArrWrapper ::try_new(...)?; 
++letnew_arc =Arc::try_new(bh_buf)?; 
++cache_lock.try_insert (bno,Arc::downgrade(& new_arc))?;
+returnOk(BufferHead ::new(new_arc,bno));
+}
+(b) Manual modification with fallible APIs.
+#[global_allocator]
+pubstaticALLOCATOR =OOMGuardAllocator ::new(&DefaultAllocator );
+#[oom_guard]
+fnbread(&self,bno:u64)->Result<BufferHead ,BentoError >{
++...calculative statements ;
++letreserve_array = [...];
++ letguard_life_ti me= ALLOCATOR.reserve (&reserve_array )?;
+//automatically generated during macro expansion
+...//allocation -free instructions
+letbh_buf=ArrWrapper ::new(...)?; 
+letnew_arc =Arc::new(bh_buf); 
+cache_lock.insert (bno,Arc::downgrade(& new_arc));
+returnOk(BufferHead ::new(new_arc,bno));
+} (c) Modification with OOM-Guard.
+Figure 2: Example from Bento-fs that demonstrates how to modify a function from infallible mode to fallible mode.
+Source Code 
+with
+OOM-Guard Macro
+Developer
+Macro 
+ExpansionNew Code 
+with 
+Mem Reservation
+Mem Cost 
+AnalysisExecutable 
+with 
+Mem ReservationCompilationDefault AllocatorProxy AllocatorAnnotate
+Extra 
+Annotation 
+Notification
+Figure 3: Overview of OOM-Guard.
+The two core components of OOM-Guard include a memory cost
+analyzer and a proxy allocator . The cost analyzer extracts the mem-
+ory cost of the target function as a tuple of multiple different-sized
+blocks, e.g.,((x,1), (8,2)) which means the function requires 1
+memory block of xbytes and 2 memory blocks of 8bytes, where x
+is a parameter or symbolic value that can be concretized when the
+function is called. Note that each function may involve multiple
+allocation sites with different-sized memory blocks. Rather than
+extracting a simple maximum cost, we prefer employing such de-
+tailed memory layout information for the reservation because it is
+useful for achieving efficient memory block management and reuse
+during execution. Our cost analyzer is based on static analysis in-
+stead of dynamic analysis because static analysis is sound and more
+reliable for our problem. To date, there are still many situationsthat static cost analysis cannot handle like unbounded loops or
+dynamic dispatches. In order to deal with such problems and make
+the results of cost analysis sound, OOM-Guard adopts a multi-level
+reservation mechanism, i.e. perform deeper reservations through
+extra annotations when encountering unsolvable situations. OOM-
+Guard will give developers the information about extra annotations
+all at once to handle these situations quickly. Section 4 will provide
+a more detailed design of our cost analysis approach.
+Another important part to achieve OOM-Guard is to implement
+the reservation mechanism for the allocator used in the programs.
+In this paper, we design a proxy allocator to achieve the reser-
+vation mechanism, which can handle subsequent allocation and
+deallocation operations for OOM-Guard functions annotated with
+#[oom_guard] and is ineffective for other functions. We design
+the proxy allocator to hold a reference to the program’s default
+allocator and leverage it to request memory from the system, thus
+the users can employ it to any rust programs directly even though
+they have their own allocator. There are three essential phases for
+proxy allocation: a reservation phase that the allocator reserves
+the required memory blocks of each size, an execution phase that
+the allocator performs allocations and deallocations based on the
+reserved blocks, and an exit phase which updates the remaining
+information. Section 5 presents more details of our proxy allocator
+design.
+736OOM-Guard: Towards Improving the Ergonomics of Rust OOM Handling via a Reservation-Based Approach ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA
+3.3 Merits Over Current Solution
+The current solution of nightly Rust requires developers to man-
+ually make tedious modifications and handle abundant allocation
+failures returned by fallible APIs. OOM-Guard is better than the
+approach of nightly Rust in several aspects. Most importantly, it
+releases developers from handling such widely existing but rarely
+occurred OOM situations. Users of OOM-Guard only need to anno-
+tate some top-level functions, and OOM-Guard will automatically
+take over all memory allocations of the call chains. Therefore, it can
+avoid aggravating code complexity. Particularly, it avoids leaking
+implementation details from function interfaces, such as changing
+thesort() method of Figure 1 to fallible mode. It can also avoid
+breaking some standard Rust interfaces ( e.g.,Drop trait) that may
+also involve small memory allocations or suffer OOM.
+4 COST ANALYSIS APPROACH
+4.1 Cost Expression and Tuple
+In our approach, a cost expression follows the following grammar
+in Backus-Naur Form [27].
+CostExpr↦→PhiExpr | ArithExpr | LeafExpr
+LeafExpr↦→Const|Var|Field
+ArithExpr↦→CostExpr BinOP CostExpr
+PhiExpr↦→Phi(CostExpr, CostExpr )
+Field↦→Var . Const|Field . Const
+BinOP↦→+|-|*|/|...
+Const↦→Number
+Var↦→Identifier(1)
+The grammar defines the format of cost expressions recursively.
+In general, a cost expression can either be a Phi expression of mul-
+tiple cost expressions, the arithmetic of multiple cost expressions,
+or a simple leaf expression. The leaf expression can be a constant
+number, a variable, or a field of a variable. For example, Phi(x,8)
++ 4is a cost expression for the function A of Figure 4c.
+We finally convert the cost expression into a tuple of different
+sized memory blocks by grouping the sub-expressions with the
+same block size. To this end, we should remove the Phi operator
+from the expression by retaining the operand expression that is
+always larger. If such an ordinary relationship does not exist, we
+simply sum all operand expressions of the Phi node. For example,
+For an expression Phi(x,8) + 8 , we can remove Phi and convert
+it to ((x + 8) + 8)) because there is no ordinary relationship
+between xand 8. Note that the Phi expression must be maintained
+in the intermediate results during analysis to enable its capacity to
+perform a set function. Thereby, it can effectively prevent repetitive
+superposition of identical constants for the situation without an
+ordinary relationship. Further, we can convert it to a tuple ((x,1),
+(8,2)) by grouping the two sub-expressions with block size 8.
+4.2 Cost Expression Extraction
+Algorithm 1 demonstrates our cost analysis algorithm for a target
+function. There are two main steps: 1) extracting the cost expres-
+sions of all allocation sites of the function (lines 2-8), 2) analyzing
+the cost of the target function by traversing its control-flow graph(lines 9-25). We choose to carry out this analysis on the LLVM-IR
+of Rust programs considering that it has completed polymorphism
+and is in the single static assignment (SSA) [5] form. We first clar-
+ify several main terms related to our cost expression extraction
+approach and then elaborate the details of these two steps.
+4.2.1 Terms and Definition. In general, the heap allocation state-
+ments may not explicitly appear in the function but are nested in
+the call chains. Therefore, we should clarify several concepts related
+to the phenomenon.
+Primitive Allocation Functions: There are two inherent functions
+in standard Rust to call the global allocator, __rust_alloc() and
+__rust_realloc() . They are the primitive points of all heap allo-
+cations.
+Primitive Allocation Site: The call site of primitive allocation
+functions.
+Allocation Site: The call site of a function that contains either
+primitive allocation sites or other allocation sites.
+Allocation Function: A function with allocation sites.
+Allocation Chain: A path on the call graph from the root function
+to a primitive allocation function.
+Take Figure 4a as an example, function E is an allocation function
+with a primitive allocation site; functions A and C are also allocation
+sites because they call other allocation functions. The call chain
+A-C-E is an allocation chain.
+4.2.2 Cost Expression of Allocation Sites. We first get the cost ex-
+pression of the function for each allocation site in the target func-
+tion through performing Algorithm 1 recursively (lines 5-6). This
+can be terminated with primitive allocation sites or cached results
+(line 4). In other words, we guarantee all functions in the allocation
+chains of the target function have been analyzed before the analysis.
+Hence, the cost expression of every related allocation function is
+available, and the main task of cost analysis for the allocation site
+is to replace the arguments of callee’s cost expression (lines 7-8).
+Taking Figure 4c as an example, we can recursively infer the cost
+expression of the function E()isz+4because it only contains one
+primitive allocation site. E(z) is an allocation site of the function
+C(). We should replace the argument of E(z) with the value of
+z, which is Phi(y,8) , and get the cost expression of function call
+E(z) asPhi(y,8) + 4 .
+To find the parameter value (line 7), we leverage the technique
+of sparse value-flow analysis [ 39–41]. In particular, the value flow
+of a parameter can be traced backward based on the define-use
+chain, which is directly available in the SSA form [ 5] of LLVM IR.
+Besides, we also leverage the pointer analysis and memory SSA [ 34]
+construction to refine the value-flow graph by resolving the use-
+define chain involved with alloca variable. The backward tracing
+would be terminated when meeting a node of a constant value
+or a parameter of the current function. Otherwise, we continue
+to search for the definition node. If a value node is defined based
+on two or multiple values ( e.g.,binary operation or Phi node), we
+continue to search the definition of each value separately.
+During the value-flow analysis, our analyzer may encounter
+some unsolvable situations (discussed in section §4.3, §4.4) and
+break off the traversing in the use-define chain. Taking Figure 4 as
+an example, the unsolvable() is such a function (e.g. a dynamic
+virtual function) and the analyzer can not fetch the value of a.
+737ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA Chengjun Chen, Zhicong Zhang, Hongliang Tian, Shoumeng Yan, and Hui Xu
+(a) Sample call graph.
+ (b) Code involving memory allocation.
+ (c) Cost expression.
+Figure 4: Demonstration of cost analysis.
+Algorithm 1: Cost analysis algorithm.
+Input: cur: the current function to analyze;
+Output: result : cost expression of the current function;
+1Function ExtractExpr( cur)
+2 allocSites←GetAllocSites( cur);
+3 foreach allocSite∈allocSites do
+4 calleeExpr←GetCalleeExpr( allocSite );
+5 ifcalleeExpr then
+6 ExtractExpr( allocSite .callee );
+7 parValue←GetParamValue( allocSite );
+8 allocSite .cost←ReplacePar( calleeExpr ,parValue );
+9 sccs←GetSCC( cur);
+10 foreach scc∈sccsdo
+11 scc.cost←HandleLoop( scc);
+12 cfgworklist←{} ;
+13 cfgworklist .Push (cfg.entry );
+14 while curblock←cfgworklist .Pop()do
+15 nextblocks←GetNextBlocks( curblock );
+16 foreach block∈nextblocks do
+17 ifblock∈sccsthen
+18 block←MoveToSCCExits() ;
+19 ifblock .indegree >1then
+20 block .cost←MergeCost( block ,curblock );
+21 else
+22 block .cost←AddCost( block ,curblock );
+23 ifHaveVisitedPrev( block )then
+24 cfgworklist .Push (block );
+25 result←cfg.exit.cost;
+Hence it is unable to get the expression of function call F(a) . To
+make the reservation mechanism sound, i.e. every infallible alloca-
+tion can be satisfied by the reserved space, OOM-Guard introduces
+a multi-level reservation mechanism. When detecting such unsolv-
+able situations, our analyzer will give the developer a notification
+that includes the location of the current analyzed function and therelated functions, and inform them to annotate the related func-
+tions ( Fin this example). After that, the function calls influenced
+by the unsolvable value flow can be ignored and will do reserva-
+tions for themselves. In this example, Fcan reserve for itself so that
+the reservation in Adoes not need to take the memory cost of F
+into consideration. Thus, we can finally get the cost expression of
+function CasPhi(y,8) + 4 andAasPhi(x,8) + 4 .
+Our approach also achieves field-sensitivity to enhance the ac-
+curacy of results. We maintain a vector as the field information
+during the value-flow analysis to indicate the located field of our
+target value in the current value node. For example, when reaching
+a parameter node that represents a struct with two i64fields in the
+current function, the field information can help to infer which field
+represents our target value, and generate a Field expression as the
+result. Furthermore, we can also leverage the field information to
+prune the branches for the value-flow analysis. Specifically, for the
+alloca variable with multiple fields, each of its fields is defined
+by a distinct store instruction hence such node will have several
+incoming edges. In this case, we can leverage the field informa-
+tion to locate the exclusive store node as the definition node. We
+will update the field information once encounter the field-related
+instructions like GetElementPtr orInsertValue by pushing the
+corresponding index to or popping an element from the vector.
+4.2.3 Cost Expression of Allocation Functions. Supposing we have
+obtained the cost expressions of all allocation sites of a function, we
+can traverse the control-flow graph (CFG) of the function to obtain
+its cost expression. To this end, we first use Tarjan algorithm [ 21]
+to extract all strongly connected components (SCC) of the CFG and
+analyze the cost of each SCC separately (lines 9-11). Since SCC is
+more complicated for cost analysis, we defer our discussion of loop
+handling to §4.3. We then shrink each SCC into a node as its exit
+node. Thus, we can treat the cost of the SCC as the cost of the exit
+node (lines 17-18).
+We employ a worklist approach to traverse the CFG in topo-
+logical order and combine the cost of each allocation site into a
+final expression (lines 12-25). For two sequential allocation sites or
+blocks in the control-flow graph, we can directly add the cost of
+the previous block to the subsequent one (line 22). For two parallel
+blocks, we should merge their cost expressions (line 20). Ideally, we
+only need to retain the expression that is always larger. However,
+738OOM-Guard: Towards Improving the Ergonomics of Rust OOM Handling via a Reservation-Based Approach ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA
+such an ordinary relationship may not exist between two expres-
+sions. For cost expressions that cannot be compared, we simply
+accumulate their costs.
+Note that if the function of an allocation site is also annotated as
+OOM-Guard, the analyzer will ignore its cost because the function
+will perform reservation for itself. Thus, we can leverage this design
+to break the recursion by annotating one of the functions in the
+recursion cycle. Such a mechanism justifies how our cost analysis
+approach supports multi-level or recursive OOM-Guard functions.
+4.3 Handling Loops
+4.3.1 General Loop Handling. SCC is special because we should
+infer the max iteration time of each loop. For each loop, the cost ex-
+pression can be represented as the cost expression of each iteration
+multiplied by the iteration time. When meeting nested loops, we
+first compute the cost of inner loops and then compute the expres-
+sion of the outer loop in turn. In general, for explicitly bounded
+loops like the foriterator, we can obtain the iteration time expres-
+sion via a value-flow analysis approach on the iterator which is
+similar to the parameter solving of Section 4.2.2.
+However, there are two exceptions that cannot be solved with
+the approach, implicit bounded loops and loop-variant allocation
+sites. Next, we discuss how OOM-Guard handles such cases.
+4.3.2 Implicit Bounded Loops. Forwhile andloop loops, either
+the step size after each iteration or the termination conditions
+cannot be easily determined. Therefore, we cannot simply employ
+the previous value-flow approach to calculate their iteration times.
+These loops as implicit bounded loops.
+OOM-Guard can detect implicitly bounded loops and give the
+notification to users. Such information can guide developers to play
+corresponding treatments. It provides two options for developers
+to handle implicit bounded loops. Firstly, it allows developers to
+specify the iteration number (either a constant value or an expres-
+sion with valid variables) manually for the loop, which will be used
+directly for cost analysis. Secondly, developers may also annotate
+the loop as OOM-Guard to achieve multi-level reservation. In this
+way, the call sites within the loop will perform reservations for
+themselves, and the caller function can ignore the cost of the loop.
+4.3.3 Loop-variant Allocation Sites. For some allocation sites within
+a loop, the parameter value could be updated during each iteration.
+Therefore, we cannot assume a uniform cost for each iteration and
+multiply the iteration number as the cost of the loop. For such cases,
+OOM-Guard also informs developers automatically and suggests
+they to annotate the loop as OOM-Guard.
+4.4 Handling Dynamic Dispatch
+Besides loops, dynamic dispatch can also cause problems for cost
+analysis because the callee function of an allocation site cannot be
+easily determined via static analysis. In Rust, dynamic traits can
+be used for dynamic dispatch, e.g.,by declaring a function with
+the parameter of dynamic traits, or calling a function that returns
+a boxed dynamic trait. If the program further invokes a member
+function of the dynamic trait, it would be difficult to determine
+which actual function would be called until runtime. For such cases,
+we generally cannot obtain a max cost expression of all candidate
+Figure 5: Pages management in OOM-Guard allocator.
+functions because such an ordinal relationship rarely exists among
+functions. Also, we cannot sum all the cost expressions of each
+candidate function because it would waste memory when there
+are many candidate functions. Therefore, OOM-Guard chooses to
+inform developers about the allocation site involving dynamic traits
+and inform them to annotate the allocation site separately.
+5IMPLEMENTATION OF PROXY ALLOCATOR
+In this section, we describe how to implement our proxy allocator
+to achieve memory reservation management.
+5.1 Objective
+To avoid users having to manually modify their allocator to adapt
+to the reservation mechanism, we implement a proxy allocator that
+can directly leverage the default allocator to achieve the reservation
+mechanism. As shown in Figure 2c, users of OOM-Guard can specify
+a new proxy allocator as the global allocator. In this way, the proxy
+allocator will receive all allocation and deallocation requests. It then
+bypasses the requests of regular functions to the original allocator
+and only processes the requests from OOM-Guard functions. Since
+such an allocator cannot manage memory directly, it may introduce
+some overhead. Hence, another objective of the allocator design is
+to reduce the overhead to achieve efficient memory management.
+Next, we discuss the detailed design of the proxy allocator.
+5.2 Data Structure for Memory Management
+Our proxy allocator adopts a classic design for memory manage-
+ment [ 6,7,38],i.e.,it reserves memory pages (4096 bytes) with
+size classes varied from 16 bytes to 2048 bytes ascending by an
+exponential of 2. Pages with the same size class are linked into a
+double-linked list. Figure 5 demonstrates the detailed structure of
+each page. In particular, each page has a free stack to record the
+indexes of empty blocks of the page, and a free index to record
+the top index of the free stack. For other memory blocks greater
+than 2048 bytes, we simply store each of them in a seperate page
+and organize them into a list which is dedicated to big memory
+allocations.
+The design described above ensures each request for memory in
+reservation is larger than the page size, which avoids a large abun-
+dant memory request. Meanwhile, the size class design eliminates
+the external memory fragmentation, making every block reusable
+as well as accelerating the page searching when allocating. In most
+instances, the allocator can also fetch a free block from a page in a
+short time count on the free index and free stack.
+739ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA Chengjun Chen, Zhicong Zhang, Hongliang Tian, Shoumeng Yan, and Hui Xu
+5.3 Allocator APIs
+There are three core APIs for the proxy allocator, reservation, allo-
+cation, and deallocation.
+5.3.1 Reservation. The reservation API is called in the entry of each
+OOM-Guard function. The proxy allocator maintains the remaining
+information for each size class to help reserve memory blocks for a
+given memory cost tuple. It mainly calculates a reserved number
+for each size class and uses it to subtract from the corresponding
+remaining number during reservation. If there are not enough
+blocks, it will request more pages from the system for reservation.
+When the OOM-Guard function exits, the reserved number
+should be added back to the remaining number since the objec-
+tive of the reservation has been achieved. However, we can not
+directly use the reserved number calculated in the reservation be-
+cause there could be some reserved memory blocks still in use after
+the function exits. To tackle the problem, we also record the actual
+allocation number and deallocation number for each OOM-Guard
+function. When the function exits, the reserved number of blocks
+to be given back should be calculated as:
+reserved_num−(alloc_num−dealloc_num) (2)
+5.3.2 Allocation. Our proxy allocator will employ the reserved
+memory for the allocations in OOM-Guard functions. For small
+allocations (≤2048 bytes), the allocator searches for empty blocks
+from pages of the corresponding size. Firstly, it gets the page list
+with the target size class and starts searching from the first page.
+If there are empty blocks within the page, our allocator can get
+theindex of an empty block through the free index and the free
+stack, then compute the address of the empty block by multiplying
+itsindex with the block size and then adding to the address
+of the page. These calculations are under O(1) time complexity.
+If the page has no empty blocks, our allocator will continue to
+search for the next page until an empty block is found. For large
+allocations ( >2048 bytes), the allocator will return the reserved big
+page directly and remove it from the page list.
+Note that our scheme can ensure there are always available
+empty blocks if the reservation succeeds. In particular, because
+the reserved number and remaining number for each size class
+are globally maintained across all OOM-Guard functions, we do
+not need to care which block is reserved by which OOM-Guard
+function. Such a design largely simplifies the complexity of our
+allocation mechanism.
+5.3.3 Deallocation. When performing deallocation, the proxy allo-
+cator first checks if the target memory is managed by it. If not, the
+proxy allocator will directly use the default allocator to release the
+memory. Otherwise, if the deallocation memory is a small block
+(≤2048 bytes), the allocator only needs to push the index of the
+corresponding block to the free stack of the page it belongs to. For
+large-sized memory ( >2048 bytes), the allocator can directly release
+it since it occupies a whole page.
+6 EVALUATION
+This section demonstrates our case study of applying OOM-Guard
+to two representative Rust system-level programs, Bento-fs and
+rCore-os.Table 1: The annotated top-level functions.
+System Top-level Function Analysis time
+rCore open, read, write, dup, pipe, exit, sleep, yield, exec,
+thread_create, condvar_wait, condvar_signal,
+condvar_create, semaphore_down, semaphore_up,
+semaphore_create, mutex_create, fork42s
+Bento-fs init, lookup, open, read, write, statfs, fsync, opendir,
+fsyncdir, create, getattr, setattr, readdir31s
+6.1 Experimental Setting
+We implement OOM-Guard based on Rust version 1.43.0 and Clang
+version 13.0.0. It consists of over 1300 lines of Rust codes and 4700
+lines of C++ codes. We implement our cost analysis algorithm based
+on LLVM IR with C++. The proxy allocator and proc-macro crate
+are developed with Rust.
+We choose Bento-fs and rCore-os for evaluation because they
+are well-known and recent research work in the Rust community
+and employ infallible mode by default. Bento-fs3is a file system
+that emphasizes memory safety and velocity. rCore4is a simple
+UNIX-like kernel based on RISC-V architecture written in Rust
+language. However, aborting on OOM will significantly impacts the
+availability and is not suitable for such low-level system softwares.
+We modify the original Bento-fs and rCore-os with OOM-Guard
+and evaluate OOM-Guard in the following aspects.
+•Usability : Is OOM-Guard a more handy approach to avoiding
+aborting on OOM compared with alternative approaches?
+(§6.2)
+•Resilience : Can OOM-Guard programs survive under OOM
+circumstances? (§6.3)
+•Cost Analysis Accuracy : How accurate is OOM-Guard in
+estimating memory usage? (§6.4)
+•Overall Efficiency : How much overhead does OOM-Guard
+introduce compared to the original programs?
+We conduct experiments on a 2.00 GHz Intel processor with the
+18.04.1-Ubuntu operating system (Linux kernel version 4.15). We
+run rCore benchmark with the qemu platform.
+6.2 Usability
+To implement the OOM-Guard version of Bento-fs, we annotate
+its top-level APIs with the #[oom_guard] macro. For rCore, we
+annotate all 18 syscall functions involving memory allocations. The
+annotated top-level functions in these benchmarks are shown in
+Table 1.
+We measure the coding efforts saved by OOM-Guard compared
+to the baseline of the existing fallible mode with try version APIs.
+To this end, we manually implement a functionally equivalent ver-
+sion with corresponding fallible APIs. Table 2 shows the result. The
+baseline version requires to modify 243 function signatures and 567
+callsites for Bento-fs, and 236 function signatures and 321 callsites
+for rCore. In comparison, using OOM-Guard only needs to modify
+about one hundred places, which is five times less than that of the
+baseline. To elaborate, the OOM-Guard version should annotate
+13 and 18 top-level functions for Bento-fs and rCore. During cost
+3https://github.com/smiller123/bento
+4https://github.com/rcore-os/rCore-Tutorial-v3
+740OOM-Guard: Towards Improving the Ergonomics of Rust OOM Handling via a Reservation-Based Approach ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA
+Table 2: Changes needed by OOM-Guard versus the try ver-
+sion APIs to modify the benchmarks. # Func Sign: the number
+of functions that should be manually changed from infallible
+mode to fallible mode. Callsite: lines of code of the callsite
+for handling allocation failures. Extra: extra lines of code
+needed.
+System # Annotation # Func Sign Callsite Extra
+Bento.Try (baseline) - 243 567 -
+Bento.OOM-Guard 13 + 17 - 58 9
+rCore.Try (baseline) - 236 321 -
+rCore.OOM-Guard 18 + 23 - 69 9
+Table 3: Resilience experiment under OOM. There are ten
+rounds for each system, and each round has 100 cases. OOM-
+Guard systems have survived all rounds.
+SystemSettingCrash# Successful Cases
+# round # cases before OOM after OOM
+Bento.Origin (baseline) 10 100 10 542 0
+Bento.OOM-Guard 10 100 0 519 96
+rCore.Origin (baseline) 10 100 10 506 0
+rCore.OOM-Guard 10 100 0 452 112
+analysis, there are respectively 17 and 23 notifications generated.
+(discussed in Section 4.3 and 4.4). For such code, we place extra
+annotations for dynamic reservation. Note that this would not un-
+dermine the effectiveness of memory reservation. If the dynamic
+reservation fails, the failure can also be propagated to and returned
+by the top-level function. In practice, the extra annotations can be
+automated to facilitate user experience. Since OOM-Guard does not
+modify the function signatures of call chains, there are relatively
+fewer callsites to be modified. Besides, OOM-Guard requires 9 ex-
+tra lines of code to import related libraries and specify the global
+allocator.
+Our cost analyzer is also efficient. As shown in Table 1, the static
+analysis time for both systems is less than one minute. In general,
+users only need to conduct cost analysis after the development is
+completed. Meanwhile, the notification for extra annotations will
+be reported at once hence it does not need to repeat the process
+several times. Therefore, performing a cost analysis does not have
+much impact on the usability of OOM-Guard.
+6.3 Resilience
+In this experiment, we test whether OOM-Guard can help Rust
+programs survive from OOM situations. To this end, we execute test
+cases in simulated low-memory situations. For Bento-fs, we set the
+memory size to 64 MB and inject memory load with several threads
+that randomly allocate or deallocate memory. The test cases of
+Bento-fs are general file system operations, including reading files,
+writing files, and reading directories. For rCore, we set the kernel
+heap size of rCore to 2MB to simulate a low-memory situation
+and also fork several processes to execute random allocations and
+deallocations to keep pressurizing the memory. The test cases of
+rCore are directly from the project repository, which covers all
+allocation-related system calls.For each benchmark, we run test cases with the original system
+and OOM-Guard system separately. We do 10 tests for each system.
+In each test, we execute 100 randomly selected test cases. Besides,
+we also randomize the parameter values (such as writing size) in
+each test case to trigger different allocation behaviors. If the system
+encounters an allocation failure when executing a test case, this
+test case will fail. At this point, an ideal OOM-sound system can
+recover from the OOM state and is able to execute some subsequent
+tests successfully when memory is sufficient again. To reveal this
+ability, we also record the number of tests executed successfully
+before and after the first encounter with the OOM state respectively
+for each benchmark.
+Table 3 shows our experimental results. OOM-Guard does im-
+prove the stability of system softwares under low memory cir-
+cumstances. OOM-Guard versions can recover from OOM state
+successfully and execute more test cases after recovering. However,
+the original versions crash and become immediately unavailable
+once OOM happens for all 10 rounds. In the results, OOM-Guard
+version executes fewer tests before first encountering OOM state
+due to the overestimation and the design of our proxy allocator,
+which performs reservation on a per-page basis. Nevertheless, this
+design serves for the safer recovery since more available space is
+left in the system when the OOM happens.
+6.4 Cost Analysis Accuracy
+In this experiment, we evaluate the accuracy of cost analysis. We
+record the ratio of the predicted memory cost to the actual memory
+cost for each callsite of OOM-Guard functions in the test cases
+used in 6.3. We execute each test case several times with diverse
+parameter values to trigger richer execution branches and allocation
+sizes. Since some allocation sites will be executed bunches of times
+with exactly the same arguments, we only record once for the same
+callsites with the same actual memory cost and predicted memory
+cost. We record the results as the scatter chart and indicate the
+number of callsites with completely accurate predictions for each
+test case.
+Figure 6 demonstrates our results. In general, over 70%of analy-
+sis results are accurate. None of these estimation results is lower
+than the actually allocated memory (ratio <1). Among all 169 al-
+location sites, there are 45 overestimated allocations (ratio >1).
+Among all overestimated cases, the overestimation ratio is below
+3.5. Such overestimations are generally caused by our estimation
+strategy that remains the max value as the memory cost for alloca-
+tions on branches. The result implies our approach will not bring
+much overestimation in most cases. Note that these overestimated
+memory does not necessarily indicate memory waste when incor-
+porating our allocator design (Section 5.3). On one hand, if there are
+enough unreserved memory blocks held by the proxy allocator, our
+preservation API simply decreases the number of remaining blocks
+instead of actually requesting memory from the default allocator.
+Secondly, even if the overestimation may lead to over reservation,
+the reserved memory can be used by other OOM-Guard functions
+after the function returns.
+741ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA Chengjun Chen, Zhicong Zhang, Hongliang Tian, Shoumeng Yan, and Hui Xu
+Figure 6: The proportions of predicted allocation size to actual allocation size. We count the result for each test case separately,
+in which the Breaddir ,Breadfile and Bwritefile are test cases in bento, and others are test cases in rCore (rCore_init counts
+the allocation sites during initialization of rCore).
+(a) The proportion of executing time of syscall tests in rCore benchmark. For the syscall tests with more frequent memory allocations ( fork,
+read,write ,thread ), we modified the executing parameters to trigger richer allocations and conduct experiments separately.
+(b) Throughput experi-
+ment in Bento-fs.
+(c) Peak memory usage ex-
+periment in Bento-fs.
+(d) Peak memory usage
+experiment in rCore.
+(e) Peak memory usage of
+thread test in rCore.
+(f) Peak memory usage of
+fork test in rCore.
+Figure 7: Performance experiment results. For Bento-fs benchmark, we perform the throughput experiment with 256MB
+large-scale writing operations under different cache size, and peak memory usage experiment with different total writing size
+under 64KB cache size. For rCore benchmark, we evaluate the overhead through its default syscall tests.
+6.5 Overall Performance
+This section evaluates the performance overhead introduced by
+OOM-Guard. Since these two systems are very different, we discuss
+their performance separately.
+For Bento-fs, we measure the throughput and peak memory
+usage when performing large-scale serial writing operations under
+varied operating sizes. We run each experiment three times and
+calculate the average value. Figure 7b demonstrates our results
+of throughput study. The original Bento-fs is 1.03×faster than
+OOM-Guard version on average and 1.05×faster in the worst case.
+Figure 7c shows the overhead of memory space, which is 10%on
+average and 15%in the worst case.
+For rCore, we first evaluate the speed overhead of OOM-Guard
+by measuring the executing time of the default syscall tests of
+rCore used in 6.3. We repeat each syscall test 10 times. Figure 7a
+demonstrates the result in box chart. The overhead of executiontime is 5%on average and 8%in the worst case. When evaluating
+the memory overhead, we sequentially execute these test cases
+several times, and measure the peak memory usage during the
+execution. Figure 7d shows the overhead of peak memory usage,
+which is 7%on average and 10%in the worst case. We also choose
+two syscall tests which involve high memory usage, thread and
+fork . We execute these two tests by creating diverse numbers of
+processes or threads. The overhead of peak memory usage is shown
+in Figure 7e and Figure 7f, which is 10%on average and 13%in the
+worst case.
+In summary, OOM-Guard only introduces a small overhead even
+in the worst cases. We further analyze which part contributes most
+to overhead. Both the executing time and peak memory usage over-
+head are mainly caused by the proxy allocator. Since it cannot
+manage memory directly, the additional overhead is unavoidable.
+The proxy allocator needs extra time to call the default allocator for
+742OOM-Guard: Towards Improving the Ergonomics of Rust OOM Handling via a Reservation-Based Approach ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA
+reservations and to manage its owned pages. When using OOM-
+Guard to handle OOM situations for general programs, such over-
+heads are acceptable. For those programs with high-performance
+requirements, implementing the reservation mechanism for their
+own allocators can further reduce these overheads.
+7 RELATED WORK
+This section reviews some related work that focus on OOM situa-
+tions and cost analysis.
+7.1 Existing Work on OOM Situations
+Large parts of work focused on OOM situations try to detect mem-
+ory leakage vulnerabilities that aggravate the memory usage and
+trigger OOM situations more easily in the programs. Mitchell et
+al. [32] construct a automated tool to detect memory leakages of
+Java programs in the server. Ma et al. [ 31] propose a framework
+that can discover memory leakage bugs in smart pointer systems.
+Xie et al. [ 45] and Sun et al. [ 42] focus on the efficiency and accurate
+static memory leakage detection in the programs with complicated
+control flows. These work can help programmers build a program
+with less OOM-related vulnerabilities. However, OOM is a general
+program event, especially for embedding systems or other memory-
+constrained venues where every allocation may lead to an OOM.
+Compared to the memory leakage detection work, our research
+tries to help users solve these more general OOM situations.
+There are also some system-level work trying to handle the
+OOM situation robustly. Biscuit [16] is a kernel written in Go and
+can deal with the OOM situation. Biscuit ensures the allocations
+in syscalls always succeed by reservation enough memory at the
+syscall entry. Anticipatory Memory Allocation (AMA) [ 43] also
+adopts the reservation mechanism to build robust allocation code
+in linux kernel. AMA requires developers to manually analyze the
+memory usage of allocation functions and modify the kernel code
+to achieve redirection for allocations. Compared to OOM-Guard,
+these two work cannot perform their mechanism in other programs
+handily as well as their approaches for prediction require more
+manual participation. Besides, some research on OOM handling
+enhances the performance of OOM killer [ 11,28,35–37]. However,
+these work only serves the Linux-based systems with OOM killer
+and cannot completely avoid the hazards caused by OOM.
+7.2 Existing Work on Cost Analysis
+Several research work aims to predict the memory cost of programs.
+Hofmann and Jost [ 25] are dedicated to studying the heap cost pre-
+diction for first-order programs. Based on this research, Hoffmann
+J et al. [ 22–24] carried out further research by using amortized
+analysis and validated the automatic analysis on a wide range of
+first-order programs. However, Rust is an imperative language that
+is more complicated than functional programming languages. Their
+approaches are not directly applicable to Rust.
+Chin et al. [ 12] work on the memory cost prediction of low-level
+languages. They calculated the parameter expression by means of
+symbol execution and constraint solution. Braberman et al.’s [ 9,
+10] work computes symbolic polynomial approximations of the
+amount of dynamic memory for Java-like imperative programs
+using region-based GC. Similarly, Albert et al. [ 3,4] proposed a heapcost prediction framework that can be instantiated with different
+GC strategies. Such work can solve some simple loop and recursion
+cases through fix-pointed analysis, but they have limitations in
+handling complex programs and cannot achieve field-sensitive.
+8 CONCLUSION
+In this paper, we propose a novel automated mechanism, OOM-
+Guard, to help Rust programs to evade the potential hazards of
+OOM status. This work contains a static analysis tool for accurate
+memory cost prediction and a platform-independent proxy alloca-
+tor to fit the reservation mechanism. We perform experiments on
+two well-known Rust system softwares. Experimental results show
+that OOM-Guard can successfully predict the memory cost of the
+target functions and help programs survive from allocation failure
+with acceptable overhead. We believe our approach can provide a
+new idea for gracefully handling OOM situations not only in Rust
+programs but also in other important scenarios.
+9 DATA AVAILABILITY
+We release OOM-Guard and supported data as open source at https:
+//github.com/cchanging/OOM.
+ACKNOWLEDGEMENT
+This work was supported by the Research Grant of Ant Group (No.
+2021092335587). It was done during Chengjun Chen’s internship at
+Ant Group.
+REFERENCES
+[1]2014. Rust RFC-2116. https://rust-lang.github.io/rfcs/2116-alloc-me-maybe.html.
+[2]2022. Procedural Macros. https://doc.rust-lang.org/reference/procedural-macros.
+html.
+[3]Elvira Albert, Puri Arenas, Samir Genaim, and Germán Puebla. 2011. Closed-form
+upper bounds in static cost analysis. Journal of automated reasoning 46, 2 (2011),
+161–203.
+[4]Elvira Albert, Samir Genaim, and Miguel Gómez-Zamalloa. 2013. Heap space
+analysis for garbage collected languages. Science of Computer Programming 78, 9
+(2013), 1427–1448.
+[5]Andrew W Appel. 2004. Modern compiler implementation in C . Cambridge
+university press.
+[6]Emery D Berger, Kathryn S McKinley, Robert D Blumofe, and Paul R Wilson.
+2000. Hoard: A scalable memory allocator for multithreaded applications. ACM
+Sigplan Notices 35, 11 (2000), 117–128.
+[7]Jeff Bonwick et al .1994. The slab allocator: An object-caching kernel memory
+allocator.. In USENIX summer , Vol. 16. Boston, MA, USA.
+[8]John Boyland. 2005. Position paper: Handling “out of memory” errors. In ECOOP
+Workshop . 150.
+[9]Vıctor Braberman. 2006. A Static Analysis for Synthesizing Paramet-ric Specifi-
+cations of Dynamic Memory Con-sumption. Journal of Object Technology 5, 5
+(2006).
+[10] Víctor Braberman, Federico Fernández, Diego Garbervetsky, and Sergio Yovine.
+2008. Parametric prediction of heap memory requirements. In Proceedings of the
+7th international symposium on Memory management . 141–150.
+[11] Wei Chen, Aidi Pi, Shaoqi Wang, and Xiaobo Zhou. 2019. Os-augmented oversub-
+scription of opportunistic memory with a user-assisted oom killer. In Proceedings
+of the 20th International Middleware Conference . 28–40.
+[12] Wei-Ngan Chin, Huu Hai Nguyen, Corneliu Popeea, and Shengchao Qin. 2008.
+Analysing memory resource bounds for low-level programs. In Proceedings of
+the 7th international symposium on Memory management . 151–160.
+[13] Jonathan Corbet. 2014. The “too small to fail” memory-allocation rule. https:
+//lwn.net/Articles/627419/.
+[14] Jonathan Corbet. 2015. Reservations for must-succeed memory allocations.
+https://lwn.net/Articles/636797/
+[15] Jonathan Corbet. 2017. Revisiting “too small to fail”.
+[16] Cody Cutler, M Frans Kaashoek, and Robert T Morris. 2018. The benefits and
+costs of writing a{POSIX}kernel in a high-level language. In 13th USENIX
+Symposium on Operating Systems Design and Implementation (OSDI 18) . 89–105.
+743ESEC/FSE ’23, December 3–9, 2023, San Francisco, CA, USA Chengjun Chen, Zhicong Zhang, Hongliang Tian, Shoumeng Yan, and Hui Xu
+[17] Edsger W Dijkstra. 1982. The mathematics behind the Banker’s algorithm. In
+Selected Writings on Computing: A Personal Perspective . Springer, 308–312.
+[18] Dawson Engler, David Yu Chen, Seth Hallem, Andy Chou, and Benjamin Chelf.
+2001. Bugs as Deviant Behavior: A General Approach to Inferring Errors in
+Systems Code. In Proceedings of the Eighteenth ACM Symposium on Operating
+Systems Principles (Banff, Alberta, Canada) (SOSP ’01) . Association for Computing
+Machinery, New York, NY, USA, 57–72.
+[19] Dawson Engler and Madanlal Musuvathi. 2004. Static analysis versus software
+model checking for bug finding. In International Workshop on Verification, Model
+Checking, and Abstract Interpretation . Springer, 191–210.
+[20] Ana Nora Evans, Bradford Campbell, and Mary Lou Soffa. 2020. Is Rust used
+safely by software developers?. In Proceedings of the ACM/IEEE 42nd International
+Conference on Software Engineering . 246–257.
+[21] Harold N Gabow and Robert Endre Tarjan. 1985. A linear-time algorithm for a
+special case of disjoint set union. Journal of computer and system sciences 30, 2
+(1985), 209–221.
+[22] Jan Hoffmann, Klaus Aehlig, and Martin Hofmann. 2011. Multivariate amor-
+tized resource analysis. In Proceedings of the 38th annual ACM SIGPLAN-SIGACT
+symposium on Principles of programming languages . 357–370.
+[23] Jan Hoffmann, Ankush Das, and Shu-Chun Weng. 2017. Towards automatic
+resource bound analysis for OCaml. In Proceedings of the 44th ACM SIGPLAN
+Symposium on Principles of Programming Languages . 359–373.
+[24] Jan Hoffmann and Martin Hofmann. 2010. Amortized resource analysis with
+polynomial potential. In European Symposium on Programming . Springer, 287–
+306.
+[25] Martin Hofmann and Steffen Jost. 2003. Static prediction of heap space usage for
+first-order functional programs. ACM SIGPLAN Notices 38, 1 (2003), 185–197.
+[26] Suman Jana, Yuan Jochen Kang, Samuel Roth, and Baishakhi Ray. 2016. Automat-
+ically detecting error handling bugs using error specifications. In 25th USENIX
+Security Symposium (USENIX Security 16) . 345–362.
+[27] Donald E Knuth. 1964. Backus normal form vs. backus naur form. Commun.
+ACM 7, 12 (1964), 735–736.
+[28] Joongjin Kook, Sukil Hong, Wooseung Lee, Eunkyeung Jae, and JungYeop Kim.
+2011. Optimization of out of memory killer for embedded Linux environments.
+InProceedings of the 2011 ACM Symposium on Applied Computing . 633–634.
+[29] Gunnar Kudrjavets, Jeff Thomas, Aditya Kumar, Nachiappan Nagappan, and
+Ayushi Rastogi. 2022. When malloc () Never Returns NULL–Reliability as an
+Illusion. arXiv preprint arXiv:2208.08484 (2022).
+[30] Junhee Lee, Seongjoon Hong, and Hakjoo Oh. 2018. Memfix: static analysis-based
+repair of memory deallocation errors for c. In Proceedings of the 2018 26th ACM
+Joint Meeting on European Software Engineering Conference and Symposium on
+the Foundations of Software Engineering . 95–106.
+[31] Xutong Ma, Jiwei Yan, Wei Wang, Jun Yan, Jian Zhang, and Zongyan Qiu. 2021.
+Detecting memory-related bugs by tracking heap memory management of C++
+smart pointers. In 2021 36th IEEE/ACM International Conference on Automated
+Software Engineering (ASE) . IEEE, 880–891.[32] Nick Mitchell and Gary Sevitsky. 2003. LeakBot: An automated and lightweight
+tool for diagnosing memory leaks in large Java applications. In European Confer-
+ence on Object-Oriented Programming . Springer, 351–377.
+[33] Madanlal Musuvathi, David YW Park, Andy Chou, Dawson R Engler, and David L
+Dill. 2002.{CMC}: A Pragmatic Approach to Model Checking Real Code. In 5th
+Symposium on Operating Systems Design and Implementation (OSDI 02) .
+[34] Diego Novillo et al .2007. Memory SSA-a unified approach for sparsely represent-
+ing memory operations. In Proceedings of the GCC Developers’ Summit . Citeseer,
+97–110.
+[35] P Patare and V Govindan. 2015. Efficient handling of low memory situations
+in linux. In International Journal of Engineering Research and Technology . Vol. 4.
+ESRSA Publications.
+[36] Rajesh Prodduturi and Deepak B Phatak. 2013. Effective handling of low memory
+scenarios in android using logs. Indian Institute of Technology (2013).
+[37] Kwan Yong Sim, F-C Kuo, and Robert Merkel. 2011. Fuzzing the out-of-memory
+killer on embedded Linux: an adaptive random approach. In Proceedings of the
+2011 ACM Symposium on Applied Computing . 387–392.
+[38] sploitfun. 2015. Understanding glibc malloc. https://sploitfun.wordpress.com/
+2015/02/10/understanding-glibc-malloc/
+[39] Yulei Sui and Jingling Xue. 2016. SVF: interprocedural static value-flow analysis in
+LLVM. In Proceedings of the 25th international conference on compiler construction .
+265–266.
+[40] Yulei Sui, Ding Ye, and Jingling Xue. 2012. Static memory leak detection using
+full-sparse value-flow analysis. In Proceedings of the 2012 International Symposium
+on Software Testing and Analysis . 254–264.
+[41] Yulei Sui, Ding Ye, and Jingling Xue. 2014. Detecting memory leaks statically
+with full-sparse value-flow analysis. IEEE Transactions on Software Engineering
+40, 2 (2014), 107–122.
+[42] Xiaohui Sun, Sihan Xu, Chenkai Guo, Jing Xu, Naipeng Dong, Xiujuan Ji, and Sen
+Zhang. 2018. A Projection-Based Approach for Memory Leak Detection. In 2018
+IEEE 42nd Annual Computer Software and Applications Conference (COMPSAC) ,
+Vol. 02. 430–435. https://doi.org/10.1109/COMPSAC.2018.10271
+[43] Swaminathan Sundararaman, Yupu Zhang, Sriram Subramanian, Andrea C
+Arpaci-Dusseau, and Remzi H Arpaci-Dusseau. 2012. Making the common
+case the only case with anticipatory memory allocation. ACM Transactions on
+Storage (TOS) 7, 4 (2012), 1–24.
+[44] wikipedia. 2022. Memory overcommitment. https://en.wikipedia.org/wiki/
+Memory_overcommitment
+[45] Yichen Xie and Alex Aiken. 2005. Context-and path-sensitive memory leak
+detection. In Proceedings of the 10th European software engineering conference
+held jointly with 13th ACM SIGSOFT international symposium on Foundations of
+software engineering . 115–125.
+[46] Junfeng Yang, Paul Twohey, Dawson Engler, and Madanlal Musuvathi. 2006.
+Using model checking to find serious file system errors. ACM Transactions on
+Computer Systems (TOCS) 24, 4 (2006), 393–423.
+Received 2023-02-02; accepted 2023-07-27
+744
