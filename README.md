@@ -10,7 +10,7 @@ You can **copy–paste this directly into your README.md**.
 
 ---
 
-# 📘 *SE Writing Style 2010–2025*
+# *SE Writing Style 2010–2025*
 
 ### Dataset + Reproducible Analysis Pipeline
 
@@ -19,7 +19,7 @@ You can **copy–paste this directly into your README.md**.
 
 ---
 
-## 🧩 Overview
+## Overview
 
 This repository provides a **fully reproducible dataset and analysis pipeline** for examining how **software engineering research writing** has changed over time (2010–2025), with a focus on the period **before vs. after the introduction of ChatGPT (Nov 2022)**.
 
@@ -35,7 +35,7 @@ The pipeline is **transparent, modular, and FAIR-compliant** — all code, inter
 
 ---
 
-# 📁 Repository Structure
+# Repository Structure
 
 ```
 se-writing-style-2010-2025/
@@ -98,7 +98,7 @@ bash scripts/download_spacy_model.sh
 
 ---
 
-# 🚀 How to Run the Pipeline
+# How to Run the Pipeline
 
 You may run each step individually **or** use the provided **Makefile**.
 
@@ -192,7 +192,7 @@ python src/stats_basiccov.py
 
 ---
 
-# 🧪 Quick Test With Sample
+# Quick Test With Sample
 
 Test end-to-end using provided small files:
 
@@ -202,7 +202,7 @@ make test
 
 ---
 
-# 📊 Reproducing the Figures / Graphs
+# Reproducing the Figures / Graphs
 
 You can load the generated `results/*.csv` into a notebook or visualization tool.
 
@@ -224,7 +224,7 @@ Graphs can be created with:
 
 ---
 
-# 📦 How to Cite the Dataset and Tool
+# How to Cite the Dataset and Tool
 
 The repository includes a **CITATION.cff** file.
 GitHub automatically generates a citation + DOI when archived.
@@ -240,7 +240,7 @@ After Zenodo deposits, the DOI will appear here.
 
 ---
 
-# 🔐 FAIR Compliance
+# FAIR Compliance
 
 ### **Findable**
 
@@ -268,7 +268,7 @@ After Zenodo deposits, the DOI will appear here.
 
 ---
 
-# 🤖 Notes for MSR Reviewers
+# Notes for MSR Reviewers
 
 This repository includes:
 
